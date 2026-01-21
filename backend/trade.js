@@ -199,7 +199,7 @@ const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 6);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
-const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
+const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
 const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
@@ -223,6 +223,13 @@ const ORPHAN_REPAIR_BEFORE_HALT = readEnvFlag('ORPHAN_REPAIR_BEFORE_HALT', true)
 const ORPHAN_SCAN_TTL_MS = readNumber('ORPHAN_SCAN_TTL_MS', 15000);
 let tradingHaltedReason = null;
 let lastOrphanScan = { tsMs: 0, orphans: [], positionsCount: 0, openOrdersCount: 0, openSellSymbols: [] };
+const AUTO_SCAN_SYMBOLS_OVERRIDE = parseAutoScanSymbols(process.env.AUTO_SCAN_SYMBOLS);
+if (AUTO_SCAN_SYMBOLS_OVERRIDE.length) {
+  console.log('auto_scan_symbols_override', {
+    autoScanSymbolsCount: AUTO_SCAN_SYMBOLS_OVERRIDE.length,
+    autoScanSymbolsPreview: AUTO_SCAN_SYMBOLS_OVERRIDE.slice(0, 10),
+  });
+}
 
 // ───────────────────────── ENTRY SIGNAL (RESTORED FROM v3) ─────────────────────────
 const symStats = Object.create(null);
@@ -397,7 +404,11 @@ async function computeEntrySignal(symbol) {
   const spreadBps = ((ask - bid) / mid) * BPS;
   if (SIMPLE_SCALPER_ENABLED) {
     if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-      return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+      return {
+        entryReady: false,
+        why: 'spread_gate',
+        meta: { symbol: asset.symbol, spreadBps, maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE },
+      };
     }
     return {
       entryReady: true,
@@ -2865,6 +2876,13 @@ function normalizeSymbolsParam(rawSymbols) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function parseAutoScanSymbols(rawSymbols) {
+  const parsed = normalizeSymbolsParam(rawSymbols)
+    .map((symbol) => normalizePair(symbol))
+    .filter(Boolean);
+  return Array.from(new Set(parsed));
 }
 
 function parseIsoTsMs(value) {
@@ -5699,6 +5717,8 @@ async function runEntryScanOnce() {
     if (!autoTradeEnabled || !liveMode) {
       return;
     }
+    const autoScanSymbols = AUTO_SCAN_SYMBOLS_OVERRIDE;
+    const universeIsOverride = autoScanSymbols.length > 0;
     if (HALT_ON_ORPHANS) {
       const orphanReport1 = await getCachedOrphanScan();
       const orphans1 = Array.isArray(orphanReport1?.orphans) ? orphanReport1.orphans : [];
@@ -5720,20 +5740,24 @@ async function runEntryScanOnce() {
           placed: 0,
           skipped: 1,
           topSkipReasons: { halted_orphans: 1 },
+          universeSize: 0,
+          universeIsOverride,
+          maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+          maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+          heldPositionsCount: null,
         });
         return;
       }
       tradingHaltedReason = null;
     }
 
-    const envSymbols = normalizeSymbolsParam(process.env.AUTO_SCAN_SYMBOLS);
     const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
     let universe = [];
-    if (SIMPLE_SCALPER_ENABLED) {
+    if (autoScanSymbols.length) {
+      universe = autoScanSymbols;
+    } else if (SIMPLE_SCALPER_ENABLED) {
       await loadSupportedCryptoPairs();
       universe = Array.from(supportedCryptoPairsState.pairs);
-    } else if (envSymbols.length) {
-      universe = envSymbols;
     } else {
       await loadSupportedCryptoPairs();
       universe = Array.from(supportedCryptoPairsState.pairs);
@@ -5744,6 +5768,7 @@ async function runEntryScanOnce() {
     const scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
+    const universeSize = scanSymbols.length;
 
     let positions = [];
     let openOrders = [];
@@ -5762,6 +5787,25 @@ async function runEntryScanOnce() {
         heldSymbols.add(normalizeSymbol(pos.symbol || pos.asset_id || pos.id || ''));
       }
     });
+    const heldPositionsCount = heldSymbols.size;
+    if (heldPositionsCount >= MAX_CONCURRENT_POSITIONS) {
+      const endMs = Date.now();
+      console.log('entry_scan', {
+        startMs,
+        endMs,
+        durationMs: endMs - startMs,
+        scanned: 0,
+        placed: 0,
+        skipped: 1,
+        topSkipReasons: { max_concurrent_positions: 1 },
+        universeSize,
+        universeIsOverride,
+        maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+        maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+        heldPositionsCount,
+      });
+      return;
+    }
 
     const openBuySymbols = new Set();
     (Array.isArray(openOrders) ? openOrders : []).forEach((order) => {
@@ -5865,6 +5909,11 @@ async function runEntryScanOnce() {
       placed,
       skipped,
       topSkipReasons,
+      universeSize,
+      universeIsOverride,
+      maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+      maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+      heldPositionsCount,
     });
   } finally {
     entryScanRunning = false;
@@ -6026,7 +6075,7 @@ async function placeSimpleScalperEntry(symbol) {
   }
   const spreadBps = ((ask - bid) / mid) * BPS;
   if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-    logSimpleScalperSkip(normalizedSymbol, 'spread_gate', { spreadBps });
+    logSimpleScalperSkip(normalizedSymbol, 'spread_gate', { spreadBps, maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE });
     return { skipped: true, reason: 'spread_gate', spreadBps };
   }
 
