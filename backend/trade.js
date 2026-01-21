@@ -3517,41 +3517,16 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     });
     desiredNetExitBpsValue = 0;
   }
-  let baseRequiredExitBps = null;
-  let requiredExitBpsFinal = null;
-  let netAfterFeesBps = null;
-  if (EXIT_MODE === 'net_after_fees') {
-    netAfterFeesBps = EXIT_NET_PROFIT_AFTER_FEES_BPS;
-    const requiredExitBps = computeRequiredExitBpsForNetAfterFees({
-      entryFeeBps,
-      exitFeeBps,
-      netAfterFeesBps,
-    });
-    baseRequiredExitBps = requiredExitBps;
-    requiredExitBpsFinal = requiredExitBps;
-  } else {
-    baseRequiredExitBps = resolveRequiredExitBps({
-      desiredNetExitBps: desiredNetExitBpsValue,
-      feeBpsRoundTrip,
-      slippageBps: slippageBpsUsed,
-      spreadBufferBps,
-      profitBufferBps,
-      maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-    });
-    requiredExitBpsFinal = baseRequiredExitBps;
-  }
-  if (Number.isFinite(entrySpreadBpsUsed)) {
-    requiredExitBpsFinal = computeSpreadAwareExitBps({
-      baseRequiredExitBps: requiredExitBpsFinal,
-      spreadBps: entrySpreadBpsUsed,
-    });
-  }
+  const fixedProfitBps = 5;
+  const requiredExitBpsFinal = feeBpsRoundTrip + fixedProfitBps;
+  const baseRequiredExitBps = requiredExitBpsFinal;
+  const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
   const minNetProfitBps = requiredExitBpsFinal;
-  const tickSize = getTickSize({ symbol, price: effectiveEntryPrice });
-  const targetPrice = computeTargetSellPrice(effectiveEntryPrice, requiredExitBpsFinal, tickSize);
-  const breakevenPrice = computeBreakevenPrice(effectiveEntryPrice, minNetProfitBps);
+  const tickSize = getTickSize({ symbol, price: entryPriceNum });
+  const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBpsFinal, tickSize);
+  const breakevenPrice = computeBreakevenPrice(entryPriceNum, minNetProfitBps);
   const postOnly = true;
-  const wantOco = !EXIT_POLICY_LOCKED && (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
+  const wantOco = false;
 
   console.log('tp_attach_plan', {
     symbol,
@@ -3997,38 +3972,12 @@ async function repairOrphanExits() {
       : DESIRED_NET_PROFIT_BASIS_POINTS;
     const profitBufferBps = PROFIT_BUFFER_BPS;
     const spreadBufferBps = BUFFER_BPS;
-    const spreadBps =
-      Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
-    let requiredExitBps = null;
-    let minNetProfitBps = null;
-    let netAfterFeesBps = null;
-    if (EXIT_MODE === 'net_after_fees') {
-      const plan = computeExitPlanNetAfterFees({
-        symbol,
-        entryPrice: avgEntryPrice,
-        entryFeeBps,
-        exitFeeBps,
-      });
-      netAfterFeesBps = plan.netAfterFeesBps;
-      requiredExitBps = plan.requiredExitBps;
-      minNetProfitBps = plan.requiredExitBps;
-      targetPrice = plan.targetPrice;
-    } else {
-      const baseRequiredExitBps = resolveRequiredExitBps({
-        desiredNetExitBps,
-        feeBpsRoundTrip,
-        slippageBps,
-        spreadBufferBps,
-        profitBufferBps,
-        maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-      });
-      requiredExitBps = Number.isFinite(spreadBps)
-        ? computeSpreadAwareExitBps({ baseRequiredExitBps, spreadBps })
-        : baseRequiredExitBps;
-      minNetProfitBps = requiredExitBps;
-      const tickSize = getTickSize({ symbol, price: avgEntryPrice });
-      targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
-    }
+    const fixedProfitBps = 5;
+    const requiredExitBps = feeBpsRoundTrip + fixedProfitBps;
+    const minNetProfitBps = requiredExitBps;
+    const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
+    const tickSize = getTickSize({ symbol, price: avgEntryPrice });
+    targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
     const postOnly = true;
 
     if (hasTrackedExit) {
@@ -4494,67 +4443,14 @@ async function manageExitStates() {
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-        const useNetAfterFeesMode = EXIT_MODE === 'net_after_fees';
-        let exitEntryPrice = Number.isFinite(state.effectiveEntryPrice) ? state.effectiveEntryPrice : state.entryPrice;
-        let requiredExitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
-        let minNetProfitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
-        let targetPrice = null;
-        let baseRequiredExitBps = requiredExitBps;
-        let requiredExitBpsFinal = requiredExitBps;
-        if (useNetAfterFeesMode) {
-          const plan = computeExitPlanNetAfterFees({
-            symbol,
-            entryPrice: state.entryPrice,
-            entryFeeBps,
-            exitFeeBps,
-            effectiveEntryPriceOverride: Number.isFinite(state.effectiveEntryPrice)
-              ? state.effectiveEntryPrice
-              : state.entryPrice,
-          });
-          state.netAfterFeesBps = plan.netAfterFeesBps;
-          state.effectiveEntryPrice = plan.effectiveEntryPrice;
-          exitEntryPrice = plan.effectiveEntryPrice;
-          baseRequiredExitBps = plan.requiredExitBps;
-          requiredExitBpsFinal = baseRequiredExitBps;
-          if (Number.isFinite(bid) && Number.isFinite(ask)) {
-            requiredExitBpsFinal = computeSpreadAwareExitBps({ baseRequiredExitBps, spreadBps });
-          }
-          requiredExitBps = requiredExitBpsFinal;
-          minNetProfitBps = requiredExitBpsFinal;
-        } else {
-          state.netAfterFeesBps = null;
-          requiredExitBps = Number.isFinite(requiredExitBps)
-            ? requiredExitBps
-            : resolveRequiredExitBps({
-              desiredNetExitBps,
-              feeBpsRoundTrip,
-              slippageBps,
-              spreadBufferBps,
-              profitBufferBps,
-              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-            });
-          minNetProfitBps = Number.isFinite(minNetProfitBps)
-            ? minNetProfitBps
-            : computeMinNetProfitBps({
-              feeBpsRoundTrip,
-              profitBufferBps,
-              desiredNetExitBps,
-              slippageBps,
-              spreadBufferBps,
-              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-            });
-          baseRequiredExitBps = Number.isFinite(baseRequiredExitBps) ? baseRequiredExitBps : requiredExitBps;
-          requiredExitBpsFinal = baseRequiredExitBps;
-          if (Number.isFinite(bid) && Number.isFinite(ask)) {
-            requiredExitBpsFinal = computeSpreadAwareExitBps({ baseRequiredExitBps, spreadBps });
-          }
-          requiredExitBps = requiredExitBpsFinal;
-          minNetProfitBps = requiredExitBpsFinal;
-        }
-        baseRequiredExitBps = Number.isFinite(baseRequiredExitBps) ? baseRequiredExitBps : requiredExitBps;
-        requiredExitBpsFinal = Number.isFinite(requiredExitBpsFinal) ? requiredExitBpsFinal : requiredExitBps;
+        const fixedProfitBps = 5;
+        const fixedExitBps = feeBpsRoundTrip + fixedProfitBps;
+        const exitEntryPrice = Number.isFinite(state.entryPrice) ? state.entryPrice : state.effectiveEntryPrice;
+        const baseRequiredExitBps = fixedExitBps;
+        const requiredExitBpsFinal = fixedExitBps;
+        const minNetProfitBps = fixedExitBps;
         const tickSize = getTickSize({ symbol, price: exitEntryPrice });
-        targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBpsFinal, tickSize);
+        const targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBpsFinal, tickSize);
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
@@ -4566,6 +4462,7 @@ async function manageExitStates() {
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
         state.effectiveEntryPrice = exitEntryPrice;
+        state.netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
         const breakevenPrice = computeBreakevenPrice(exitEntryPrice, minNetProfitBps);
         state.breakevenPrice = breakevenPrice;
         const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
@@ -4580,11 +4477,116 @@ async function manageExitStates() {
           roundedBreakeven <= roundedAsk
             ? Math.min(roundedAsk, Math.max(roundedBreakeven, askMinusTick))
             : null;
-        const desiredLimit = Number.isFinite(makerDesiredLimit) ? makerDesiredLimit : roundedBreakeven;
+        const desiredLimit = targetPrice;
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
         const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
         const hasOpenSell = openSellOrders.length > 0 || Boolean(state.sellOrderId);
+
+        if (openSellCount > 0) {
+          actionTaken = 'hold_existing_order';
+          reasonCode = 'hold_existing_order';
+          const decisionPath = 'hold_existing_order';
+          logExitDecision({
+            symbol,
+            heldSeconds,
+            entryPrice: state.entryPrice,
+            targetPrice,
+            bid,
+            ask,
+            minNetProfitBps,
+            actionTaken,
+          });
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            bid,
+            ask,
+            spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsFinal,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            breakevenPrice,
+            desiredLimit,
+            decisionPath,
+            lastRepriceAgeMs,
+            lastCancelReplaceAt: lastCancelReplaceAtMs,
+            actionTaken,
+            reasonCode,
+            iocRequestedQty: null,
+            iocFilledQty: null,
+            iocFallbackReason: null,
+          });
+          continue;
+        }
+
+        if (openSellCount === 0) {
+          const replacement = await submitLimitSell({
+            symbol,
+            qty: state.qty,
+            limitPrice: targetPrice,
+            reason: 'place_gtc_tp',
+            intentRef: state.entryOrderId || getOrderIntentBucket(),
+            openOrders: symbolOrders,
+          });
+          if (!replacement?.skipped && replacement?.id) {
+            state.sellOrderId = replacement.id;
+            state.sellOrderSubmittedAt = Date.now();
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? targetPrice;
+            actionTaken = 'place_gtc_tp';
+            reasonCode = 'place_gtc_tp';
+            lastActionAt.set(symbol, now);
+          } else {
+            actionTaken = 'hold_existing_order';
+            reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
+          }
+          const decisionPath = 'place_gtc_tp';
+          logExitDecision({
+            symbol,
+            heldSeconds,
+            entryPrice: state.entryPrice,
+            targetPrice,
+            bid,
+            ask,
+            minNetProfitBps,
+            actionTaken,
+          });
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            bid,
+            ask,
+            spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsFinal,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            breakevenPrice,
+            desiredLimit,
+            decisionPath,
+            lastRepriceAgeMs,
+            lastCancelReplaceAt: lastCancelReplaceAtMs,
+            actionTaken,
+            reasonCode,
+            iocRequestedQty: null,
+            iocFilledQty: null,
+            iocFallbackReason: null,
+          });
+          continue;
+        }
 
         if (quoteStale) {
           const lastKnownBid = Number.isFinite(state.lastBid) ? state.lastBid : null;
