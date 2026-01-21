@@ -28,6 +28,19 @@ Optional:
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 
+## Trading Gates
+
+Entry scans apply multiple gates before placing a trade:
+- **Spread gate**: skips symbols where spread bps exceed the configured max spread threshold.
+- **Orderbook gate**: skips symbols where orderbook depth/impact does not meet liquidity criteria.
+- **pUp + EV gates**: requires probability of upside (pUp) to exceed `PUP_MIN` and expected value to exceed `EV_MIN_BPS`.
+- **Required gross exit cap**: skips symbols when the modeled gross take-profit bps for a +1% net move exceeds `MAX_REQUIRED_GROSS_EXIT_BPS`.
+
+## Exit Policy
+
+- Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).
+- Optional refresh repricing can cancel and replace stale exit orders when `EXIT_REFRESH_ENABLED=true` and the order age exceeds `EXIT_MAX_ORDER_AGE_MS`.
+
 ## Notes
 
 - `GET /health` remains public for uptime checks.
