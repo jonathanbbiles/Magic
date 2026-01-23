@@ -5768,7 +5768,7 @@ async function manageExitStates() {
       }
 
       const rawAge = state.sellOrderSubmittedAt ? Date.now() - state.sellOrderSubmittedAt : null;
-      const existingOrderAgeMs = Number.isFinite(rawAge) ? Math.max(0, rawAge) : null;
+      const existingOrderAgeMsLogged = Number.isFinite(rawAge) ? Math.max(0, rawAge) : null;
       const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || lastCancelReplaceAtMs;
       const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
 
@@ -5803,7 +5803,7 @@ async function manageExitStates() {
         requiredExitBpsFinal,
         openBuyCount,
         openSellCount,
-        existingOrderAgeMs,
+        existingOrderAgeMs: existingOrderAgeMsLogged,
         feeBpsRoundTrip,
         profitBufferBps,
         minNetProfitBps,
