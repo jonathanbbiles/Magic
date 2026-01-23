@@ -120,6 +120,9 @@ function alpacaJsonHeaders() {
 const TRADE_PORTFOLIO_PCT = Number(process.env.TRADE_PORTFOLIO_PCT || 0.10);
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 1);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
+const TRADING_BLOCK_COOLDOWN_MS = readNumber('TRADING_BLOCK_COOLDOWN_MS', 300000);
+const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
+const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
 const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
 const MARKET_DATA_RETRIES = Number(process.env.MARKET_DATA_RETRIES || 2);
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
@@ -230,6 +233,20 @@ const ORPHAN_REPAIR_BEFORE_HALT = readEnvFlag('ORPHAN_REPAIR_BEFORE_HALT', true)
 const ORPHAN_SCAN_TTL_MS = readNumber('ORPHAN_SCAN_TTL_MS', 15000);
 let tradingHaltedReason = null;
 let lastOrphanScan = { tsMs: 0, orphans: [], positionsCount: 0, openOrdersCount: 0, openSellSymbols: [] };
+let tradingBlockedUntilMs = 0;
+let lastTradingDisabledLogMs = 0;
+
+function isTradingBlockedNow() {
+  return Date.now() < tradingBlockedUntilMs;
+}
+
+function logTradingDisabledOnce() {
+  const nowMs = Date.now();
+  if (!lastTradingDisabledLogMs || nowMs - lastTradingDisabledLogMs >= 60000) {
+    lastTradingDisabledLogMs = nowMs;
+    console.warn('TRADING_DISABLED_BY_ENV', { enabled: TRADING_ENABLED });
+  }
+}
 const AUTO_SCAN_SYMBOLS_OVERRIDE = parseAutoScanSymbols(process.env.AUTO_SCAN_SYMBOLS);
 if (AUTO_SCAN_SYMBOLS_OVERRIDE.length) {
   console.log('auto_scan_symbols_override', {
@@ -880,6 +897,36 @@ function getMarketDataLabel(type) {
   return normalized.toLowerCase() || 'marketdata';
 }
 
+function extractErrorCodeFromBody(body) {
+  if (!body) return null;
+  if (typeof body === 'object') {
+    const code = Number(body?.code ?? body?.error?.code);
+    return Number.isFinite(code) ? code : null;
+  }
+  if (typeof body !== 'string') return null;
+  try {
+    const parsed = JSON.parse(body);
+    const code = Number(parsed?.code ?? parsed?.error?.code);
+    return Number.isFinite(code) ? code : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function extractHttpErrorCode({ error, snippet }) {
+  const candidates = [
+    error?.response?.data,
+    error?.responseSnippet200,
+    error?.responseSnippet,
+    snippet,
+  ];
+  for (const candidate of candidates) {
+    const code = extractErrorCodeFromBody(candidate);
+    if (Number.isFinite(code)) return code;
+  }
+  return null;
+}
+
 function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, requestId, urlHost, urlPath }) {
   const label = getMarketDataLabel(type);
   console.log('alpaca_marketdata', {
@@ -912,6 +959,7 @@ function logHttpError({ symbol, label, url, error }) {
   const urlHost = error?.urlHost || null;
   const urlPath = error?.urlPath || null;
   const errorType = error?.isNetworkError || error?.isTimeout ? 'network' : 'http';
+  const errorCode = extractHttpErrorCode({ error, snippet });
   console.error('alpaca_http_error', {
     symbol,
     label,
@@ -925,6 +973,10 @@ function logHttpError({ symbol, label, url, error }) {
     errorMessage,
     snippet,
   });
+  if (statusCode === 403 && errorCode === 40310000) {
+    console.error('TRADING_BLOCKED', { code: 40310000, message: 'new orders are rejected by user request' });
+    return;
+  }
   if (statusCode === 401 || statusCode === 403) {
     console.error('AUTH_ERROR: check Render env vars');
   }
@@ -1079,6 +1131,15 @@ async function placeOrderUnified({
   reason,
   context,
 }) {
+  if (!TRADING_ENABLED) {
+    logTradingDisabledOnce();
+    return { skipped: true, reason: 'trading_disabled' };
+  }
+  if (isTradingBlockedNow()) {
+    const remainingMs = Math.max(0, tradingBlockedUntilMs - Date.now());
+    console.warn('TRADING_BLOCKED_COOLDOWN', { remainingMs, blockedUntilMs: tradingBlockedUntilMs });
+    return { skipped: true, reason: 'trading_blocked_cooldown', remainingMs, blockedUntilMs: tradingBlockedUntilMs };
+  }
   logOrderIntent({ label, payload, reason });
   logOrderPayload({ label, payload });
   let response;
@@ -1093,6 +1154,18 @@ async function placeOrderUnified({
   } catch (err) {
     logHttpError({ symbol, label: 'orders', url, error: err });
     logOrderResponse({ label, payload, error: err });
+    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
+    if (statusCode === 403 && errorCode === 40310000) {
+      if (!isTradingBlockedNow()) {
+        tradingBlockedUntilMs = Date.now() + TRADING_BLOCK_COOLDOWN_MS;
+        console.error('TRADING_BLOCKED_SET_COOLDOWN', {
+          blockedUntilMs: tradingBlockedUntilMs,
+          blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
+          cooldownMs: TRADING_BLOCK_COOLDOWN_MS,
+        });
+      }
+    }
     if (isNetworkError(err)) {
       logNetworkError({
         type: 'order',
@@ -3154,6 +3227,15 @@ async function submitOcoExit({
   clientOrderId,
 
 }) {
+  if (!TRADING_ENABLED) {
+    logTradingDisabledOnce();
+    return null;
+  }
+  if (isTradingBlockedNow()) {
+    const remainingMs = Math.max(0, tradingBlockedUntilMs - Date.now());
+    console.warn('TRADING_BLOCKED_COOLDOWN', { remainingMs, blockedUntilMs: tradingBlockedUntilMs });
+    return null;
+  }
 
   const stopBps = readNumber('STOP_LOSS_BPS', 60);
   const offBps = readNumber('STOP_LIMIT_OFFSET_BPS', 10);
@@ -3197,6 +3279,16 @@ async function submitOcoExit({
     return res;
   } catch (err) {
     console.warn('oco_exit_rejected', { symbol, err: err?.response?.data || err?.message });
+    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
+    if (statusCode === 403 && errorCode === 40310000 && !isTradingBlockedNow()) {
+      tradingBlockedUntilMs = Date.now() + TRADING_BLOCK_COOLDOWN_MS;
+      console.error('TRADING_BLOCKED_SET_COOLDOWN', {
+        blockedUntilMs: tradingBlockedUntilMs,
+        blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
+        cooldownMs: TRADING_BLOCK_COOLDOWN_MS,
+      });
+    }
     return null;
   }
 
@@ -4466,6 +4558,21 @@ async function manageExitStates() {
 
         if (quoteFetchFailed) {
           console.warn('exit_manager_skip_orders', { symbol, reason: 'quote_network_error' });
+          continue;
+        }
+
+        const qtyNum = Number(state?.qty ?? 0);
+        const midPrice = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : state.lastMid;
+        const positionNotionalUsd = Number.isFinite(state?.notionalUsd)
+          ? state.notionalUsd
+          : (Number.isFinite(midPrice) && Number.isFinite(qtyNum) ? qtyNum * midPrice : null);
+        if (Number.isFinite(positionNotionalUsd) && positionNotionalUsd < MIN_POSITION_NOTIONAL_USD) {
+          console.log('DUST_POSITION_SKIP', {
+            symbol,
+            qty: qtyNum,
+            positionNotionalUsd,
+            min: MIN_POSITION_NOTIONAL_USD,
+          });
           continue;
         }
 
@@ -6815,6 +6922,14 @@ async function submitManagedEntryBuy({
     reason: 'managed_entry_buy',
     context: 'managed_entry_buy',
   });
+  if (!buyOrder?.id) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: buyOrder?.reason || 'entry_not_submitted',
+      order: buyOrder || null,
+    };
+  }
   if (buyOrder?.id) {
     markRecentEntry(normalizedSymbol, buyOrder?.id || null);
   }
