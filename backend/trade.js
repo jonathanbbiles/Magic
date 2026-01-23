@@ -240,6 +240,16 @@ function isTradingBlockedNow() {
   return Date.now() < tradingBlockedUntilMs;
 }
 
+function shouldSkipTradeActionBecauseTradingOff(reasonContext) {
+  if (!TRADING_ENABLED) {
+    return { skip: true, reasonCode: 'trading_disabled', context: reasonContext || null };
+  }
+  if (isTradingBlockedNow()) {
+    return { skip: true, reasonCode: 'trading_blocked_cooldown', context: reasonContext || null };
+  }
+  return { skip: false };
+}
+
 function logTradingDisabledOnce() {
   const nowMs = Date.now();
   if (!lastTradingDisabledLogMs || nowMs - lastTradingDisabledLogMs >= 60000) {
@@ -2221,7 +2231,7 @@ function roundNotional(notional) {
   return parseFloat(Number(notional).toFixed(2));
 }
 
-function guardTradeSize({ symbol, qty, notional, price, side, context }) {
+function guardTradeSize({ symbol, qty, notional, price, side, context, allowSellBelowMin = true }) {
   const qtyNum = Number(qty);
   const notionalNum = Number(notional);
   const roundedQty = Number.isFinite(qtyNum) ? roundQty(qtyNum) : null;
@@ -2233,7 +2243,7 @@ function guardTradeSize({ symbol, qty, notional, price, side, context }) {
   }
 
   if (Number.isFinite(roundedQty) && roundedQty > 0 && roundedQty < MIN_TRADE_QTY) {
-    if (sideLower === 'sell') {
+    if (sideLower === 'sell' && allowSellBelowMin) {
       console.log(`${symbol} — Sell allowed despite below_min_order_size`, {
         qty: roundedQty,
         minQty: MIN_TRADE_QTY,
@@ -2252,7 +2262,7 @@ function guardTradeSize({ symbol, qty, notional, price, side, context }) {
   }
 
   if (Number.isFinite(computedNotional) && computedNotional < MIN_ORDER_NOTIONAL_USD) {
-    if (sideLower === 'sell') {
+    if (sideLower === 'sell' && allowSellBelowMin) {
       console.log(`${symbol} — Sell allowed despite below_min_notional`, {
         notionalUsd: computedNotional,
         minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
@@ -3305,11 +3315,20 @@ async function submitLimitSell({
   reason,
   intentRef,
   openOrders,
+  availableQtyOverride,
+  allowSellBelowMin = true,
 
 }) {
+  const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, reason, context: 'limit_sell' });
+  if (tradeGate.skip) {
+    return { skipped: true, reason: tradeGate.reasonCode };
+  }
 
   const open = openOrders || (await fetchLiveOrders());
-  const availableQty = await getAvailablePositionQty(symbol);
+  const availableQty =
+    Number.isFinite(availableQtyOverride) && availableQtyOverride >= 0
+      ? availableQtyOverride
+      : await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
     return { skipped: true, reason: 'no_position_qty' };
@@ -3385,6 +3404,7 @@ async function submitLimitSell({
     price: roundedLimit,
     side: 'sell',
     context: 'limit_sell',
+    allowSellBelowMin,
   });
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade' };
@@ -3422,6 +3442,9 @@ async function submitLimitSell({
       reason,
       context: 'limit_sell',
     });
+    if (response?.skipped) {
+      return { skipped: true, reason: response.reason };
+    }
   } catch (err) {
     const status = err?.statusCode ?? err?.response?.status ?? null;
     const body = err?.response?.data ?? err?.responseSnippet200 ?? err?.responseSnippet ?? err?.message ?? null;
@@ -3482,6 +3505,7 @@ async function submitMarketSell({
   qty,
 
   reason,
+  allowSellBelowMin = true,
 
 }) {
 
@@ -3498,6 +3522,7 @@ async function submitMarketSell({
     qty: adjustedQty,
     side: 'sell',
     context: 'market_sell',
+    allowSellBelowMin,
   });
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade' };
@@ -3533,6 +3558,7 @@ async function submitIocLimitSell({
   qty,
   limitPrice,
   reason,
+  allowSellBelowMin = true,
 }) {
   const availableQty = await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
@@ -3549,6 +3575,7 @@ async function submitIocLimitSell({
     price: roundedLimit,
     side: 'sell',
     context: 'ioc_limit_sell',
+    allowSellBelowMin,
   });
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade' };
@@ -3557,7 +3584,12 @@ async function submitIocLimitSell({
 
   if (DISABLE_IOC_EXITS) {
     console.log('ioc_disabled_market_sell', { symbol, qty: finalQty, reason });
-    const order = await submitMarketSell({ symbol, qty: finalQty, reason: `${reason}_market` });
+    const order = await submitMarketSell({
+      symbol,
+      qty: finalQty,
+      reason: `${reason}_market`,
+      allowSellBelowMin,
+    });
     return { order, requestedQty: finalQty };
   }
 
@@ -4563,15 +4595,22 @@ async function manageExitStates() {
 
         const qtyNum = Number(state?.qty ?? 0);
         const midPrice = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : state.lastMid;
-        const positionNotionalUsd = Number.isFinite(state?.notionalUsd)
-          ? state.notionalUsd
-          : (Number.isFinite(midPrice) && Number.isFinite(qtyNum) ? qtyNum * midPrice : null);
-        if (Number.isFinite(positionNotionalUsd) && positionNotionalUsd < MIN_POSITION_NOTIONAL_USD) {
+        const referencePrice = Number.isFinite(midPrice)
+          ? midPrice
+          : (Number.isFinite(state?.effectiveEntryPrice) ? state.effectiveEntryPrice : state.entryPrice);
+        const rawNotional =
+          Number.isFinite(referencePrice) && Number.isFinite(qtyNum) ? qtyNum * referencePrice : null;
+        if (
+          (Number.isFinite(rawNotional) && rawNotional < MIN_POSITION_NOTIONAL_USD) ||
+          (Number.isFinite(qtyNum) && qtyNum > 0 && qtyNum < MIN_TRADE_QTY)
+        ) {
           console.log('DUST_POSITION_SKIP', {
             symbol,
             qty: qtyNum,
-            positionNotionalUsd,
-            min: MIN_POSITION_NOTIONAL_USD,
+            rawNotional,
+            minNotionalUsd: MIN_POSITION_NOTIONAL_USD,
+            minQty: MIN_TRADE_QTY,
+            context: 'exit_manager',
           });
           continue;
         }
@@ -4646,6 +4685,67 @@ async function manageExitStates() {
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
 
+        const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, context: 'exit_manager' });
+        if (tradeGate.skip) {
+          actionTaken = 'hold_existing_order';
+          reasonCode = tradeGate.reasonCode;
+          const decisionPath = tradeGate.reasonCode;
+          logExitDecision({
+            symbol,
+            heldSeconds,
+            entryPrice: state.entryPrice,
+            targetPrice,
+            bid,
+            ask,
+            minNetProfitBps,
+            actionTaken,
+          });
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            bid,
+            ask,
+            spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsFinal,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            breakevenPrice,
+            desiredLimit,
+            decisionPath,
+            lastRepriceAgeMs,
+            lastCancelReplaceAt: lastCancelReplaceAtMs,
+            actionTaken,
+            reasonCode,
+            iocRequestedQty: null,
+            iocFilledQty: null,
+            iocFallbackReason: null,
+          });
+          continue;
+        }
+
+        let availableQtyOverride = null;
+        if (openSellCount === 0 && openBuyCount === 0) {
+          const availableQtyFromApi = await getAvailablePositionQty(symbol);
+          if (availableQtyFromApi === 0 && qtyNum > 0) {
+            console.log('AVAILABLE_QTY_OVERRIDE', {
+              symbol,
+              heldQty: qtyNum,
+              availableQtyFromApi: 0,
+              reason: 'no_open_orders',
+            });
+            availableQtyOverride = qtyNum;
+          } else {
+            availableQtyOverride = availableQtyFromApi;
+          }
+        }
+
         if (openSellCount > 0) {
           if (
             EXIT_REFRESH_ENABLED &&
@@ -4670,6 +4770,7 @@ async function manageExitStates() {
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
                 openOrders: refreshedOpenOrders,
+                allowSellBelowMin: false,
               });
               if (!replacement?.skipped && replacement?.id) {
                 state.sellOrderId = replacement.id;
@@ -4779,11 +4880,13 @@ async function manageExitStates() {
         if (openSellCount === 0) {
           const replacement = await submitLimitSell({
             symbol,
-            qty: state.qty,
+            qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
             limitPrice: targetPrice,
             reason: 'place_gtc_tp',
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             openOrders: symbolOrders,
+            availableQtyOverride,
+            allowSellBelowMin: false,
           });
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
@@ -4930,12 +5033,14 @@ async function manageExitStates() {
             const conservativeLimit = roundToTick(fallbackBase, tickSize, 'up');
             const replacement = await submitLimitSell({
               symbol,
-              qty: state.qty,
+              qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
               limitPrice: conservativeLimit,
               reason: 'stale_quote_fallback',
               intentRef: state.entryOrderId || getOrderIntentBucket(),
               postOnly: EXIT_POST_ONLY,
               openOrders: symbolOrders,
+              availableQtyOverride,
+              allowSellBelowMin: false,
             });
             if (!replacement?.skipped && replacement?.id) {
               state.sellOrderId = replacement.id;
@@ -5090,6 +5195,7 @@ async function manageExitStates() {
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             postOnly: EXIT_POST_ONLY,
             openOrders: symbolOrders,
+            allowSellBelowMin: false,
           });
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
@@ -5123,6 +5229,7 @@ async function manageExitStates() {
             qty: state.qty,
             limitPrice: iocLimitPrice,
             reason: 'target_touch',
+            allowSellBelowMin: false,
           });
           console.log('target_touch_taker', { symbol, targetPrice, bid, qty: state.qty, iocLimitPrice });
           if (!iocResult?.skipped) {
@@ -5134,7 +5241,12 @@ async function manageExitStates() {
                 : null;
             let realizedOrderId = iocResult?.order?.id || iocResult?.order?.order_id || null;
             if (remainingQty && remainingQty > 0) {
-              const marketOrder = await submitMarketSell({ symbol, qty: remainingQty, reason: 'target_touch_fallback' });
+              const marketOrder = await submitMarketSell({
+                symbol,
+                qty: remainingQty,
+                reason: 'target_touch_fallback',
+                allowSellBelowMin: false,
+              });
               realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
             }
             exitState.delete(symbol);
@@ -5208,6 +5320,7 @@ async function manageExitStates() {
               qty: state.qty,
               limitPrice: bid,
               reason: 'hard_stop',
+              allowSellBelowMin: false,
             });
             const iocStatus = String(ioc?.order?.status || '').toLowerCase();
             const requestedQty = ioc?.requestedQty;
@@ -5227,6 +5340,7 @@ async function manageExitStates() {
                 symbol,
                 qty: Number.isFinite(remainingQty) && remainingQty > 0 ? remainingQty : state.qty,
                 reason: 'hard_stop_market',
+                allowSellBelowMin: false,
               });
               realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
             }
@@ -5302,6 +5416,7 @@ async function manageExitStates() {
             symbol,
             qty: state.qty,
             reason: allowLossExit ? 'kill_switch' : 'timeout_exit',
+            allowSellBelowMin: false,
           });
 
           exitState.delete(symbol);
@@ -5511,6 +5626,7 @@ async function manageExitStates() {
           qty: state.qty,
           limitPrice: iocPrice,
           reason: 'taker_ioc',
+          allowSellBelowMin: false,
         });
         if (!iocResult?.skipped) {
           iocRequestedQty = iocResult.requestedQty;
@@ -5521,7 +5637,7 @@ async function manageExitStates() {
               : null;
           if (remainingQty && remainingQty > 0) {
             iocFallbackReason = 'ioc_partial_fill';
-            await submitMarketSell({ symbol, qty: remainingQty, reason: 'ioc_fallback' });
+            await submitMarketSell({ symbol, qty: remainingQty, reason: 'ioc_fallback', allowSellBelowMin: false });
           }
           exitState.delete(symbol);
           actionTaken = 'taker_ioc_exit';
