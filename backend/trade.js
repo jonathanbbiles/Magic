@@ -9,6 +9,8 @@ const {
   normalizeQuoteAgeMs,
 } = require('./quoteUtils');
 const { canonicalAsset, normalizePair, alpacaSymbol } = require('./symbolUtils');
+const { predictOne } = require('./modules/predictor');
+const recorder = require('./modules/recorder');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -203,11 +205,15 @@ const FEE_BPS_EST = readNumber('FEE_BPS_EST', 25);
 const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
 const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
 const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 3000);
-const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 10);
-const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 250);
+const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 20);
+const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 150);
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
-const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 6);
+const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
+const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
+const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
+const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.7);
+const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
@@ -466,93 +472,104 @@ function microMetrics({ mid, prevMid, spreadBps }) {
 
 async function computeEntrySignal(symbol) {
   const asset = { symbol: normalizeSymbol(symbol) };
-  const riskLvl = clamp(Math.round(RISK_LEVEL), 0, 4);
+  const configSnapshot = {
+    targetMoveBps: TARGET_MOVE_BPS,
+    targetHorizonMinutes: TARGET_HORIZON_MINUTES,
+    minProbToEnter: MIN_PROB_TO_ENTER,
+    maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
+    orderbookBandBps: ORDERBOOK_BAND_BPS,
+    orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+    orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+  };
+  const baseRecord = {
+    ts: new Date().toISOString(),
+    symbol: asset.symbol,
+    refPrice: null,
+    spreadBps: null,
+    orderbookAskDepthUsd: null,
+    orderbookBidDepthUsd: null,
+    orderbookImpactBpsBuy: null,
+    orderbookImbalance: null,
+    orderbookUnavailableReason: null,
+    predictorProbability: null,
+    predictorSignals: null,
+    driftBps: null,
+    volatilityBps: null,
+    config: configSnapshot,
+  };
   let quote;
   try {
     quote = await getLatestQuote(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
   } catch (err) {
-    return { entryReady: false, why: 'stale_quote', meta: { symbol: asset.symbol, error: err?.message || err } };
+    return {
+      entryReady: false,
+      why: 'stale_quote',
+      meta: { symbol: asset.symbol, error: err?.message || err },
+      record: baseRecord,
+    };
   }
 
   const bid = Number(quote.bid);
   const ask = Number(quote.ask);
   const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : Number(quote.mid || bid || ask);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || !Number.isFinite(mid)) {
-    return { entryReady: false, why: 'invalid_quote', meta: { symbol: asset.symbol, bid, ask } };
-  }
-
-  const spreadBps = ((ask - bid) / mid) * BPS;
-  if (SIMPLE_SCALPER_ENABLED) {
-    if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-      return {
-        entryReady: false,
-        why: 'spread_gate',
-        meta: { symbol: asset.symbol, spreadBps, maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE },
-      };
-    }
     return {
-      entryReady: true,
-      symbol: asset.symbol,
-      spreadBps,
-      meta: { spreadBps },
+      entryReady: false,
+      why: 'invalid_quote',
+      meta: { symbol: asset.symbol, bid, ask },
+      record: baseRecord,
     };
   }
 
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
-    return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+  const spreadBps = ((ask - bid) / mid) * BPS;
+  baseRecord.refPrice = mid;
+  baseRecord.spreadBps = spreadBps;
+
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_ENTER) {
+    return {
+      entryReady: false,
+      why: 'spread_gate',
+      meta: { symbol: asset.symbol, spreadBps, maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER },
+      record: baseRecord,
+    };
   }
 
-  let orderbookMeta = null;
-  let obBias = 0;
-  let obImpactBpsBuy = null;
-  let priceSource = 'quote';
+  const obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+  if (!obResult.ok) {
+    baseRecord.orderbookUnavailableReason = obResult.reason;
+    return {
+      entryReady: false,
+      why: 'ob_depth_insufficient',
+      meta: { symbol: asset.symbol, spreadBps, obReason: obResult.reason, obDetails: obResult.details },
+      record: baseRecord,
+    };
+  }
 
-  if (ORDERBOOK_GUARD_ENABLED) {
-    const obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
-    if (obResult.ok) {
-      const m = computeOrderbookMetrics(obResult.orderbook, { bid, ask });
-      orderbookMeta = m;
-      obBias = m.obBias || 0;
-      obImpactBpsBuy = m.impactBpsBuy;
+  const orderbookMeta = computeOrderbookMetrics(obResult.orderbook, { bid, ask });
+  baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
+  baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
+  baseRecord.orderbookImpactBpsBuy = orderbookMeta.impactBpsBuy;
+  baseRecord.orderbookImbalance = orderbookMeta.imbalance;
 
-      if (!m.ok) {
-        return {
-          entryReady: false,
-          why: 'orderbook_liquidity_gate',
-          meta: { symbol: asset.symbol, spreadBps, ...m },
-        };
-      }
-    } else {
-      if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) {
-        return {
-          entryReady: false,
-          why: 'quote_unavailable',
-          meta: { symbol: asset.symbol, spreadBps, obReason: obResult.reason, obDetails: obResult.details },
-        };
-      }
-      if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-        return {
-          entryReady: false,
-          why: 'spread_gate_quote_fallback',
-          meta: {
-            symbol: asset.symbol,
-            spreadBps,
-            maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
-            obReason: obResult.reason,
-            obDetails: obResult.details,
-          },
-        };
-      }
-      priceSource = 'quote_fallback';
-      orderbookMeta = { unavailableReason: obResult.reason, unavailableDetails: obResult.details };
-    }
+  if (!orderbookMeta.ok) {
+    return {
+      entryReady: false,
+      why: 'ob_depth_insufficient',
+      meta: { symbol: asset.symbol, spreadBps, ...orderbookMeta },
+      record: baseRecord,
+    };
   }
 
   let bars;
   try {
     bars = await fetchCryptoBars({ symbols: [asset.symbol], limit: 16, timeframe: '1Min' });
   } catch (err) {
-    return { entryReady: false, why: 'bars_unavailable', meta: { symbol: asset.symbol, error: err?.message || err } };
+    return {
+      entryReady: false,
+      why: 'predictor_error',
+      meta: { symbol: asset.symbol, error: err?.message || err },
+      record: baseRecord,
+    };
   }
 
   const barKey = normalizeSymbol(asset.symbol);
@@ -562,120 +579,74 @@ async function computeEntrySignal(symbol) {
   ).filter((value) => Number.isFinite(value) && value > 0);
 
   if (closes.length < 3) {
-    return { entryReady: false, why: 'insufficient_bars', meta: { symbol: asset.symbol, barCount: closes.length } };
-  }
-
-  const sigmaRawBps = ewmaSigmaFromCloses(closes, VOL_HALF_LIFE_MIN);
-  const sigmaAlpha = 2 / (Math.max(2, VOL_HALF_LIFE_MIN) + 1);
-  const prevSigma = sigmaEwmaBySymbol.get(asset.symbol) ?? sigmaRawBps;
-  const sigmaEwma = sigmaAlpha * sigmaRawBps + (1 - sigmaAlpha) * prevSigma;
-  sigmaEwmaBySymbol.set(asset.symbol, sigmaEwma);
-
-  const spreadAlpha = 0.2;
-  const prevSpread = spreadEwmaBySymbol.get(asset.symbol) ?? spreadBps;
-  const spreadEwma = spreadAlpha * spreadBps + (1 - spreadAlpha) * prevSpread;
-  spreadEwmaBySymbol.set(asset.symbol, spreadEwma);
-
-  const rawSlip = Number.isFinite(spreadBps)
-    ? Math.max(SLIPPAGE_BPS, Math.min(spreadBps, 250))
-    : SLIPPAGE_BPS;
-  const prevSlip = slipEwmaBySymbol.get(asset.symbol) ?? rawSlip;
-  const slipEwma = spreadAlpha * rawSlip + (1 - spreadAlpha) * prevSlip;
-  slipEwmaBySymbol.set(asset.symbol, slipEwma);
-
-  const prevMid = symStats[asset.symbol]?.lastMid;
-  const micro = microMetrics({ mid, prevMid, spreadBps: spreadEwma });
-  const closesEma = emaArr(closes.slice(-8), 5);
-  const emaTail = closesEma[closesEma.length - 1];
-  const momentumBps = Number.isFinite(emaTail) ? ((closes[closes.length - 1] - emaTail) / emaTail) * BPS : 0;
-  const momentumPenaltyBps = momentumBps < 0 ? Math.abs(momentumBps) * 0.35 : 0;
-  const momBias = clamp(momentumBps / Math.max(sigmaEwma, 1) * 0.15, -0.15, 0.15);
-
-  const stopBps = Math.max(STOP_LOSS_BPS, sigmaEwma * STOP_VOL_MULT);
-  const needBpsVol = Math.max(1, sigmaEwma * TP_VOL_SCALE);
-  const desiredNetExitBps = DESIRED_NET_PROFIT_BASIS_POINTS;
-  const obSlip = Number.isFinite(obImpactBpsBuy) ? obImpactBpsBuy : 0;
-  const slippageBpsForExit = Math.max(SLIPPAGE_BPS, obSlip, Number.isFinite(slipEwma) ? slipEwma : 0);
-  const requiredGrossExitBps = requiredProfitBpsForSymbol({
-    slippageBps: slippageBpsForExit,
-    feeBps: feeBpsRoundTrip(),
-    desiredNetExitBps,
-  });
-  const riskScale = [1.25, 1.1, 1.0, 0.9, 0.8][riskLvl] ?? 1.0;
-  const needDyn = Math.max(requiredGrossExitBps, needBpsVol * riskScale) + momentumPenaltyBps;
-  const pUpBarrier = barrierPTouchUpDriftless(requiredGrossExitBps, stopBps);
-  let pUp = 0.5 + micro.microBias + momBias + obBias + (pUpBarrier - 0.5) * 0.65;
-  pUp = clamp(pUp, 0.05, 0.95);
-
-  const expectedBps = expectedValueBps({
-    pUp,
-    winBps: requiredGrossExitBps,
-    loseBps: stopBps,
-    feeBps: feeBpsRoundTrip(),
-    spreadBps: spreadEwma,
-    slippageBps: slippageBpsForExit,
-  });
-
-  if (pUp < PUP_MIN) {
     return {
       entryReady: false,
-      why: 'pup_guard',
-      meta: { symbol: asset.symbol, expectedBps, pUp, requiredGrossExitBps, stopBps },
+      why: 'predictor_error',
+      meta: { symbol: asset.symbol, barCount: closes.length },
+      record: baseRecord,
     };
   }
 
-  if (EV_GUARD_ENABLED && expectedBps < EV_MIN_BPS) {
+  let predictor;
+  try {
+    predictor = predictOne({
+      symbol: asset.symbol,
+      bars: barSeries,
+      orderbook: obResult.orderbook,
+      spreadBps,
+      refPrice: mid,
+      marketContext: {
+        targetMoveBps: TARGET_MOVE_BPS,
+        horizonMinutes: TARGET_HORIZON_MINUTES,
+        orderbookBandBps: ORDERBOOK_BAND_BPS,
+        orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        orderbookImpactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      },
+    });
+  } catch (err) {
     return {
       entryReady: false,
-      why: 'ev_guard',
-      meta: { symbol: asset.symbol, expectedBps, pUp, requiredGrossExitBps, stopBps },
+      why: 'predictor_error',
+      meta: { symbol: asset.symbol, error: err?.message || err },
+      record: baseRecord,
     };
   }
 
-  if (requiredGrossExitBps > MAX_REQUIRED_GROSS_EXIT_BPS) {
-    return {
-      entryReady: false,
-      why: 'required_gross_exit_too_high',
-      meta: { symbol: asset.symbol, expectedBps, pUp, requiredGrossExitBps, stopBps },
-    };
-  }
-
-  const desiredNetExitBpsForV22 = desiredNetExitBps;
+  baseRecord.predictorProbability = predictor.probability;
+  baseRecord.predictorSignals = predictor.signals;
+  baseRecord.driftBps = predictor.signals?.driftBps ?? null;
+  baseRecord.volatilityBps = predictor.signals?.volatilityBps ?? null;
 
   symStats[asset.symbol] = {
     lastMid: mid,
     lastTs: quote.tsMs,
-    sigmaBps: sigmaEwma,
-    spreadBps: spreadEwma,
-    slipBps: slipEwma,
   };
+
+  if (predictor.probability < MIN_PROB_TO_ENTER) {
+    return {
+      entryReady: false,
+      why: 'predictor_gate',
+      meta: { symbol: asset.symbol, probability: predictor.probability, minProbToEnter: MIN_PROB_TO_ENTER },
+      record: baseRecord,
+    };
+  }
+
+  const desiredNetExitBpsForV22 = DESIRED_NET_PROFIT_BASIS_POINTS;
 
   return {
     entryReady: true,
     symbol: asset.symbol,
-    grossTpBps: requiredGrossExitBps,
     desiredNetExitBpsForV22,
-    stopBps,
-    spreadBps: spreadEwma,
-    slippageBps: slipEwma,
-    sigmaBps: sigmaEwma,
-    pUp,
-    expectedBps,
+    spreadBps,
     meta: {
-      riskLvl,
-      microDeltaBps: micro.deltaBps,
-      momentumBps,
-      needBpsVol,
-      needDyn,
-      requiredGrossExitBps,
-      feeBps: feeBpsRoundTrip(),
+      predictorProbability: predictor.probability,
       orderbookAskDepthUsd: orderbookMeta?.askDepthUsd,
       orderbookBidDepthUsd: orderbookMeta?.bidDepthUsd,
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
       orderbookImbalance: orderbookMeta?.imbalance,
-      orderbookUnavailableReason: orderbookMeta?.unavailableReason || null,
-      priceSource,
     },
+    record: baseRecord,
   };
 }
 
@@ -3241,12 +3212,19 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
   return requestMarketDataJson({ type: 'TRADE', url, symbol: dataSymbols.join(',') });
 }
 
-async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min' }) {
+async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min', start, end }) {
   const dataSymbols = symbols.map((s) => toDataSymbol(s));
+  const params = { symbols: dataSymbols.join(','), limit: String(limit), timeframe };
+  if (start) {
+    params.start = start;
+  }
+  if (end) {
+    params.end = end;
+  }
   const url = buildAlpacaUrl({
     baseUrl: CRYPTO_DATA_URL,
     path: `${location}/bars`,
-    params: { symbols: dataSymbols.join(','), limit: String(limit), timeframe },
+    params,
     label: 'crypto_bars_batch',
   });
   return requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') });
@@ -6350,6 +6328,7 @@ async function runEntryScanOnce() {
       }
 
       const signal = await computeEntrySignal(symbol);
+      const recordBase = signal?.record ? { ...signal.record } : null;
       if (DEBUG_ENTRY) {
         console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
       }
@@ -6357,6 +6336,11 @@ async function runEntryScanOnce() {
         skipped += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
         recordSkip(skipReason, symbol, signal.meta || null);
+        if (recordBase) {
+          recordBase.decision = 'skipped';
+          recordBase.skipReason = skipReason;
+          recorder.appendRecord(recordBase);
+        }
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, signal.why || 'signal_skip', signal.meta || {});
         }
@@ -6373,12 +6357,26 @@ async function runEntryScanOnce() {
       attempts += 1;
       if (result?.submitted) {
         placed += 1;
+        if (recordBase) {
+          recordBase.decision = 'placed';
+          recordBase.skipReason = null;
+          recorder.appendRecord(recordBase);
+        }
         break;
       }
       if (result?.skipped || result?.failed) {
         skipped += 1;
         const reason = result.reason || (result.failed ? 'attempt_failed' : 'attempt_skipped');
         recordSkip(reason, symbol, result.meta || null);
+        if (recordBase) {
+          recordBase.decision = 'skipped';
+          recordBase.skipReason = reason;
+          recorder.appendRecord(recordBase);
+        }
+      } else if (recordBase) {
+        recordBase.decision = 'skipped';
+        recordBase.skipReason = 'entry_not_submitted';
+        recorder.appendRecord(recordBase);
       }
     }
 
