@@ -109,7 +109,12 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString(), version: VERSION });
+  res.json({
+    ok: true,
+    uptimeSec: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+    version: VERSION,
+  });
 });
 
 app.get('/account', async (req, res) => {
@@ -676,7 +681,7 @@ app.get('/market/stocks/bars', async (req, res) => {
 
  
 
-const PORT = process.env.PORT || 3000;
+const port = process.env.PORT || 3000;
 
 function withTimeout(promise, ms, label) {
   let t;
@@ -726,8 +731,8 @@ async function bootstrapTrading() {
   console.log('bootstrap_done');
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+const server = app.listen(port, () => {
+  console.log('server_start', { env: process.env.NODE_ENV || 'development', port });
 });
 
 bootstrapTrading().catch((err) => {

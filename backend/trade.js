@@ -120,7 +120,11 @@ function alpacaJsonHeaders() {
 const TRADE_PORTFOLIO_PCT = Number(process.env.TRADE_PORTFOLIO_PCT || 0.10);
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 1);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
-const TRADING_BLOCK_COOLDOWN_MS = readNumber('TRADING_BLOCK_COOLDOWN_MS', 300000);
+const TRADING_BLOCK_COOLDOWN_MS = readNumber('TRADING_BLOCK_COOLDOWN_MS', 60000);
+const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
+  'BROKER_TRADING_DISABLED_BACKOFF_MS',
+  TRADING_BLOCK_COOLDOWN_MS,
+);
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
 const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
@@ -235,17 +239,21 @@ let tradingHaltedReason = null;
 let lastOrphanScan = { tsMs: 0, orphans: [], positionsCount: 0, openOrdersCount: 0, openSellSymbols: [] };
 let tradingBlockedUntilMs = 0;
 let lastTradingDisabledLogMs = 0;
+let lastBrokerTradingDisabledLogMs = 0;
+let lastBrokerTradingDisabledExitLogMs = 0;
 
 function isTradingBlockedNow() {
   return Date.now() < tradingBlockedUntilMs;
 }
 
-function shouldSkipTradeActionBecauseTradingOff(reasonContext) {
+function shouldSkipTradeActionBecauseTradingOff(reasonContext, options = {}) {
+  const intent = String(options.intent || '').toLowerCase();
+  const isEntry = intent === 'entry';
   if (!TRADING_ENABLED) {
     return { skip: true, reasonCode: 'trading_disabled', context: reasonContext || null };
   }
-  if (isTradingBlockedNow()) {
-    return { skip: true, reasonCode: 'trading_blocked_cooldown', context: reasonContext || null };
+  if (isEntry && isTradingBlockedNow()) {
+    return { skip: true, reasonCode: 'entry_blocked_cooldown', context: reasonContext || null };
   }
   return { skip: false };
 }
@@ -255,6 +263,44 @@ function logTradingDisabledOnce() {
   if (!lastTradingDisabledLogMs || nowMs - lastTradingDisabledLogMs >= 60000) {
     lastTradingDisabledLogMs = nowMs;
     console.warn('TRADING_DISABLED_BY_ENV', { enabled: TRADING_ENABLED });
+  }
+}
+
+function isBrokerTradingDisabledError({ statusCode, errorCode, message, snippet }) {
+  if (statusCode !== 403) return false;
+  if (errorCode === 40310000) return true;
+  const combined = `${message || ''} ${snippet || ''}`.toLowerCase();
+  return combined.includes('new orders are rejected') || combined.includes('trading is disabled');
+}
+
+function startBrokerTradingDisabledCooldown() {
+  tradingBlockedUntilMs = Date.now() + BROKER_TRADING_DISABLED_BACKOFF_MS;
+  lastBrokerTradingDisabledLogMs = 0;
+  lastBrokerTradingDisabledExitLogMs = 0;
+}
+
+function logBrokerTradingDisabledOnce({ intent, statusCode, errorCode }) {
+  const nowMs = Date.now();
+  if (intent === 'exit') {
+    if (!lastBrokerTradingDisabledExitLogMs || nowMs - lastBrokerTradingDisabledExitLogMs >= BROKER_TRADING_DISABLED_BACKOFF_MS) {
+      lastBrokerTradingDisabledExitLogMs = nowMs;
+      console.warn('broker_trading_disabled_exit', {
+        statusCode,
+        errorCode,
+        blockedUntilMs: tradingBlockedUntilMs,
+        cooldownMs: BROKER_TRADING_DISABLED_BACKOFF_MS,
+      });
+    }
+    return;
+  }
+  if (!lastBrokerTradingDisabledLogMs || nowMs - lastBrokerTradingDisabledLogMs >= BROKER_TRADING_DISABLED_BACKOFF_MS) {
+    lastBrokerTradingDisabledLogMs = nowMs;
+    console.error('TRADING DISABLED AT BROKER', {
+      statusCode,
+      errorCode,
+      blockedUntilMs: tradingBlockedUntilMs,
+      cooldownMs: BROKER_TRADING_DISABLED_BACKOFF_MS,
+    });
   }
 }
 const AUTO_SCAN_SYMBOLS_OVERRIDE = parseAutoScanSymbols(process.env.AUTO_SCAN_SYMBOLS);
@@ -1003,10 +1049,6 @@ function logHttpError({ symbol, label, url, error }) {
     errorMessage,
     snippet,
   });
-  if (statusCode === 403 && errorCode === 40310000) {
-    console.error('TRADING_BLOCKED', { code: 40310000, message: 'new orders are rejected by user request' });
-    return;
-  }
   if (statusCode === 401 || statusCode === 403) {
     console.error('AUTH_ERROR: check Render env vars');
   }
@@ -1160,15 +1202,24 @@ async function placeOrderUnified({
   label,
   reason,
   context,
+  intent,
 }) {
+  const resolvedIntent = String(
+    intent ||
+      (String(payload?.side || '').toLowerCase() === 'buy'
+        ? 'entry'
+        : (String(payload?.side || '').toLowerCase() === 'sell' ? 'exit' : ''))
+  ).toLowerCase();
+  const isEntry = resolvedIntent === 'entry';
+  const isExit = resolvedIntent === 'exit';
   if (!TRADING_ENABLED) {
     logTradingDisabledOnce();
     return { skipped: true, reason: 'trading_disabled' };
   }
-  if (isTradingBlockedNow()) {
+  if (isEntry && isTradingBlockedNow()) {
     const remainingMs = Math.max(0, tradingBlockedUntilMs - Date.now());
-    console.warn('TRADING_BLOCKED_COOLDOWN', { remainingMs, blockedUntilMs: tradingBlockedUntilMs });
-    return { skipped: true, reason: 'trading_blocked_cooldown', remainingMs, blockedUntilMs: tradingBlockedUntilMs };
+    logBrokerTradingDisabledOnce({ intent: 'entry', statusCode: null, errorCode: null });
+    return { skipped: true, reason: 'broker_trading_disabled', remainingMs, blockedUntilMs: tradingBlockedUntilMs };
   }
   logOrderIntent({ label, payload, reason });
   logOrderPayload({ label, payload });
@@ -1186,15 +1237,18 @@ async function placeOrderUnified({
     logOrderResponse({ label, payload, error: err });
     const statusCode = err?.statusCode ?? err?.response?.status ?? null;
     const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
-    if (statusCode === 403 && errorCode === 40310000) {
+    const errorMessage = err?.errorMessage || err?.message || '';
+    const errorSnippet = err?.responseSnippet200 || err?.responseSnippet || '';
+    if (isBrokerTradingDisabledError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })) {
       if (!isTradingBlockedNow()) {
-        tradingBlockedUntilMs = Date.now() + TRADING_BLOCK_COOLDOWN_MS;
+        startBrokerTradingDisabledCooldown();
         console.error('TRADING_BLOCKED_SET_COOLDOWN', {
           blockedUntilMs: tradingBlockedUntilMs,
           blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
-          cooldownMs: TRADING_BLOCK_COOLDOWN_MS,
+          cooldownMs: BROKER_TRADING_DISABLED_BACKOFF_MS,
         });
       }
+      logBrokerTradingDisabledOnce({ intent: isExit ? 'exit' : 'entry', statusCode, errorCode });
     }
     if (isNetworkError(err)) {
       logNetworkError({
@@ -1844,6 +1898,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     label: 'orders_limit_buy',
     reason: 'limit_buy',
     context: 'limit_buy',
+    intent: 'entry',
   });
 
  
@@ -3308,11 +3363,6 @@ async function submitOcoExit({
     logTradingDisabledOnce();
     return null;
   }
-  if (isTradingBlockedNow()) {
-    const remainingMs = Math.max(0, tradingBlockedUntilMs - Date.now());
-    console.warn('TRADING_BLOCKED_COOLDOWN', { remainingMs, blockedUntilMs: tradingBlockedUntilMs });
-    return null;
-  }
 
   const stopBps = readNumber('STOP_LOSS_BPS', 60);
   const offBps = readNumber('STOP_LIMIT_OFFSET_BPS', 10);
@@ -3358,13 +3408,18 @@ async function submitOcoExit({
     console.warn('oco_exit_rejected', { symbol, err: err?.response?.data || err?.message });
     const statusCode = err?.statusCode ?? err?.response?.status ?? null;
     const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
-    if (statusCode === 403 && errorCode === 40310000 && !isTradingBlockedNow()) {
-      tradingBlockedUntilMs = Date.now() + TRADING_BLOCK_COOLDOWN_MS;
-      console.error('TRADING_BLOCKED_SET_COOLDOWN', {
-        blockedUntilMs: tradingBlockedUntilMs,
-        blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
-        cooldownMs: TRADING_BLOCK_COOLDOWN_MS,
-      });
+    const errorMessage = err?.errorMessage || err?.message || '';
+    const errorSnippet = err?.responseSnippet200 || err?.responseSnippet || '';
+    if (isBrokerTradingDisabledError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })) {
+      if (!isTradingBlockedNow()) {
+        startBrokerTradingDisabledCooldown();
+        console.error('TRADING_BLOCKED_SET_COOLDOWN', {
+          blockedUntilMs: tradingBlockedUntilMs,
+          blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
+          cooldownMs: BROKER_TRADING_DISABLED_BACKOFF_MS,
+        });
+      }
+      logBrokerTradingDisabledOnce({ intent: 'exit', statusCode, errorCode });
     }
     return null;
   }
@@ -3386,7 +3441,7 @@ async function submitLimitSell({
   allowSellBelowMin = true,
 
 }) {
-  const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, reason, context: 'limit_sell' });
+  const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, reason, context: 'limit_sell' }, { intent: 'exit' });
   if (tradeGate.skip) {
     return { skipped: true, reason: tradeGate.reasonCode };
   }
@@ -3508,6 +3563,7 @@ async function submitLimitSell({
       label: 'orders_limit_sell',
       reason,
       context: 'limit_sell',
+      intent: 'exit',
     });
     if (response?.skipped) {
       return { skipped: true, reason: response.reason };
@@ -3612,6 +3668,7 @@ async function submitMarketSell({
     label: 'orders_market_sell',
     reason,
     context: 'market_sell',
+    intent: 'exit',
   });
 
   console.log('submit_market_sell', { symbol, qty, reason, exit_reason: reason, orderId: response?.id });
@@ -3677,6 +3734,7 @@ async function submitIocLimitSell({
     label: 'orders_exit_limit_sell',
     reason,
     context: 'ioc_limit_sell',
+    intent: 'exit',
   });
 
   console.log('submit_exit_limit_sell', { symbol, qty: finalQty, limitPrice: roundedLimit, reason, orderId: response?.id });
@@ -4752,7 +4810,7 @@ async function manageExitStates() {
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
 
-        const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, context: 'exit_manager' });
+        const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, context: 'exit_manager' }, { intent: 'exit' });
         if (tradeGate.skip) {
           actionTaken = 'hold_existing_order';
           reasonCode = tradeGate.reasonCode;
@@ -6589,6 +6647,7 @@ async function placeSimpleScalperEntry(symbol) {
       label: 'orders_simple_scalper_buy',
       reason: 'simple_scalper_market_buy',
       context: 'simple_scalper_market_buy',
+      intent: 'entry',
     });
   } catch (err) {
     console.warn('simple_scalper_market_buy_failed', {
@@ -6615,6 +6674,7 @@ async function placeSimpleScalperEntry(symbol) {
         label: 'orders_simple_scalper_buy',
         reason: 'simple_scalper_limit_buy',
         context: 'simple_scalper_limit_buy',
+        intent: 'entry',
       });
     } catch (submitErr) {
       setInFlightStatus(normalizedSymbol, {
@@ -6691,6 +6751,7 @@ async function placeSimpleScalperEntry(symbol) {
     label: 'orders_simple_scalper_tp',
     reason: 'simple_scalper_tp',
     context: 'simple_scalper_tp',
+    intent: 'exit',
   });
   console.log('simple_scalper_tp_submit', { symbol: normalizedSymbol, qty: filledQty, targetPrice });
   monitorSimpleScalperTpFill({ symbol: normalizedSymbol, orderId: sellOrder?.id });
@@ -6804,6 +6865,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
     label: 'orders_limit_buy',
     reason: 'maker_limit_buy',
     context: 'maker_limit_buy',
+    intent: 'entry',
   });
   const submitted = Boolean(buyOrder?.id);
 
@@ -6995,6 +7057,7 @@ async function placeMarketBuyThenSell(symbol) {
     label: 'orders_market_buy',
     reason: 'market_buy',
     context: 'market_buy',
+    intent: 'entry',
   });
   const submitted = Boolean(buyOrder?.id);
   if (buyOrder?.id) {
@@ -7132,6 +7195,7 @@ async function submitManagedEntryBuy({
     label: 'orders_entry_buy',
     reason: 'managed_entry_buy',
     context: 'managed_entry_buy',
+    intent: 'entry',
   });
   if (!buyOrder?.id) {
     return {
@@ -7213,6 +7277,7 @@ async function submitOrder(order = {}) {
 
     reason,
     desiredNetExitBps,
+    intent: orderIntent,
     raw = false,
 
   } = order;
@@ -7220,7 +7285,8 @@ async function submitOrder(order = {}) {
   const normalizedSymbol = normalizeSymbol(rawSymbol);
   const isCrypto = isCryptoSymbol(normalizedSymbol);
   const sideLower = String(side || '').toLowerCase();
-  const intent = sideLower === 'buy' ? 'ENTRY' : null;
+  const resolvedIntent = String(orderIntent || '').trim().toLowerCase();
+  const intent = resolvedIntent ? resolvedIntent.toUpperCase() : (sideLower === 'buy' ? 'ENTRY' : 'EXIT');
   const typeLower = String(type || '').toLowerCase();
   const allowedCryptoTypes = new Set(['market', 'limit', 'stop_limit']);
   const finalType = isCrypto && !allowedCryptoTypes.has(typeLower) ? 'market' : (typeLower || 'market');
@@ -7423,6 +7489,7 @@ async function submitOrder(order = {}) {
     label: 'orders_submit',
     reason,
     context: 'submit_order',
+    intent: intent === 'ENTRY' ? 'entry' : 'exit',
   });
   if (orderOk?.id && sideLower === 'buy' && intent === 'ENTRY') {
     markRecentEntry(normalizedSymbol, orderOk?.id || null);
