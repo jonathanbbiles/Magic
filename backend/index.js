@@ -44,6 +44,8 @@ const {
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
+const recorder = require('./modules/recorder');
+const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
 const app = express();
 
@@ -183,6 +185,21 @@ app.get('/diagnostics/orphans', async (req, res) => {
     console.error('Orphan diagnostics error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
+});
+
+app.get('/debug/predictor/recent', (req, res) => {
+  const limit = Number(req.query?.limit || 200);
+  res.json({ items: recorder.getRecent(limit) });
+});
+
+app.get('/debug/labels/recent', (req, res) => {
+  const limit = Number(req.query?.limit || 200);
+  res.json({ items: getRecentLabels(limit) });
+});
+
+app.get('/debug/predictor/stats', (req, res) => {
+  const hours = Number(req.query?.hours || 6);
+  res.json(getLabelStats(hours));
 });
 
 app.get('/positions/:symbol', async (req, res) => {
@@ -726,6 +743,7 @@ async function bootstrapTrading() {
   }
 
   startEntryManager();
+  startLabeler();
   startExitManager();
   console.log('exit_manager_start_attempted');
   console.log('bootstrap_done');
