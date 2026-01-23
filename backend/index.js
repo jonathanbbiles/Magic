@@ -678,36 +678,61 @@ app.get('/market/stocks/bars', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-initializeInventoryFromPositions()
-
-  .then((inventory) => {
-
-    console.log(`Initialized inventory for ${inventory.size} symbols.`);
-
-    return loadSupportedCryptoPairs()
-      .catch((err) => {
-        console.error('Supported crypto pairs preload failed', err?.message || err);
-      })
-      .then(() => runDustCleanup());
-
-  })
-
-  .catch((err) => {
-
-    console.error('Failed to initialize inventory', err?.responseSnippet || err.message);
-
-  })
-
-  .finally(() => {
-
-    app.listen(PORT, () => {
-
-      console.log(`Backend server running on port ${PORT}`);
-
-    });
-
-    startEntryManager();
-    startExitManager();
-    console.log('exit_manager_start_attempted');
-
+function withTimeout(promise, ms, label) {
+  let t;
+  const timeout = new Promise((_, reject) => {
+    t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+async function bootstrapTrading() {
+  console.log('bootstrap_start');
+  try {
+    const inventory = await withTimeout(
+      initializeInventoryFromPositions(),
+      15000,
+      'initializeInventoryFromPositions',
+    );
+    console.log(`Initialized inventory for ${inventory.size} symbols.`);
+  } catch (err) {
+    console.error('bootstrap_step_failed', {
+      step: 'initializeInventoryFromPositions',
+      message: err?.responseSnippet || err?.message || String(err),
+    });
+  }
+
+  try {
+    await withTimeout(loadSupportedCryptoPairs(), 15000, 'loadSupportedCryptoPairs');
+  } catch (err) {
+    console.error('bootstrap_step_failed', {
+      step: 'loadSupportedCryptoPairs',
+      message: err?.responseSnippet || err?.message || String(err),
+    });
+  }
+
+  try {
+    await withTimeout(runDustCleanup(), 15000, 'runDustCleanup');
+  } catch (err) {
+    console.error('bootstrap_step_failed', {
+      step: 'runDustCleanup',
+      message: err?.responseSnippet || err?.message || String(err),
+    });
+  }
+
+  startEntryManager();
+  startExitManager();
+  console.log('exit_manager_start_attempted');
+  console.log('bootstrap_done');
+}
+
+const server = app.listen(PORT, () => {
+  console.log(`Backend server running on port ${PORT}`);
+});
+
+bootstrapTrading().catch((err) => {
+  console.error('bootstrap_step_failed', {
+    step: 'bootstrapTrading',
+    message: err?.responseSnippet || err?.message || String(err),
+  });
+});
