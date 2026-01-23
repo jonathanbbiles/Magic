@@ -459,11 +459,12 @@ async function computeEntrySignal(symbol) {
   let orderbookMeta = null;
   let obBias = 0;
   let obImpactBpsBuy = null;
+  let priceSource = 'quote';
 
   if (ORDERBOOK_GUARD_ENABLED) {
-    try {
-      const ob = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
-      const m = computeOrderbookMetrics(ob, { bid, ask });
+    const obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+    if (obResult.ok) {
+      const m = computeOrderbookMetrics(obResult.orderbook, { bid, ask });
       orderbookMeta = m;
       obBias = m.obBias || 0;
       obImpactBpsBuy = m.impactBpsBuy;
@@ -475,12 +476,29 @@ async function computeEntrySignal(symbol) {
           meta: { symbol: asset.symbol, spreadBps, ...m },
         };
       }
-    } catch (err) {
-      return {
-        entryReady: false,
-        why: 'orderbook_unavailable',
-        meta: { symbol: asset.symbol, spreadBps, error: err?.message || String(err) },
-      };
+    } else {
+      if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) {
+        return {
+          entryReady: false,
+          why: 'quote_unavailable',
+          meta: { symbol: asset.symbol, spreadBps, obReason: obResult.reason, obDetails: obResult.details },
+        };
+      }
+      if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
+        return {
+          entryReady: false,
+          why: 'spread_gate_quote_fallback',
+          meta: {
+            symbol: asset.symbol,
+            spreadBps,
+            maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+            obReason: obResult.reason,
+            obDetails: obResult.details,
+          },
+        };
+      }
+      priceSource = 'quote_fallback';
+      orderbookMeta = { unavailableReason: obResult.reason, unavailableDetails: obResult.details };
     }
   }
 
@@ -609,6 +627,8 @@ async function computeEntrySignal(symbol) {
       orderbookBidDepthUsd: orderbookMeta?.bidDepthUsd,
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
       orderbookImbalance: orderbookMeta?.imbalance,
+      orderbookUnavailableReason: orderbookMeta?.unavailableReason || null,
+      priceSource,
     },
   };
 }
@@ -3017,29 +3037,69 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     Number.isFinite(cached.receivedAtMs) &&
     (now - cached.receivedAtMs) <= Math.max(250, maxAgeMs)
   ) {
-    return cached;
+    return { ok: true, orderbook: cached, source: 'cache' };
   }
 
-  const resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
+  let resp;
+  try {
+    resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
+  } catch (err) {
+    return { ok: false, reason: 'ob_http_empty', details: { symbol, error: err?.message || String(err) } };
+  }
+
+  const orderbooks = resp?.orderbooks;
+  if (!orderbooks || Object.keys(orderbooks).length === 0) {
+    return { ok: false, reason: 'ob_http_empty', details: { symbol, hasOrderbooks: Boolean(orderbooks) } };
+  }
+
   const key = toDataSymbol(symbol);
   const book =
-    resp?.orderbooks?.[key] ||
-    resp?.orderbooks?.[normalizePair(key)] ||
-    resp?.orderbooks?.[symbol] ||
+    orderbooks?.[key] ||
+    orderbooks?.[normalizePair(key)] ||
+    orderbooks?.[symbol] ||
     null;
+
+  if (!book) {
+    const availableSymbols = Object.keys(orderbooks);
+    return {
+      ok: false,
+      reason: 'ob_symbol_not_supported',
+      details: {
+        symbol,
+        key,
+        availableSymbols: availableSymbols.slice(0, 5),
+        availableCount: availableSymbols.length,
+      },
+    };
+  }
 
   const asks = Array.isArray(book?.a) ? book.a : [];
   const bids = Array.isArray(book?.b) ? book.b : [];
+  if (!asks.length) return { ok: false, reason: 'ob_missing_asks', details: { symbol, askLevels: asks.length } };
+  if (!bids.length) return { ok: false, reason: 'ob_missing_bids', details: { symbol, bidLevels: bids.length } };
+
+  const bestAsk = Number(asks?.[0]?.p ?? asks?.[0]?.price);
+  const bestBid = Number(bids?.[0]?.p ?? bids?.[0]?.price);
+  if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) {
+    return {
+      ok: false,
+      reason: 'ob_top_invalid',
+      details: { symbol, bestAsk, bestBid },
+    };
+  }
+
   const tsMs = Number.isFinite(book?.t) ? Number(book.t) : parseIsoTsMs(book?.t);
+  if (!Number.isFinite(tsMs)) {
+    return { ok: false, reason: 'ob_http_empty', details: { symbol, timestamp: book?.t ?? null } };
+  }
 
-  if (!asks.length || !bids.length) throw new Error(`Orderbook missing levels for ${symbol}`);
-  if (!Number.isFinite(tsMs)) throw new Error(`Orderbook timestamp missing for ${symbol}`);
-
-  if (now - tsMs > maxAgeMs) throw new Error(`Orderbook stale for ${symbol}`);
+  if (now - tsMs > maxAgeMs) {
+    return { ok: false, reason: 'ob_http_empty', details: { symbol, ageMs: now - tsMs, maxAgeMs } };
+  }
 
   const normalized = { asks, bids, tsMs, receivedAtMs: now };
   orderbookCache.set(symbol, normalized);
-  return normalized;
+  return { ok: true, orderbook: normalized, source: 'fresh' };
 }
 
 function sumDepthUsdWithinBand(levels, bestPrice, bandBps, side) {
@@ -3094,7 +3154,14 @@ function computeOrderbookMetrics({ asks, bids }, { bid, ask }) {
   const okDepth = askDepthUsd >= ORDERBOOK_MIN_DEPTH_USD && bidDepthUsd >= (ORDERBOOK_MIN_DEPTH_USD * 0.5);
   const okImpact = Number.isFinite(impactBpsBuy) && impactBpsBuy <= ORDERBOOK_MAX_IMPACT_BPS;
 
-  return { askDepthUsd, bidDepthUsd, impactBpsBuy, imbalance, obBias, ok: okDepth && okImpact };
+  let reason = null;
+  if (!okDepth) {
+    reason = 'ob_depth_insufficient';
+  } else if (!okImpact) {
+    reason = 'ob_impact_too_high';
+  }
+
+  return { askDepthUsd, bidDepthUsd, impactBpsBuy, imbalance, obBias, ok: okDepth && okImpact, reason };
 }
 
 async function fetchCryptoQuotes({ symbols, location = 'us' }) {
@@ -6172,7 +6239,24 @@ async function runEntryScanOnce() {
     let scanned = 0;
     let skipped = 0;
     let attempts = 0;
-    const skipCounts = new Map();
+    const skipDetailCounts = new Map();
+    const skipSamples = new Map();
+
+    const recordSkip = (reason, symbol, details) => {
+      const normalizedReason = reason || 'signal_skip';
+      skipDetailCounts.set(normalizedReason, (skipDetailCounts.get(normalizedReason) || 0) + 1);
+      if (!symbol) return;
+      const existing = skipSamples.get(normalizedReason) || [];
+      if (existing.length >= 5) return;
+      existing.push({ symbol, details: details || null });
+      skipSamples.set(normalizedReason, existing);
+    };
+
+    const resolveSkipReason = (reason, meta) => {
+      if (reason === 'orderbook_unavailable' && meta?.obReason) return meta.obReason;
+      if (reason === 'orderbook_liquidity_gate' && meta?.reason) return meta.reason;
+      return reason || 'signal_skip';
+    };
 
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
@@ -6181,7 +6265,7 @@ async function runEntryScanOnce() {
       scanned += 1;
       if (heldSymbols.has(symbol)) {
         skipped += 1;
-        skipCounts.set('held_position', (skipCounts.get('held_position') || 0) + 1);
+        recordSkip('held_position', symbol, null);
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, 'held_position');
         }
@@ -6190,7 +6274,7 @@ async function runEntryScanOnce() {
       if (openBuySymbols.has(symbol)) {
         skipped += 1;
         const reason = SIMPLE_SCALPER_ENABLED ? 'open_order' : 'open_buy';
-        skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+        recordSkip(reason, symbol, null);
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, 'open_order');
         }
@@ -6201,7 +6285,7 @@ async function runEntryScanOnce() {
         if (inFlight) {
           skipped += 1;
           const reason = inFlight.reason || 'in_flight';
-          skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+          recordSkip(reason, symbol, { untilMs: inFlight.untilMs ?? null });
           logSimpleScalperSkip(symbol, reason, { untilMs: inFlight.untilMs ?? null });
           continue;
         }
@@ -6213,7 +6297,8 @@ async function runEntryScanOnce() {
       }
       if (!signal.entryReady) {
         skipped += 1;
-        skipCounts.set(signal.why || 'signal_skip', (skipCounts.get(signal.why || 'signal_skip') || 0) + 1);
+        const skipReason = resolveSkipReason(signal.why, signal.meta);
+        recordSkip(skipReason, symbol, signal.meta || null);
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, signal.why || 'signal_skip', signal.meta || {});
         }
@@ -6235,17 +6320,25 @@ async function runEntryScanOnce() {
       if (result?.skipped || result?.failed) {
         skipped += 1;
         const reason = result.reason || (result.failed ? 'attempt_failed' : 'attempt_skipped');
-        skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+        recordSkip(reason, symbol, result.meta || null);
       }
     }
 
-    const topSkipReasons = Array.from(skipCounts.entries())
+    const topSkipReasons = Array.from(skipDetailCounts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
       .reduce((acc, [reason, count]) => {
         acc[reason] = count;
         return acc;
       }, {});
+    const skipDetailCountsObj = Array.from(skipDetailCounts.entries()).reduce((acc, [reason, count]) => {
+      acc[reason] = count;
+      return acc;
+    }, {});
+    const skipSamplesObj = Array.from(skipSamples.entries()).reduce((acc, [reason, samples]) => {
+      acc[reason] = samples;
+      return acc;
+    }, {});
 
     const endMs = Date.now();
     console.log('entry_scan', {
@@ -6256,6 +6349,8 @@ async function runEntryScanOnce() {
       placed,
       skipped,
       topSkipReasons,
+      skipDetailCounts: skipDetailCountsObj,
+      skipSamples: skipSamplesObj,
       universeSize,
       universeIsOverride,
       maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
