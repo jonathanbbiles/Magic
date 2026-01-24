@@ -205,11 +205,15 @@ const FEE_BPS_EST = readNumber('FEE_BPS_EST', 25);
 const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
 const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
 const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 3000);
-const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 20);
-const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 150);
+const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 60);
+const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 75);
+const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN', 0.25);
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
 const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
+const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.1);
+const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 2);
+const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
 const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
 const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.7);
@@ -480,6 +484,10 @@ async function computeEntrySignal(symbol) {
     orderbookBandBps: ORDERBOOK_BAND_BPS,
     orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
     orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+    orderbookLiquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
+    volumeTrendMin: VOLUME_TREND_MIN,
+    timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
+    regimeZscoreThreshold: REGIME_ZSCORE_THRESHOLD,
   };
   const baseRecord = {
     ts: new Date().toISOString(),
@@ -490,6 +498,7 @@ async function computeEntrySignal(symbol) {
     orderbookBidDepthUsd: null,
     orderbookImpactBpsBuy: null,
     orderbookImbalance: null,
+    orderbookLiquidityScore: null,
     orderbookUnavailableReason: null,
     predictorProbability: null,
     predictorSignals: null,
@@ -539,7 +548,7 @@ async function computeEntrySignal(symbol) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
     return {
       entryReady: false,
-      why: 'ob_depth_insufficient',
+      why: 'orderbook_unavailable',
       meta: {
         symbol: asset.symbol,
         spreadBps,
@@ -548,6 +557,7 @@ async function computeEntrySignal(symbol) {
         askDepthUsd: null,
         bidDepthUsd: null,
         impactBpsBuy: null,
+        liquidityScore: null,
         obBestAsk: null,
         obBestBid: null,
         quoteAsk: ask,
@@ -568,11 +578,12 @@ async function computeEntrySignal(symbol) {
   baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
   baseRecord.orderbookImpactBpsBuy = orderbookMeta.impactBpsBuy;
   baseRecord.orderbookImbalance = orderbookMeta.imbalance;
+  baseRecord.orderbookLiquidityScore = orderbookMeta.liquidityScore;
 
   if (!orderbookMeta.ok) {
     return {
       entryReady: false,
-      why: 'ob_depth_insufficient',
+      why: 'orderbook_liquidity_gate',
       meta: {
         symbol: asset.symbol,
         spreadBps,
@@ -589,9 +600,36 @@ async function computeEntrySignal(symbol) {
     };
   }
 
-  let bars;
+  if (ORDERBOOK_GUARD_ENABLED && orderbookMeta.liquidityScore < ORDERBOOK_LIQUIDITY_SCORE_MIN) {
+    return {
+      entryReady: false,
+      why: 'orderbook_liquidity_gate',
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        ...orderbookMeta,
+        obBestAsk: obResult.orderbook.bestAsk,
+        obBestBid: obResult.orderbook.bestBid,
+        quoteAsk: ask,
+        quoteBid: bid,
+        bandBps: ORDERBOOK_BAND_BPS,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        liquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
+      },
+      record: baseRecord,
+    };
+  }
+
+  let bars1m;
+  let bars5m;
+  let bars15m;
   try {
-    bars = await fetchCryptoBars({ symbols: [asset.symbol], limit: 16, timeframe: '1Min' });
+    [bars1m, bars5m, bars15m] = await Promise.all([
+      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '1Min' }),
+      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '5Min' }),
+      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '15Min' }),
+    ]);
   } catch (err) {
     return {
       entryReady: false,
@@ -602,25 +640,34 @@ async function computeEntrySignal(symbol) {
   }
 
   const barKey = normalizeSymbol(asset.symbol);
-  const barSeries = bars?.bars?.[barKey] || bars?.bars?.[normalizePair(barKey)] || [];
-  const closes = (Array.isArray(barSeries) ? barSeries : []).map((bar) =>
+  const barSeries1m =
+    bars1m?.bars?.[barKey] || bars1m?.bars?.[normalizePair(barKey)] || [];
+  const closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
     Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
   ).filter((value) => Number.isFinite(value) && value > 0);
 
-  if (closes.length < 3) {
+  if (closes1m.length < 3) {
     return {
       entryReady: false,
       why: 'predictor_error',
-      meta: { symbol: asset.symbol, barCount: closes.length },
+      meta: { symbol: asset.symbol, barCount: closes1m.length },
       record: baseRecord,
     };
   }
+
+  const barSeries5m =
+    bars5m?.bars?.[barKey] || bars5m?.bars?.[normalizePair(barKey)] || [];
+  const barSeries15m =
+    bars15m?.bars?.[barKey] || bars15m?.bars?.[normalizePair(barKey)] || [];
 
   let predictor;
   try {
     predictor = predictOne({
       symbol: asset.symbol,
-      bars: barSeries,
+      bars: barSeries1m,
+      bars1m: barSeries1m,
+      bars5m: barSeries5m,
+      bars15m: barSeries15m,
       orderbook: obResult.orderbook,
       spreadBps,
       refPrice: mid,
@@ -631,6 +678,9 @@ async function computeEntrySignal(symbol) {
         orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
         orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
         orderbookImpactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        volumeTrendMin: VOLUME_TREND_MIN,
+        timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
+        regimeZscoreThreshold: REGIME_ZSCORE_THRESHOLD,
       },
     });
   } catch (err) {
@@ -674,6 +724,7 @@ async function computeEntrySignal(symbol) {
       orderbookBidDepthUsd: orderbookMeta?.bidDepthUsd,
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
       orderbookImbalance: orderbookMeta?.imbalance,
+      orderbookLiquidityScore: orderbookMeta?.liquidityScore,
     },
     record: baseRecord,
   };
@@ -3216,17 +3267,40 @@ function computeOrderbookMetrics({ asks, bids }, { bid, ask }) {
   const imbalance = (bidDepthUsd - askDepthUsd) / denom;
   const obBias = clamp(imbalance * ORDERBOOK_IMBALANCE_BIAS_SCALE, -0.05, 0.05);
 
-  const okDepth = askDepthUsd >= ORDERBOOK_MIN_DEPTH_USD && bidDepthUsd >= (ORDERBOOK_MIN_DEPTH_USD * 0.5);
-  const okImpact = Number.isFinite(impactBpsBuy) && impactBpsBuy <= ORDERBOOK_MAX_IMPACT_BPS;
+  const depthScore = clamp(Math.min(askDepthUsd, bidDepthUsd) / Math.max(1, ORDERBOOK_MIN_DEPTH_USD), 0, 1);
+  const impactScore = clamp(
+    1 - (Number.isFinite(impactBpsBuy) ? impactBpsBuy : ORDERBOOK_MAX_IMPACT_BPS) / Math.max(1, ORDERBOOK_MAX_IMPACT_BPS),
+    0,
+    1,
+  );
+  const liquidityScore = clamp(0.7 * depthScore + 0.3 * impactScore, 0, 1);
+
+  const extremeAskDepthUsd = ORDERBOOK_MIN_DEPTH_USD * 0.2;
+  const extremeBidDepthUsd = ORDERBOOK_MIN_DEPTH_USD * 0.1;
+  const extremeImpactBps = ORDERBOOK_MAX_IMPACT_BPS * 3;
+  const hardFailDepth = askDepthUsd < extremeAskDepthUsd || bidDepthUsd < extremeBidDepthUsd;
+  const hardFailImpact = !Number.isFinite(impactBpsBuy) || impactBpsBuy > extremeImpactBps;
+  const hardFail = hardFailDepth || hardFailImpact;
 
   let reason = null;
-  if (!okDepth) {
+  if (hardFailDepth) {
     reason = 'ob_depth_insufficient';
-  } else if (!okImpact) {
+  } else if (hardFailImpact) {
     reason = 'ob_impact_too_high';
   }
 
-  return { askDepthUsd, bidDepthUsd, impactBpsBuy, imbalance, obBias, ok: okDepth && okImpact, reason };
+  return {
+    askDepthUsd,
+    bidDepthUsd,
+    impactBpsBuy,
+    imbalance,
+    obBias,
+    depthScore,
+    impactScore,
+    liquidityScore,
+    ok: !hardFail,
+    reason,
+  };
 }
 
 async function fetchCryptoQuotes({ symbols, location = 'us' }) {
@@ -6316,6 +6390,7 @@ async function runEntryScanOnce() {
     let attempts = 0;
     const skipDetailCounts = new Map();
     const skipSamples = new Map();
+    const candidateSignals = [];
 
     const recordSkip = (reason, symbol, details) => {
       const normalizedReason = reason || 'signal_skip';
@@ -6368,6 +6443,13 @@ async function runEntryScanOnce() {
 
       const signal = await computeEntrySignal(symbol);
       const recordBase = signal?.record ? { ...signal.record } : null;
+      if (Number.isFinite(recordBase?.predictorProbability)) {
+        candidateSignals.push({
+          symbol,
+          probability: recordBase.predictorProbability,
+          signals: recordBase.predictorSignals,
+        });
+      }
       if (DEBUG_ENTRY) {
         console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
       }
@@ -6436,6 +6518,13 @@ async function runEntryScanOnce() {
     }, {});
 
     const endMs = Date.now();
+    const topCandidates = candidateSignals
+      .filter((candidate) => Number.isFinite(candidate.probability))
+      .sort((a, b) => b.probability - a.probability)
+      .slice(0, 3);
+    if (topCandidates.length) {
+      console.log('entry_candidates', { startMs, endMs, topCandidates });
+    }
     console.log('entry_scan', {
       startMs,
       endMs,

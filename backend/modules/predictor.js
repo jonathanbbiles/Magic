@@ -1,3 +1,5 @@
+const { macd, slope, zscore, volumeTrend } = require('./indicators');
+
 const BPS = 10000;
 
 function clamp(value, min, max) {
@@ -13,6 +15,13 @@ function extractCloses(bars) {
   if (!Array.isArray(bars)) return [];
   return bars
     .map((bar) => getNumber(bar?.c ?? bar?.close ?? bar?.close_price ?? bar?.price ?? bar?.vwap))
+    .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function extractVolumes(bars) {
+  if (!Array.isArray(bars)) return [];
+  return bars
+    .map((bar) => getNumber(bar?.v ?? bar?.volume ?? bar?.vol ?? bar?.size))
     .filter((value) => Number.isFinite(value) && value > 0);
 }
 
@@ -105,8 +114,8 @@ function computeOrderbookSignals(orderbook, options) {
     };
   }
 
-  const bandBps = Number(options?.orderbookBandBps ?? 20);
-  const minDepthUsd = Number(options?.orderbookMinDepthUsd ?? 150);
+  const bandBps = Number(options?.orderbookBandBps ?? 60);
+  const minDepthUsd = Number(options?.orderbookMinDepthUsd ?? 75);
   const maxImpactBps = Number(options?.orderbookMaxImpactBps ?? 15);
   const impactNotionalUsd = Number(options?.orderbookImpactNotionalUsd ?? 100);
 
@@ -131,28 +140,95 @@ function computeOrderbookSignals(orderbook, options) {
   };
 }
 
-function predictOne({ bars, orderbook, refPrice, marketContext, symbol }) {
+function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, marketContext, symbol }) {
   const targetMoveBps = Number(marketContext?.targetMoveBps ?? 100);
   const horizonMinutes = Number(marketContext?.horizonMinutes ?? 30);
-  const closes = extractCloses(bars);
-  const volatilityBps = computeVolatilityBps(closes);
-  const driftBps = computeDriftBps(closes);
-  const windowMinutes = Math.max(1, closes.length - 1);
+  const fallbackBars = Array.isArray(bars) ? bars : [];
+  const series1m = Array.isArray(bars1m) && bars1m.length ? bars1m : fallbackBars;
+  const series5m = Array.isArray(bars5m) && bars5m.length ? bars5m : fallbackBars;
+  const series15m = Array.isArray(bars15m) && bars15m.length ? bars15m : fallbackBars;
+
+  const closes1m = extractCloses(series1m);
+  const closes5m = extractCloses(series5m);
+  const closes15m = extractCloses(series15m);
+  const volumes1m = extractVolumes(series1m);
+
+  const volatilityBps = computeVolatilityBps(closes1m);
+  const driftBps = computeDriftBps(closes1m);
+  const windowMinutes = Math.max(1, closes1m.length - 1);
   const driftPerMinBps = driftBps / windowMinutes;
   const projectedMoveBps = driftPerMinBps * horizonMinutes;
   const expectedMoveBps = volatilityBps * Math.sqrt(Math.max(1, horizonMinutes));
   const feasibilityScore = clamp(expectedMoveBps / Math.max(1, targetMoveBps), 0, 1);
   const driftScore = clamp(0.5 + projectedMoveBps / Math.max(1, targetMoveBps * 2), 0, 1);
 
+  const macd1m = macd(closes1m);
+  const macd5m = macd(closes5m);
+  const macd15m = macd(closes15m);
+  const histSlope1m = slope(
+    closes1m.map((_, idx) => {
+      const subset = closes1m.slice(0, idx + 1);
+      return macd(subset)?.histogram ?? null;
+    }).filter((value) => Number.isFinite(value)),
+    5,
+  );
+  const zscore1m = zscore(closes1m, 20);
+  const zscore5m = zscore(closes5m, 20);
+  const zscore15m = zscore(closes15m, 20);
+  const volumeTrend1m = volumeTrend(volumes1m, 5);
+
+  const zscoreThreshold = Number(marketContext?.regimeZscoreThreshold ?? 2);
+  const zscoreAbs = Math.max(Math.abs(zscore1m ?? 0), Math.abs(zscore5m ?? 0));
+  const regime = zscoreAbs >= zscoreThreshold ? 'mean_reversion' : 'momentum';
+
+  const histPositive1m = Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0;
+  const histSlopePositive1m = Number.isFinite(histSlope1m) && histSlope1m > 0;
+  const hist5m = macd5m?.histogram;
+  const hist15m = macd15m?.histogram;
+  const histNotStronglyNegative5m =
+    Number.isFinite(hist5m) &&
+    (hist5m >= 0 || hist5m > -Math.abs(Number(macd1m?.histogram) || 0) * 0.5);
+  const momentumScore = histPositive1m && histSlopePositive1m && histNotStronglyNegative5m ? 1 : 0;
+
+  const meanReversionScore =
+    (Number.isFinite(zscore1m) && zscore1m <= -2) ||
+    (Number.isFinite(zscore5m) && zscore5m <= -2)
+      ? histSlopePositive1m
+        ? 1
+        : 0
+      : 0;
+
+  const volumeTrendMin = Number(marketContext?.volumeTrendMin ?? 1.1);
+  const volumeConfirm = Number.isFinite(volumeTrend1m) && volumeTrend1m >= volumeTrendMin ? 1 : 0;
+
+  const confirmationRequired = Math.max(1, Number(marketContext?.timeframeConfirmations ?? 2));
+  const timeframeChecks = {
+    '1m':
+      regime === 'mean_reversion'
+        ? Number.isFinite(zscore1m) && zscore1m <= -2
+        : Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0,
+    '5m':
+      regime === 'mean_reversion'
+        ? Number.isFinite(zscore5m) && zscore5m <= -2
+        : Number.isFinite(hist5m) && hist5m > 0,
+    '15m':
+      regime === 'mean_reversion'
+        ? Number.isFinite(zscore15m) && zscore15m <= -2
+        : Number.isFinite(hist15m) && hist15m > 0,
+  };
+  const confirmationCount = Object.values(timeframeChecks).filter(Boolean).length;
+  const multiTimeframeConfirm = confirmationCount >= confirmationRequired ? 1 : 0;
+
   const orderbookSignals = computeOrderbookSignals(orderbook, marketContext);
   const imbalanceScore = clamp(0.5 + (Number(orderbookSignals.imbalance) || 0) / 2, 0, 1);
 
+  const branchScore = regime === 'mean_reversion' ? meanReversionScore : momentumScore;
   const probabilityRaw =
-    0.1 +
-    0.35 * feasibilityScore +
-    0.25 * driftScore +
-    0.15 * orderbookSignals.depthScore +
-    0.1 * orderbookSignals.impactScore +
+    0.05 +
+    0.35 * branchScore +
+    0.2 * multiTimeframeConfirm +
+    0.15 * volumeConfirm +
+    0.2 * orderbookSignals.liquidityScore +
     0.05 * imbalanceScore;
   const probability = clamp(probabilityRaw, 0, 1);
 
@@ -172,6 +248,22 @@ function predictOne({ bars, orderbook, refPrice, marketContext, symbol }) {
       feasibilityScore,
       driftScore,
       imbalanceScore,
+      macd1m,
+      macd5m,
+      histSlope1m,
+      zscore1m,
+      zscore5m,
+      volumeTrend1m,
+      regime,
+      checks: {
+        momentumScore,
+        meanReversionScore,
+        volumeConfirm,
+        multiTimeframeConfirm,
+        confirmationCount,
+        confirmationRequired,
+        timeframeChecks,
+      },
       ...orderbookSignals,
     },
   };
