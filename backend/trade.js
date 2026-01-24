@@ -3124,6 +3124,50 @@ function parseIsoTsMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeOrderbookTimestampMs(book, resp) {
+  const rawTsCandidates = {
+    bookT: book?.t ?? null,
+    bookTimestamp: book?.timestamp ?? null,
+    bookTs: book?.ts ?? null,
+    bookTime: book?.time ?? null,
+    respT: resp?.t ?? null,
+    respTimestamp: resp?.timestamp ?? null,
+  };
+
+  const parseCandidate = (value) => {
+    if (typeof value === 'string') {
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (value > 1e15) return Math.floor(value / 1e6);
+      if (value > 1e12) return Math.floor(value);
+      return Math.floor(value * 1000);
+    }
+    return null;
+  };
+
+  const orderedCandidates = [
+    rawTsCandidates.bookT,
+    rawTsCandidates.bookTimestamp,
+    rawTsCandidates.bookTs,
+    rawTsCandidates.bookTime,
+    rawTsCandidates.respT,
+    rawTsCandidates.respTimestamp,
+  ];
+
+  let tsMs = null;
+  for (const candidate of orderedCandidates) {
+    const parsed = parseCandidate(candidate);
+    if (Number.isFinite(parsed)) {
+      tsMs = parsed;
+      break;
+    }
+  }
+
+  return { tsMs, rawTsCandidates };
+}
+
 async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   const dataSymbols = symbols.map((s) => toDataSymbol(s));
   const url = buildAlpacaUrl({
@@ -3150,12 +3194,33 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
   try {
     resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
   } catch (err) {
-    return { ok: false, reason: 'ob_http_empty', details: { symbol, error: err?.message || String(err) } };
+    return {
+      ok: false,
+      reason: 'ob_http_empty',
+      details: {
+        symbol,
+        error: err?.message || String(err),
+        rawTsCandidates: {
+          bookT: null,
+          bookTimestamp: null,
+          bookTs: null,
+          bookTime: null,
+          respT: null,
+          respTimestamp: null,
+        },
+        bookKeys: [],
+      },
+    };
   }
 
   const orderbooks = resp?.orderbooks;
   if (!orderbooks || Object.keys(orderbooks).length === 0) {
-    return { ok: false, reason: 'ob_http_empty', details: { symbol, hasOrderbooks: Boolean(orderbooks) } };
+    const { rawTsCandidates } = normalizeOrderbookTimestampMs(null, resp);
+    return {
+      ok: false,
+      reason: 'ob_http_empty',
+      details: { symbol, hasOrderbooks: Boolean(orderbooks), rawTsCandidates, bookKeys: [] },
+    };
   }
 
   const key = toDataSymbol(symbol);
@@ -3181,8 +3246,32 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
 
   const asks = Array.isArray(book?.a) ? book.a : [];
   const bids = Array.isArray(book?.b) ? book.b : [];
-  if (!asks.length) return { ok: false, reason: 'ob_missing_asks', details: { symbol, askLevels: asks.length } };
-  if (!bids.length) return { ok: false, reason: 'ob_missing_bids', details: { symbol, bidLevels: bids.length } };
+  if (!asks.length) {
+    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+    return {
+      ok: false,
+      reason: 'ob_http_empty',
+      details: {
+        symbol,
+        askLevels: asks.length,
+        rawTsCandidates,
+        bookKeys: Object.keys(book || {}).slice(0, 25),
+      },
+    };
+  }
+  if (!bids.length) {
+    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+    return {
+      ok: false,
+      reason: 'ob_http_empty',
+      details: {
+        symbol,
+        bidLevels: bids.length,
+        rawTsCandidates,
+        bookKeys: Object.keys(book || {}).slice(0, 25),
+      },
+    };
+  }
 
   const priceOf = (level) => Number(level?.p ?? level?.price);
   const sortedAsks = [...asks].sort((a, b) => priceOf(a) - priceOf(b));
@@ -3190,20 +3279,34 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
   const bestAsk = priceOf(sortedAsks?.[0]);
   const bestBid = priceOf(sortedBids?.[0]);
   if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) {
+    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
     return {
       ok: false,
-      reason: 'ob_top_invalid',
-      details: { symbol, bestAsk, bestBid },
+      reason: 'ob_http_empty',
+      details: { symbol, bestAsk, bestBid, rawTsCandidates, bookKeys: Object.keys(book || {}).slice(0, 25) },
     };
   }
 
-  const tsMs = Number.isFinite(book?.t) ? Number(book.t) : parseIsoTsMs(book?.t);
+  const { tsMs: parsedTsMs, rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+  let tsMs = parsedTsMs;
+  let tsFallbackUsed = false;
   if (!Number.isFinite(tsMs)) {
-    return { ok: false, reason: 'ob_http_empty', details: { symbol, timestamp: book?.t ?? null } };
+    tsMs = now;
+    tsFallbackUsed = true;
   }
 
-  if (now - tsMs > maxAgeMs) {
-    return { ok: false, reason: 'ob_http_empty', details: { symbol, ageMs: now - tsMs, maxAgeMs } };
+  if (Number.isFinite(parsedTsMs) && now - tsMs > maxAgeMs) {
+    return {
+      ok: false,
+      reason: 'ob_http_empty',
+      details: {
+        symbol,
+        ageMs: now - tsMs,
+        maxAgeMs,
+        rawTsCandidates,
+        bookKeys: Object.keys(book || {}).slice(0, 25),
+      },
+    };
   }
 
   const normalized = {
@@ -3212,6 +3315,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     bestAsk,
     bestBid,
     tsMs,
+    tsFallbackUsed,
     receivedAtMs: now,
   };
   orderbookCache.set(symbol, normalized);
