@@ -540,12 +540,30 @@ async function computeEntrySignal(symbol) {
     return {
       entryReady: false,
       why: 'ob_depth_insufficient',
-      meta: { symbol: asset.symbol, spreadBps, obReason: obResult.reason, obDetails: obResult.details },
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        obReason: obResult.reason,
+        obDetails: obResult.details,
+        askDepthUsd: null,
+        bidDepthUsd: null,
+        impactBpsBuy: null,
+        obBestAsk: null,
+        obBestBid: null,
+        quoteAsk: ask,
+        quoteBid: bid,
+        bandBps: ORDERBOOK_BAND_BPS,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+      },
       record: baseRecord,
     };
   }
 
-  const orderbookMeta = computeOrderbookMetrics(obResult.orderbook, { bid, ask });
+  const orderbookMeta = computeOrderbookMetrics(obResult.orderbook, {
+    bid: obResult.orderbook.bestBid,
+    ask: obResult.orderbook.bestAsk,
+  });
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
   baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
   baseRecord.orderbookImpactBpsBuy = orderbookMeta.impactBpsBuy;
@@ -555,7 +573,18 @@ async function computeEntrySignal(symbol) {
     return {
       entryReady: false,
       why: 'ob_depth_insufficient',
-      meta: { symbol: asset.symbol, spreadBps, ...orderbookMeta },
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        ...orderbookMeta,
+        obBestAsk: obResult.orderbook.bestAsk,
+        obBestBid: obResult.orderbook.bestBid,
+        quoteAsk: ask,
+        quoteBid: bid,
+        bandBps: ORDERBOOK_BAND_BPS,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+      },
       record: baseRecord,
     };
   }
@@ -3104,8 +3133,11 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
   if (!asks.length) return { ok: false, reason: 'ob_missing_asks', details: { symbol, askLevels: asks.length } };
   if (!bids.length) return { ok: false, reason: 'ob_missing_bids', details: { symbol, bidLevels: bids.length } };
 
-  const bestAsk = Number(asks?.[0]?.p ?? asks?.[0]?.price);
-  const bestBid = Number(bids?.[0]?.p ?? bids?.[0]?.price);
+  const priceOf = (level) => Number(level?.p ?? level?.price);
+  const sortedAsks = [...asks].sort((a, b) => priceOf(a) - priceOf(b));
+  const sortedBids = [...bids].sort((a, b) => priceOf(b) - priceOf(a));
+  const bestAsk = priceOf(sortedAsks?.[0]);
+  const bestBid = priceOf(sortedBids?.[0]);
   if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) {
     return {
       ok: false,
@@ -3123,7 +3155,14 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     return { ok: false, reason: 'ob_http_empty', details: { symbol, ageMs: now - tsMs, maxAgeMs } };
   }
 
-  const normalized = { asks, bids, tsMs, receivedAtMs: now };
+  const normalized = {
+    asks: sortedAsks,
+    bids: sortedBids,
+    bestAsk,
+    bestBid,
+    tsMs,
+    receivedAtMs: now,
+  };
   orderbookCache.set(symbol, normalized);
   return { ok: true, orderbook: normalized, source: 'fresh' };
 }
