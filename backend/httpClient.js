@@ -1,6 +1,9 @@
 const { alpacaLimiter, quoteLimiter } = require('./limiters');
 
-const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_TIMEOUT_MS = (() => {
+  const value = Number(process.env.HTTP_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 10000;
+})();
 const DEFAULT_RETRIES = 2;
 
 function parseUrlDetails(url) {

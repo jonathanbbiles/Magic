@@ -23,7 +23,11 @@ const rateLimit = (req, res, next) => {
   }
 
   if (bucket.count >= max) {
-    return res.status(429).json({ ok: false, error: 'rate_limited' });
+    const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+    res.set('Retry-After', String(retryAfterSec));
+    res.set('x-rate-limit-window-ms', String(windowMs));
+    res.set('x-rate-limit-max', String(max));
+    return res.status(429).json({ ok: false, error: 'rate_limited', retryAfterSec });
   }
 
   bucket.count += 1;
