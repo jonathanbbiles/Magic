@@ -18,6 +18,12 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import {
+  BACKEND_GET_CACHE_TTL_MS,
+  CONNECTION_CHECK_RETRIES,
+  CONNECTION_CHECK_TIMEOUT_MS,
+  SUPPORTED_CRYPTO_REFRESH_MS,
+} from './src/config/polling';
 const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
@@ -80,6 +86,7 @@ const BACKEND_BASE_URL = normalizeBaseUrl(
     ? (EX.BACKEND_BASE_URL || DEV_LAN_IP || 'http://localhost:3000')
     : (EX.BACKEND_BASE_URL || RENDER_BACKEND_URL)
 );
+const IS_HOSTED_BACKEND = BACKEND_BASE_URL.includes('onrender.com');
 
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
 const DATA_LOCATIONS = ['us'];
@@ -96,12 +103,12 @@ const FORCE_ONE_TEST_BUY_NOTIONAL = Number(EX.FORCE_ONE_TEST_BUY_NOTIONAL || 2);
 let forceTestBuyUsed = false;
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
-function bootConnectivityCheck(setStatusFn) {
+function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
   let active = true;
   (async () => {
     const startedAt = Date.now();
     try {
-      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: BACKEND_HEADERS }, 8000, 1);
+      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: BACKEND_HEADERS }, CONNECTION_CHECK_TIMEOUT_MS, CONNECTION_CHECK_RETRIES);
       const ms = Date.now() - startedAt;
       const ok = !!res?.ok;
       const data = await res.json().catch(() => null);
@@ -121,6 +128,30 @@ function bootConnectivityCheck(setStatusFn) {
       console.log(`BACKEND_UNREACHABLE ${message}`);
       if (!active) return;
       setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
+      return;
+    }
+
+    try {
+      const authRes = await f(`${BACKEND_BASE_URL}/debug/auth`, { headers: BACKEND_HEADERS }, CONNECTION_CHECK_TIMEOUT_MS, CONNECTION_CHECK_RETRIES);
+      const authPayload = await authRes.json().catch(() => null);
+      if (!active) return;
+      if (!authRes?.ok) {
+        const message = authPayload?.error || authPayload?.message || `HTTP ${authRes?.status ?? 'NA'}`;
+        setAuthStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message, apiTokenSet: null });
+        return;
+      }
+      setAuthStatusFn?.({
+        ok: true,
+        checkedAt: new Date().toISOString(),
+        error: null,
+        apiTokenSet: Boolean(authPayload?.apiTokenSet),
+        serverTime: authPayload?.serverTime || null,
+        version: authPayload?.version || null,
+      });
+    } catch (e) {
+      if (!active) return;
+      const message = e?.message || String(e);
+      setAuthStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message, apiTokenSet: null });
     }
   })();
   return () => { active = false; };
@@ -350,6 +381,22 @@ function safeJsonParse(raw, fallback = null, context = 'unknown') {
   }
 }
 
+const authState = {
+  mismatch: false,
+  last401At: null,
+  lastAuthHint: null,
+  lastUrl: null,
+};
+const authListeners = new Set();
+const notifyAuthState = (next) => {
+  Object.assign(authState, next);
+  authListeners.forEach((cb) => cb({ ...authState }));
+};
+const subscribeAuthState = (cb) => {
+  authListeners.add(cb);
+  return () => authListeners.delete(cb);
+};
+
 // --- Global request rate limiter (simple token bucket) ---
 let __TOKENS = 180; // ~180 req/min default budget
 let __LAST_REFILL = Date.now();
@@ -377,11 +424,16 @@ function readRateLimitHeaders(res) {
     limit: res?.headers?.get?.('x-ratelimit-limit') || null,
     remaining: res?.headers?.get?.('x-ratelimit-remaining') || null,
     reset: res?.headers?.get?.('x-ratelimit-reset') || null,
+    retryAfter: res?.headers?.get?.('retry-after') || null,
   };
 }
 
 function computeRateLimitBackoff(attempt, headers = {}) {
   const base = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+  const retryAfterSec = headers.retryAfter ? Number(headers.retryAfter) : null;
+  if (Number.isFinite(retryAfterSec) && retryAfterSec > 0) {
+    return Math.max(base, Math.min(retryAfterSec * 1000, 15000));
+  }
   const resetRaw = headers.reset ? Number(headers.reset) : null;
   if (Number.isFinite(resetRaw) && resetRaw > 0) {
     const nowSec = Date.now() / 1000;
@@ -391,15 +443,72 @@ function computeRateLimitBackoff(attempt, headers = {}) {
   return base;
 }
 
-async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
+const endpointBackoffUntil = new Map();
+const backendGetCache = new Map();
+
+function getRetryAfterMs(res) {
+  const raw = res?.headers?.get?.('retry-after');
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+  const dateMs = Date.parse(raw);
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return null;
+}
+
+function setEndpointBackoff(url, ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  const until = Date.now() + ms;
+  endpointBackoffUntil.set(url, Math.max(endpointBackoffUntil.get(url) || 0, until));
+}
+
+function getEndpointBackoffMs(url) {
+  const until = endpointBackoffUntil.get(url) || 0;
+  if (!until) return 0;
+  return Math.max(0, until - Date.now());
+}
+
+function buildCachedResponse(payload) {
+  const headers = new Headers(payload.headers || []);
+  return new Response(payload.bodyText || '', {
+    status: payload.status,
+    statusText: payload.statusText,
+    headers,
+  });
+}
+
+async function rawFetch(url, opts = {}, timeoutMs = 12000, retries = 3) {
   let lastErr = null;
+  const method = String(opts?.method || 'GET').toUpperCase();
   for (let i = 0; i <= retries; i++) {
     await __takeToken();
+    const backoffMs = method === 'GET' ? getEndpointBackoffMs(url) : 0;
+    if (backoffMs > 0) {
+      await sleep(backoffMs);
+    }
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
     try {
       const res = await fetch(url, { ...opts, signal: ac.signal });
       clearTimeout(t);
+      if (res.status === 401) {
+        notifyAuthState({
+          mismatch: true,
+          last401At: new Date().toISOString(),
+          lastAuthHint: res.headers?.get?.('x-auth-hint') || null,
+          lastUrl: url,
+        });
+      }
+      if (res.status === 429) {
+        const retryAfterMs = getRetryAfterMs(res);
+        if (retryAfterMs) {
+          setEndpointBackoff(url, retryAfterMs);
+        }
+      }
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
         const headers = res.status === 429 ? readRateLimitHeaders(res) : null;
@@ -416,6 +525,37 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
     }
   }
   throw lastErr || new Error('fetch failed');
+}
+
+async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
+  const method = String(opts?.method || 'GET').toUpperCase();
+  if (method !== 'GET') {
+    return rawFetch(url, opts, timeoutMs, retries);
+  }
+  const cacheKey = `${method}:${url}`;
+  const now = Date.now();
+  const cached = backendGetCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.promise.then((payload) => buildCachedResponse(payload));
+  }
+  const requestPromise = (async () => {
+    const res = await rawFetch(url, opts, timeoutMs, retries);
+    const bodyText = await res.text().catch(() => '');
+    return {
+      status: res.status,
+      statusText: res.statusText,
+      headers: Array.from(res.headers.entries()),
+      bodyText,
+    };
+  })();
+  backendGetCache.set(cacheKey, { expiresAt: now + BACKEND_GET_CACHE_TTL_MS, promise: requestPromise });
+  try {
+    const payload = await requestPromise;
+    return buildCachedResponse(payload);
+  } catch (err) {
+    backendGetCache.delete(cacheKey);
+    throw err;
+  }
 }
 
 const MARKET_DATA_TIMEOUT_MS = 9000;
@@ -1219,7 +1359,6 @@ const STATIC_UNIVERSE = Array.from(
 /* ───────────────────────── 11) QUOTE CACHE / SUPPORT FLAGS ───────────────────────── */
 const SUPPORTED_CRYPTO_CACHE_KEY = 'supported_crypto_pairs_v1';
 const SUPPORTED_CRYPTO_CACHE_TS_KEY = 'supported_crypto_pairs_last_refresh_v1';
-const SUPPORTED_CRYPTO_REFRESH_MS = 24 * 60 * 60 * 1000;
 const quoteCache = new Map();
 const lastQuoteBatchMissing = new Map();
 const unsupportedSymbols = new Map();
@@ -5837,6 +5976,9 @@ export default function App() {
   const [notification, setNotification] = useState(null);
   const [logHistory, setLogHistory] = useState([]);
   const [connectivity, setConnectivity] = useState({ ok: null, checkedAt: null, error: null });
+  const [authStatus, setAuthStatus] = useState({ ok: null, checkedAt: null, error: null, apiTokenSet: null });
+  const [authMismatch, setAuthMismatch] = useState({ mismatch: false, last401At: null, lastAuthHint: null, lastUrl: null });
+  const [authBanner, setAuthBanner] = useState(null);
   const [haltState, setHaltState] = useState({ halted: TRADING_HALTED, reason: HALT_REASON });
 
   const [overrides, setOverrides] = useState({});
@@ -5969,9 +6111,29 @@ export default function App() {
   }, [overrideSym]);
 
   useEffect(() => {
-    const cancel = bootConnectivityCheck(setConnectivity);
+    const cancel = bootConnectivityCheck(setConnectivity, setAuthStatus);
     return () => { if (typeof cancel === 'function') cancel(); };
   }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribeAuthState((next) => {
+      setAuthMismatch(next);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (authStatus?.apiTokenSet && !API_TOKEN) {
+      setAuthBanner('Backend requires API_TOKEN but app has none.');
+      return;
+    }
+    if (authMismatch?.mismatch) {
+      const tokenSetLabel = API_TOKEN ? 'yes' : 'no';
+      setAuthBanner(`Token mismatch. Backend ${BACKEND_BASE_URL} — API_TOKEN set: ${tokenSetLabel}.`);
+      return;
+    }
+    setAuthBanner(null);
+  }, [authStatus?.apiTokenSet, authMismatch?.mismatch]);
 
   useEffect(() => {
     let active = true;
@@ -7586,6 +7748,39 @@ export default function App() {
               <Text style={styles.topBannerText}>{notification}</Text>
             </View>
           )}
+          {authBanner && (
+            <View style={[styles.topBanner, styles.topBannerAlert]}>
+              <Text style={styles.topBannerText}>{authBanner}</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={styles.connectionCard}>
+          <Text style={styles.cardTitle}>Connection</Text>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Backend</Text>
+            <Text style={styles.value}>{BACKEND_BASE_URL}</Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Backend reachable</Text>
+            <Text style={styles.value}>
+              {connectivity.ok == null ? 'unknown' : connectivity.ok ? 'yes' : 'no'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Auth required</Text>
+            <Text style={styles.value}>
+              {authStatus.apiTokenSet == null ? 'unknown' : authStatus.apiTokenSet ? 'yes' : 'no'}
+            </Text>
+          </View>
+          {IS_HOSTED_BACKEND && (
+            <Text style={styles.smallNote}>Using hosted backend</Text>
+          )}
+          {!!(authMismatch?.mismatch || authStatus?.error || connectivity?.error) && (
+            <Text style={styles.smallNote}>
+              Last error: {authMismatch?.mismatch ? '401 token mismatch' : authStatus?.error || connectivity?.error}
+            </Text>
+          )}
         </View>
 
         <View style={styles.accountSnapshot}>
@@ -7743,6 +7938,10 @@ const styles = StyleSheet.create({
   dot: { color: '#657788', fontWeight: '800' },
   topBanner: { marginTop: 6, paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#ead5ff', borderRadius: 8, width: '100%' },
   topBannerText: { color: '#355070', textAlign: 'center', fontWeight: '700', fontSize: 12 },
+  topBannerAlert: { backgroundColor: '#ffe1e1' },
+
+  connectionCard: { backgroundColor: '#ffffff', borderRadius: 12, padding: 12, marginBottom: 10 },
+  connectionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 },
 
   accountSnapshot: {
     backgroundColor: '#ffffff',

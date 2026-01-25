@@ -13,15 +13,20 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 Required:
 - `ALPACA_API_KEY`
 - `ALPACA_SECRET_KEY`
-- `ALPACA_API_BASE`
+- `TRADE_BASE` (or `ALPACA_API_BASE` for legacy configs)
 
 Recommended:
 - `API_TOKEN` (shared token used by the frontend; include it as `Authorization: Bearer <token>` or `x-api-key`.)
 
 Optional:
 - `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
+- `CORS_ALLOWED_ORIGIN_REGEX` (comma-separated regex patterns for allowed origins)
+- `CORS_ALLOW_LAN` (set `true` to allow common LAN origins like `http://192.168.x.x:port`)
 - `RATE_LIMIT_WINDOW_MS` (default `60000`)
 - `RATE_LIMIT_MAX` (default `120`)
+- `HTTP_TIMEOUT_MS` (default `10000`)
+- `DATA_BASE` (defaults to Alpaca data API base URL)
+- `DATASET_DIR` (default `./data`; set to a persistent disk on hosts like Render)
 - `DESIRED_NET_PROFIT_BASIS_POINTS` (default `100`, target net profit per trade after fees)
 - `MAX_GROSS_TAKE_PROFIT_BASIS_POINTS` (default `220`, cap on gross take-profit distance above entry)
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
@@ -44,4 +49,6 @@ Entry scans apply multiple gates before placing a trade:
 ## Notes
 
 - `GET /health` remains public for uptime checks.
+- `GET /debug/auth` is public for token diagnostics.
 - All other routes require a valid API token.
+- Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
