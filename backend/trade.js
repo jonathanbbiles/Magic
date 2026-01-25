@@ -14,6 +14,8 @@ const recorder = require('./modules/recorder');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
+const DEBUG_ALPACA_HTTP = String(process.env.DEBUG_ALPACA_HTTP || '').trim() === '1';
+const DEBUG_ALPACA_HTTP_OK = String(process.env.DEBUG_ALPACA_HTTP_OK || '').trim() === '1';
 
 function normalizeTradeBase(baseUrl) {
   if (!baseUrl) return 'https://api.alpaca.markets';
@@ -918,7 +920,9 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
     });
   }
   const finalUrl = url.toString();
-  console.log('alpaca_request_url', { label, url: finalUrl });
+  if (DEBUG_ALPACA_HTTP) {
+    console.log('alpaca_request_url', { label, url: finalUrl });
+  }
   return finalUrl;
 }
 
@@ -1056,6 +1060,11 @@ function extractHttpErrorCode({ error, snippet }) {
 
 function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, requestId, urlHost, urlPath }) {
   const label = getMarketDataLabel(type);
+  const normalizedErrorType = String(errorType || '').trim().toLowerCase();
+  const isOk = normalizedErrorType === 'ok';
+  if (isOk && !(DEBUG_ALPACA_HTTP || DEBUG_ALPACA_HTTP_OK)) {
+    return;
+  }
   console.log('alpaca_marketdata', {
     label,
     type,
