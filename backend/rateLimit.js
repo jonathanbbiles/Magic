@@ -27,6 +27,8 @@ const rateLimit = (req, res, next) => {
     res.set('Retry-After', String(retryAfterSec));
     res.set('x-rate-limit-window-ms', String(windowMs));
     res.set('x-rate-limit-max', String(max));
+    res.set('x-rate-limit-remaining', '0');
+    res.set('x-rate-limit-reset-ms', String(bucket.resetAt));
     return res.status(429).json({ ok: false, error: 'rate_limited', retryAfterSec });
   }
 

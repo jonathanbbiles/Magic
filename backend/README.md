@@ -8,6 +8,11 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 2. Create a `.env` file with your Alpaca API keys and API token.
 3. `npm start`
 
+## Node 22 requirement
+
+- Run locally with Node 22: `nvm use` in the backend directory.
+- Hosted services must support Node 22 (set the Node version in your service config).
+
 ## Environment Variables
 
 Required:

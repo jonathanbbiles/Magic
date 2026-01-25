@@ -13,3 +13,4 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+!.env.live.example

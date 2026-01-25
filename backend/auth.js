@@ -32,6 +32,7 @@ const requireApiToken = (req, res, next) => {
     return res.status(401).json({
       error: 'unauthorized',
       hint: 'Set API_TOKEN on server and API_TOKEN in Expo extra, or unset API_TOKEN to disable auth.',
+      serverTokenSet: Boolean(expectedToken),
     });
   }
   return next();
