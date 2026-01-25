@@ -7,7 +7,7 @@
 ### Backend
 1. `cd backend`
 2. `npm install`
-3. `cp .env.example.live .env` and fill in your **live** keys + token.
+3. `cp .env.live.example .env` and fill in your **live** keys + token.
 4. `npm start`
 5. Verify: `curl http://localhost:3000/health` and `curl http://localhost:3000/debug/auth`
 
@@ -19,6 +19,7 @@
 ## Node version
 - Local: `cd backend && nvm use`
 - Render/hosted: set Node version **22** in service settings (or use `.node-version` if your platform supports it).
+- Hosts must support Node 22, or deployments will fail with engine/host mismatch.
 
 ## Troubleshooting
 

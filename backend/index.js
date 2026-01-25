@@ -51,9 +51,19 @@ const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler
 
 validateEnv();
 
+const VERSION =
+  process.env.VERSION ||
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.COMMIT_SHA ||
+  'dev';
+
 const app = express();
 
 app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  res.set('x-server-version', VERSION);
+  next();
+});
 app.use(cors(corsOptionsDelegate));
 app.use((err, req, res, next) => {
   if (err?.code === 'CORS_NOT_ALLOWED') {
@@ -67,12 +77,6 @@ const apiToken = String(process.env.API_TOKEN || '').trim();
 if (!apiToken) {
   console.warn('SECURITY WARNING: API_TOKEN not set. Backend endpoints are unprotected.');
 }
-
-const VERSION =
-  process.env.VERSION ||
-  process.env.RENDER_GIT_COMMIT ||
-  process.env.COMMIT_SHA ||
-  'dev';
 
 function extractOrderSummary(order) {
   if (!order) {

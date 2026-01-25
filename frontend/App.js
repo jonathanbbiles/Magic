@@ -103,6 +103,21 @@ const FORCE_ONE_TEST_BUY_NOTIONAL = Number(EX.FORCE_ONE_TEST_BUY_NOTIONAL || 2);
 let forceTestBuyUsed = false;
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
+function formatConnectivityError(res, payload) {
+  const status = res?.status;
+  const authHint = res?.headers?.get?.('x-auth-hint');
+  if (status === 401 || authHint) {
+    return 'Auth token mismatch (API_TOKEN).';
+  }
+  if (status === 429) {
+    return 'Rate limited (backend). Slow refresh or raise RATE_LIMIT_MAX.';
+  }
+  if (status === 403 && payload?.error === 'cors_blocked') {
+    return 'CORS blocked. Add origin or enable CORS_ALLOW_LAN.';
+  }
+  return payload?.error || payload?.message || `HTTP ${status ?? 'NA'}`;
+}
+
 function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
   let active = true;
   (async () => {
@@ -115,7 +130,7 @@ function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
       console.log(`BACKEND health ok=${ok} ms=${ms}`);
       if (!active) return;
       if (!ok) {
-        const message = data?.error || data?.message || `HTTP ${res?.status ?? 'NA'}`;
+        const message = formatConnectivityError(res, data);
         console.log(`BACKEND_UNREACHABLE ${message}`);
         setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
         return;
@@ -136,7 +151,7 @@ function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
       const authPayload = await authRes.json().catch(() => null);
       if (!active) return;
       if (!authRes?.ok) {
-        const message = authPayload?.error || authPayload?.message || `HTTP ${authRes?.status ?? 'NA'}`;
+        const message = formatConnectivityError(authRes, authPayload);
         setAuthStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message, apiTokenSet: null });
         return;
       }

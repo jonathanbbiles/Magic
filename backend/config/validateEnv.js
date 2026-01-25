@@ -37,6 +37,7 @@ const parseCorsRegexes = (raw) =>
     });
 
 const resolveDatasetDir = () => String(process.env.DATASET_DIR || './data');
+const resolveRecorderEnabled = () => String(process.env.RECORDER_ENABLED || 'true').toLowerCase() !== 'false';
 
 const isRenderEnvironment = () =>
   Boolean(
@@ -46,16 +47,76 @@ const isRenderEnvironment = () =>
       process.env.RENDER_GIT_COMMIT
   );
 
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE;
+const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
+
+function normalizeTradeBase(baseUrl) {
+  if (!baseUrl) return 'https://api.alpaca.markets';
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('data.alpaca.markets')) {
+      console.warn('trade_base_invalid_host', { host: parsed.hostname });
+      return 'https://api.alpaca.markets';
+    }
+  } catch (err) {
+    console.warn('trade_base_parse_failed', { baseUrl: trimmed });
+  }
+  return trimmed.replace(/\/v2$/, '');
+}
+
+function normalizeDataBase(baseUrl) {
+  if (!baseUrl) return 'https://data.alpaca.markets';
+  let trimmed = baseUrl.replace(/\/+$/, '');
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('api.alpaca.markets') || parsed.hostname.includes('paper-api.alpaca.markets')) {
+      console.warn('data_base_invalid_host', { host: parsed.hostname });
+      return 'https://data.alpaca.markets';
+    }
+  } catch (err) {
+    console.warn('data_base_parse_failed', { baseUrl: trimmed });
+  }
+  trimmed = trimmed.replace(/\/v1beta2$/, '');
+  trimmed = trimmed.replace(/\/v1beta3$/, '');
+  trimmed = trimmed.replace(/\/v2\/stocks$/, '');
+  trimmed = trimmed.replace(/\/v2$/, '');
+  return trimmed;
+}
+
 const validateEnv = () => {
-  const tradeBase = process.env.TRADE_BASE;
-  const dataBase = process.env.DATA_BASE;
+  const tradeBase = RAW_TRADE_BASE;
+  const dataBase = RAW_DATA_BASE;
+  const rawTradeBaseSource = process.env.TRADE_BASE
+    ? 'TRADE_BASE'
+    : process.env.ALPACA_API_BASE
+      ? 'ALPACA_API_BASE'
+      : 'missing';
+  const rawDataBaseSource = process.env.DATA_BASE ? 'DATA_BASE' : 'default';
+  const effectiveTradeBase = normalizeTradeBase(RAW_TRADE_BASE);
+  const effectiveDataBase = normalizeDataBase(RAW_DATA_BASE);
   const apiToken = String(process.env.API_TOKEN || '').trim();
   const corsAllowedOrigins = parseCorsOrigins(process.env.CORS_ALLOWED_ORIGINS);
   const corsAllowedRegexes = parseCorsRegexes(process.env.CORS_ALLOWED_ORIGIN_REGEX);
   const corsAllowLan = String(process.env.CORS_ALLOW_LAN || '').toLowerCase() === 'true';
+  const recorderEnabled = resolveRecorderEnabled();
 
-  parseUrl('TRADE_BASE', tradeBase);
-  parseUrl('DATA_BASE', dataBase);
+  if (!process.env.TRADE_BASE) {
+    console.warn('config_warning', {
+      field: 'TRADE_BASE',
+      message: 'TRADE_BASE not set; falling back to ALPACA_API_BASE or default.',
+    });
+  }
+
+  if (!RAW_TRADE_BASE) {
+    console.error('config_error', {
+      message: 'Missing TRADE_BASE/ALPACA_API_BASE; trading/account calls will fail.',
+      howToFix: 'Set TRADE_BASE or ALPACA_API_BASE to https://api.alpaca.markets',
+    });
+  }
+
+  parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
+  parseUrl('DATA_BASE', effectiveDataBase);
 
   if (apiToken && apiToken.length < 12) {
     console.warn('config_warning', {
@@ -71,6 +132,10 @@ const validateEnv = () => {
   const datasetDir = resolveDatasetDir();
   const datasetPath = recorder.getDatasetPath();
   const datasetDirAbsolute = path.isAbsolute(datasetDir);
+
+  if (!recorderEnabled) {
+    console.log('recorder_disabled');
+  }
 
   if (!datasetDirAbsolute && isRenderEnvironment()) {
     console.warn('dataset_path_warning', {
@@ -100,6 +165,10 @@ const validateEnv = () => {
     nodeEnv: process.env.NODE_ENV || 'development',
     tradeBase: tradeBase || null,
     dataBase: dataBase || null,
+    rawTradeBaseSource,
+    rawDataBaseSource,
+    effectiveTradeBase,
+    effectiveDataBase,
     apiTokenSet: Boolean(apiToken),
     apiTokenPreview: apiToken ? maskSecret(apiToken) : null,
     corsAllowedOrigins,
@@ -110,6 +179,7 @@ const validateEnv = () => {
     datasetDir,
     datasetPath,
     datasetDirAbsolute,
+    recorderEnabled,
     httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS) || null,
   });
 };
