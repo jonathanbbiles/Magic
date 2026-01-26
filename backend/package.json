@@ -12,7 +12,7 @@
   "scripts": {
 
     "start": "node index.js",
-    "test": "node quoteUtils.test.js && node symbolUtils.test.js"
+    "test": "node startup.test.js && node quoteUtils.test.js && node symbolUtils.test.js"
 
   },
 

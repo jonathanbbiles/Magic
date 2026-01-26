@@ -20,6 +20,9 @@ const {
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
   getAlpacaAuthStatus,
+  resolveAlpacaAuth,
+  getAlpacaBaseStatus,
+  getTradingManagerStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
   runDustCleanup,
@@ -67,16 +70,83 @@ app.use((req, res, next) => {
 app.use(cors(corsOptionsDelegate));
 app.use((err, req, res, next) => {
   if (err?.code === 'CORS_NOT_ALLOWED') {
-    return res.status(403).json({ ok: false, error: 'cors_blocked', message: err.message });
+    err.statusCode = 403;
+    err.error = 'cors_blocked';
+    return sendError(res, err, err.message);
   }
   return next(err);
 });
 app.use(express.json({ limit: '100kb' }));
 
-const apiToken = String(process.env.API_TOKEN || '').trim();
-if (!apiToken) {
-  console.warn('SECURITY WARNING: API_TOKEN not set. Backend endpoints are unprotected.');
-}
+const parseCorsOrigins = (raw) =>
+  String(raw || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+const parseCorsRegexes = (raw) =>
+  String(raw || '')
+    .split(',')
+    .map((pattern) => pattern.trim())
+    .filter(Boolean)
+    .map((pattern) => {
+      try {
+        return new RegExp(pattern);
+      } catch (err) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+const isPublicEndpoint = (req) =>
+  req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth' || req.path === '/debug/status');
+
+const serializeError = (error, fallbackMessage = 'Request failed') => {
+  const statusCode = Number.isFinite(error?.statusCode)
+    ? error.statusCode
+    : Number.isFinite(error?.response?.status)
+      ? error.response.status
+      : null;
+  const code = error?.code || error?.errorCode || null;
+  const details = error?.details || null;
+  let errorId = error?.error || error?.message || 'unknown_error';
+  if (code === 'ALPACA_AUTH_MISSING' || errorId === 'alpaca_auth_missing') {
+    errorId = 'alpaca_auth_missing';
+  }
+  if (errorId === 'cors_blocked' || code === 'CORS_NOT_ALLOWED') {
+    errorId = 'cors_blocked';
+  }
+  if (errorId === 'rate_limited') {
+    errorId = 'rate_limited';
+  }
+
+  let message = fallbackMessage;
+  if (errorId === 'alpaca_auth_missing') {
+    message = 'Backend missing Alpaca API credentials. Set Alpaca key and secret env vars.';
+  } else if (errorId === 'cors_blocked') {
+    message = 'CORS blocked. Add the origin to allowlist or enable CORS_ALLOW_LAN=true.';
+  } else if (statusCode === 401) {
+    message = 'API_TOKEN mismatch. Ensure frontend and backend API_TOKEN match.';
+  } else if (statusCode === 429 || errorId === 'rate_limited') {
+    message = 'Rate limited. Slow polling or raise RATE_LIMIT_MAX.';
+  } else if (error?.message) {
+    message = error.message;
+  }
+
+  const payload = {
+    ok: false,
+    error: errorId,
+    message,
+  };
+  if (code) payload.code = code;
+  if (details) payload.details = details;
+  return { payload, statusCode: statusCode || 500 };
+};
+
+const sendError = (res, error, fallbackMessage) => {
+  const { payload, statusCode } = serializeError(error, fallbackMessage);
+  return res.status(statusCode).json(payload);
+};
 
 function extractOrderSummary(order) {
   if (!order) {
@@ -89,7 +159,7 @@ function extractOrderSummary(order) {
 }
 
 app.use((req, res, next) => {
-  if (req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth')) {
+  if (isPublicEndpoint(req)) {
     return next();
   }
   return rateLimit(req, res, next);
@@ -99,7 +169,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     return next();
   }
-  if (req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth')) {
+  if (isPublicEndpoint(req)) {
     return next();
   }
   return requireApiToken(req, res, next);
@@ -129,7 +199,7 @@ app.get('/account', async (req, res) => {
     res.json(account);
   } catch (error) {
     console.error('Account fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Account fetch failed');
   }
 });
 
@@ -139,7 +209,7 @@ app.get('/account/portfolio/history', async (req, res) => {
     res.json(history);
   } catch (error) {
     console.error('Portfolio history error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Portfolio history fetch failed');
   }
 });
 
@@ -152,7 +222,7 @@ app.get('/account/activities', async (req, res) => {
     res.json({ items: result?.items || [], nextPageToken: result?.nextPageToken || null });
   } catch (error) {
     console.error('Account activities error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Account activities fetch failed');
   }
 });
 
@@ -162,7 +232,7 @@ app.get('/clock', async (req, res) => {
     res.json(clock);
   } catch (error) {
     console.error('Clock fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Clock fetch failed');
   }
 });
 
@@ -172,7 +242,7 @@ app.get('/positions', async (req, res) => {
     res.json(Array.isArray(positions) ? positions : []);
   } catch (error) {
     console.error('Positions fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Positions fetch failed');
   }
 });
 
@@ -187,7 +257,7 @@ app.get('/diagnostics/orphans', async (req, res) => {
     });
   } catch (error) {
     console.error('Orphan diagnostics error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Orphan diagnostics failed');
   }
 });
 
@@ -212,7 +282,7 @@ app.get('/positions/:symbol', async (req, res) => {
     res.json(position || null);
   } catch (error) {
     console.error('Position fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Position fetch failed');
   }
 });
 
@@ -222,7 +292,7 @@ app.get('/assets/:symbol', async (req, res) => {
     res.json(asset || null);
   } catch (error) {
     console.error('Asset fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Asset fetch failed');
   }
 });
 
@@ -233,7 +303,7 @@ app.get('/crypto/supported', async (req, res) => {
     res.json({ pairs: snapshot.pairs || [], lastUpdated: snapshot.lastUpdated || null });
   } catch (error) {
     console.error('Supported crypto error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Supported crypto fetch failed');
   }
 });
 
@@ -253,7 +323,7 @@ app.post('/trade', async (req, res) => {
 
     console.error('Trade error:', err?.responseSnippet || err.message);
 
-    res.status(500).json({ error: err.message });
+    return sendError(res, err, 'Trade failed');
 
   }
 
@@ -321,14 +391,7 @@ app.post('/buy', async (req, res) => {
 
     console.error('Buy error:', error?.responseSnippet || error.message);
 
-    res.status(500).json({
-      ok: false,
-      error: {
-        message: error.message,
-        code: error?.errorCode ?? error?.code ?? null,
-        status: error?.statusCode ?? 500,
-      },
-    });
+    return sendError(res, error, 'Order submit failed');
 
   }
 
@@ -340,7 +403,7 @@ app.get('/orders', async (req, res) => {
     res.json(orders);
   } catch (error) {
     console.error('Orders fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Orders fetch failed');
   }
 });
 
@@ -350,7 +413,7 @@ app.get('/orders/:id', async (req, res) => {
     res.json(order || null);
   } catch (error) {
     console.error('Order fetch error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Order fetch failed');
   }
 });
 
@@ -398,14 +461,7 @@ app.post('/orders', async (req, res) => {
     }
   } catch (error) {
     console.error('Order submit error:', error?.responseSnippet || error.message);
-    res.status(500).json({
-      ok: false,
-      error: {
-        message: error.message,
-        code: error?.errorCode ?? error?.code ?? null,
-        status: error?.statusCode ?? 500,
-      },
-    });
+    return sendError(res, error, 'Order submit failed');
   }
 });
 
@@ -427,14 +483,7 @@ app.patch('/orders/:id', async (req, res) => {
     }
   } catch (error) {
     console.error('Order replace error:', error?.responseSnippet || error.message);
-    res.status(500).json({
-      ok: false,
-      error: {
-        message: error.message,
-        code: error?.errorCode ?? error?.code ?? null,
-        status: error?.statusCode ?? 500,
-      },
-    });
+    return sendError(res, error, 'Order replace failed');
   }
 });
 
@@ -444,31 +493,79 @@ app.delete('/orders/:id', async (req, res) => {
     res.json(result || { canceled: true, id: req.params.id });
   } catch (error) {
     console.error('Order cancel error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Order cancel failed');
   }
 });
 
 app.get('/debug/status', async (req, res) => {
   try {
-    const guardStatus = await getConcurrencyGuardStatus();
-    const lastQuoteAt = getLastQuoteSnapshot();
     const authStatus = getAlpacaAuthStatus();
+    const guardStatus = authStatus.alpacaAuthOk
+      ? await getConcurrencyGuardStatus()
+      : {
+          openPositions: [],
+          openOrders: [],
+          activeSlotsUsed: 0,
+          capMax: null,
+          lastScanAt: null,
+        };
+    const lastQuoteAt = getLastQuoteSnapshot();
+    const baseStatus = getAlpacaBaseStatus();
+    const tradingStatus = getTradingManagerStatus();
+    const corsAllowedOrigins = parseCorsOrigins(process.env.CORS_ALLOWED_ORIGINS);
+    const corsAllowedRegexes = parseCorsRegexes(process.env.CORS_ALLOWED_ORIGIN_REGEX);
+    const corsAllowLan = String(process.env.CORS_ALLOW_LAN || '').toLowerCase() === 'true';
+    const lastHttpError = getLastHttpError();
+    const trimmedLastHttpError = lastHttpError
+      ? {
+          statusCode: lastHttpError?.statusCode ?? lastHttpError?.response?.status ?? null,
+          errorMessage: lastHttpError?.errorMessage || lastHttpError?.message || null,
+          errorCode: lastHttpError?.errorCode || lastHttpError?.code || null,
+          requestId: lastHttpError?.requestId || null,
+          urlHost: lastHttpError?.urlHost || null,
+          urlPath: lastHttpError?.urlPath || null,
+          responseSnippet200: lastHttpError?.responseSnippet200 || lastHttpError?.responseSnippet || null,
+        }
+      : null;
     res.json({
-      openPositions: guardStatus.openPositions,
-      openOrders: guardStatus.openOrders,
-      activeSlotsUsed: guardStatus.activeSlotsUsed,
-      capMax: guardStatus.capMax,
-      lastScanAt: guardStatus.lastScanAt,
-      lastQuoteAt,
-      alpacaAuthOk: authStatus.alpacaAuthOk,
-      alpacaKeyIdPresent: authStatus.alpacaKeyIdPresent,
-      lastHttpError: getLastHttpError(),
-      nodeVersion: process.version,
-      portPresent: Boolean(process.env.PORT),
+      ok: true,
+      version: VERSION,
+      serverTime: new Date().toISOString(),
+      uptimeSec: Math.round(process.uptime()),
+      env: {
+        apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
+        tradeBaseEffective: baseStatus.tradeBase,
+        dataBaseEffective: baseStatus.dataBase,
+        corsAllowLan,
+        corsAllowedOrigins,
+        corsAllowedOriginRegex: corsAllowedRegexes.map((regex) => regex.source),
+      },
+      alpaca: {
+        alpacaAuthOk: authStatus.alpacaAuthOk,
+        alpacaKeyIdPresent: authStatus.alpacaKeyIdPresent,
+        missing: authStatus.missing || [],
+        tradeBase: baseStatus.tradeBase,
+        dataBase: baseStatus.dataBase,
+      },
+      trading: {
+        TRADING_ENABLED: tradingStatus.tradingEnabled,
+        entryManagerRunning: tradingStatus.entryManagerRunning,
+        exitManagerRunning: tradingStatus.exitManagerRunning,
+      },
+      limiter: getLimiterStatus(),
+      lastHttpError: trimmedLastHttpError,
+      diagnostics: {
+        openPositions: guardStatus.openPositions,
+        openOrders: guardStatus.openOrders,
+        activeSlotsUsed: guardStatus.activeSlotsUsed,
+        capMax: guardStatus.capMax,
+        lastScanAt: guardStatus.lastScanAt,
+        lastQuoteAt,
+      },
     });
   } catch (error) {
     console.error('Status debug error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Status debug failed');
   }
 });
 
@@ -480,7 +577,7 @@ app.get('/debug/net', (req, res) => {
     });
   } catch (error) {
     console.error('Net debug error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Net debug failed');
   }
 });
 
@@ -490,7 +587,7 @@ app.get('/debug/alpaca', async (req, res) => {
     res.json(status);
   } catch (error) {
     console.error('Alpaca debug error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Alpaca debug failed');
   }
 });
 
@@ -500,7 +597,7 @@ app.get('/health/alpaca', async (req, res) => {
     res.json(status);
   } catch (error) {
     console.error('Alpaca health error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    return sendError(res, error, 'Alpaca health failed');
   }
 });
 
@@ -514,14 +611,7 @@ app.get('/market/quote', async (req, res) => {
     return res.json({ symbol, quote });
   } catch (error) {
     console.error('Market quote error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market quote failed');
   }
 });
 
@@ -535,14 +625,7 @@ app.get('/market/trade', async (req, res) => {
     return res.json({ symbol, price });
   } catch (error) {
     console.error('Market trade error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market trade failed');
   }
 });
 
@@ -561,14 +644,7 @@ app.get('/market/crypto/quotes', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market crypto quotes error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market crypto quotes failed');
   }
 });
 
@@ -587,14 +663,7 @@ app.get('/market/crypto/trades', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market crypto trades error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market crypto trades failed');
   }
 });
 
@@ -620,14 +689,7 @@ app.get('/market/crypto/bars', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market crypto bars error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market crypto bars failed');
   }
 });
 
@@ -641,14 +703,7 @@ app.get('/market/stocks/quotes', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market stocks quotes error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market stocks quotes failed');
   }
 });
 
@@ -662,14 +717,7 @@ app.get('/market/stocks/trades', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market stocks trades error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market stocks trades failed');
   }
 });
 
@@ -689,14 +737,7 @@ app.get('/market/stocks/bars', async (req, res) => {
     return res.json(payload || {});
   } catch (error) {
     console.error('Market stocks bars error:', error?.responseSnippet200 || error.message);
-    const status = Number.isFinite(error?.statusCode) ? error.statusCode : 500;
-    return res.status(status).json({
-      error: error.message,
-      statusCode: error?.statusCode ?? null,
-      requestId: error?.requestId ?? null,
-      urlHost: error?.urlHost ?? null,
-      urlPath: error?.urlPath ?? null,
-    });
+    return sendError(res, error, 'Market stocks bars failed');
   }
 });
 
@@ -714,6 +755,16 @@ function withTimeout(promise, ms, label) {
 
 async function bootstrapTrading() {
   console.log('bootstrap_start');
+  const authStatus = resolveAlpacaAuth();
+  if (!authStatus.alpacaAuthOk) {
+    console.warn('startup_blocked_missing_alpaca_auth', {
+      missing: authStatus.missing,
+      checkedKeyVars: authStatus.checkedKeyVars,
+      checkedSecretVars: authStatus.checkedSecretVars,
+    });
+    return;
+  }
+
   try {
     const inventory = await withTimeout(
       initializeInventoryFromPositions(),
@@ -746,10 +797,14 @@ async function bootstrapTrading() {
     });
   }
 
-  startEntryManager();
   startLabeler();
-  startExitManager();
-  console.log('exit_manager_start_attempted');
+  if (getTradingManagerStatus().tradingEnabled) {
+    startEntryManager();
+    startExitManager();
+    console.log('exit_manager_start_attempted');
+  } else {
+    console.log('trading_disabled_skip_entry_exit');
+  }
   console.log('bootstrap_done');
 }
 

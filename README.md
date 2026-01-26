@@ -9,7 +9,7 @@
 2. `npm install`
 3. `cp .env.live.example .env` and fill in your **live** keys + token.
 4. `npm start`
-5. Verify: `curl http://localhost:3000/health` and `curl http://localhost:3000/debug/auth`
+5. Verify: `curl http://localhost:3000/health`, `curl http://localhost:3000/debug/auth`, and `curl http://localhost:3000/debug/status`
 
 ### Frontend
 1. `cd frontend`
@@ -22,6 +22,14 @@
 - Hosts must support Node 22, or deployments will fail with engine/host mismatch.
 
 ## Troubleshooting
+
+### Render + Expo/iPad checklist
+- Set `API_TOKEN` on the backend and in Expo extra (frontend `.env` or app config).
+- Set `TRADE_BASE=https://api.alpaca.markets` (live trading only).
+- Set `DATA_BASE=https://data.alpaca.markets`.
+- Set `CORS_ALLOW_LAN=true` if the iPad/Expo client is on the same LAN.
+- Raise `RATE_LIMIT_MAX` if the dashboard polls frequently.
+- Use `/debug/status` to confirm Alpaca auth, CORS, and trading flags.
 
 | Symptom | Likely Cause | Fix |
 | --- | --- | --- |

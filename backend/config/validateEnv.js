@@ -124,6 +124,12 @@ const validateEnv = () => {
       message: 'API_TOKEN should be at least 12 characters.',
     });
   }
+  if (!apiToken) {
+    console.warn('config_warning', {
+      field: 'API_TOKEN',
+      message: 'API_TOKEN not set. Backend endpoints are unprotected.',
+    });
+  }
 
   corsAllowedOrigins.forEach((origin) => {
     parseUrl('CORS_ALLOWED_ORIGINS', origin);

@@ -61,16 +61,9 @@ const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
 const ALPACA_KEY_ENV_VARS = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY'];
 const ALPACA_SECRET_ENV_VARS = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
 
-const resolvedAlpacaAuth = (() => {
-  const envStatus = {
-    ALPACA_KEY_ID: Boolean(process.env.ALPACA_KEY_ID),
-    ALPACA_SECRET_KEY: Boolean(process.env.ALPACA_SECRET_KEY),
-    APCA_API_KEY_ID: Boolean(process.env.APCA_API_KEY_ID),
-    APCA_API_SECRET_KEY: Boolean(process.env.APCA_API_SECRET_KEY),
-    ALPACA_API_KEY_ID: Boolean(process.env.ALPACA_API_KEY_ID),
-    ALPACA_API_KEY: Boolean(process.env.ALPACA_API_KEY),
-  };
-  console.log('alpaca_auth_env', envStatus);
+let alpacaAuthWarned = false;
+
+function resolveAlpacaAuth() {
   const keyId =
     process.env.APCA_API_KEY_ID ||
     process.env.ALPACA_KEY_ID ||
@@ -82,34 +75,50 @@ const resolvedAlpacaAuth = (() => {
     process.env.ALPACA_SECRET_KEY ||
     process.env.ALPACA_API_SECRET_KEY ||
     '';
-  if (!keyId || !secretKey) {
-    const missing = [];
-    if (!keyId) missing.push('key id');
-    if (!secretKey) missing.push('secret key');
-    throw new Error(
-      `Missing Alpaca ${missing.join(' and ')}. Checked env vars: key id -> ${ALPACA_KEY_ENV_VARS.join(
-        ', '
-      )}; secret -> ${ALPACA_SECRET_ENV_VARS.join(', ')}.`
-    );
-  }
   const alpacaKeyIdPresent = Boolean(keyId);
   const alpacaAuthOk = Boolean(keyId && secretKey);
+  const missing = [];
+  if (!keyId) missing.push('key id');
+  if (!secretKey) missing.push('secret key');
+  if (!alpacaAuthWarned && !alpacaAuthOk) {
+    console.warn('alpaca_auth_missing', {
+      missing,
+      checkedKeyVars: ALPACA_KEY_ENV_VARS,
+      checkedSecretVars: ALPACA_SECRET_ENV_VARS,
+    });
+    alpacaAuthWarned = true;
+  }
   return {
-    keyId,
-    secretKey,
-    alpacaKeyIdPresent,
+    keyId: keyId || null,
+    secretKey: secretKey || null,
     alpacaAuthOk,
+    alpacaKeyIdPresent,
+    missing,
+    checkedKeyVars: ALPACA_KEY_ENV_VARS,
+    checkedSecretVars: ALPACA_SECRET_ENV_VARS,
   };
-})();
+}
+
+function requireAlpacaAuth() {
+  const status = resolveAlpacaAuth();
+  if (!status.alpacaAuthOk) {
+    const err = new Error('alpaca_auth_missing');
+    err.code = 'ALPACA_AUTH_MISSING';
+    err.details = {
+      missing: status.missing,
+      checkedKeyVars: status.checkedKeyVars,
+      checkedSecretVars: status.checkedSecretVars,
+    };
+    throw err;
+  }
+  return status;
+}
 
 function alpacaHeaders() {
+  const auth = requireAlpacaAuth();
   const headers = { Accept: 'application/json' };
-  if (resolvedAlpacaAuth.keyId) {
-    headers['APCA-API-KEY-ID'] = resolvedAlpacaAuth.keyId;
-  }
-  if (resolvedAlpacaAuth.secretKey) {
-    headers['APCA-API-SECRET-KEY'] = resolvedAlpacaAuth.secretKey;
-  }
+  headers['APCA-API-KEY-ID'] = auth.keyId;
+  headers['APCA-API-SECRET-KEY'] = auth.secretKey;
   return headers;
 }
 
@@ -8028,9 +8037,30 @@ async function runDustCleanup() {
 }
 
 function getAlpacaAuthStatus() {
+  const auth = resolveAlpacaAuth();
   return {
-    alpacaAuthOk: resolvedAlpacaAuth.alpacaAuthOk,
-    alpacaKeyIdPresent: resolvedAlpacaAuth.alpacaKeyIdPresent,
+    alpacaAuthOk: auth.alpacaAuthOk,
+    alpacaKeyIdPresent: auth.alpacaKeyIdPresent,
+    missing: auth.missing,
+    checkedKeyVars: auth.checkedKeyVars,
+    checkedSecretVars: auth.checkedSecretVars,
+  };
+}
+
+function getAlpacaBaseStatus() {
+  return {
+    tradeBase: TRADE_BASE,
+    dataBase: DATA_BASE,
+    tradeBaseUrl: ALPACA_BASE_URL,
+    dataBaseUrl: DATA_URL,
+  };
+}
+
+function getTradingManagerStatus() {
+  return {
+    tradingEnabled: TRADING_ENABLED,
+    entryManagerRunning,
+    exitManagerRunning,
   };
 }
 
@@ -8061,7 +8091,18 @@ async function cancelOrder(orderId) {
 }
 
 async function getAlpacaConnectivityStatus() {
-  const hasAuth = resolvedAlpacaAuth.alpacaAuthOk;
+  const authStatus = resolveAlpacaAuth();
+  if (!authStatus.alpacaAuthOk) {
+    const err = new Error('alpaca_auth_missing');
+    err.code = 'ALPACA_AUTH_MISSING';
+    err.details = {
+      missing: authStatus.missing,
+      checkedKeyVars: authStatus.checkedKeyVars,
+      checkedSecretVars: authStatus.checkedSecretVars,
+    };
+    throw err;
+  }
+  const hasAuth = authStatus.alpacaAuthOk;
   const tradeUrl = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account_health' });
   const dataSymbol = 'AAPL';
   const dataUrl = buildAlpacaUrl({
@@ -8102,8 +8143,8 @@ async function getAlpacaConnectivityStatus() {
   return {
     auth: {
       hasAuth,
-      alpacaAuthOk: resolvedAlpacaAuth.alpacaAuthOk,
-      alpacaKeyIdPresent: resolvedAlpacaAuth.alpacaKeyIdPresent,
+      alpacaAuthOk: authStatus.alpacaAuthOk,
+      alpacaKeyIdPresent: authStatus.alpacaKeyIdPresent,
     },
     tradeAccountOk: !tradeResult.error,
     tradeStatus: tradeResult.error ? tradeResult.error.statusCode ?? null : tradeResult.statusCode ?? 200,
@@ -8177,6 +8218,9 @@ module.exports = {
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
   getAlpacaAuthStatus,
+  resolveAlpacaAuth,
+  getAlpacaBaseStatus,
+  getTradingManagerStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
   runDustCleanup,
