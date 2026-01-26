@@ -123,7 +123,13 @@ function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
   (async () => {
     const startedAt = Date.now();
     try {
-      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: BACKEND_HEADERS }, CONNECTION_CHECK_TIMEOUT_MS, CONNECTION_CHECK_RETRIES);
+      const res = await f(
+        `${BACKEND_BASE_URL}/health`,
+        { headers: BACKEND_HEADERS },
+        CONNECTION_CHECK_TIMEOUT_MS,
+        CONNECTION_CHECK_RETRIES,
+        { essential: true }
+      );
       const ms = Date.now() - startedAt;
       const ok = !!res?.ok;
       const data = await res.json().catch(() => null);
@@ -147,7 +153,13 @@ function bootConnectivityCheck(setStatusFn, setAuthStatusFn) {
     }
 
     try {
-      const authRes = await f(`${BACKEND_BASE_URL}/debug/auth`, { headers: BACKEND_HEADERS }, CONNECTION_CHECK_TIMEOUT_MS, CONNECTION_CHECK_RETRIES);
+      const authRes = await f(
+        `${BACKEND_BASE_URL}/debug/auth`,
+        { headers: BACKEND_HEADERS },
+        CONNECTION_CHECK_TIMEOUT_MS,
+        CONNECTION_CHECK_RETRIES,
+        { essential: true }
+      );
       const authPayload = await authRes.json().catch(() => null);
       if (!active) return;
       if (!authRes?.ok) {
@@ -412,6 +424,37 @@ const subscribeAuthState = (cb) => {
   return () => authListeners.delete(cb);
 };
 
+const pollingState = {
+  pausedUntil: 0,
+  reason: null,
+  message: null,
+  lastUrl: null,
+};
+const pollingListeners = new Set();
+const notifyPollingState = (next) => {
+  Object.assign(pollingState, next);
+  pollingListeners.forEach((cb) => cb({ ...pollingState }));
+};
+const subscribePollingState = (cb) => {
+  pollingListeners.add(cb);
+  return () => pollingListeners.delete(cb);
+};
+const isPollingPaused = () => Date.now() < pollingState.pausedUntil;
+const getPollingPauseRemainingMs = () => Math.max(0, pollingState.pausedUntil - Date.now());
+const pausePolling = ({ reason, message, url, pauseMs }) => {
+  const durationMs = Math.min(Math.max(pauseMs || 30000, 5000), 300000);
+  const until = Date.now() + durationMs;
+  if (until <= pollingState.pausedUntil && pollingState.reason === reason) {
+    return;
+  }
+  notifyPollingState({
+    pausedUntil: until,
+    reason,
+    message,
+    lastUrl: url || pollingState.lastUrl || null,
+  });
+};
+
 // --- Global request rate limiter (simple token bucket) ---
 let __TOKENS = 180; // ~180 req/min default budget
 let __LAST_REFILL = Date.now();
@@ -496,9 +539,18 @@ function buildCachedResponse(payload) {
   });
 }
 
-async function rawFetch(url, opts = {}, timeoutMs = 12000, retries = 3) {
+async function fetchJson(url, opts = {}, timeoutMs = 12000, retries = 3, meta = {}) {
   let lastErr = null;
   const method = String(opts?.method || 'GET').toUpperCase();
+  if (!meta?.essential && isPollingPaused()) {
+    const err = new Error(pollingState.message || 'Polling paused');
+    err.code = 'POLLING_PAUSED';
+    err.details = {
+      reason: pollingState.reason,
+      pausedForMs: getPollingPauseRemainingMs(),
+    };
+    throw err;
+  }
   for (let i = 0; i <= retries; i++) {
     await __takeToken();
     const backoffMs = method === 'GET' ? getEndpointBackoffMs(url) : 0;
@@ -516,6 +568,22 @@ async function rawFetch(url, opts = {}, timeoutMs = 12000, retries = 3) {
           last401At: new Date().toISOString(),
           lastAuthHint: res.headers?.get?.('x-auth-hint') || null,
           lastUrl: url,
+        });
+        if (res.headers?.get?.('x-auth-hint')) {
+          pausePolling({
+            reason: 'auth',
+            message: 'API_TOKEN mismatch. Update Expo extra and backend API_TOKEN.',
+            url,
+            pauseMs: 60000,
+          });
+        }
+      }
+      if (res.status === 403) {
+        pausePolling({
+          reason: 'cors',
+          message: 'CORS blocked. Add origin or enable CORS_ALLOW_LAN=true.',
+          url,
+          pauseMs: 60000,
         });
       }
       if (res.status === 429) {
@@ -542,10 +610,10 @@ async function rawFetch(url, opts = {}, timeoutMs = 12000, retries = 3) {
   throw lastErr || new Error('fetch failed');
 }
 
-async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
+async function f(url, opts = {}, timeoutMs = 12000, retries = 3, meta = {}) {
   const method = String(opts?.method || 'GET').toUpperCase();
   if (method !== 'GET') {
-    return rawFetch(url, opts, timeoutMs, retries);
+    return fetchJson(url, opts, timeoutMs, retries, meta);
   }
   const cacheKey = `${method}:${url}`;
   const now = Date.now();
@@ -554,7 +622,7 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
     return cached.promise.then((payload) => buildCachedResponse(payload));
   }
   const requestPromise = (async () => {
-    const res = await rawFetch(url, opts, timeoutMs, retries);
+    const res = await fetchJson(url, opts, timeoutMs, retries, meta);
     const bodyText = await res.text().catch(() => '');
     return {
       status: res.status,
@@ -5994,6 +6062,8 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState({ ok: null, checkedAt: null, error: null, apiTokenSet: null });
   const [authMismatch, setAuthMismatch] = useState({ mismatch: false, last401At: null, lastAuthHint: null, lastUrl: null });
   const [authBanner, setAuthBanner] = useState(null);
+  const [pollingPause, setPollingPause] = useState({ pausedUntil: 0, reason: null, message: null, lastUrl: null });
+  const [backendStatus, setBackendStatus] = useState({ ok: null, checkedAt: null, error: null, payload: null });
   const [haltState, setHaltState] = useState({ halted: TRADING_HALTED, reason: HALT_REASON });
 
   const [overrides, setOverrides] = useState({});
@@ -6131,8 +6201,73 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    const fetchStatus = async () => {
+      if (!BACKEND_BASE_URL) {
+        if (active) {
+          setBackendStatus({
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            error: 'BACKEND_BASE_URL missing',
+            payload: null,
+          });
+        }
+        return;
+      }
+      try {
+        const res = await f(
+          `${BACKEND_BASE_URL}/debug/status`,
+          { headers: { Accept: 'application/json' } },
+          8000,
+          1,
+          { essential: true }
+        );
+        const payload = await res.json().catch(() => null);
+        if (!active) return;
+        if (!res.ok) {
+          const message = formatConnectivityError(res, payload);
+          setBackendStatus({
+            ok: false,
+            checkedAt: new Date().toISOString(),
+            error: message,
+            payload,
+          });
+          return;
+        }
+        setBackendStatus({
+          ok: true,
+          checkedAt: new Date().toISOString(),
+          error: null,
+          payload,
+        });
+      } catch (err) {
+        if (!active) return;
+        setBackendStatus({
+          ok: false,
+          checkedAt: new Date().toISOString(),
+          error: err?.message || String(err),
+          payload: null,
+        });
+      }
+    };
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 30000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  useEffect(() => {
     const unsubscribe = subscribeAuthState((next) => {
       setAuthMismatch(next);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribePollingState((next) => {
+      setPollingPause(next);
     });
     return () => unsubscribe();
   }, []);
@@ -7088,6 +7223,13 @@ export default function App() {
     if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return;
     let stopped = false;
     const sweep = async () => {
+      if (isPollingPaused()) {
+        if (!stopped) {
+          if (dustSweepTimerRef.current) clearTimeout(dustSweepTimerRef.current);
+          dustSweepTimerRef.current = setTimeout(sweep, effectiveSettings.dustSweepMinutes * 60 * 1000);
+        }
+        return;
+      }
       try {
         const [positions, openOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
         const openSellBySym = new Map(
@@ -7199,6 +7341,13 @@ export default function App() {
     scanningRef.current = true;
     scanLockRef.current = true;
     setIsLoading(true);
+    if (isPollingPaused()) {
+      setIsLoading(false);
+      setRefreshing(false);
+      scanningRef.current = false;
+      scanLockRef.current = false;
+      return;
+    }
     if (isMarketDataCooldown()) {
       setIsLoading(false);
       setRefreshing(false);
@@ -7563,6 +7712,7 @@ export default function App() {
     let cancelled = false;
     const tick = async () => {
       if (cancelled || exitManagerActiveRef.current) return;
+      if (isPollingPaused()) return;
       exitManagerActiveRef.current = true;
       try {
         const exitBatchId = `exit_${Date.now()}`;
@@ -7744,6 +7894,33 @@ export default function App() {
   const combinedBuyingPower =
     (Number.isFinite(acctSummary.cryptoBuyingPower) ? acctSummary.cryptoBuyingPower : 0) +
     (Number.isFinite(acctSummary.stockBuyingPower) ? acctSummary.stockBuyingPower : 0);
+  const backendPayload = backendStatus?.payload || null;
+  const backendBaseValid = (() => {
+    if (!BACKEND_BASE_URL) return false;
+    try {
+      const parsed = new URL(BACKEND_BASE_URL);
+      return Boolean(parsed.protocol && parsed.host);
+    } catch (err) {
+      return false;
+    }
+  })();
+  const configWarnings = [];
+  if (!API_TOKEN) {
+    configWarnings.push('API_TOKEN missing in Expo extra.');
+  }
+  if (!backendBaseValid) {
+    configWarnings.push('BACKEND_BASE_URL missing or invalid.');
+  }
+  if (backendPayload?.alpaca?.alpacaAuthOk === false) {
+    const missing = backendPayload?.alpaca?.missing || [];
+    const missingLabel = missing.length ? ` Missing: ${missing.join(', ')}.` : '';
+    configWarnings.push(
+      `Backend missing Alpaca keys.${missingLabel} Set APCA_API_KEY_ID (or ALPACA_KEY_ID/ALPACA_API_KEY_ID/ALPACA_API_KEY) and APCA_API_SECRET_KEY (or ALPACA_SECRET_KEY/ALPACA_API_SECRET_KEY).`
+    );
+  }
+  if (pollingPause?.reason && pollingPause?.message) {
+    configWarnings.push(`Polling paused: ${pollingPause.message}`);
+  }
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -7768,6 +7945,11 @@ export default function App() {
               <Text style={styles.topBannerText}>{authBanner}</Text>
             </View>
           )}
+          {configWarnings.map((warning, idx) => (
+            <View key={`${warning}-${idx}`} style={[styles.topBanner, styles.topBannerAlert]}>
+              <Text style={styles.topBannerText}>{warning}</Text>
+            </View>
+          ))}
         </View>
 
         <View style={styles.connectionCard}>
@@ -7795,6 +7977,53 @@ export default function App() {
             <Text style={styles.smallNote}>
               Last error: {authMismatch?.mismatch ? '401 token mismatch' : authStatus?.error || connectivity?.error}
             </Text>
+          )}
+        </View>
+
+        <View style={styles.connectionCard}>
+          <Text style={styles.cardTitle}>Backend Status</Text>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Status</Text>
+            <Text style={styles.value}>
+              {backendStatus.ok == null ? 'unknown' : backendStatus.ok ? 'ok' : 'error'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Alpaca auth</Text>
+            <Text style={styles.value}>
+              {backendPayload?.alpaca?.alpacaAuthOk == null ? 'unknown' : backendPayload.alpaca.alpacaAuthOk ? 'ok' : 'missing'}
+            </Text>
+          </View>
+          {backendPayload?.alpaca?.alpacaAuthOk === false && (
+            <Text style={styles.smallNote}>
+              Missing: {(backendPayload?.alpaca?.missing || []).join(', ') || 'unknown'}
+            </Text>
+          )}
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>API_TOKEN set</Text>
+            <Text style={styles.value}>
+              {backendPayload?.env?.apiTokenSet == null ? 'unknown' : backendPayload.env.apiTokenSet ? 'yes' : 'no'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>CORS_ALLOW_LAN</Text>
+            <Text style={styles.value}>
+              {backendPayload?.env?.corsAllowLan == null ? 'unknown' : backendPayload.env.corsAllowLan ? 'yes' : 'no'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.label}>Trading enabled</Text>
+            <Text style={styles.value}>
+              {backendPayload?.trading?.TRADING_ENABLED == null ? 'unknown' : backendPayload.trading.TRADING_ENABLED ? 'yes' : 'no'}
+            </Text>
+          </View>
+          {backendPayload?.lastHttpError?.errorMessage && (
+            <Text style={styles.smallNote}>
+              Last HTTP error: {backendPayload.lastHttpError.errorMessage}
+            </Text>
+          )}
+          {backendStatus?.error && (
+            <Text style={styles.smallNote}>Status error: {backendStatus.error}</Text>
           )}
         </View>
 
