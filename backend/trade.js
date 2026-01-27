@@ -149,10 +149,12 @@ const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
 const DESIRED_NET_PROFIT_BASIS_POINTS = readNumber('DESIRED_NET_PROFIT_BASIS_POINTS', 100);
 const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 150);
 const MIN_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MIN_GROSS_TAKE_PROFIT_BASIS_POINTS', 60);
+const TARGET_PROFIT_BPS = 75; // 0.75%
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 0);
 
 const BUFFER_BPS = Number(process.env.BUFFER_BPS || 0);
+const ENTRY_BUFFER_BPS = readNumber('ENTRY_BUFFER_BPS', 10);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
@@ -487,11 +489,15 @@ function microMetrics({ mid, prevMid, spreadBps }) {
 
 async function computeEntrySignal(symbol) {
   const asset = { symbol: normalizeSymbol(symbol) };
+  const requiredEdgeBps = computeRequiredEntryEdgeBps();
   const configSnapshot = {
     targetMoveBps: TARGET_MOVE_BPS,
     targetHorizonMinutes: TARGET_HORIZON_MINUTES,
     minProbToEnter: MIN_PROB_TO_ENTER,
     maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
+    requiredEdgeBps,
+    targetProfitBps: TARGET_PROFIT_BPS,
+    entryBufferBps: ENTRY_BUFFER_BPS,
     orderbookBandBps: ORDERBOOK_BAND_BPS,
     orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
     orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
@@ -545,11 +551,22 @@ async function computeEntrySignal(symbol) {
   baseRecord.refPrice = mid;
   baseRecord.spreadBps = spreadBps;
 
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_ENTER) {
+  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'profit_gate',
+    });
     return {
       entryReady: false,
-      why: 'spread_gate',
-      meta: { symbol: asset.symbol, spreadBps, maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER },
+      why: 'profit_gate',
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        targetProfitBps: TARGET_PROFIT_BPS,
+      },
       record: baseRecord,
     };
   }
@@ -714,15 +731,20 @@ async function computeEntrySignal(symbol) {
   };
 
   if (predictor.probability < MIN_PROB_TO_ENTER) {
-    return {
-      entryReady: false,
-      why: 'predictor_gate',
-      meta: { symbol: asset.symbol, probability: predictor.probability, minProbToEnter: MIN_PROB_TO_ENTER },
-      record: baseRecord,
-    };
+    console.log('predictor_gate_disabled', {
+      symbol: asset.symbol,
+      probability: predictor.probability,
+      minProbToEnter: MIN_PROB_TO_ENTER,
+    });
   }
 
   const desiredNetExitBpsForV22 = DESIRED_NET_PROFIT_BASIS_POINTS;
+
+  logEntryDecision({
+    symbol: asset.symbol,
+    spreadBps,
+    requiredEdgeBps,
+  });
 
   return {
     entryReady: true,
@@ -822,9 +844,32 @@ function sleep(ms) {
 }
 
 function logSkip(reason, details = {}) {
-
   console.log(`Skip — ${reason}`, details);
+}
 
+function computeRequiredEntryEdgeBps() {
+  const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
+  const entryBufferBps = Number.isFinite(ENTRY_BUFFER_BPS) ? ENTRY_BUFFER_BPS : 0;
+  return TARGET_PROFIT_BPS + (2 * takerFeeBps) + entryBufferBps;
+}
+
+function logEntryDecision({ symbol, spreadBps, requiredEdgeBps }) {
+  console.log('entry_decision', {
+    symbol,
+    spreadBps,
+    requiredEdgeBps,
+    targetProfitBps: TARGET_PROFIT_BPS,
+    decision: 'enter',
+  });
+}
+
+function logEntrySkip({ symbol, spreadBps, requiredEdgeBps, reason }) {
+  console.log('entry_skip', {
+    symbol,
+    spreadBps,
+    requiredEdgeBps,
+    reason: reason || 'profit_gate',
+  });
 }
 
 function logSimpleScalperSkip(symbol, reason, details = {}) {
@@ -1898,9 +1943,18 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   } catch (err) {
     console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
   }
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
-    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
-    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
+    logEntrySkip({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
+    logSkip('profit_gate', {
+      symbol: normalizedSymbol,
+      bid,
+      ask,
+      spreadBps,
+      requiredEdgeBps,
+      targetProfitBps: TARGET_PROFIT_BPS,
+    });
+    return { skipped: true, reason: 'profit_gate', spreadBps };
   }
 
   const qtyNum = Number(qty);
@@ -6824,10 +6878,17 @@ async function placeSimpleScalperEntry(symbol) {
     return { skipped: true, reason: 'invalid_quote' };
   }
   const spreadBps = ((ask - bid) / mid) * BPS;
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-    logSimpleScalperSkip(normalizedSymbol, 'spread_gate', { spreadBps, maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE });
-    return { skipped: true, reason: 'spread_gate', spreadBps };
+  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
+    logEntrySkip({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
+    logSimpleScalperSkip(normalizedSymbol, 'profit_gate', {
+      spreadBps,
+      requiredEdgeBps,
+      targetProfitBps: TARGET_PROFIT_BPS,
+    });
+    return { skipped: true, reason: 'profit_gate', spreadBps };
   }
+  logEntryDecision({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps });
 
   const account = await getAccountInfo();
   const portfolioValue = account.portfolioValue;
@@ -6978,8 +7039,7 @@ async function placeSimpleScalperEntry(symbol) {
     updateInventoryFromBuy(normalizedSymbol, filledQty, avgPrice);
   }
 
-  const targetRaw = avgPrice * (1 + PROFIT_NET_BPS / 10000 + FEE_BPS_EST / 10000);
-  const targetPrice = roundToTick(targetRaw, normalizedSymbol, 'up');
+  const takeProfitPrice = roundToTick(avgPrice * (1 + TARGET_PROFIT_BPS / 10000), normalizedSymbol, 'up');
   const sellOrderUrl = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'orders',
@@ -6991,7 +7051,7 @@ async function placeSimpleScalperEntry(symbol) {
     side: 'sell',
     type: 'limit',
     time_in_force: 'gtc',
-    limit_price: targetPrice,
+    limit_price: takeProfitPrice,
     client_order_id: buildTpClientOrderId(normalizedSymbol, buyOrderId),
   };
   const sellOrder = await placeOrderUnified({
@@ -7003,7 +7063,7 @@ async function placeSimpleScalperEntry(symbol) {
     context: 'simple_scalper_tp',
     intent: 'exit',
   });
-  console.log('simple_scalper_tp_submit', { symbol: normalizedSymbol, qty: filledQty, targetPrice });
+  console.log('simple_scalper_tp_submit', { symbol: normalizedSymbol, qty: filledQty, targetPrice: takeProfitPrice });
   monitorSimpleScalperTpFill({ symbol: normalizedSymbol, orderId: sellOrder?.id });
 
   return { submitted: true, buy: filledOrder, sell: sellOrder };
@@ -7033,9 +7093,18 @@ async function placeMakerLimitBuyThenSell(symbol) {
   } catch (err) {
     console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
   }
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
-    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
-    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
+    logEntrySkip({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
+    logSkip('profit_gate', {
+      symbol: normalizedSymbol,
+      bid,
+      ask,
+      spreadBps,
+      requiredEdgeBps,
+      targetProfitBps: TARGET_PROFIT_BPS,
+    });
+    return { skipped: true, reason: 'profit_gate', spreadBps };
   }
 
   const account = await getAccountInfo();
@@ -7156,8 +7225,8 @@ async function placeMakerLimitBuyThenSell(symbol) {
     if (buyOrder?.id) {
       await cancelOrderSafe(buyOrder.id);
     }
-    if (ENTRY_FALLBACK_MARKET && Number.isFinite(spreadBps) && spreadBps <= MAX_SPREAD_BPS_TO_TRADE) {
-      console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps });
+    if (ENTRY_FALLBACK_MARKET && Number.isFinite(spreadBps) && spreadBps <= requiredEdgeBps) {
+      console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps, requiredEdgeBps });
       return placeMarketBuyThenSell(normalizedSymbol);
     }
     return { skipped: true, reason: 'entry_not_filled', submitted };
@@ -7205,9 +7274,18 @@ async function placeMarketBuyThenSell(symbol) {
   } catch (err) {
     console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
   }
-  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
-    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
-    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
+    logEntrySkip({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
+    logSkip('profit_gate', {
+      symbol: normalizedSymbol,
+      bid,
+      ask,
+      spreadBps,
+      requiredEdgeBps,
+      targetProfitBps: TARGET_PROFIT_BPS,
+    });
+    return { skipped: true, reason: 'profit_gate', spreadBps };
   }
 
   const [price, account] = await Promise.all([
