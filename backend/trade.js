@@ -215,7 +215,7 @@ const PROFIT_NET_BPS = readNumber('PROFIT_NET_BPS', 100);
 const FEE_BPS_EST = readNumber('FEE_BPS_EST', 25);
 const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
 const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
-const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 3000);
+const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 10000);
 const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 60);
 const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 75);
 const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN', 0.25);
@@ -3158,9 +3158,11 @@ function normalizeOrderbookTimestampMs(book, resp) {
       return Number.isFinite(parsed) ? parsed : null;
     }
     if (typeof value === 'number' && Number.isFinite(value)) {
-      if (value > 1e15) return Math.floor(value / 1e6);
-      if (value > 1e12) return Math.floor(value);
-      return Math.floor(value * 1000);
+      // Alpaca timestamps may arrive in seconds, ms, µs, or ns; normalize via range checks.
+      if (value >= 1e17) return Math.floor(value / 1e6);
+      if (value >= 1e14 && value < 1e17) return Math.floor(value / 1e3);
+      if (value >= 1e11 && value < 1e14) return Math.floor(value);
+      if (value >= 1e9 && value < 1e11) return Math.floor(value * 1000);
     }
     return null;
   };
