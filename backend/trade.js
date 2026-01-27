@@ -1,6 +1,6 @@
 const { randomUUID, randomBytes } = require('crypto');
 
-const { httpJson } = require('./httpClient');
+const { httpJson, buildHttpsUrl } = require('./httpClient');
 const {
   MAX_QUOTE_AGE_MS,
   ABSURD_AGE_MS,
@@ -964,7 +964,7 @@ function recordQuoteSuccess(symbol) {
 }
 
 function buildAlpacaUrl({ baseUrl, path, params, label }) {
-  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const base = buildHttpsUrl(String(baseUrl || '').replace(/\/+$/, ''));
   const cleanPath = String(path || '').replace(/^\/+/, '');
   const url = new URL(`${base}/${cleanPath}`);
   if (params) {
@@ -978,6 +978,29 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
     console.log('alpaca_request_url', { label, url: finalUrl });
   }
   return finalUrl;
+}
+
+function logMarketDataUrlSelfCheck() {
+  try {
+    const symbol = toDataSymbol('BTC/USD');
+    const url = buildAlpacaUrl({
+      baseUrl: CRYPTO_DATA_URL,
+      path: 'us/latest/quotes',
+      params: { symbols: symbol },
+      label: 'marketdata_selfcheck_quote',
+    });
+    const parsed = new URL(url);
+    console.log('marketdata_url_selfcheck', {
+      url,
+      urlHost: parsed.host,
+      urlPath: `${parsed.pathname}${parsed.search || ''}`,
+    });
+  } catch (err) {
+    console.error('marketdata_url_selfcheck_failed', {
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+    });
+  }
 }
 
 function toTradeSymbol(rawSymbol) {
@@ -1112,7 +1135,19 @@ function extractHttpErrorCode({ error, snippet }) {
   return null;
 }
 
-function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, requestId, urlHost, urlPath }) {
+function logMarketDataDiagnostics({
+  type,
+  url,
+  method,
+  statusCode,
+  snippet,
+  errorType,
+  requestId,
+  urlHost,
+  urlPath,
+  errorMessage,
+  errorName,
+}) {
   const label = getMarketDataLabel(type);
   const normalizedErrorType = String(errorType || '').trim().toLowerCase();
   const isOk = normalizedErrorType === 'ok';
@@ -1122,12 +1157,15 @@ function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, r
   console.log('alpaca_marketdata', {
     label,
     type,
-    url: formatLogUrl(url),
+    method: method || null,
+    url,
     urlHost: urlHost || null,
     urlPath: urlPath || null,
     requestId: requestId || null,
     statusCode,
     errorType,
+    errorMessage: errorMessage || null,
+    errorName: errorName || null,
     snippet,
   });
 }
@@ -1412,6 +1450,7 @@ async function requestMarketDataJson({ type, url, symbol }) {
       statusCode: null,
       snippet: '',
       errorType: 'cooldown',
+      method: 'GET',
     });
     throw err;
   }
@@ -1424,6 +1463,7 @@ async function requestMarketDataJson({ type, url, symbol }) {
       statusCode: null,
       snippet: '',
       errorType: 'degraded',
+      method: 'GET',
     });
     throw err;
   }
@@ -1437,7 +1477,8 @@ async function requestMarketDataJson({ type, url, symbol }) {
   });
 
   if (result.error) {
-    const errorType = result.error.isNetworkError || result.error.isTimeout ? 'network' : 'http';
+    const errorType = result.error.errorType
+      || (result.error.isNetworkError || result.error.isTimeout ? 'network_error' : 'http_error');
     logMarketDataDiagnostics({
       type,
       url,
@@ -1447,13 +1488,33 @@ async function requestMarketDataJson({ type, url, symbol }) {
       requestId: result.error.requestId || null,
       urlHost: result.error.urlHost || null,
       urlPath: result.error.urlPath || null,
+      method: result.error.method || 'GET',
+      errorMessage: result.error.errorMessage || result.error.message || null,
+      errorName: result.error.errorName || null,
     });
+    if (errorType === 'invalid_request') {
+      console.error('marketdata_invalid_request', {
+        type,
+        url,
+        method: result.error.method || 'GET',
+        errorMessage: result.error.errorMessage || result.error.message || null,
+        errorName: result.error.errorName || null,
+      });
+    }
     markMarketDataFailure(result.error.statusCode ?? null);
     markDataDegraded();
     lastHttpError = result.error;
     const err = new Error(result.error.errorMessage || 'Market data request failed');
-    err.errorCode = errorType === 'network' ? 'NETWORK' : 'HTTP_ERROR';
-    if (errorType === 'network') {
+    if (errorType === 'invalid_request') {
+      err.errorCode = 'INVALID_REQUEST';
+    } else if (errorType === 'empty_body') {
+      err.errorCode = 'EMPTY_BODY';
+    } else if (errorType === 'network_error') {
+      err.errorCode = 'NETWORK';
+    } else {
+      err.errorCode = 'HTTP_ERROR';
+    }
+    if (errorType === 'network_error') {
       err.attempts = result.error.attempts ?? MARKET_DATA_RETRIES + 1;
       logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: err.attempts });
     }
@@ -1482,6 +1543,7 @@ async function requestMarketDataJson({ type, url, symbol }) {
     requestId: result.requestId || null,
     urlHost: result.urlHost || null,
     urlPath: result.urlPath || null,
+    method: 'GET',
   });
   markMarketDataSuccess();
   return result.data;
@@ -8303,6 +8365,7 @@ module.exports = {
   getTradingManagerStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
+  logMarketDataUrlSelfCheck,
   runDustCleanup,
 
 };

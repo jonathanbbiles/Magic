@@ -6,16 +6,21 @@ const DEFAULT_TIMEOUT_MS = (() => {
 })();
 const DEFAULT_RETRIES = 2;
 
-function parseUrlDetails(url) {
-  try {
-    const parsed = new URL(url);
-    return {
-      urlHost: parsed.host,
-      urlPath: `${parsed.pathname}${parsed.search || ''}`,
-    };
-  } catch (err) {
-    return { urlHost: null, urlPath: null };
-  }
+function buildHttpsUrl(rawOrHostPath) {
+  const raw = String(rawOrHostPath || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith('//')) return `https:${raw}`;
+  const normalized = raw.replace(/^\/+/, '');
+  return `https://${normalized}`;
+}
+
+function parseUrlDetails(urlObj) {
+  if (!urlObj) return { urlHost: null, urlPath: null };
+  return {
+    urlHost: urlObj.host,
+    urlPath: `${urlObj.pathname}${urlObj.search || ''}`,
+  };
 }
 
 function getRequestId(headers) {
@@ -39,12 +44,18 @@ function getRateLimitHeaders(headers) {
 }
 
 function getLimiterForUrl(url) {
-  const host = new URL(url).hostname;
-  if (host.includes('data.alpaca.markets')) {
-    return quoteLimiter;
-  }
-  if (host.includes('alpaca.markets')) {
-    return alpacaLimiter;
+  try {
+    const resolvedUrl = buildHttpsUrl(url);
+    if (!resolvedUrl) return null;
+    const host = new URL(resolvedUrl).hostname;
+    if (host.includes('data.alpaca.markets')) {
+      return quoteLimiter;
+    }
+    if (host.includes('alpaca.markets')) {
+      return alpacaLimiter;
+    }
+  } catch (err) {
+    return null;
   }
   return null;
 }
@@ -55,6 +66,8 @@ function sleep(ms) {
 
 function shouldRetry(error) {
   if (!error) return false;
+  if (error.isInvalidRequest || error.errorType === 'invalid_request') return false;
+  if (error.isEmptyBody || error.errorType === 'empty_body') return true;
   if (error.isTimeout || error.isNetworkError) return true;
   if (Number.isFinite(error.statusCode) && error.statusCode === 429) return true;
   if (Number.isFinite(error.statusCode) && error.statusCode >= 500) return true;
@@ -82,13 +95,45 @@ function getBackoffDelayMs(attempt, error) {
 }
 
 async function executeFetch({ method, url, headers, body, timeoutMs }) {
-  const { urlHost, urlPath } = parseUrlDetails(url);
+  const resolvedMethod = method || 'GET';
+  const finalUrl = buildHttpsUrl(url);
+  let urlObj;
+  try {
+    urlObj = new URL(finalUrl);
+  } catch (err) {
+    const message = err?.message || 'invalid_request';
+    return {
+      data: null,
+      error: {
+        url: finalUrl || url || null,
+        method: resolvedMethod,
+        statusCode: null,
+        errorMessage: message,
+        message,
+        errorType: 'invalid_request',
+        errorName: err?.name || null,
+        responseSnippet200: '',
+        isTimeout: false,
+        isNetworkError: false,
+        isInvalidRequest: true,
+        requestId: null,
+        urlHost: null,
+        urlPath: null,
+      },
+      statusCode: null,
+      responseSnippet200: '',
+      requestId: null,
+      urlHost: null,
+      urlPath: null,
+    };
+  }
+  const { urlHost, urlPath } = parseUrlDetails(urlObj);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
-      method,
+    const response = await fetch(finalUrl, {
+      method: resolvedMethod,
       headers,
       body,
       signal: controller.signal,
@@ -103,11 +148,12 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
       return {
         data: null,
         error: {
-          url,
-          method,
+          url: finalUrl,
+          method: resolvedMethod,
           statusCode: response.status,
           errorMessage: `HTTP ${response.status} ${response.statusText}`,
           message: `HTTP ${response.status} ${response.statusText}`,
+          errorType: 'http_error',
           responseSnippet200: snippet,
           isTimeout: false,
           isNetworkError: false,
@@ -128,7 +174,22 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
     if (!text) {
       return {
         data: null,
-        error: null,
+        error: {
+          url: finalUrl,
+          method: resolvedMethod,
+          statusCode: response.status,
+          errorMessage: 'empty_body',
+          message: 'empty_body',
+          errorType: 'empty_body',
+          responseSnippet200: '',
+          isTimeout: false,
+          isNetworkError: false,
+          isEmptyBody: true,
+          requestId,
+          rateLimit,
+          urlHost,
+          urlPath,
+        },
         statusCode: response.status,
         responseSnippet200: '',
         requestId,
@@ -151,11 +212,13 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
       return {
         data: null,
         error: {
-          url,
-          method,
+          url: finalUrl,
+          method: resolvedMethod,
           statusCode: response.status,
           errorMessage: 'parse_error',
           message: 'parse_error',
+          errorType: 'parse_error',
+          errorName: err?.name || null,
           responseSnippet200: snippet,
           isTimeout: false,
           isNetworkError: false,
@@ -179,11 +242,13 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
     return {
       data: null,
       error: {
-        url,
-        method,
+        url: finalUrl,
+        method: resolvedMethod,
         statusCode: null,
         errorMessage: message,
         message,
+        errorType: 'network_error',
+        errorName: err?.name || null,
         responseSnippet200: '',
         isTimeout,
         isNetworkError: !isTimeout,
@@ -248,4 +313,5 @@ async function httpJson({
 
 module.exports = {
   httpJson,
+  buildHttpsUrl,
 };
