@@ -25,6 +25,7 @@ const {
   getTradingManagerStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
+  logMarketDataUrlSelfCheck,
   runDustCleanup,
   getLatestQuote,
   getLatestPrice,
@@ -755,6 +756,7 @@ function withTimeout(promise, ms, label) {
 
 async function bootstrapTrading() {
   console.log('bootstrap_start');
+  logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
   if (!authStatus.alpacaAuthOk) {
     console.warn('startup_blocked_missing_alpaca_auth', {
