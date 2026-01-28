@@ -1,6 +1,6 @@
 import React from 'react';
 import { SafeAreaView, StyleSheet, View, StatusBar } from 'react-native';
-import StageDashboardScreen from './screens/StageDashboardScreen';
+import StageDashboardScreen from './StageDashboardScreen';
 
 export default function App() {
   return (
