@@ -1,13 +1,13 @@
 import React from 'react';
-import { SafeAreaView, StyleSheet, View, StatusBar } from 'react-native';
-import StageDashboardScreen from './StageDashboardScreen';
+import { SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
+import DashboardScreen from './src/screens/DashboardScreen';
 
 export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="light-content" />
       <View style={styles.container}>
-        <StageDashboardScreen />
+        <DashboardScreen />
       </View>
     </SafeAreaView>
   );
