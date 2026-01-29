@@ -1,20 +1,7 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
-type LogItem = {
-  id: string;
-  title: string;
-  subtitle?: string;
-  timestamp?: string;
-};
-
-type LogListProps = {
-  title: string;
-  items: LogItem[];
-  emptyLabel?: string;
-};
-
-export default function LogList({ title, items, emptyLabel = 'No logs yet.' }: LogListProps) {
+export default function LogList({ title, items, emptyLabel = 'No logs yet.' }) {
   return (
     <View style={styles.container}>
       <Text style={styles.title}>{title}</Text>

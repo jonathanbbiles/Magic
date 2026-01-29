@@ -1,13 +1,7 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 
-type MetricCardProps = {
-  label: string;
-  value: string;
-  subvalue?: string;
-};
-
-export default function MetricCard({ label, value, subvalue }: MetricCardProps) {
+export default function MetricCard({ label, value, subvalue }) {
   return (
     <View style={styles.card}>
       <Text style={styles.label}>{label}</Text>
