@@ -1,6 +1,6 @@
 import React from 'react';
 import { SafeAreaView, StatusBar, StyleSheet } from 'react-native';
-import DashboardScreen from './src/screens/DashboardScreen';
+import DashboardScreen from './src/screens/DashboardScreen.js';
 import theme from './src/styles/theme';
 
 export default function App() {
