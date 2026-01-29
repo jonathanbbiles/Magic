@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "Magic Dashboard",
+    "slug": "magic-dashboard",
+    "version": "1.0.0",
+    "sdkVersion": "50.0.0",
+    "orientation": "portrait",
+    "platforms": ["ios", "android", "web"],
+    "userInterfaceStyle": "dark"
+  }
+}

@@ -1,37 +1,34 @@
 import React from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
+import theme from '../styles/theme';
 
-export default function MetricCard({ label, value, subvalue }) {
+export default function MetricCard({ label, value }) {
   return (
     <View style={styles.card}>
       <Text style={styles.label}>{label}</Text>
-      <Text style={styles.value}>{value}</Text>
-      {subvalue ? <Text style={styles.subvalue}>{subvalue}</Text> : null}
+      <Text style={styles.value} numberOfLines={2}>
+        {value}
+      </Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    backgroundColor: '#141420',
-    borderRadius: 16,
-    padding: 16,
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border,
   },
   label: {
-    color: '#9fa0b5',
+    color: theme.muted,
     fontSize: 12,
+    marginBottom: 4,
     textTransform: 'uppercase',
-    letterSpacing: 1.4,
+    letterSpacing: 0.5,
   },
   value: {
-    color: '#f5f5f8',
-    fontSize: 22,
-    fontWeight: '700',
-    marginTop: 10,
-  },
-  subvalue: {
-    color: '#7d7f95',
-    fontSize: 12,
-    marginTop: 6,
+    color: theme.text,
+    fontSize: 16,
+    fontFamily: 'Courier',
   },
 });

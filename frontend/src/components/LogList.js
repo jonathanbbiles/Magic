@@ -1,69 +1,46 @@
 import React from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { ScrollView, Text, StyleSheet, View } from 'react-native';
+import theme from '../styles/theme';
 
-export default function LogList({ title, items, emptyLabel = 'No logs yet.' }) {
+export default function LogList({ lines }) {
+  if (!lines || lines.length === 0) {
+    return (
+      <View style={styles.empty}>
+        <Text style={styles.emptyText}>No logs to display.</Text>
+      </View>
+    );
+  }
+
+  const trimmed = lines.slice(0, 80);
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>{title}</Text>
-      {items.length === 0 ? (
-        <Text style={styles.empty}>{emptyLabel}</Text>
-      ) : (
-        items.map((item) => (
-          <View key={item.id} style={styles.row}>
-            <View style={styles.rowText}>
-              <Text style={styles.rowTitle}>{item.title}</Text>
-              {item.subtitle ? <Text style={styles.rowSubtitle}>{item.subtitle}</Text> : null}
-            </View>
-            <Text style={styles.rowTime}>{item.timestamp || '—'}</Text>
-          </View>
-        ))
-      )}
-    </View>
+    <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
+      {trimmed.map((line, index) => (
+        <Text key={`${index}-${line}`} style={styles.line}>
+          {line}
+        </Text>
+      ))}
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    backgroundColor: '#141420',
-    borderRadius: 16,
-    padding: 16,
+  scroll: {
+    maxHeight: 280,
   },
-  title: {
-    color: '#f5f5f8',
-    fontSize: 13,
-    fontWeight: '700',
-    letterSpacing: 2,
-    textTransform: 'uppercase',
-    marginBottom: 12,
+  content: {
+    paddingBottom: 8,
+  },
+  line: {
+    color: theme.muted,
+    fontSize: 12,
+    marginBottom: 6,
   },
   empty: {
-    color: '#7d7f95',
+    paddingVertical: 12,
+  },
+  emptyText: {
+    color: theme.muted,
     fontSize: 12,
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 8,
-    borderTopWidth: 1,
-    borderTopColor: '#1f1f2f',
-  },
-  rowText: {
-    flex: 1,
-    marginRight: 12,
-  },
-  rowTitle: {
-    color: '#f5f5f8',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  rowSubtitle: {
-    color: '#9fa0b5',
-    fontSize: 12,
-    marginTop: 4,
-  },
-  rowTime: {
-    color: '#7d7f95',
-    fontSize: 11,
   },
 });

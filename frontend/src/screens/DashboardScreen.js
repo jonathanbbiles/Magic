@@ -1,275 +1,272 @@
-import React, { useEffect, useState } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
-import { apiGet } from '../api/client';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { View, Text, StyleSheet, ScrollView } from 'react-native';
+import { firstWorking, getBaseUrl } from '../api/client';
+import Section from '../components/Section';
 import MetricCard from '../components/MetricCard';
 import LogList from '../components/LogList';
+import theme from '../styles/theme';
 
-const POLL_MS = 10000;
+const POLL_MS = 2000;
 
-const formatUsd = (value) => {
-  if (value == null) return '—';
-  return `$${value.toFixed(2)}`;
+const METRICS_PATHS = [
+  '/metrics',
+  '/status',
+  '/summary',
+  '/dashboard',
+  '/api/metrics',
+  '/api/status',
+  '/api/summary',
+  '/api/dashboard',
+  '/health',
+];
+
+const LOGS_PATHS = [
+  '/logs',
+  '/live-logs',
+  '/api/logs',
+  '/api/live-logs',
+];
+
+const initialStreamState = {
+  loading: true,
+  ok: false,
+  sourceUrl: null,
+  data: null,
+  error: null,
+  updatedAt: null,
 };
 
-const formatPct = (value) => {
-  if (value == null) return '—';
-  return `${(value * 100).toFixed(2)}%`;
-};
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (error) {
+    return String(value);
+  }
+}
 
-const formatAgo = (timestamp) => {
-  if (!timestamp) return '—';
-  const diffMs = Date.now() - new Date(timestamp).getTime();
-  if (!Number.isFinite(diffMs)) return '—';
-  const diffMin = Math.max(0, Math.floor(diffMs / 60000));
-  if (diffMin < 1) return 'just now';
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.floor(diffMin / 60);
-  return `${diffHr}h ago`;
-};
+function normalizeMetrics(data) {
+  if (!data) {
+    return [{ label: 'Status', value: 'No data' }];
+  }
 
-const safeNumber = (value) => {
-  const parsed = typeof value === 'string' ? Number(value) : value;
-  return Number.isFinite(parsed) ? Number(parsed) : null;
-};
+  if (typeof data === 'string') {
+    return [{ label: 'Message', value: data }];
+  }
+
+  if (Array.isArray(data)) {
+    return [{ label: 'Items', value: String(data.length) }];
+  }
+
+  if (typeof data === 'object') {
+    const entries = Object.entries(data);
+    if (entries.length === 0) {
+      return [{ label: 'Status', value: 'No metrics available' }];
+    }
+
+    return entries.map(([key, value]) => {
+      const displayValue =
+        value && typeof value === 'object' ? safeStringify(value) : String(value);
+      return { label: key, value: displayValue };
+    });
+  }
+
+  return [{ label: 'Value', value: String(data) }];
+}
+
+function normalizeLogs(data) {
+  if (!data) {
+    return [];
+  }
+
+  if (Array.isArray(data)) {
+    return data.map((item) => String(item)).reverse();
+  }
+
+  if (typeof data === 'string') {
+    return data
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .reverse();
+  }
+
+  return [safeStringify(data)];
+}
 
 export default function DashboardScreen() {
-  const [account, setAccount] = useState(null);
-  const [positions, setPositions] = useState([]);
-  const [activities, setActivities] = useState([]);
-  const [status, setStatus] = useState(null);
-  const [backendOk, setBackendOk] = useState(false);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
-  const [error, setError] = useState(null);
+  const [metricsState, setMetricsState] = useState(initialStreamState);
+  const [logsState, setLogsState] = useState(initialStreamState);
+  const metricsInFlight = useRef(false);
+  const logsInFlight = useRef(false);
+
+  const baseUrl = useMemo(() => getBaseUrl(), []);
 
   useEffect(() => {
-    let mounted = true;
-    const poll = async () => {
-      let nextError = null;
-      try {
-        await apiGet('/health');
-        if (mounted) setBackendOk(true);
-      } catch (err) {
-        nextError = err instanceof Error ? err.message : 'Backend unreachable';
-        if (mounted) {
-          setBackendOk(false);
-          setError(nextError);
-        }
+    let isMounted = true;
+
+    const loadMetrics = async () => {
+      if (metricsInFlight.current) {
         return;
       }
-
+      metricsInFlight.current = true;
       try {
-        const [accountData, positionsData, activityData, statusData] = await Promise.all([
-          apiGet('/account'),
-          apiGet('/positions'),
-          apiGet('/account/activities'),
-          apiGet('/debug/status'),
-        ]);
-        if (mounted) {
-          setAccount(accountData || null);
-          setPositions(Array.isArray(positionsData) ? positionsData : []);
-          setActivities(Array.isArray(activityData) ? activityData : []);
-          setStatus(statusData || null);
+        setMetricsState((prev) => ({ ...prev, loading: true }));
+        const result = await firstWorking(METRICS_PATHS);
+        if (!isMounted) {
+          return;
         }
-      } catch (err) {
-        nextError = err instanceof Error ? err.message : 'Data fetch failed';
-      }
-
-      if (mounted) {
-        setError(nextError);
-        setLastUpdatedAt(new Date().toISOString());
+        setMetricsState({
+          loading: false,
+          ok: result.ok,
+          sourceUrl: result.url,
+          data: result.data,
+          error: result.ok ? null : result.error,
+          updatedAt: new Date(),
+        });
+      } finally {
+        metricsInFlight.current = false;
       }
     };
 
-    poll();
-    const interval = setInterval(poll, POLL_MS);
+    const loadLogs = async () => {
+      if (logsInFlight.current) {
+        return;
+      }
+      logsInFlight.current = true;
+      try {
+        setLogsState((prev) => ({ ...prev, loading: true }));
+        const result = await firstWorking(LOGS_PATHS);
+        if (!isMounted) {
+          return;
+        }
+        setLogsState({
+          loading: false,
+          ok: result.ok,
+          sourceUrl: result.url,
+          data: result.data,
+          error: result.ok ? null : result.error,
+          updatedAt: new Date(),
+        });
+      } finally {
+        logsInFlight.current = false;
+      }
+    };
+
+    loadMetrics();
+    loadLogs();
+
+    const intervalId = setInterval(() => {
+      loadMetrics();
+      loadLogs();
+    }, POLL_MS);
+
     return () => {
-      mounted = false;
-      clearInterval(interval);
+      isMounted = false;
+      clearInterval(intervalId);
     };
   }, []);
 
-  const equity = safeNumber(account?.equity);
-  const lastEquity = safeNumber(account?.last_equity);
-  const portfolioValue = safeNumber(account?.portfolio_value ?? account?.equity);
-  const buyingPower = safeNumber(account?.buying_power);
-  const dayPnl = equity != null && lastEquity != null ? equity - lastEquity : null;
-  const dayPct = dayPnl != null && lastEquity ? dayPnl / lastEquity : null;
-  const exposure = positions.reduce((sum, pos) => sum + (safeNumber(pos?.market_value) || 0), 0);
-
-  const logItems = activities.slice(0, 8).map((activity, index) => {
-    const titleParts = [activity.activity_type || 'activity', activity.symbol].filter(Boolean);
-    const subtitleParts = [
-      activity.side,
-      activity.qty ? `qty ${activity.qty}` : null,
-      activity.price ? `@ ${activity.price}` : null,
-    ].filter(Boolean);
-    return {
-      id: activity.id || `${index}`,
-      title: titleParts.join(' ').trim() || 'activity',
-      subtitle: subtitleParts.join(' '),
-      timestamp: formatAgo(activity.transaction_time),
-    };
-  });
-
-  const authOk = status?.alpaca?.alpacaAuthOk !== false;
+  const metricsItems = normalizeMetrics(metricsState.data);
+  const logLines = normalizeLogs(logsState.data);
+  const hasConnection = metricsState.ok || logsState.ok;
 
   return (
-    <ScrollView style={styles.scroll} contentContainerStyle={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>MagicMoney</Text>
-        <Text style={styles.subtitle}>Portfolio Metrics</Text>
-        <Text style={styles.statusText}>{backendOk ? 'Backend connected' : 'Backend down'}</Text>
-        <Text style={styles.statusText}>{authOk ? 'Auth OK' : 'Auth issue'}</Text>
-        <Text style={styles.updatedText}>
-          Last updated {lastUpdatedAt ? formatAgo(lastUpdatedAt) : '—'}
+    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <Text style={styles.title}>Magic $$ Dashboard</Text>
+      <View style={styles.subheader}>
+        <Text style={styles.baseUrl}>Base URL: {baseUrl}</Text>
+        <Text style={styles.editNote}>Edit in code</Text>
+        <Text style={[styles.status, hasConnection ? styles.good : styles.bad]}>
+          {hasConnection ? 'Connected' : 'Backend unreachable'}
         </Text>
-        {error ? <Text style={styles.errorText}>{error}</Text> : null}
       </View>
 
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Account</Text>
-        <View style={styles.grid}>
-          <View style={styles.cardWrap}>
-            <MetricCard
-              label="Portfolio Value"
-              value={formatUsd(portfolioValue)}
-              subvalue="Current equity"
-            />
-          </View>
-          <View style={styles.cardWrap}>
-            <MetricCard
-              label="Day P/L"
-              value={formatUsd(dayPnl)}
-              subvalue={formatPct(dayPct)}
-            />
-          </View>
-        </View>
-        <View style={styles.grid}>
-          <View style={styles.cardWrap}>
-            <MetricCard label="Buying Power" value={formatUsd(buyingPower)} subvalue="Available" />
-          </View>
-          <View style={styles.cardWrap}>
-            <MetricCard
-              label="Exposure"
-              value={formatUsd(exposure)}
-              subvalue={`${positions.length} holdings`}
-            />
-          </View>
-        </View>
-      </View>
+      <Section title="Metrics">
+        {metricsState.loading && !metricsState.updatedAt ? (
+          <Text style={styles.loading}>Loading metrics...</Text>
+        ) : null}
+        {metricsState.error ? (
+          <Text style={styles.error}>{metricsState.error}</Text>
+        ) : null}
+        {metricsItems.map((item) => (
+          <MetricCard key={item.label} label={item.label} value={item.value} />
+        ))}
+        {metricsState.updatedAt ? (
+          <Text style={styles.timestamp}>
+            Updated {metricsState.updatedAt.toLocaleTimeString()}
+          </Text>
+        ) : null}
+      </Section>
 
-      <View style={styles.section}>
-        <LogList title="Recent Activity" items={logItems} />
-      </View>
-
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>System</Text>
-        <View style={styles.statusPanel}>
-          <View style={styles.statusRow}>
-            <Text style={styles.statusLabel}>Open Positions</Text>
-            <Text style={styles.statusValue}>{status?.diagnostics?.openPositions?.length ?? '—'}</Text>
-          </View>
-          <View style={styles.statusRow}>
-            <Text style={styles.statusLabel}>Open Orders</Text>
-            <Text style={styles.statusValue}>{status?.diagnostics?.openOrders?.length ?? '—'}</Text>
-          </View>
-          <View style={styles.statusRow}>
-            <Text style={styles.statusLabel}>Last Scan</Text>
-            <Text style={styles.statusValue}>{formatAgo(status?.diagnostics?.lastScanAt)}</Text>
-          </View>
-          <View style={styles.statusRow}>
-            <Text style={styles.statusLabel}>Last Quote</Text>
-            <Text style={styles.statusValue}>{formatAgo(status?.diagnostics?.lastQuoteAt)}</Text>
-          </View>
-          <View style={styles.statusRow}>
-            <Text style={styles.statusLabel}>Last HTTP Error</Text>
-            <Text style={styles.statusValue} numberOfLines={1}>
-              {status?.lastHttpError?.errorMessage || '—'}
-            </Text>
-          </View>
-        </View>
-      </View>
+      <Section title="Logs">
+        {logsState.loading && !logsState.updatedAt ? (
+          <Text style={styles.loading}>Loading logs...</Text>
+        ) : null}
+        {logsState.error ? (
+          <Text style={styles.error}>{logsState.error}</Text>
+        ) : null}
+        <LogList lines={logLines} />
+        {logsState.updatedAt ? (
+          <Text style={styles.timestamp}>
+            Updated {logsState.updatedAt.toLocaleTimeString()}
+          </Text>
+        ) : null}
+      </Section>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  scroll: {
-    flex: 1,
-    backgroundColor: '#0b0b0f',
-  },
   container: {
-    padding: 20,
-    paddingBottom: 40,
+    flex: 1,
+    backgroundColor: theme.background,
   },
-  header: {
-    marginBottom: 24,
+  content: {
+    padding: 20,
+    paddingBottom: 32,
   },
   title: {
-    color: '#f5f5f8',
-    fontSize: 32,
-    fontWeight: '800',
-    letterSpacing: 1.4,
+    color: theme.text,
+    fontSize: 24,
+    fontWeight: '700',
+    marginBottom: 8,
   },
-  subtitle: {
-    color: '#9fa0b5',
-    fontSize: 14,
-    marginTop: 4,
-    textTransform: 'uppercase',
-    letterSpacing: 2.6,
+  subheader: {
+    marginBottom: 20,
   },
-  statusText: {
-    color: '#c9c9d4',
+  baseUrl: {
+    color: theme.muted,
+    fontSize: 13,
+  },
+  editNote: {
+    color: theme.muted,
     fontSize: 12,
-    marginTop: 8,
+    marginTop: 2,
   },
-  updatedText: {
-    color: '#7d7f95',
-    fontSize: 12,
+  status: {
+    fontSize: 13,
+    fontWeight: '600',
     marginTop: 6,
   },
-  errorText: {
-    color: '#ffb4bd',
+  good: {
+    color: theme.good,
+  },
+  bad: {
+    color: theme.danger,
+  },
+  loading: {
+    color: theme.muted,
     fontSize: 12,
-    marginTop: 8,
+    marginBottom: 6,
   },
-  section: {
-    marginBottom: 24,
-  },
-  sectionTitle: {
-    color: '#f5f5f8',
-    fontSize: 13,
-    fontWeight: '700',
-    letterSpacing: 2.6,
-    textTransform: 'uppercase',
-    marginBottom: 12,
-  },
-  grid: {
-    flexDirection: 'row',
-    marginBottom: 12,
-  },
-  cardWrap: {
-    flex: 1,
-    marginRight: 12,
-  },
-  statusPanel: {
-    backgroundColor: '#141420',
-    borderRadius: 16,
-    padding: 16,
-  },
-  statusRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingVertical: 6,
-  },
-  statusLabel: {
-    color: '#9fa0b5',
+  error: {
+    color: theme.danger,
     fontSize: 12,
+    marginBottom: 6,
   },
-  statusValue: {
-    color: '#f5f5f8',
-    fontSize: 12,
-    maxWidth: '60%',
-    textAlign: 'right',
+  timestamp: {
+    color: theme.muted,
+    fontSize: 11,
+    marginTop: 10,
   },
 });
