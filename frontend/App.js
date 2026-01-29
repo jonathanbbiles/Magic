@@ -1,25 +1,21 @@
 import React from 'react';
-import { SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
+import { SafeAreaView, StyleSheet } from 'react-native';
+import { StatusBar } from 'expo-status-bar';
 import DashboardScreen from './src/screens/DashboardScreen';
+import theme from './src/styles/theme';
 
 export default function App() {
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="light-content" />
-      <View style={styles.container}>
-        <DashboardScreen />
-      </View>
+    <SafeAreaView style={styles.container}>
+      <StatusBar style="light" />
+      <DashboardScreen />
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#0b0b0f',
-  },
   container: {
     flex: 1,
-    backgroundColor: '#0b0b0f',
+    backgroundColor: theme.background,
   },
 });
