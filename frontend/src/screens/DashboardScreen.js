@@ -3,21 +3,20 @@ import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { apiGet } from '../api/client';
 import MetricCard from '../components/MetricCard';
 import LogList from '../components/LogList';
-import type { Account, Activity, Position, StatusResponse } from '../types';
 
 const POLL_MS = 10000;
 
-const formatUsd = (value: number | null) => {
+const formatUsd = (value) => {
   if (value == null) return '—';
   return `$${value.toFixed(2)}`;
 };
 
-const formatPct = (value: number | null) => {
+const formatPct = (value) => {
   if (value == null) return '—';
   return `${(value * 100).toFixed(2)}%`;
 };
 
-const formatAgo = (timestamp?: string | null) => {
+const formatAgo = (timestamp) => {
   if (!timestamp) return '—';
   const diffMs = Date.now() - new Date(timestamp).getTime();
   if (!Number.isFinite(diffMs)) return '—';
@@ -28,24 +27,24 @@ const formatAgo = (timestamp?: string | null) => {
   return `${diffHr}h ago`;
 };
 
-const safeNumber = (value?: string | number | null) => {
+const safeNumber = (value) => {
   const parsed = typeof value === 'string' ? Number(value) : value;
   return Number.isFinite(parsed) ? Number(parsed) : null;
 };
 
 export default function DashboardScreen() {
-  const [account, setAccount] = useState<Account | null>(null);
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [activities, setActivities] = useState<Activity[]>([]);
-  const [status, setStatus] = useState<StatusResponse | null>(null);
-  const [backendOk, setBackendOk] = useState<boolean>(false);
-  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [account, setAccount] = useState(null);
+  const [positions, setPositions] = useState([]);
+  const [activities, setActivities] = useState([]);
+  const [status, setStatus] = useState(null);
+  const [backendOk, setBackendOk] = useState(false);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     let mounted = true;
     const poll = async () => {
-      let nextError: string | null = null;
+      let nextError = null;
       try {
         await apiGet('/health');
         if (mounted) setBackendOk(true);
@@ -60,10 +59,10 @@ export default function DashboardScreen() {
 
       try {
         const [accountData, positionsData, activityData, statusData] = await Promise.all([
-          apiGet<Account>('/account'),
-          apiGet<Position[]>('/positions'),
-          apiGet<Activity[]>('/account/activities'),
-          apiGet<StatusResponse>('/debug/status'),
+          apiGet('/account'),
+          apiGet('/positions'),
+          apiGet('/account/activities'),
+          apiGet('/debug/status'),
         ]);
         if (mounted) {
           setAccount(accountData || null);
