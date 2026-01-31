@@ -834,6 +834,8 @@ const marketDataState = {
   cooldownLoggedAt: 0,
 };
 let dataDegradedUntil = 0;
+const insufficientBalanceExitCooldowns = new Map();
+const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
 
  
 
@@ -1135,6 +1137,26 @@ function extractHttpErrorCode({ error, snippet }) {
   return null;
 }
 
+function isInsufficientBalanceError({ statusCode, errorCode, message, snippet }) {
+  if (statusCode !== 403) return false;
+  if (errorCode === 40310000) return true;
+  const combined = `${message || ''} ${snippet || ''}`.toLowerCase();
+  return combined.includes('insufficient balance');
+}
+
+function clearExitTracking(symbol) {
+  const normalized = normalizePair(symbol);
+  exitState.delete(normalized);
+  desiredExitBpsBySymbol.delete(normalized);
+  lastActionAt.delete(normalized);
+  lastCancelReplaceAt.delete(normalized);
+  lastExitRefreshAt.delete(normalized);
+  lastOrderFetchAt.delete(normalized);
+  lastOrderSnapshotBySymbol.delete(normalized);
+  symbolLocks.delete(normalized);
+  insufficientBalanceExitCooldowns.delete(normalized);
+}
+
 function logMarketDataDiagnostics({
   type,
   url,
@@ -1201,7 +1223,13 @@ function logHttpError({ symbol, label, url, error }) {
     errorMessage,
     snippet,
   });
-  if (statusCode === 401 || statusCode === 403) {
+  const isInsufficientBalance = isInsufficientBalanceError({
+    statusCode,
+    errorCode,
+    message: errorMessage,
+    snippet,
+  });
+  if (statusCode === 401 || (statusCode === 403 && !isInsufficientBalance)) {
     console.error('AUTH_ERROR: check Render env vars');
   }
 }
@@ -1391,6 +1419,21 @@ async function placeOrderUnified({
     const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
     const errorMessage = err?.errorMessage || err?.message || '';
     const errorSnippet = err?.responseSnippet200 || err?.responseSnippet || '';
+    if (
+      String(payload?.side || '').toLowerCase() === 'sell' &&
+      isInsufficientBalanceError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })
+    ) {
+      const normalizedSymbol = normalizePair(symbol);
+      const untilMs = Date.now() + INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS;
+      insufficientBalanceExitCooldowns.set(normalizedSymbol, untilMs);
+      console.warn('insufficient_balance_exit_cooldown', {
+        symbol: normalizedSymbol,
+        statusCode,
+        errorCode,
+        cooldownMs: INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS,
+        cooldownUntilMs: untilMs,
+      });
+    }
     if (isBrokerTradingDisabledError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })) {
       if (!isTradingBlockedNow()) {
         startBrokerTradingDisabledCooldown();
@@ -4999,6 +5042,44 @@ async function manageExitStates() {
       acc.get(symbol).push(order);
       return acc;
     }, new Map());
+    const openSellSymbols = new Set();
+    openOrdersList.forEach((order) => {
+      const side = String(order.side || '').toLowerCase();
+      if (side !== 'sell') return;
+      const status = String(order.status || '').toLowerCase();
+      if (!isOpenLikeOrderStatus(status)) return;
+      const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+      if (orderSymbol) {
+        openSellSymbols.add(orderSymbol);
+      }
+    });
+    let brokerHeldSymbols = new Set();
+    try {
+      const positions = await fetchPositions();
+      brokerHeldSymbols = new Set(
+        (Array.isArray(positions) ? positions : [])
+          .map((pos) => {
+            const qty = Number(pos.qty ?? pos.quantity ?? pos.position_qty ?? pos.available);
+            if (!Number.isFinite(qty) || qty <= 0 || isDustQty(qty)) return null;
+            return normalizeSymbol(pos.symbol || pos.rawSymbol || pos.asset_id || pos.id || '');
+          })
+          .filter((sym) => sym),
+      );
+    } catch (err) {
+      console.warn('exit_manager_positions_failed', { error: err?.message || err });
+    }
+    for (const [symbol, state] of exitState.entries()) {
+      const normalizedSymbol = normalizePair(symbol);
+      if (brokerHeldSymbols.has(normalizedSymbol) || openSellSymbols.has(normalizedSymbol)) {
+        continue;
+      }
+      console.log('EXIT_STATE_RECONCILE_DROP', {
+        symbol: normalizedSymbol,
+        stateQty: state?.qty ?? null,
+        reason: 'not_in_broker_positions',
+      });
+      clearExitTracking(normalizedSymbol);
+    }
     const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
 
     for (const [symbol, state] of exitState.entries()) {
@@ -5013,6 +5094,18 @@ async function manageExitStates() {
         const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
         const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
         const openSellCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell').length;
+        const cooldownUntil = insufficientBalanceExitCooldowns.get(normalizePair(symbol));
+        if (Number.isFinite(cooldownUntil) && cooldownUntil > now) {
+          console.log('exit_manager_skip_orders', {
+            symbol,
+            reason: 'insufficient_balance_cooldown',
+            remainingMs: Math.max(0, cooldownUntil - now),
+          });
+          continue;
+        }
+        if (Number.isFinite(cooldownUntil) && cooldownUntil <= now) {
+          insufficientBalanceExitCooldowns.delete(normalizePair(symbol));
+        }
 
         let bid = null;
 
@@ -5190,13 +5283,30 @@ async function manageExitStates() {
         if (openSellCount === 0 && openBuyCount === 0) {
           const availableQtyFromApi = await getAvailablePositionQty(symbol);
           if (availableQtyFromApi === 0 && qtyNum > 0) {
-            console.log('AVAILABLE_QTY_OVERRIDE', {
-              symbol,
-              heldQty: qtyNum,
-              availableQtyFromApi: 0,
-              reason: 'no_open_orders',
-            });
-            availableQtyOverride = qtyNum;
+            let refreshedPosition = null;
+            try {
+              refreshedPosition = await fetchPosition(symbol);
+            } catch (err) {
+              console.warn('exit_state_reconcile_fetch_failed', { symbol, error: err?.message || err });
+              continue;
+            }
+            const refreshedQty = Number(
+              refreshedPosition?.qty_available ??
+                refreshedPosition?.available ??
+                refreshedPosition?.qty ??
+                refreshedPosition?.quantity ??
+                0,
+            );
+            if (!(Number.isFinite(refreshedQty) && refreshedQty > 0)) {
+              console.log('EXIT_STATE_RECONCILE_DROP', {
+                symbol,
+                stateQty: qtyNum,
+                reason: 'alpaca_position_missing_or_zero',
+              });
+              clearExitTracking(symbol);
+              continue;
+            }
+            availableQtyOverride = refreshedQty;
           } else {
             availableQtyOverride = availableQtyFromApi;
           }
@@ -8367,5 +8477,6 @@ module.exports = {
   getAlpacaConnectivityStatus,
   logMarketDataUrlSelfCheck,
   runDustCleanup,
+  isInsufficientBalanceError,
 
 };
