@@ -233,7 +233,13 @@ const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.7);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
-const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
+const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
+
+function getEffectiveMaxConcurrentPositions() {
+  const n = Number(MAX_CONCURRENT_POSITIONS);
+  if (!Number.isFinite(n) || n <= 0) return Number.POSITIVE_INFINITY;
+  return Math.floor(n);
+}
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
 const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
@@ -6630,6 +6636,11 @@ async function runEntryScanOnce() {
     if (!autoTradeEnabled || !liveMode) {
       return;
     }
+    const maxConcurrentPositionsEffective = getEffectiveMaxConcurrentPositions();
+    const capEnabled =
+      Number.isFinite(maxConcurrentPositionsEffective) &&
+      maxConcurrentPositionsEffective !== Number.POSITIVE_INFINITY;
+    const maxConcurrentPositionsLog = capEnabled ? maxConcurrentPositionsEffective : null;
     const autoScanSymbols = AUTO_SCAN_SYMBOLS_OVERRIDE;
     const universeIsOverride = autoScanSymbols.length > 0;
     if (HALT_ON_ORPHANS) {
@@ -6657,6 +6668,9 @@ async function runEntryScanOnce() {
           universeIsOverride,
           maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
           maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+          maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
+          maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
+          capEnabled,
           heldPositionsCount: null,
         });
         return;
@@ -6701,24 +6715,6 @@ async function runEntryScanOnce() {
       }
     });
     const heldPositionsCount = heldSymbols.size;
-    if (heldPositionsCount >= MAX_CONCURRENT_POSITIONS) {
-      const endMs = Date.now();
-      console.log('entry_scan', {
-        startMs,
-        endMs,
-        durationMs: endMs - startMs,
-        scanned: 0,
-        placed: 0,
-        skipped: 1,
-        topSkipReasons: { max_concurrent_positions: 1 },
-        universeSize,
-        universeIsOverride,
-        maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
-        maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
-        heldPositionsCount,
-      });
-      return;
-    }
 
     const openBuySymbols = new Set();
     (Array.isArray(openOrders) ? openOrders : []).forEach((order) => {
@@ -6733,6 +6729,30 @@ async function runEntryScanOnce() {
       if (side !== 'buy') return;
       openBuySymbols.add(orderSymbol);
     });
+    if (!capEnabled) {
+      console.log('max_concurrent_positions_disabled', { env: MAX_CONCURRENT_POSITIONS });
+    }
+    if (capEnabled && heldPositionsCount >= maxConcurrentPositionsEffective) {
+      const endMs = Date.now();
+      console.log('entry_scan', {
+        startMs,
+        endMs,
+        durationMs: endMs - startMs,
+        scanned: 0,
+        placed: 0,
+        skipped: 1,
+        topSkipReasons: { max_concurrent_positions: 1 },
+        universeSize,
+        universeIsOverride,
+        maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+        maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+        maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
+        maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
+        capEnabled,
+        heldPositionsCount,
+      });
+      return;
+    }
 
     let placed = 0;
     let scanned = 0;
@@ -6889,6 +6909,9 @@ async function runEntryScanOnce() {
       universeIsOverride,
       maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
       maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+      maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
+      maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
+      capEnabled,
       heldPositionsCount,
     });
   } finally {
@@ -8202,14 +8225,19 @@ async function getConcurrencyGuardStatus() {
   const activeSlotsUsed = activeSymbols.size;
   const positionsCount = positionSymbols.size;
   const ordersCount = orderSymbols.size;
+  const cap = getEffectiveMaxConcurrentPositions();
+  const capEnabled = Number.isFinite(cap) && cap !== Number.POSITIVE_INFINITY;
+  const capDisplay = capEnabled ? cap : '∞';
   console.log(
-    `Concurrency guard: used=${activeSlotsUsed} cap=${MAX_CONCURRENT_POSITIONS} positions=${positionsCount} orders=${ordersCount}`
+    `Concurrency guard: used=${activeSlotsUsed} cap=${capDisplay} positions=${positionsCount} orders=${ordersCount}`
   );
   return {
     openPositions,
     openOrders,
     activeSlotsUsed,
-    capMax: MAX_CONCURRENT_POSITIONS,
+    capMaxEnv: MAX_CONCURRENT_POSITIONS,
+    capMaxEffective: capEnabled ? cap : null,
+    capEnabled,
     lastScanAt: scanState.lastScanAt,
   };
 }
