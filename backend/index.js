@@ -507,7 +507,9 @@ app.get('/debug/status', async (req, res) => {
           openPositions: [],
           openOrders: [],
           activeSlotsUsed: 0,
-          capMax: null,
+          capMaxEnv: null,
+          capMaxEffective: null,
+          capEnabled: false,
           lastScanAt: null,
         };
     const lastQuoteAt = getLastQuoteSnapshot();
@@ -559,7 +561,9 @@ app.get('/debug/status', async (req, res) => {
         openPositions: guardStatus.openPositions,
         openOrders: guardStatus.openOrders,
         activeSlotsUsed: guardStatus.activeSlotsUsed,
-        capMax: guardStatus.capMax,
+        capMaxEnv: guardStatus.capMaxEnv,
+        capMaxEffective: guardStatus.capMaxEffective,
+        capEnabled: guardStatus.capEnabled,
         lastScanAt: guardStatus.lastScanAt,
         lastQuoteAt,
       },
