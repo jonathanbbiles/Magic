@@ -164,6 +164,7 @@ const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BP
 const EXIT_FIXED_NET_PROFIT_BPS = readNumber('EXIT_FIXED_NET_PROFIT_BPS', 5);
 const EXIT_POST_ONLY = readEnvFlag('EXIT_POST_ONLY', true);
 const EXIT_CANCELS_ENABLED = readEnvFlag('EXIT_CANCELS_ENABLED', false);
+const EXIT_CANCELS_FORCE_ALL = readEnvFlag('EXIT_CANCELS_FORCE_ALL', false);
 const SELL_REPRICE_ENABLED = readEnvFlag('SELL_REPRICE_ENABLED', false);
 const EXIT_TAKER_ON_TOUCH_ENABLED = readEnvFlag('EXIT_TAKER_ON_TOUCH_ENABLED', false);
 const EXIT_MARKET_EXITS_ENABLED = readEnvFlag('EXIT_MARKET_EXITS_ENABLED', false);
@@ -3721,12 +3722,59 @@ async function cancelOrderSafe(orderId) {
 }
 
 function shouldCancelExitSell() {
-  return false; // POLICY: never cancel TP sells
+  return EXIT_CANCELS_ENABLED || SELL_REPRICE_ENABLED || EXIT_MARKET_EXITS_ENABLED;
 }
 
 async function maybeCancelExitSell({ symbol, orderId, reason }) {
   if (!orderId) return false;
-  console.log('exit_cancel_blocked_policy', { symbol, orderId, reason });
+  if (!shouldCancelExitSell()) {
+    console.log('exit_cancel_failed', { symbol, orderId, reason: reason || 'policy_disabled' });
+    return false;
+  }
+
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const tpPrefix = buildIntentPrefix({ symbol: normalizedSymbol, side: 'SELL', intent: 'TP' });
+  const exitPrefix = buildIntentPrefix({ symbol: normalizedSymbol, side: 'SELL', intent: 'EXIT' });
+  let order = null;
+  let fetchFailed = false;
+
+  try {
+    order = await fetchOrderByIdThrottled({ symbol, orderId });
+  } catch (err) {
+    fetchFailed = true;
+    if (!EXIT_CANCELS_FORCE_ALL) {
+      console.log('exit_cancel_failed', { symbol, orderId, reason: 'order_fetch_failed' });
+      return false;
+    }
+  }
+
+  if (order) {
+    const status = String(order.status || '').toLowerCase();
+    const filledQty = Number(order?.filled_qty ?? order?.filledQty ?? 0);
+    if (status === 'filled' || (Number.isFinite(filledQty) && filledQty > 0)) {
+      console.log('exit_cancel_failed', { symbol, orderId, reason: 'already_filled' });
+      return false;
+    }
+    const clientOrderId = String(order?.client_order_id ?? order?.clientOrderId ?? '');
+    const isBotOrder = clientOrderId.startsWith(tpPrefix) || clientOrderId.startsWith(exitPrefix);
+    if (!isBotOrder && !EXIT_CANCELS_FORCE_ALL) {
+      console.log('exit_cancel_skip_not_bot_order', { symbol, orderId, client_order_id: clientOrderId, reason });
+      return false;
+    }
+  } else if (!EXIT_CANCELS_FORCE_ALL && !fetchFailed) {
+    console.log('exit_cancel_failed', { symbol, orderId, reason: 'order_not_found' });
+    return false;
+  }
+
+  console.log('exit_cancel_attempt', { symbol, orderId, reason });
+  const canceled = await cancelOrderSafe(orderId);
+  if (canceled) {
+    console.log('exit_cancel_success', { symbol, orderId, reason });
+    lastCancelReplaceAt.set(symbol, Date.now());
+    return true;
+  }
+
+  console.log('exit_cancel_failed', { symbol, orderId, reason });
   return false;
 }
 
@@ -6183,12 +6231,12 @@ async function manageExitStates() {
 
       if (EXIT_MARKET_EXITS_ENABLED && ALLOW_TAKER_BEFORE_TARGET && bidMeetsBreakeven && Number.isFinite(bid)) {
         if (state.sellOrderId) {
-          await maybeCancelExitSell({
+          const canceled = await maybeCancelExitSell({
             symbol,
             orderId: state.sellOrderId,
             reason: 'taker_before_target',
           });
-          if (shouldCancelExitSell()) {
+          if (canceled) {
             lastCancelReplaceAt.set(symbol, now);
           }
         }
@@ -6327,7 +6375,7 @@ async function manageExitStates() {
               awayBps > REPRICE_IF_AWAY_BPS &&
               !repriceCooldownActive
             ) {
-              await maybeCancelExitSell({
+              const canceled = await maybeCancelExitSell({
                 symbol,
                 orderId: state.sellOrderId,
                 reason: 'reprice_ttl',
@@ -6348,7 +6396,7 @@ async function manageExitStates() {
                 reasonCode = 'reprice_ttl';
                 decisionPath = 'reprice_ttl';
                 lastActionAt.set(symbol, now);
-                if (shouldCancelExitSell()) {
+                if (canceled) {
                   lastCancelReplaceAt.set(symbol, now);
                 }
               } else {
@@ -6365,7 +6413,7 @@ async function manageExitStates() {
               reasonCode = 'reprice_ttl_within_band';
               decisionPath = 'reprice_ttl';
             } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
-              await maybeCancelExitSell({
+              const canceled = await maybeCancelExitSell({
                 symbol,
                 orderId: state.sellOrderId,
                 reason: 'reprice_away',
@@ -6386,7 +6434,7 @@ async function manageExitStates() {
                 reasonCode = 'reprice_away';
                 decisionPath = 'reprice_away';
                 lastActionAt.set(symbol, now);
-                if (shouldCancelExitSell()) {
+                if (canceled) {
                   lastCancelReplaceAt.set(symbol, now);
                 }
               } else {
@@ -6470,7 +6518,7 @@ async function manageExitStates() {
                 awayBps > REPRICE_IF_AWAY_BPS &&
                 !repriceCooldownActive
               ) {
-                await maybeCancelExitSell({
+                const canceled = await maybeCancelExitSell({
                   symbol,
                   orderId: state.sellOrderId,
                   reason: 'reprice_ttl',
@@ -6491,7 +6539,7 @@ async function manageExitStates() {
                   reasonCode = 'reprice_ttl';
                   decisionPath = 'reprice_ttl';
                   lastActionAt.set(symbol, now);
-                  if (shouldCancelExitSell()) {
+                  if (canceled) {
                     lastCancelReplaceAt.set(symbol, now);
                   }
                 } else {
@@ -6505,7 +6553,7 @@ async function manageExitStates() {
                 actionTaken = 'hold_existing_order';
                 reasonCode = 'reprice_ttl_within_band';
               } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
-                await maybeCancelExitSell({
+                const canceled = await maybeCancelExitSell({
                   symbol,
                   orderId: state.sellOrderId,
                   reason: 'reprice_away',
@@ -6526,7 +6574,7 @@ async function manageExitStates() {
                   reasonCode = 'reprice_away';
                   decisionPath = 'reprice_away';
                   lastActionAt.set(symbol, now);
-                  if (shouldCancelExitSell()) {
+                  if (canceled) {
                     lastCancelReplaceAt.set(symbol, now);
                   }
                 } else {
@@ -8506,5 +8554,6 @@ module.exports = {
   logMarketDataUrlSelfCheck,
   runDustCleanup,
   isInsufficientBalanceError,
+  shouldCancelExitSell,
 
 };
