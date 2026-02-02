@@ -1,6 +1,38 @@
 const assert = require('assert/strict');
 
-const { isInsufficientBalanceError } = require('./trade');
+const tradeModulePath = require.resolve('./trade');
+
+function withEnv(overrides, callback) {
+  const previous = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    previous[key] = process.env[key];
+    if (value === null || value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    return callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+function loadTrade(overrides = {}) {
+  return withEnv(overrides, () => {
+    delete require.cache[tradeModulePath];
+    return require('./trade');
+  });
+}
+
+const { isInsufficientBalanceError } = loadTrade();
 
 assert.equal(
   isInsufficientBalanceError({
@@ -31,5 +63,21 @@ assert.equal(
   }),
   false,
 );
+
+const tradeWithReprice = loadTrade({
+  SELL_REPRICE_ENABLED: '1',
+  EXIT_CANCELS_ENABLED: '0',
+  EXIT_MARKET_EXITS_ENABLED: '0',
+});
+
+assert.equal(tradeWithReprice.shouldCancelExitSell(), true);
+
+const tradeWithCancelDisabled = loadTrade({
+  SELL_REPRICE_ENABLED: '0',
+  EXIT_CANCELS_ENABLED: '0',
+  EXIT_MARKET_EXITS_ENABLED: '0',
+});
+
+assert.equal(tradeWithCancelDisabled.shouldCancelExitSell(), false);
 
 console.log('trade tests passed');
