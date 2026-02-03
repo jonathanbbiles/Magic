@@ -158,7 +158,9 @@ const ENTRY_BUFFER_BPS = readNumber('ENTRY_BUFFER_BPS', 10);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
-const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 0);
+const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', 50);
+const BOOK_EXIT_ANCHOR = String(process.env.BOOK_EXIT_ANCHOR || 'ask').trim().toLowerCase();
+const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', true);
 const EXIT_POLICY_LOCKED = readEnvFlag('EXIT_POLICY_LOCKED', true);
 const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 5);
 const EXIT_FIXED_NET_PROFIT_BPS = readNumber('EXIT_FIXED_NET_PROFIT_BPS', 5);
@@ -2686,16 +2688,19 @@ function computeUnifiedExitPlan({
 }) {
   const entryPriceUsed = Number.isFinite(effectiveEntryPrice) ? effectiveEntryPrice : entryPrice;
   const feeBpsRoundTrip = Number.isFinite(entryFeeBps) && Number.isFinite(exitFeeBps) ? entryFeeBps + exitFeeBps : 0;
-  const slippageBpsUsed = Number.isFinite(slippageBps) ? slippageBps : SLIPPAGE_BPS;
-  const spreadBufferBpsUsed = Number.isFinite(spreadBufferBps) ? spreadBufferBps : BUFFER_BPS;
+  const desiredNetExitBpsExplicit = Number.isFinite(desiredNetExitBps);
+  const slippageBpsUsed = desiredNetExitBpsExplicit
+    ? (Number.isFinite(slippageBps) ? slippageBps : SLIPPAGE_BPS)
+    : 0;
+  const spreadBufferBpsUsed = desiredNetExitBpsExplicit
+    ? (Number.isFinite(spreadBufferBps) ? spreadBufferBps : BUFFER_BPS)
+    : 0;
   const profitBufferBpsUsed = Number.isFinite(profitBufferBps) ? profitBufferBps : PROFIT_BUFFER_BPS;
-  const desiredNetExitBpsUsed = Number.isFinite(desiredNetExitBps)
-    ? Math.max(0, desiredNetExitBps)
-    : DESIRED_NET_PROFIT_BASIS_POINTS;
+  const desiredNetExitBpsUsed = desiredNetExitBpsExplicit ? Math.max(0, desiredNetExitBps) : 0;
   const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
 
   let requiredExitBpsPreCap;
-  if (EXIT_MODE === 'net_after_fees') {
+  if (EXIT_MODE === 'net_after_fees' && desiredNetExitBpsExplicit) {
     const plan = computeExitPlanNetAfterFees({
       symbol,
       entryPrice,
@@ -2830,6 +2835,21 @@ function computeTargetSellPrice(entryPrice, requiredExitBps, tickSize) {
     return rawTarget;
   }
   return Math.ceil(rawTarget / tickSize) * tickSize;
+}
+
+function computeBookAnchoredSellLimit({ symbol, entryPrice, bid, ask, requiredExitBps, tickSize }) {
+  const askNum = Number(ask);
+  if (!Number.isFinite(askNum)) return null;
+  const minBps = Number.isFinite(requiredExitBps) ? requiredExitBps : 0;
+  const bookRaw = askNum * (1 + minBps / 10000);
+  const bookRounded = roundToTick(bookRaw, tickSize, 'up');
+  const entryFloor = computeTargetSellPrice(entryPrice, minBps, tickSize);
+  let candidate = Math.max(entryFloor, bookRounded);
+  const bidNum = Number(bid);
+  if (Number.isFinite(bidNum) && Number.isFinite(tickSize) && tickSize > 0) {
+    candidate = Math.max(candidate, roundToTick(bidNum + tickSize, tickSize, 'up'));
+  }
+  return candidate;
 }
 
 function computeBreakevenPrice(entryPrice, minNetProfitBps) {
@@ -4321,7 +4341,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   const slippageBpsUsed = SLIPPAGE_BPS;
   const spreadBufferBps = BUFFER_BPS;
   if (!Number.isFinite(desiredNetExitBpsValue)) {
-    desiredNetExitBpsValue = DESIRED_NET_PROFIT_BASIS_POINTS;
+    desiredNetExitBpsValue = null;
   }
   if (Number.isFinite(desiredNetExitBpsValue) && desiredNetExitBpsValue < 0) {
     console.log('desired_exit_basis_points_raised', {
@@ -4353,6 +4373,32 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   const entryPriceUsed = exitPlan.entryPriceUsed;
   const postOnly = EXIT_POST_ONLY;
   const wantOco = false;
+  let initialLimit = targetPrice;
+  let bookBid = null;
+  let bookAsk = null;
+
+  if (BOOK_EXIT_ENABLED) {
+    try {
+      const quote = await getLatestQuote(symbol);
+      bookBid = quote?.bid ?? null;
+      bookAsk = quote?.ask ?? null;
+    } catch (err) {
+      console.warn('tp_attach_quote_failed', { symbol, error: err?.message || err });
+    }
+    if (Number.isFinite(bookAsk)) {
+      const bookLimit = computeBookAnchoredSellLimit({
+        symbol,
+        entryPrice: entryPriceUsed,
+        bid: bookBid,
+        ask: bookAsk,
+        requiredExitBps: requiredExitBpsFinal,
+        tickSize: exitPlan.tickSize,
+      });
+      if (Number.isFinite(bookLimit)) {
+        initialLimit = bookLimit;
+      }
+    }
+  }
 
   console.log('tp_attach_plan', {
     symbol,
@@ -4374,6 +4420,10 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     breakevenPrice,
     targetPrice,
+    anchor: BOOK_EXIT_ANCHOR,
+    initialLimit,
+    bookAsk,
+    bookBid,
     takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
     postOnly,
   });
@@ -4401,7 +4451,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   const sellOrder = await submitLimitSell({
     symbol,
     qty: qtyNum,
-    limitPrice: targetPrice,
+    limitPrice: initialLimit,
     reason: 'initial_target',
     intentRef: entryOrderId || getOrderIntentBucket(),
     postOnly,
@@ -4409,7 +4459,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
 
   const now = Date.now();
   const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
-  const sellOrderLimit = normalizeOrderLimitPrice(sellOrder) ?? targetPrice;
+  const sellOrderLimit = normalizeOrderLimitPrice(sellOrder) ?? initialLimit;
   const sellOrderSubmittedAtRaw = sellOrder?.submittedAt || sellOrder?.submitted_at || null;
   const sellOrderSubmittedAt =
     typeof sellOrderSubmittedAtRaw === 'string' ? Date.parse(sellOrderSubmittedAtRaw) : sellOrderSubmittedAtRaw;
@@ -5411,19 +5461,25 @@ async function manageExitStates() {
         state.netAfterFeesBps = exitPlan.netAfterFeesBps;
         const breakevenPrice = exitPlan.breakevenPrice;
         state.breakevenPrice = breakevenPrice;
-        const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
         const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
-        const roundedAsk = Number.isFinite(ask) ? roundToTick(ask, tickSize, 'down') : null;
-        const askMinusTick = Number.isFinite(ask) ? roundToTick(ask - tickSize, tickSize, 'down') : null;
-        const makerDesiredLimit =
-          askMeetsBreakeven &&
-          Number.isFinite(roundedBreakeven) &&
-          Number.isFinite(roundedAsk) &&
-          roundedBreakeven <= roundedAsk
-            ? Math.min(roundedAsk, Math.max(roundedBreakeven, askMinusTick))
+        const bookAnchored =
+          BOOK_EXIT_ENABLED && Number.isFinite(ask)
+            ? computeBookAnchoredSellLimit({
+                symbol,
+                entryPrice: entryPriceUsed,
+                bid,
+                ask,
+                requiredExitBps: requiredExitBpsFinal,
+                tickSize,
+              })
             : null;
-        const desiredLimit = targetPrice;
+        const makerDesiredLimit = Number.isFinite(bookAnchored) ? bookAnchored : targetPrice;
+        const desiredLimit = makerDesiredLimit;
+        const marketToExitBps =
+          Number.isFinite(ask) && Number.isFinite(makerDesiredLimit) && ask > 0
+            ? ((makerDesiredLimit - ask) / ask) * 10000
+            : null;
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
         const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
@@ -5464,10 +5520,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -5625,10 +5687,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -5670,7 +5738,7 @@ async function manageExitStates() {
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
-                limitPrice: targetPrice,
+                limitPrice: desiredLimit,
                 reason: 'exit_refresh_reprice',
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
@@ -5680,7 +5748,7 @@ async function manageExitStates() {
               if (!replacement?.skipped && replacement?.id) {
                 state.sellOrderId = replacement.id;
                 state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? targetPrice;
+                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
                 actionTaken = 'exit_refresh_reprice';
                 reasonCode = 'exit_refresh_reprice';
                 lastActionAt.set(symbol, now);
@@ -5688,7 +5756,7 @@ async function manageExitStates() {
                   symbol,
                   oldOrderId,
                   ageMs: existingOrderAgeMs,
-                  newTargetPrice: targetPrice,
+                  newTargetPrice: desiredLimit,
                   requiredExitBpsFinal,
                 });
               } else {
@@ -5717,6 +5785,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -5811,6 +5885,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -5856,10 +5936,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -5886,7 +5972,7 @@ async function manageExitStates() {
           const replacement = await submitLimitSell({
             symbol,
             qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
-            limitPrice: targetPrice,
+            limitPrice: desiredLimit,
             reason: 'place_gtc_tp',
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             openOrders: symbolOrders,
@@ -5896,7 +5982,7 @@ async function manageExitStates() {
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
             state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? targetPrice;
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
             actionTaken = 'place_gtc_tp';
             reasonCode = 'place_gtc_tp';
             lastActionAt.set(symbol, now);
@@ -5922,10 +6008,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -5996,6 +6088,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6081,6 +6179,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6135,10 +6239,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -6207,7 +6317,7 @@ async function manageExitStates() {
           const replacement = await submitLimitSell({
             symbol,
             qty: state.qty,
-            limitPrice: targetPrice,
+            limitPrice: desiredLimit,
             reason: 'missing_sell_order',
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             postOnly: EXIT_POST_ONLY,
@@ -6217,7 +6327,7 @@ async function manageExitStates() {
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
             state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? targetPrice;
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
             actionTaken = 'recreate_limit_sell';
             reasonCode = 'missing_sell_order';
             lastActionAt.set(symbol, now);
@@ -6296,6 +6406,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6394,6 +6510,12 @@ async function manageExitStates() {
               entryPriceUsed,
               bid,
               ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6512,6 +6634,12 @@ async function manageExitStates() {
           entryPriceUsed,
           bid,
           ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
           spreadBps,
           baseRequiredExitBps,
           requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6602,10 +6730,16 @@ async function manageExitStates() {
             entryPriceUsed,
             bid,
             ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
             spreadBps,
             baseRequiredExitBps,
-            requiredExitBpsPreCap: baseRequiredExitBps,
-            requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
@@ -6769,7 +6903,7 @@ async function manageExitStates() {
           }
           const awayBps =
             Number.isFinite(currentLimit) && Number.isFinite(makerDesiredLimit) && makerDesiredLimit > 0
-              ? ((currentLimit - makerDesiredLimit) / makerDesiredLimit) * 10000
+              ? Math.abs((currentLimit - makerDesiredLimit) / makerDesiredLimit) * 10000
               : null;
 
           if (SELL_REPRICE_ENABLED) {
@@ -6913,7 +7047,7 @@ async function manageExitStates() {
             }
             const awayBps =
               Number.isFinite(currentLimit) && desiredLimit > 0
-                ? ((currentLimit - desiredLimit) / desiredLimit) * 10000
+                ? Math.abs((currentLimit - desiredLimit) / desiredLimit) * 10000
                 : null;
             if (SELL_REPRICE_ENABLED) {
               if (!shouldCancelExitSell()) {
@@ -7051,10 +7185,16 @@ async function manageExitStates() {
         entryPriceUsed,
         bid,
         ask,
+          bookBid: bid,
+          bookAsk: ask,
+          bookAnchoredLimit: makerDesiredLimit,
+          entryFloorTarget: targetPrice,
+          requiredExitBps: requiredExitBpsFinal,
+          marketToExitBps,
         spreadBps,
         baseRequiredExitBps,
-        requiredExitBpsPreCap: baseRequiredExitBps,
-        requiredExitBpsFinal,
+          requiredExitBpsPreCap: baseRequiredExitBps,
+          requiredExitBpsFinal,
         maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
         openBuyCount,
         openSellCount,
@@ -8967,5 +9107,6 @@ module.exports = {
   runDustCleanup,
   isInsufficientBalanceError,
   shouldCancelExitSell,
+  computeBookAnchoredSellLimit,
 
 };

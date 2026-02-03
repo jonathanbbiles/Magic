@@ -32,7 +32,7 @@ function loadTrade(overrides = {}) {
   });
 }
 
-const { isInsufficientBalanceError } = loadTrade();
+const { isInsufficientBalanceError, computeBookAnchoredSellLimit } = loadTrade();
 
 assert.equal(
   isInsufficientBalanceError({
@@ -79,5 +79,29 @@ const tradeWithCancelDisabled = loadTrade({
 });
 
 assert.equal(tradeWithCancelDisabled.shouldCancelExitSell(), false);
+
+assert.equal(
+  computeBookAnchoredSellLimit({
+    symbol: 'BTC/USD',
+    entryPrice: 100,
+    bid: 100.74,
+    ask: 100,
+    requiredExitBps: 75,
+    tickSize: 0.01,
+  }),
+  100.75,
+);
+
+assert.equal(
+  computeBookAnchoredSellLimit({
+    symbol: 'BTC/USD',
+    entryPrice: 101,
+    bid: 100.74,
+    ask: 100,
+    requiredExitBps: 50,
+    tickSize: 0.01,
+  }),
+  101.51,
+);
 
 console.log('trade tests passed');
