@@ -177,6 +177,7 @@ const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const ORDER_FETCH_THROTTLE_MS = 1000;
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
+const EXIT_REPRICE_THRESHOLD_BPS = readNumber('EXIT_REPRICE_THRESHOLD_BPS', 25);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', 60);
@@ -200,6 +201,11 @@ const EXIT_MODE_RAW = String(process.env.EXIT_MODE || 'robust').trim().toLowerCa
 const EXIT_MODE = EXIT_POLICY_LOCKED ? 'net_after_fees' : EXIT_MODE_RAW;
 const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 0);
 const FORCE_EXIT_ALLOW_LOSS = readFlag('FORCE_EXIT_ALLOW_LOSS', false);
+const EXIT_MAX_HOLD_SECONDS = readNumber('EXIT_MAX_HOLD_SECONDS', 0);
+const EXIT_FORCE_EXIT_MODE_RAW = String(process.env.EXIT_FORCE_EXIT_MODE || 'ioc_limit').trim().toLowerCase();
+const EXIT_FORCE_EXIT_MODE = ['ioc_limit', 'market'].includes(EXIT_FORCE_EXIT_MODE_RAW)
+  ? EXIT_FORCE_EXIT_MODE_RAW
+  : 'ioc_limit';
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const ENTRY_INTENT_TTL_MS = readNumber('ENTRY_INTENT_TTL_MS', 45000);
 const ENTRY_BUY_TIF = String(process.env.ENTRY_BUY_TIF || 'ioc').trim().toLowerCase();
@@ -2658,6 +2664,82 @@ function computeRequiredExitBpsForNetAfterFees({ entryFeeBps, exitFeeBps, netAft
   return Math.max(0, requiredExitBps);
 }
 
+/**
+ * Unified exit-plan math:
+ * - Start from a deterministic entry anchor (max fill -> avg fill -> entry price).
+ * - Derive the gross exit bps from desired net (or net-after-fees mode), apply spread-aware
+ *   adjustments, then clamp to MAX_GROSS_TAKE_PROFIT_BASIS_POINTS while honoring the
+ *   fee/slippage/buffer floor. This prevents runaway sell limits while keeping fees/buffers intact.
+ */
+function computeUnifiedExitPlan({
+  symbol,
+  entryPrice,
+  effectiveEntryPrice,
+  entryFeeBps,
+  exitFeeBps,
+  desiredNetExitBps,
+  slippageBps,
+  spreadBufferBps,
+  profitBufferBps,
+  maxGrossTakeProfitBps,
+  spreadBps,
+}) {
+  const entryPriceUsed = Number.isFinite(effectiveEntryPrice) ? effectiveEntryPrice : entryPrice;
+  const feeBpsRoundTrip = Number.isFinite(entryFeeBps) && Number.isFinite(exitFeeBps) ? entryFeeBps + exitFeeBps : 0;
+  const slippageBpsUsed = Number.isFinite(slippageBps) ? slippageBps : SLIPPAGE_BPS;
+  const spreadBufferBpsUsed = Number.isFinite(spreadBufferBps) ? spreadBufferBps : BUFFER_BPS;
+  const profitBufferBpsUsed = Number.isFinite(profitBufferBps) ? profitBufferBps : PROFIT_BUFFER_BPS;
+  const desiredNetExitBpsUsed = Number.isFinite(desiredNetExitBps)
+    ? Math.max(0, desiredNetExitBps)
+    : DESIRED_NET_PROFIT_BASIS_POINTS;
+  const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
+
+  let requiredExitBpsPreCap;
+  if (EXIT_MODE === 'net_after_fees') {
+    const plan = computeExitPlanNetAfterFees({
+      symbol,
+      entryPrice,
+      entryFeeBps,
+      exitFeeBps,
+      effectiveEntryPriceOverride: entryPriceUsed,
+    });
+    requiredExitBpsPreCap = plan.requiredExitBps;
+  } else {
+    requiredExitBpsPreCap =
+      desiredNetExitBpsUsed + feeBpsRoundTrip + slippageBpsUsed + spreadBufferBpsUsed + profitBufferBpsUsed;
+  }
+
+  const spreadAwareExitBps = Number.isFinite(spreadBps)
+    ? computeSpreadAwareExitBps({ baseRequiredExitBps: requiredExitBpsPreCap, spreadBps })
+    : requiredExitBpsPreCap;
+  const safetyFloor = feeBpsRoundTrip + slippageBpsUsed + spreadBufferBpsUsed + profitBufferBpsUsed;
+  const desiredForCap = Math.max(0, spreadAwareExitBps - safetyFloor);
+  const requiredExitBpsFinal = resolveRequiredExitBps({
+    desiredNetExitBps: desiredForCap,
+    feeBpsRoundTrip,
+    slippageBps: slippageBpsUsed,
+    spreadBufferBps: spreadBufferBpsUsed,
+    profitBufferBps: profitBufferBpsUsed,
+    maxGrossTakeProfitBps,
+  });
+
+  const tickSize = getTickSize({ symbol, price: entryPriceUsed });
+  const targetPrice = computeTargetSellPrice(entryPriceUsed, requiredExitBpsFinal, tickSize);
+  const breakevenPrice = computeBreakevenPrice(entryPriceUsed, requiredExitBpsFinal);
+
+  return {
+    entryPriceUsed,
+    feeBpsRoundTrip,
+    requiredExitBpsPreCap: spreadAwareExitBps,
+    requiredExitBpsFinal,
+    maxGrossTakeProfitBps,
+    tickSize,
+    targetPrice,
+    breakevenPrice,
+    netAfterFeesBps,
+  };
+}
+
 function computeExitPlanNetAfterFees({
   symbol,
   entryPrice,
@@ -4178,11 +4260,22 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
 
   let entryOrderType = null;
   let entryPostOnly = null;
+  let actualEntryFillPrice = null;
   if (entryOrderId) {
     try {
       const entryOrder = await fetchOrderById(entryOrderId);
       entryOrderType = entryOrder?.type ?? entryOrder?.order_type ?? null;
       entryPostOnly = entryOrder?.post_only ?? entryOrder?.postOnly ?? null;
+      const avgFillCandidate = Number(
+        entryOrder?.filled_avg_price ??
+          entryOrder?.filledAvgPrice ??
+          entryOrder?.filled_price ??
+          entryOrder?.filledPrice ??
+          entryOrder?.avg_fill_price ??
+          entryOrder?.avgFillPrice ??
+          null,
+      );
+      actualEntryFillPrice = Number.isFinite(avgFillCandidate) ? avgFillCandidate : null;
     } catch (err) {
       console.warn('entry_order_fetch_failed', { symbol, entryOrderId, error: err?.message || err });
     }
@@ -4214,7 +4307,9 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     postOnly: entryPostOnly,
   });
   const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-  const effectiveEntryPrice = Number.isFinite(maxFill) ? maxFill : entryPriceNum;
+  const effectiveEntryPrice = Number.isFinite(maxFill)
+    ? maxFill
+    : (Number.isFinite(actualEntryFillPrice) ? actualEntryFillPrice : entryPriceNum);
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
   let desiredNetExitBpsValue = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
     ? desiredExitBpsBySymbol.get(symbol)
@@ -4236,14 +4331,26 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     });
     desiredNetExitBpsValue = 0;
   }
-  const fixedProfitBps = EXIT_FIXED_NET_PROFIT_BPS;
-  const requiredExitBpsFinal = feeBpsRoundTrip + fixedProfitBps;
-  const baseRequiredExitBps = requiredExitBpsFinal;
-  const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
+  const exitPlan = computeUnifiedExitPlan({
+    symbol,
+    entryPrice: entryPriceNum,
+    effectiveEntryPrice,
+    entryFeeBps,
+    exitFeeBps,
+    desiredNetExitBps: desiredNetExitBpsValue,
+    slippageBps: slippageBpsUsed,
+    spreadBufferBps,
+    profitBufferBps,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+    spreadBps: entrySpreadBpsUsed,
+  });
+  const requiredExitBpsPreCap = exitPlan.requiredExitBpsPreCap;
+  const requiredExitBpsFinal = exitPlan.requiredExitBpsFinal;
+  const netAfterFeesBps = exitPlan.netAfterFeesBps;
   const minNetProfitBps = requiredExitBpsFinal;
-  const tickSize = getTickSize({ symbol, price: entryPriceNum });
-  const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBpsFinal, tickSize);
-  const breakevenPrice = computeBreakevenPrice(entryPriceNum, minNetProfitBps);
+  const targetPrice = exitPlan.targetPrice;
+  const breakevenPrice = exitPlan.breakevenPrice;
+  const entryPriceUsed = exitPlan.entryPriceUsed;
   const postOnly = EXIT_POST_ONLY;
   const wantOco = false;
 
@@ -4252,16 +4359,17 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     entryPrice: entryPriceNum,
     effectiveEntryPrice,
     maxFillPriceUsed: Number.isFinite(maxFill) ? maxFill : null,
+    actualEntryFillPrice,
+    entryPriceUsed,
     entryFeeBps,
     exitFeeBps,
     feeBpsRoundTrip,
     desiredNetExitBps: desiredNetExitBpsValue,
-    fixedNetExitBps: fixedProfitBps,
     netAfterFeesBps,
     entrySpreadBpsUsed,
     slippageBpsUsed,
     spreadBufferBps,
-    baseRequiredExitBps,
+    requiredExitBpsPreCap,
     requiredExitBps: requiredExitBpsFinal,
     maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     breakevenPrice,
@@ -4311,6 +4419,9 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     qty: qtyNum,
     entryPrice: entryPriceNum,
     effectiveEntryPrice,
+    entryPriceUsed,
+    maxFillPrice: Number.isFinite(maxFill) ? maxFill : null,
+    actualEntryFillPrice,
     entryTime: now,
     notionalUsd,
     minNetProfitBps,
@@ -4322,6 +4433,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     slippageBpsUsed,
     spreadBufferBps,
     requiredExitBps: requiredExitBpsFinal,
+    requiredExitBpsPreCap,
     entryFeeBps,
     exitFeeBps,
     entryOrderId: entryOrderId || null,
@@ -5259,14 +5371,30 @@ async function manageExitStates() {
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-        const fixedProfitBps = EXIT_FIXED_NET_PROFIT_BPS;
-        const fixedExitBps = feeBpsRoundTrip + fixedProfitBps;
-        const exitEntryPrice = Number.isFinite(state.entryPrice) ? state.entryPrice : state.effectiveEntryPrice;
-        const baseRequiredExitBps = fixedExitBps;
-        const requiredExitBpsFinal = fixedExitBps;
-        const minNetProfitBps = fixedExitBps;
-        const tickSize = getTickSize({ symbol, price: exitEntryPrice });
-        const targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBpsFinal, tickSize);
+        const exitEntryPrice = Number.isFinite(state.maxFillPrice)
+          ? state.maxFillPrice
+          : (Number.isFinite(state.actualEntryFillPrice)
+            ? state.actualEntryFillPrice
+            : (Number.isFinite(state.effectiveEntryPrice) ? state.effectiveEntryPrice : state.entryPrice));
+        const exitPlan = computeUnifiedExitPlan({
+          symbol,
+          entryPrice: Number.isFinite(state.entryPrice) ? state.entryPrice : exitEntryPrice,
+          effectiveEntryPrice: exitEntryPrice,
+          entryFeeBps,
+          exitFeeBps,
+          desiredNetExitBps,
+          slippageBps,
+          spreadBufferBps,
+          profitBufferBps,
+          maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+          spreadBps,
+        });
+        const baseRequiredExitBps = exitPlan.requiredExitBpsPreCap;
+        const requiredExitBpsFinal = exitPlan.requiredExitBpsFinal;
+        const minNetProfitBps = requiredExitBpsFinal;
+        const tickSize = exitPlan.tickSize;
+        const targetPrice = exitPlan.targetPrice;
+        const entryPriceUsed = exitPlan.entryPriceUsed;
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
@@ -5278,8 +5406,10 @@ async function manageExitStates() {
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
         state.effectiveEntryPrice = exitEntryPrice;
-        state.netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
-        const breakevenPrice = computeBreakevenPrice(exitEntryPrice, minNetProfitBps);
+        state.entryPriceUsed = entryPriceUsed;
+        state.requiredExitBpsPreCap = baseRequiredExitBps;
+        state.netAfterFeesBps = exitPlan.netAfterFeesBps;
+        const breakevenPrice = exitPlan.breakevenPrice;
         state.breakevenPrice = breakevenPrice;
         const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
@@ -5331,11 +5461,14 @@ async function manageExitStates() {
             symbol,
             heldQty: state.qty,
             entryPrice: state.entryPrice,
+            entryPriceUsed,
             bid,
             ask,
             spreadBps,
             baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
             requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -5388,6 +5521,134 @@ async function manageExitStates() {
           } else {
             availableQtyOverride = availableQtyFromApi;
           }
+        }
+
+        const maxHoldMsForced =
+          Number.isFinite(EXIT_MAX_HOLD_SECONDS) && EXIT_MAX_HOLD_SECONDS > 0 ? EXIT_MAX_HOLD_SECONDS * 1000 : 0;
+        if (maxHoldMsForced > 0 && heldMs >= maxHoldMsForced) {
+          if (state.sellOrderId) {
+            await maybeCancelExitSell({
+              symbol,
+              orderId: state.sellOrderId,
+              reason: 'max_hold_forced_exit',
+            });
+          }
+          const baseLimitCandidate = Number.isFinite(ask)
+            ? Math.min(ask - tickSize, ask)
+            : (Number.isFinite(midPrice) ? midPrice : bid);
+          const executableLimitBase =
+            Number.isFinite(bid) && Number.isFinite(baseLimitCandidate) ? Math.min(baseLimitCandidate, bid) : baseLimitCandidate;
+          const forcedLimit = Number.isFinite(executableLimitBase)
+            ? roundDownToTick(executableLimitBase, tickSize)
+            : null;
+          const forcedExitMode = EXIT_FORCE_EXIT_MODE;
+          let requestedQty = null;
+          let filledQty = null;
+          let fallbackReason = null;
+          let realizedOrderId = null;
+
+          if (forcedExitMode === 'market') {
+            const marketOrder = await submitMarketSell({
+              symbol,
+              qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
+              reason: 'max_hold_forced_exit',
+              allowSellBelowMin: false,
+            });
+            realizedOrderId = marketOrder?.id || marketOrder?.order_id || null;
+            actionTaken = 'forced_exit_market';
+            reasonCode = 'max_hold_forced_exit';
+          } else if (Number.isFinite(forcedLimit)) {
+            const iocResult = await submitIocLimitSell({
+              symbol,
+              qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
+              limitPrice: forcedLimit,
+              reason: 'max_hold_forced_exit',
+              allowSellBelowMin: false,
+            });
+            if (!iocResult?.skipped) {
+              requestedQty = iocResult.requestedQty;
+              filledQty = normalizeFilledQty(iocResult.order);
+              const remainingQty =
+                Number.isFinite(requestedQty) && Number.isFinite(filledQty)
+                  ? Math.max(requestedQty - filledQty, 0)
+                  : null;
+              realizedOrderId = iocResult?.order?.id || iocResult?.order?.order_id || null;
+              if (remainingQty && remainingQty > 0) {
+                fallbackReason = 'max_hold_ioc_partial';
+                await submitMarketSell({
+                  symbol,
+                  qty: remainingQty,
+                  reason: 'max_hold_forced_exit_fallback',
+                  allowSellBelowMin: false,
+                });
+              }
+              actionTaken = 'forced_exit_ioc';
+              reasonCode = 'max_hold_forced_exit';
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = iocResult?.reason || 'max_hold_ioc_skipped';
+            }
+          } else {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'max_hold_price_unavailable';
+          }
+
+          if (actionTaken.startsWith('forced_exit')) {
+            exitState.delete(symbol);
+            lastActionAt.set(symbol, now);
+            await logExitRealized({
+              symbol,
+              entryPrice: state.entryPrice,
+              feeBpsRoundTrip,
+              entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+              heldSeconds,
+              reasonCode,
+              orderId: realizedOrderId,
+            });
+          }
+
+          const decisionPath = 'max_hold_forced_exit';
+          logExitDecision({
+            symbol,
+            heldSeconds,
+            entryPrice: state.entryPrice,
+            targetPrice,
+            bid,
+            ask,
+            minNetProfitBps,
+            actionTaken,
+          });
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            entryPriceUsed,
+            bid,
+            ask,
+            spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
+            requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            breakevenPrice,
+            desiredLimit,
+            decisionPath,
+            lastRepriceAgeMs,
+            lastCancelReplaceAt: lastCancelReplaceAtMs,
+            actionTaken,
+            reasonCode,
+            iocRequestedQty: requestedQty,
+            iocFilledQty: filledQty,
+            iocFallbackReason: fallbackReason,
+          });
+          continue;
         }
 
         if (openSellCount > 0) {
@@ -5453,11 +5714,108 @@ async function manageExitStates() {
               symbol,
               heldQty: state.qty,
               entryPrice: state.entryPrice,
+              entryPriceUsed,
               bid,
               ask,
               spreadBps,
               baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
               requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+              openBuyCount,
+              openSellCount,
+              existingOrderAgeMs,
+              feeBpsRoundTrip,
+              profitBufferBps,
+              minNetProfitBps,
+              targetPrice,
+              breakevenPrice,
+              desiredLimit,
+              decisionPath,
+              lastRepriceAgeMs,
+              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              actionTaken,
+              reasonCode,
+              iocRequestedQty: null,
+              iocFilledQty: null,
+              iocFallbackReason: null,
+            });
+            continue;
+          }
+          const currentLimit = normalizeOrderLimitPrice(refreshOrder) ?? state.sellOrderLimit;
+          if (Number.isFinite(currentLimit)) {
+            state.sellOrderLimit = currentLimit;
+          }
+          const repriceDiffBps =
+            Number.isFinite(currentLimit) && Number.isFinite(desiredLimit) && desiredLimit > 0
+              ? Math.abs((currentLimit - desiredLimit) / desiredLimit) * 10000
+              : null;
+          const repriceCooldownActive =
+            Number.isFinite(lastCancelReplaceAtMs) && now - lastCancelReplaceAtMs < MIN_REPRICE_INTERVAL_MS;
+          if (
+            SELL_REPRICE_ENABLED &&
+            EXIT_REFRESH_ENABLED &&
+            Number.isFinite(repriceDiffBps) &&
+            repriceDiffBps >= EXIT_REPRICE_THRESHOLD_BPS
+          ) {
+            if (!shouldCancelExitSell()) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'policy_no_cancel_no_reprice';
+            } else if (repriceCooldownActive) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_cooldown';
+            } else {
+              const canceled = await maybeCancelExitSell({
+                symbol,
+                orderId: state.sellOrderId || refreshOrder?.id || refreshOrder?.order_id,
+                reason: 'reprice_threshold',
+              });
+              const replacement = await submitLimitSell({
+                symbol,
+                qty: state.qty,
+                limitPrice: desiredLimit,
+                reason: 'reprice_threshold',
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                postOnly: EXIT_POST_ONLY,
+              });
+              if (!replacement?.skipped && replacement?.id) {
+                state.sellOrderId = replacement.id;
+                state.sellOrderSubmittedAt = Date.now();
+                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
+                actionTaken = 'reprice_cancel_replace';
+                reasonCode = 'reprice_threshold';
+                lastActionAt.set(symbol, now);
+                if (canceled) {
+                  lastCancelReplaceAt.set(symbol, now);
+                }
+              } else {
+                actionTaken = 'hold_existing_order';
+                reasonCode = replacement?.reason || 'reprice_threshold_skipped';
+              }
+            }
+            const decisionPath = 'cancel_replace';
+            logExitDecision({
+              symbol,
+              heldSeconds,
+              entryPrice: state.entryPrice,
+              targetPrice,
+              bid,
+              ask,
+              minNetProfitBps,
+              actionTaken,
+            });
+            console.log('exit_scan', {
+              symbol,
+              heldQty: state.qty,
+              entryPrice: state.entryPrice,
+              entryPriceUsed,
+              bid,
+              ask,
+              spreadBps,
+              baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
+              requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs,
@@ -5495,11 +5853,14 @@ async function manageExitStates() {
             symbol,
             heldQty: state.qty,
             entryPrice: state.entryPrice,
+            entryPriceUsed,
             bid,
             ask,
             spreadBps,
             baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
             requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs,
@@ -5558,11 +5919,14 @@ async function manageExitStates() {
             symbol,
             heldQty: state.qty,
             entryPrice: state.entryPrice,
+            entryPriceUsed,
             bid,
             ask,
             spreadBps,
             baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
             requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -5629,11 +5993,14 @@ async function manageExitStates() {
               symbol,
               heldQty: state.qty,
               entryPrice: state.entryPrice,
+              entryPriceUsed,
               bid,
               ask,
               spreadBps,
               baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
               requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -5711,11 +6078,14 @@ async function manageExitStates() {
               symbol,
               heldQty: state.qty,
               entryPrice: state.entryPrice,
+              entryPriceUsed,
               bid,
               ask,
               spreadBps,
               baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
               requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -5762,11 +6132,14 @@ async function manageExitStates() {
             symbol,
             heldQty: state.qty,
             entryPrice: state.entryPrice,
+            entryPriceUsed,
             bid,
             ask,
             spreadBps,
             baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
             requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -5920,11 +6293,14 @@ async function manageExitStates() {
               symbol,
               heldQty: state.qty,
               entryPrice: state.entryPrice,
+              entryPriceUsed,
               bid,
               ask,
               spreadBps,
               baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
               requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -6015,11 +6391,14 @@ async function manageExitStates() {
               symbol,
               heldQty: state.qty,
               entryPrice: state.entryPrice,
+              entryPriceUsed,
               bid,
               ask,
               spreadBps,
               baseRequiredExitBps,
+              requiredExitBpsPreCap: baseRequiredExitBps,
               requiredExitBpsFinal,
+              maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -6130,11 +6509,14 @@ async function manageExitStates() {
           symbol,
           heldQty: state.qty,
           entryPrice: state.entryPrice,
+          entryPriceUsed,
           bid,
           ask,
           spreadBps,
           baseRequiredExitBps,
+          requiredExitBpsPreCap: baseRequiredExitBps,
           requiredExitBpsFinal,
+          maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
           openBuyCount,
           openSellCount,
           existingOrderAgeMs: null,
@@ -6217,11 +6599,14 @@ async function manageExitStates() {
             symbol,
             heldQty: state.qty,
             entryPrice: state.entryPrice,
+            entryPriceUsed,
             bid,
             ask,
             spreadBps,
             baseRequiredExitBps,
+            requiredExitBpsPreCap: baseRequiredExitBps,
             requiredExitBpsFinal,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -6663,11 +7048,14 @@ async function manageExitStates() {
         symbol,
         heldQty: state.qty,
         entryPrice: state.entryPrice,
+        entryPriceUsed,
         bid,
         ask,
         spreadBps,
         baseRequiredExitBps,
+        requiredExitBpsPreCap: baseRequiredExitBps,
         requiredExitBpsFinal,
+        maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
         openBuyCount,
         openSellCount,
         existingOrderAgeMs: existingOrderAgeMsLogged,
