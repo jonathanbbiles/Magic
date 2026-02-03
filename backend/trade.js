@@ -4749,71 +4749,21 @@ async function repairOrphanExits() {
     }
 
     if (hasOpenSell && !hasTrackedExit) {
-      const bestOrder = openSellOrders
-        .map((order) => {
-          const orderQty = resolveOrderQty(order);
-          const limitPrice = normalizeOrderLimitPrice(order);
-          return { order, orderQty, limitPrice };
-        })
-        .filter((item) => Number.isFinite(item.orderQty) && item.orderQty > 0 && Number.isFinite(item.limitPrice))
-        .reduce((best, current) => {
-          if (!best) return current;
-          if (current.orderQty > best.orderQty) return current;
-          if (current.orderQty < best.orderQty) return best;
-          if (!Number.isFinite(targetPrice)) return best;
-          const bestDiff = Math.abs(best.limitPrice - targetPrice);
-          const currentDiff = Math.abs(current.limitPrice - targetPrice);
-          return currentDiff < bestDiff ? current : best;
-        }, null);
-      if (bestOrder) {
-        const adoptedOrder = bestOrder.order;
-        const adoptedOrderId = adoptedOrder?.id || adoptedOrder?.order_id || null;
-        const sellOrderSubmittedAtRaw =
-          adoptedOrder?.submitted_at ||
-          adoptedOrder?.submittedAt ||
-          adoptedOrder?.created_at ||
-          adoptedOrder?.createdAt ||
-          null;
-        const sellOrderSubmittedAt = sellOrderSubmittedAtRaw ? Date.parse(sellOrderSubmittedAtRaw) : null;
-        const now = Date.now();
-        const sellOrderSubmittedAtMs = Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now;
-        const entryTime = Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now;
-        exitState.set(symbol, {
+      let sellOrder = null;
+      try {
+        sellOrder = await submitLimitSell({
           symbol,
           qty,
-          entryPrice: avgEntryPrice,
-          effectiveEntryPrice: avgEntryPrice,
-          entryTime,
-          notionalUsd,
-          minNetProfitBps,
-          targetPrice,
-          feeBpsRoundTrip,
-          profitBufferBps,
-          desiredNetExitBps,
-          slippageBpsUsed: slippageBps,
-          spreadBufferBps,
-          entryFeeBps,
-          exitFeeBps,
-          requiredExitBps,
-          netAfterFeesBps,
-          sellOrderId: adoptedOrderId,
-          sellOrderSubmittedAt: sellOrderSubmittedAtMs,
-          sellOrderLimit: bestOrder.limitPrice,
-          takerAttempted: false,
-          entryOrderId: null,
+          limitPrice: targetPrice,
+          reason: 'exit_repair_orphan',
+          intentRef: getOrderIntentBucket(),
+          openOrders: expandedOrders,
+          postOnly: true,
         });
-        desiredExitBpsBySymbol.delete(symbol);
-        console.log('exit_repair_adopt_open_sell', {
-          symbol,
-          adoptedOrderId,
-          adoptedLimitPrice: bestOrder.limitPrice,
-          qty,
-          entryPrice: avgEntryPrice,
-          targetPrice,
-        });
-        decision = 'ADOPT:open_sell_untracked';
-        adopted += 1;
-        exitsSkippedReasons.set('adopt_open_sell_untracked', (exitsSkippedReasons.get('adopt_open_sell_untracked') || 0) + 1);
+      } catch (err) {
+        failed += 1;
+        decision = 'FAILED:exit_repair_submit_sell';
+        console.warn('exit_repair_submit_sell_failed', { symbol, error: err?.message || err });
         logExitRepairDecision({
           symbol,
           qty,
@@ -4830,27 +4780,101 @@ async function repairOrphanExits() {
         });
         continue;
       }
-    }
-
-    if (hasOpenSell) {
-      decision = 'SKIP:open_sell';
-      skipped += 1;
-      exitsSkippedReasons.set('open_sell', (exitsSkippedReasons.get('open_sell') || 0) + 1);
-      logExitRepairDecision({
-        symbol,
-        qty,
-        avgEntryPrice,
-        costBasis,
-        bid,
-        ask,
-        targetPrice,
-        timeInForce,
-        orderType,
-        hasOpenSell,
-        gates: gateFlags,
-        decision,
-      });
-      continue;
+      if (sellOrder?.skipped) {
+        decision = `SKIP:${sellOrder.reason || 'exit_repair_sell_skipped'}`;
+        skipped += 1;
+        exitsSkippedReasons.set('exit_repair_sell_skipped', (exitsSkippedReasons.get('exit_repair_sell_skipped') || 0) + 1);
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+      const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
+      if (sellOrderId) {
+        const now = Date.now();
+        const rawSubmittedAt =
+          sellOrder?.submittedAt ||
+          sellOrder?.submitted_at ||
+          sellOrder?.created_at ||
+          sellOrder?.createdAt ||
+          null;
+        const parsedSubmittedAt =
+          typeof rawSubmittedAt === 'number' ? rawSubmittedAt : rawSubmittedAt ? Date.parse(rawSubmittedAt) : null;
+        const sellOrderSubmittedAt = Number.isFinite(parsedSubmittedAt) ? parsedSubmittedAt : now;
+        const returnedLimit =
+          Number.isFinite(Number(sellOrder?.limitPrice))
+            ? Number(sellOrder.limitPrice)
+            : normalizeOrderLimitPrice(sellOrder);
+        const sellOrderLimit = Number.isFinite(returnedLimit) ? returnedLimit : targetPrice;
+        exitState.set(symbol, {
+          symbol,
+          qty,
+          entryPrice: avgEntryPrice,
+          effectiveEntryPrice: avgEntryPrice,
+          entryTime: now,
+          notionalUsd,
+          minNetProfitBps,
+          targetPrice,
+          feeBpsRoundTrip,
+          profitBufferBps,
+          desiredNetExitBps,
+          slippageBpsUsed: slippageBps,
+          spreadBufferBps,
+          entryFeeBps,
+          exitFeeBps,
+          requiredExitBps,
+          netAfterFeesBps,
+          sellOrderId,
+          sellOrderSubmittedAt,
+          sellOrderLimit,
+          takerAttempted: false,
+          entryOrderId: null,
+        });
+        desiredExitBpsBySymbol.delete(symbol);
+        if (sellOrder?.adopted) {
+          adopted += 1;
+          decision = 'ADOPT_EXIT';
+          console.warn('exit_repair_adopted_sell', {
+            symbol,
+            orderId: sellOrderId,
+            adoptedLimit: sellOrderLimit,
+            adoptedSubmittedAt: sellOrderSubmittedAt,
+          });
+        } else {
+          placed += 1;
+          decision = 'PLACED:exit_repair_submit_sell';
+        }
+        exitsSkippedReasons.set(
+          sellOrder?.adopted ? 'adopt_exit_repair' : 'placed_exit_repair',
+          (exitsSkippedReasons.get(sellOrder?.adopted ? 'adopt_exit_repair' : 'placed_exit_repair') || 0) + 1
+        );
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
     }
 
     if (!autoSellEnabled) {
