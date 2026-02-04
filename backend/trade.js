@@ -160,7 +160,7 @@ const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
 const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', 50);
 const BOOK_EXIT_ANCHOR = String(process.env.BOOK_EXIT_ANCHOR || 'ask').trim().toLowerCase();
-const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', true);
+const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', false);
 const EXIT_POLICY_LOCKED = readEnvFlag('EXIT_POLICY_LOCKED', true);
 const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 5);
 const EXIT_FIXED_NET_PROFIT_BPS = readNumber('EXIT_FIXED_NET_PROFIT_BPS', 5);
@@ -168,7 +168,7 @@ const EXIT_ENFORCE_ENTRY_FLOOR = readEnvFlag('EXIT_ENFORCE_ENTRY_FLOOR', false);
 const EXIT_POST_ONLY = readEnvFlag('EXIT_POST_ONLY', true);
 const EXIT_CANCELS_ENABLED = readEnvFlag('EXIT_CANCELS_ENABLED', false);
 const EXIT_CANCELS_FORCE_ALL = readEnvFlag('EXIT_CANCELS_FORCE_ALL', false);
-const SELL_REPRICE_ENABLED = readEnvFlag('SELL_REPRICE_ENABLED', false);
+const SELL_REPRICE_ENABLED = readEnvFlag('SELL_REPRICE_ENABLED', true);
 const EXIT_TAKER_ON_TOUCH_ENABLED = readEnvFlag('EXIT_TAKER_ON_TOUCH_ENABLED', false);
 const EXIT_MARKET_EXITS_ENABLED = readEnvFlag('EXIT_MARKET_EXITS_ENABLED', false);
 const DISABLE_IOC_EXITS = readEnvFlag('DISABLE_IOC_EXITS', true);
@@ -1851,6 +1851,12 @@ function parseAvgEntryPrice(position, symbol) {
   return avgEntry;
 }
 
+function extractAvgEntryRaw(position) {
+  if (!position) return null;
+  const avgEntryRaw = position?.avg_entry_price ?? position?.avgEntryPrice ?? null;
+  return avgEntryRaw ?? null;
+}
+
 function resolveEntryBasis({ avgEntryPrice, fallbackEntryPrice }) {
   const avgEntry = Number(avgEntryPrice);
   if (Number.isFinite(avgEntry) && avgEntry > 0) {
@@ -2564,16 +2570,42 @@ async function getAvgEntryPriceFromAlpaca(symbol) {
     position = await fetchPosition(normalized);
   } catch (err) {
     console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
-    avgEntryPriceCache.set(normalized, { value: null, fetchedAtMs: nowMs });
+    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
     return null;
   }
   if (!position) {
-    avgEntryPriceCache.set(normalized, { value: null, fetchedAtMs: nowMs });
+    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
     return null;
   }
+  const avgEntryRaw = extractAvgEntryRaw(position);
   const avgEntryPrice = parseAvgEntryPrice(position, normalized);
-  avgEntryPriceCache.set(normalized, { value: avgEntryPrice, fetchedAtMs: nowMs });
+  avgEntryPriceCache.set(normalized, { value: avgEntryPrice, raw: avgEntryRaw, fetchedAtMs: nowMs });
   return avgEntryPrice;
+}
+
+async function getAvgEntryPriceInfoFromAlpaca(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const nowMs = Date.now();
+  const cached = avgEntryPriceCache.get(normalized);
+  if (cached && nowMs - cached.fetchedAtMs < AVG_ENTRY_CACHE_TTL_MS) {
+    return { avgEntryPrice: cached.value, avgEntryPriceRaw: cached.raw ?? null };
+  }
+  let position = null;
+  try {
+    position = await fetchPosition(normalized);
+  } catch (err) {
+    console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
+    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
+    return { avgEntryPrice: null, avgEntryPriceRaw: null };
+  }
+  if (!position) {
+    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
+    return { avgEntryPrice: null, avgEntryPriceRaw: null };
+  }
+  const avgEntryPriceRaw = extractAvgEntryRaw(position);
+  const avgEntryPrice = parseAvgEntryPrice(position, normalized);
+  avgEntryPriceCache.set(normalized, { value: avgEntryPrice, raw: avgEntryPriceRaw, fetchedAtMs: nowMs });
+  return { avgEntryPrice, avgEntryPriceRaw };
 }
 
 async function fetchAsset(symbol) {
@@ -4398,11 +4430,18 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     console.warn('entry_spread_unknown', { symbol });
   }
 
-  const avgEntryPrice = await getAvgEntryPriceFromAlpaca(symbol);
+  const { avgEntryPrice, avgEntryPriceRaw } = await getAvgEntryPriceInfoFromAlpaca(symbol);
   const { entryBasis, entryBasisType } = resolveEntryBasis({
     avgEntryPrice,
     fallbackEntryPrice: entryPriceNum,
   });
+  if (!(Number.isFinite(avgEntryPrice) && avgEntryPrice > 0)) {
+    console.warn('alpaca_avg_entry_missing_fallback', {
+      symbol,
+      avgEntryPriceRaw: avgEntryPriceRaw ?? null,
+      fallbackEntryPrice: entryPriceNum,
+    });
+  }
   const entryPriceBasis = Number.isFinite(entryBasis) ? entryBasis : entryPriceNum;
   const notionalUsd = qtyNum * entryPriceBasis;
   const entryFeeBps = inferEntryFeeBps({
@@ -4459,32 +4498,18 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   let bookBid = null;
   let bookAsk = null;
 
-  if (BOOK_EXIT_ENABLED) {
-    try {
-      const quote = await getLatestQuote(symbol);
-      bookBid = quote?.bid ?? null;
-      bookAsk = quote?.ask ?? null;
-    } catch (err) {
-      console.warn('tp_attach_quote_failed', { symbol, error: err?.message || err });
-    }
-    if (Number.isFinite(bookAsk)) {
-      const bookLimit = computeBookAnchoredSellLimit({
-        symbol,
-        entryPrice: entryPriceUsed,
-        bid: bookBid,
-        ask: bookAsk,
-        requiredExitBps: requiredExitBpsFinal,
-        tickSize: exitPlan.tickSize,
-      });
-      if (Number.isFinite(bookLimit)) {
-        initialLimit = bookLimit;
-      }
-    }
+  try {
+    const quote = await getLatestQuote(symbol);
+    bookBid = quote?.bid ?? null;
+    bookAsk = quote?.ask ?? null;
+  } catch (err) {
+    console.warn('tp_attach_quote_failed', { symbol, error: err?.message || err });
   }
   initialLimit = applyMakerGuard(initialLimit, bookBid, exitPlan.tickSize);
 
   console.log('tp_attach_plan', {
     symbol,
+    avgEntryPriceRaw: avgEntryPriceRaw ?? null,
     entryPrice: entryPriceBasis,
     entryBasisType,
     entryBasisValue: entryPriceBasis,
@@ -4501,12 +4526,13 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     slippageBpsUsed,
     spreadBufferBps,
     requiredExitBpsPreCap,
-    requiredExitBps: requiredExitBpsFinal,
+    requiredExitBpsFinal,
     maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     breakevenPrice,
     targetPrice,
-    anchor: BOOK_EXIT_ANCHOR,
-    initialLimit,
+    finalLimit: initialLimit,
+    currentLimit: null,
+    awayBps: null,
     bookAsk,
     bookBid,
     takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
@@ -5543,12 +5569,19 @@ async function manageExitStates() {
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-        const avgEntryPrice = await getAvgEntryPriceFromAlpaca(symbol);
+        const { avgEntryPrice, avgEntryPriceRaw } = await getAvgEntryPriceInfoFromAlpaca(symbol);
         const { entryBasis, entryBasisType } = resolveEntryBasis({
           avgEntryPrice,
           fallbackEntryPrice: state.entryPrice,
         });
         const entryBasisValue = Number.isFinite(entryBasis) ? entryBasis : state.entryPrice;
+        if (!(Number.isFinite(avgEntryPrice) && avgEntryPrice > 0)) {
+          console.warn('alpaca_avg_entry_missing_fallback', {
+            symbol,
+            avgEntryPriceRaw: avgEntryPriceRaw ?? null,
+            fallbackEntryPrice: state.entryPrice,
+          });
+        }
         const exitEntryPrice = entryBasisValue;
         const exitPlan = computeUnifiedExitPlan({
           symbol,
@@ -5617,16 +5650,18 @@ async function manageExitStates() {
         const awayBps = computeAwayBps(currentLimit, desiredLimit);
         const exitScanBase = {
           entryPriceUsed,
+          avgEntryPriceRaw: avgEntryPriceRaw ?? null,
           entryBasisType,
           entryBasisValue,
-          avgEntry: avgEntryPrice,
           bookAsk: ask,
           bookBid: bid,
           enforceEntryFloor: EXIT_ENFORCE_ENTRY_FLOOR,
           requiredExitBpsFinal,
-          desiredLimit,
+          targetPrice,
+          finalLimit,
           currentLimit,
           awayBps,
+          desiredLimit,
           marketToExitBps_from_entry,
         };
         const lastRefreshAtMs = lastExitRefreshAt.get(symbol) || null;
@@ -5653,9 +5688,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -5818,9 +5851,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -5911,9 +5942,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6003,9 +6032,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6052,9 +6079,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             entryPrice: state.entryPrice,
             ...exitScanBase,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6122,9 +6147,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6200,9 +6223,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6286,9 +6307,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6345,9 +6364,7 @@ async function manageExitStates() {
             entryPrice: state.entryPrice,
             entryPriceUsed,
             ...exitScanBase,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6510,9 +6527,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6610,9 +6625,7 @@ async function manageExitStates() {
               entryPrice: state.entryPrice,
               entryPriceUsed,
               ...exitScanBase,
-              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
-              requiredExitBps: requiredExitBpsFinal,
               spreadBps,
               baseRequiredExitBps,
               requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6731,9 +6744,7 @@ async function manageExitStates() {
           entryPriceUsed,
           bid,
           ...exitScanBase,
-          bookAnchoredLimit: desiredLimit,
           entryFloorTarget: targetPrice,
-          requiredExitBps: requiredExitBpsFinal,
           spreadBps,
           baseRequiredExitBps,
           requiredExitBpsPreCap: baseRequiredExitBps,
@@ -6822,9 +6833,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
-            requiredExitBps: requiredExitBpsFinal,
             spreadBps,
             baseRequiredExitBps,
             requiredExitBpsPreCap: baseRequiredExitBps,
@@ -7266,9 +7275,7 @@ async function manageExitStates() {
         heldQty: state.qty,
         ...exitScanBase,
         entryPrice: state.entryPrice,
-        bookAnchoredLimit: desiredLimit,
         entryFloorTarget: targetPrice,
-        requiredExitBps: requiredExitBpsFinal,
         spreadBps,
         baseRequiredExitBps,
         requiredExitBpsPreCap: baseRequiredExitBps,

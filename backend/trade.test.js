@@ -1,4 +1,6 @@
 const assert = require('assert/strict');
+const fs = require('fs');
+const path = require('path');
 
 const tradeModulePath = require.resolve('./trade');
 
@@ -122,11 +124,21 @@ assert.equal(resolvedEntry.entryBasis, 100);
 const desiredLimit = computeTargetSellPrice(resolvedEntry.entryBasis, 50, 0.01);
 assert.equal(desiredLimit, 100.5);
 
+const desiredLimitFromEntry = computeTargetSellPrice(100, 75, 0.01);
+assert.equal(desiredLimitFromEntry, 100.75);
+
 const fallbackEntry = resolveEntryBasis({ avgEntryPrice: 0, fallbackEntryPrice: 101 });
 assert.equal(fallbackEntry.entryBasisType, 'fallback_local');
 assert.equal(fallbackEntry.entryBasis, 101);
 
 assert.equal(computeAwayBps(110, 100), 1000);
 assert.equal(computeAwayBps(90, 100), 1000);
+
+const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
+const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
+const attachEnd = tradeSource.indexOf('async function handleBuyFill');
+assert.ok(attachStart !== -1 && attachEnd !== -1);
+const attachBlock = tradeSource.slice(attachStart, attachEnd);
+assert.equal(/computeBookAnchoredSellLimit/.test(attachBlock), false);
 
 console.log('trade tests passed');
