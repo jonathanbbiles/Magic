@@ -180,7 +180,7 @@ const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const ORDER_FETCH_THROTTLE_MS = 1000;
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
-const EXIT_REPRICE_THRESHOLD_BPS = readNumber('EXIT_REPRICE_THRESHOLD_BPS', 25);
+const REPRICE_TTL_MS = readNumber('REPRICE_TTL_MS', SELL_ORDER_TTL_MS);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', 60);
@@ -5561,7 +5561,7 @@ async function manageExitStates() {
           spreadBufferBps,
           profitBufferBps,
           maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-          spreadBps,
+          spreadBps: null,
         });
         const baseRequiredExitBps = exitPlan.requiredExitBpsPreCap;
         const requiredExitBpsFinal = exitPlan.requiredExitBpsFinal;
@@ -5590,45 +5590,21 @@ async function manageExitStates() {
         state.breakevenPrice = breakevenPrice;
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
         const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
-        const bookAnchored =
-          BOOK_EXIT_ENABLED && Number.isFinite(ask)
-            ? computeBookAnchoredSellLimit({
-                symbol,
-                entryPrice: entryPriceUsed,
-                bid,
-                ask,
-                requiredExitBps: requiredExitBpsFinal,
-                tickSize,
-              })
-            : null;
-        const makerDesiredLimit = Number.isFinite(bookAnchored) ? bookAnchored : targetPrice;
-        const desiredLimit = applyMakerGuard(makerDesiredLimit, bid, tickSize);
+        const desiredLimit = Number.isFinite(targetPrice)
+          ? targetPrice
+          : computeTargetSellPrice(entryBasisValue, requiredExitBpsFinal, tickSize);
+        const finalLimit = applyMakerGuard(desiredLimit, bid, tickSize);
         const marketToExitBps_from_entry =
           Number.isFinite(desiredLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
             ? ((desiredLimit - entryBasisValue) / entryBasisValue) * 10000
             : null;
-        const marketToExitBps =
-          Number.isFinite(ask) && Number.isFinite(makerDesiredLimit) && ask > 0
-            ? ((makerDesiredLimit - ask) / ask) * 10000
-            : null;
-        const exitScanBase = {
-          entryPriceUsed,
-          entryBasisType,
-          entryBasisValue,
-          bookAsk: ask,
-          bookBid: bid,
-          makerDesiredLimit,
-          enforceEntryFloor: EXIT_ENFORCE_ENTRY_FLOOR,
-          requiredExitBpsFinal,
-          marketToExitBps,
-          marketToExitBps_from_entry,
-        };
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
         const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
         const hasOpenSell = openSellOrders.length > 0 || Boolean(state.sellOrderId);
         let existingOrderAgeMs = null;
         let refreshOrder = null;
+        let currentLimit = null;
         if (openSellOrders.length) {
           if (state.sellOrderId) {
             refreshOrder = openSellOrders.find((order) => (order?.id || order?.order_id) === state.sellOrderId);
@@ -5636,7 +5612,23 @@ async function manageExitStates() {
           refreshOrder = refreshOrder || openSellOrders[0];
           const orderAgeMs = getOrderAgeMs(refreshOrder);
           existingOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
+          currentLimit = normalizeOrderLimitPrice(refreshOrder) ?? state.sellOrderLimit;
         }
+        const awayBps = computeAwayBps(currentLimit, desiredLimit);
+        const exitScanBase = {
+          entryPriceUsed,
+          entryBasisType,
+          entryBasisValue,
+          avgEntry: avgEntryPrice,
+          bookAsk: ask,
+          bookBid: bid,
+          enforceEntryFloor: EXIT_ENFORCE_ENTRY_FLOOR,
+          requiredExitBpsFinal,
+          desiredLimit,
+          currentLimit,
+          awayBps,
+          marketToExitBps_from_entry,
+        };
         const lastRefreshAtMs = lastExitRefreshAt.get(symbol) || null;
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
@@ -5661,7 +5653,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -5677,10 +5669,14 @@ async function manageExitStates() {
             targetPrice,
             breakevenPrice,
             desiredLimit,
+            finalLimit,
+            currentLimit,
+            awayBps,
             decisionPath,
             lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -5822,7 +5818,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -5842,6 +5838,7 @@ async function manageExitStates() {
             lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: requestedQty,
             iocFilledQty: filledQty,
@@ -5869,7 +5866,7 @@ async function manageExitStates() {
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
-                limitPrice: desiredLimit,
+                limitPrice: finalLimit,
                 reason: 'exit_refresh_reprice',
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
@@ -5879,7 +5876,7 @@ async function manageExitStates() {
               if (!replacement?.skipped && replacement?.id) {
                 state.sellOrderId = replacement.id;
                 state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
+                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
                 actionTaken = 'exit_refresh_reprice';
                 reasonCode = 'exit_refresh_reprice';
                 lastActionAt.set(symbol, now);
@@ -5887,7 +5884,7 @@ async function manageExitStates() {
                   symbol,
                   oldOrderId,
                   ageMs: existingOrderAgeMs,
-                  newTargetPrice: desiredLimit,
+                  newTargetPrice: finalLimit,
                   requiredExitBpsFinal,
                 });
               } else {
@@ -5914,7 +5911,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -5930,10 +5927,14 @@ async function manageExitStates() {
               targetPrice,
               breakevenPrice,
               desiredLimit,
+              finalLimit,
+              currentLimit,
+              awayBps,
               decisionPath,
               lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: null,
               iocFilledQty: null,
@@ -5941,48 +5942,39 @@ async function manageExitStates() {
             });
             continue;
           }
-          const currentLimit = normalizeOrderLimitPrice(refreshOrder) ?? state.sellOrderLimit;
           if (Number.isFinite(currentLimit)) {
             state.sellOrderLimit = currentLimit;
           }
-          const repriceDiffBps =
-            Number.isFinite(currentLimit) && Number.isFinite(desiredLimit) && desiredLimit > 0
-              ? Math.abs((currentLimit - desiredLimit) / desiredLimit) * 10000
-              : null;
           const repriceCooldownActive =
             Number.isFinite(lastCancelReplaceAtMs) && now - lastCancelReplaceAtMs < MIN_REPRICE_INTERVAL_MS;
-          if (
-            SELL_REPRICE_ENABLED &&
-            EXIT_REFRESH_ENABLED &&
-            Number.isFinite(repriceDiffBps) &&
-            repriceDiffBps >= EXIT_REPRICE_THRESHOLD_BPS
-          ) {
-            if (!shouldCancelExitSell()) {
-              actionTaken = 'hold_existing_order';
-              reasonCode = 'policy_no_cancel_no_reprice';
-            } else if (repriceCooldownActive) {
+          if (SELL_REPRICE_ENABLED && shouldCancelExitSell()) {
+            if (repriceCooldownActive) {
               actionTaken = 'hold_existing_order';
               reasonCode = 'reprice_cooldown';
-            } else {
+            } else if (
+              Number.isFinite(awayBps) &&
+              (awayBps >= REPRICE_IF_AWAY_BPS ||
+                (Number.isFinite(existingOrderAgeMs) && existingOrderAgeMs >= REPRICE_TTL_MS))
+            ) {
               const canceled = await maybeCancelExitSell({
                 symbol,
                 orderId: state.sellOrderId || refreshOrder?.id || refreshOrder?.order_id,
-                reason: 'reprice_threshold',
+                reason: awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : 'reprice_ttl',
               });
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
-                limitPrice: desiredLimit,
-                reason: 'reprice_threshold',
+                limitPrice: finalLimit,
+                reason: awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : 'reprice_ttl',
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
               });
               if (!replacement?.skipped && replacement?.id) {
                 state.sellOrderId = replacement.id;
                 state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
+                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
                 actionTaken = 'reprice_cancel_replace';
-                reasonCode = 'reprice_threshold';
+                reasonCode = awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : 'reprice_ttl';
                 lastActionAt.set(symbol, now);
                 if (canceled) {
                   lastCancelReplaceAt.set(symbol, now);
@@ -5991,6 +5983,9 @@ async function manageExitStates() {
                 actionTaken = 'hold_existing_order';
                 reasonCode = replacement?.reason || 'reprice_threshold_skipped';
               }
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'no_reprice_needed';
             }
             const decisionPath = 'cancel_replace';
             logExitDecision({
@@ -6008,7 +6003,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -6024,10 +6019,14 @@ async function manageExitStates() {
               targetPrice,
               breakevenPrice,
               desiredLimit,
+              finalLimit,
+              currentLimit,
+              awayBps,
               decisionPath,
               lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: null,
               iocFilledQty: null,
@@ -6053,7 +6052,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             entryPrice: state.entryPrice,
             ...exitScanBase,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -6069,10 +6068,14 @@ async function manageExitStates() {
             targetPrice,
             breakevenPrice,
             desiredLimit,
+            finalLimit,
+            currentLimit,
+            awayBps,
             decisionPath,
             lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -6085,7 +6088,7 @@ async function manageExitStates() {
           const replacement = await submitLimitSell({
             symbol,
             qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
-            limitPrice: desiredLimit,
+            limitPrice: finalLimit,
             reason: 'place_gtc_tp',
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             openOrders: symbolOrders,
@@ -6095,7 +6098,7 @@ async function manageExitStates() {
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
             state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
             actionTaken = 'place_gtc_tp';
             reasonCode = 'place_gtc_tp';
             lastActionAt.set(symbol, now);
@@ -6119,7 +6122,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -6135,10 +6138,14 @@ async function manageExitStates() {
             targetPrice,
             breakevenPrice,
             desiredLimit,
+            finalLimit,
+            currentLimit,
+            awayBps,
             decisionPath,
             lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -6193,7 +6200,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -6213,6 +6220,7 @@ async function manageExitStates() {
               lastRepriceAgeMs: lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: null,
               iocFilledQty: null,
@@ -6240,7 +6248,7 @@ async function manageExitStates() {
           }
 
           if (Number.isFinite(fallbackBase)) {
-            const conservativeLimit = roundToTick(fallbackBase, tickSize, 'up');
+            const conservativeLimit = finalLimit;
             const replacement = await submitLimitSell({
               symbol,
               qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
@@ -6278,7 +6286,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -6294,10 +6302,14 @@ async function manageExitStates() {
               targetPrice,
               breakevenPrice,
               desiredLimit,
+              finalLimit,
+              currentLimit,
+              awayBps,
               decisionPath: 'stale_quote_fallback',
               lastRepriceAgeMs: lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: null,
               iocFilledQty: null,
@@ -6333,7 +6345,7 @@ async function manageExitStates() {
             entryPrice: state.entryPrice,
             entryPriceUsed,
             ...exitScanBase,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -6349,10 +6361,14 @@ async function manageExitStates() {
             targetPrice,
             breakevenPrice,
             desiredLimit,
+            finalLimit,
+            currentLimit,
+            awayBps,
             decisionPath: 'stale_quote_no_price',
             lastRepriceAgeMs: lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -6407,7 +6423,7 @@ async function manageExitStates() {
           const replacement = await submitLimitSell({
             symbol,
             qty: state.qty,
-            limitPrice: desiredLimit,
+            limitPrice: finalLimit,
             reason: 'missing_sell_order',
             intentRef: state.entryOrderId || getOrderIntentBucket(),
             postOnly: EXIT_POST_ONLY,
@@ -6417,7 +6433,7 @@ async function manageExitStates() {
           if (!replacement?.skipped && replacement?.id) {
             state.sellOrderId = replacement.id;
             state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? desiredLimit;
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
             actionTaken = 'recreate_limit_sell';
             reasonCode = 'missing_sell_order';
             lastActionAt.set(symbol, now);
@@ -6494,7 +6510,7 @@ async function manageExitStates() {
               heldQty: state.qty,
               ...exitScanBase,
               entryPrice: state.entryPrice,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -6514,6 +6530,7 @@ async function manageExitStates() {
               lastRepriceAgeMs: lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: requestedQty ?? null,
               iocFilledQty: filledQty ?? null,
@@ -6593,7 +6610,7 @@ async function manageExitStates() {
               entryPrice: state.entryPrice,
               entryPriceUsed,
               ...exitScanBase,
-              bookAnchoredLimit: makerDesiredLimit,
+              bookAnchoredLimit: desiredLimit,
               entryFloorTarget: targetPrice,
               requiredExitBps: requiredExitBpsFinal,
               spreadBps,
@@ -6613,6 +6630,7 @@ async function manageExitStates() {
               lastRepriceAgeMs: lastRepriceAgeMs,
               lastCancelReplaceAt: lastCancelReplaceAtMs,
               actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
               iocRequestedQty: requestedQty ?? null,
               iocFilledQty: filledQty ?? null,
@@ -6713,7 +6731,7 @@ async function manageExitStates() {
           entryPriceUsed,
           bid,
           ...exitScanBase,
-          bookAnchoredLimit: makerDesiredLimit,
+          bookAnchoredLimit: desiredLimit,
           entryFloorTarget: targetPrice,
           requiredExitBps: requiredExitBpsFinal,
           spreadBps,
@@ -6733,6 +6751,7 @@ async function manageExitStates() {
           lastRepriceAgeMs: loggedLastRepriceAgeMs,
           lastCancelReplaceAt: loggedLastCancelReplaceAt,
           actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
           reasonCode,
           iocRequestedQty: null,
           iocFilledQty: null,
@@ -6803,7 +6822,7 @@ async function manageExitStates() {
             heldQty: state.qty,
             ...exitScanBase,
             entryPrice: state.entryPrice,
-            bookAnchoredLimit: makerDesiredLimit,
+            bookAnchoredLimit: desiredLimit,
             entryFloorTarget: targetPrice,
             requiredExitBps: requiredExitBpsFinal,
             spreadBps,
@@ -6823,6 +6842,7 @@ async function manageExitStates() {
             lastRepriceAgeMs: loggedLastRepriceAgeMs,
             lastCancelReplaceAt: loggedLastCancelReplaceAt,
             actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -6890,7 +6910,7 @@ async function manageExitStates() {
           reasonCode = iocResult?.reason || 'taker_ioc_skipped';
           decisionPath = 'taker_ioc';
         }
-      } else if (askMeetsBreakeven && Number.isFinite(makerDesiredLimit)) {
+        } else if (askMeetsBreakeven && Number.isFinite(desiredLimit)) {
         let order;
         if (state.sellOrderId) {
           try {
@@ -6929,18 +6949,18 @@ async function manageExitStates() {
           const replacement = await submitLimitSell({
             symbol,
             qty: state.qty,
-            limitPrice: makerDesiredLimit,
-            reason: 'missing_sell_order',
-            intentRef: state.entryOrderId || getOrderIntentBucket(),
-            postOnly: EXIT_POST_ONLY,
-          });
-          if (!replacement?.skipped && replacement?.id) {
-            state.sellOrderId = replacement.id;
-            state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = makerDesiredLimit;
-            actionTaken = 'recreate_limit_sell';
-            reasonCode = 'maker_post_only';
-            decisionPath = 'maker_post_only';
+                limitPrice: finalLimit,
+                reason: 'missing_sell_order',
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                postOnly: EXIT_POST_ONLY,
+              });
+              if (!replacement?.skipped && replacement?.id) {
+                state.sellOrderId = replacement.id;
+                state.sellOrderSubmittedAt = Date.now();
+                state.sellOrderLimit = finalLimit;
+                actionTaken = 'recreate_limit_sell';
+                reasonCode = 'maker_post_only';
+                decisionPath = 'maker_post_only';
             lastActionAt.set(symbol, now);
           } else {
             actionTaken = 'hold_existing_order';
@@ -6970,7 +6990,7 @@ async function manageExitStates() {
           if (Number.isFinite(currentLimit)) {
             state.sellOrderLimit = currentLimit;
           }
-          const awayBps = computeAwayBps(currentLimit, makerDesiredLimit);
+          const awayBps = computeAwayBps(currentLimit, desiredLimit);
 
           if (SELL_REPRICE_ENABLED) {
             if (!shouldCancelExitSell()) {
@@ -6979,9 +6999,9 @@ async function manageExitStates() {
               decisionPath = 'policy_lock';
             } else if (
               existingOrderAgeMs != null &&
-              existingOrderAgeMs > SELL_ORDER_TTL_MS &&
+              existingOrderAgeMs >= REPRICE_TTL_MS &&
               Number.isFinite(awayBps) &&
-              awayBps > REPRICE_IF_AWAY_BPS &&
+              awayBps >= REPRICE_IF_AWAY_BPS &&
               !repriceCooldownActive
             ) {
               const canceled = await maybeCancelExitSell({
@@ -6992,7 +7012,7 @@ async function manageExitStates() {
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
-                limitPrice: makerDesiredLimit,
+                limitPrice: finalLimit,
                 reason: 'reprice_ttl',
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
@@ -7000,7 +7020,7 @@ async function manageExitStates() {
               if (replacement?.id) {
                 state.sellOrderId = replacement.id;
                 state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = makerDesiredLimit;
+                state.sellOrderLimit = finalLimit;
                 actionTaken = 'reprice_cancel_replace';
                 reasonCode = 'reprice_ttl';
                 decisionPath = 'reprice_ttl';
@@ -7013,15 +7033,15 @@ async function manageExitStates() {
                 reasonCode = replacement?.reason || 'reprice_ttl_skipped';
                 decisionPath = 'reprice_ttl';
               }
-            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs >= REPRICE_TTL_MS && repriceCooldownActive) {
               actionTaken = 'hold_existing_order';
               reasonCode = 'reprice_ttl_cooldown';
               decisionPath = 'reprice_ttl';
-            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs >= REPRICE_TTL_MS) {
               actionTaken = 'hold_existing_order';
               reasonCode = 'reprice_ttl_within_band';
               decisionPath = 'reprice_ttl';
-            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
+            } else if (Number.isFinite(awayBps) && awayBps >= REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
               const canceled = await maybeCancelExitSell({
                 symbol,
                 orderId: state.sellOrderId,
@@ -7030,7 +7050,7 @@ async function manageExitStates() {
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
-                limitPrice: makerDesiredLimit,
+                limitPrice: finalLimit,
                 reason: 'reprice_away',
                 intentRef: state.entryOrderId || getOrderIntentBucket(),
                 postOnly: EXIT_POST_ONLY,
@@ -7038,7 +7058,7 @@ async function manageExitStates() {
               if (replacement?.id) {
                 state.sellOrderId = replacement.id;
                 state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = makerDesiredLimit;
+                state.sellOrderLimit = finalLimit;
                 actionTaken = 'reprice_cancel_replace';
                 reasonCode = 'reprice_away';
                 decisionPath = 'reprice_away';
@@ -7051,7 +7071,7 @@ async function manageExitStates() {
                 reasonCode = replacement?.reason || 'reprice_away_skipped';
                 decisionPath = 'hold_within_band';
               }
-            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
+            } else if (Number.isFinite(awayBps) && awayBps >= REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
               actionTaken = 'hold_existing_order';
               reasonCode = 'reprice_cooldown';
               decisionPath = 'hold_within_band';
@@ -7246,7 +7266,7 @@ async function manageExitStates() {
         heldQty: state.qty,
         ...exitScanBase,
         entryPrice: state.entryPrice,
-        bookAnchoredLimit: makerDesiredLimit,
+        bookAnchoredLimit: desiredLimit,
         entryFloorTarget: targetPrice,
         requiredExitBps: requiredExitBpsFinal,
         spreadBps,
@@ -7266,6 +7286,7 @@ async function manageExitStates() {
         lastRepriceAgeMs: loggedLastRepriceAgeMs,
         lastCancelReplaceAt: loggedLastCancelReplaceAt,
         actionTaken,
+            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
         reasonCode,
         iocRequestedQty,
         iocFilledQty,
