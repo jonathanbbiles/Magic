@@ -799,6 +799,8 @@ const inFlightBySymbol = new Map();
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
+const AVG_ENTRY_CACHE_TTL_MS = 20000;
+const avgEntryPriceCache = new Map();
 const QUOTE_FAILURE_WINDOW_MS = 120000;
 const QUOTE_FAILURE_THRESHOLD = 3;
 const QUOTE_COOLDOWN_MS = 300000;
@@ -1786,6 +1788,8 @@ function logExitRepairDecision({
   symbol,
   qty,
   avgEntryPrice,
+  entryBasisType,
+  entryBasisValue,
   costBasis,
   bid,
   ask,
@@ -1800,6 +1804,8 @@ function logExitRepairDecision({
     symbol,
     qty,
     avgEntryPrice,
+    entryBasisType,
+    entryBasisValue,
     costBasis,
     bid,
     ask,
@@ -1832,6 +1838,50 @@ function readFlag(name, defaultValue = false) {
 function readNumber(name, fallback) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function parseAvgEntryPrice(position, symbol) {
+  if (!position) return null;
+  const avgEntryRaw = position?.avg_entry_price ?? position?.avgEntryPrice ?? null;
+  const avgEntry = Number(avgEntryRaw);
+  if (!Number.isFinite(avgEntry) || avgEntry <= 0) {
+    console.warn('alpaca_avg_entry_invalid', { symbol, avgEntryRaw, position });
+    return null;
+  }
+  return avgEntry;
+}
+
+function resolveEntryBasis({ avgEntryPrice, fallbackEntryPrice }) {
+  const avgEntry = Number(avgEntryPrice);
+  if (Number.isFinite(avgEntry) && avgEntry > 0) {
+    return { entryBasis: avgEntry, entryBasisType: 'alpaca_avg_entry' };
+  }
+  const fallback = Number(fallbackEntryPrice);
+  if (Number.isFinite(fallback) && fallback > 0) {
+    return { entryBasis: fallback, entryBasisType: 'fallback_local' };
+  }
+  return { entryBasis: null, entryBasisType: 'fallback_local' };
+}
+
+function computeAwayBps(currentLimit, desiredLimit) {
+  const current = Number(currentLimit);
+  const desired = Number(desiredLimit);
+  if (!Number.isFinite(current) || !Number.isFinite(desired) || desired <= 0) {
+    return null;
+  }
+  return Math.abs((current - desired) / desired) * 10000;
+}
+
+function applyMakerGuard(limitPrice, bid, tickSize) {
+  const limitNum = Number(limitPrice);
+  if (!Number.isFinite(limitNum)) {
+    return limitNum;
+  }
+  const bidNum = Number(bid);
+  if (Number.isFinite(bidNum) && Number.isFinite(tickSize) && tickSize > 0) {
+    return Math.max(limitNum, roundToTick(bidNum + tickSize, tickSize, 'up'));
+  }
+  return limitNum;
 }
 
 function updateInventoryFromBuy(symbol, qty, price) {
@@ -2500,6 +2550,30 @@ async function fetchPosition(symbol) {
     logPositionError({ symbol, statusCode, snippet, level: 'error' });
     throw err;
   }
+}
+
+async function getAvgEntryPriceFromAlpaca(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const nowMs = Date.now();
+  const cached = avgEntryPriceCache.get(normalized);
+  if (cached && nowMs - cached.fetchedAtMs < AVG_ENTRY_CACHE_TTL_MS) {
+    return cached.value;
+  }
+  let position = null;
+  try {
+    position = await fetchPosition(normalized);
+  } catch (err) {
+    console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
+    avgEntryPriceCache.set(normalized, { value: null, fetchedAtMs: nowMs });
+    return null;
+  }
+  if (!position) {
+    avgEntryPriceCache.set(normalized, { value: null, fetchedAtMs: nowMs });
+    return null;
+  }
+  const avgEntryPrice = parseAvgEntryPrice(position, normalized);
+  avgEntryPriceCache.set(normalized, { value: avgEntryPrice, fetchedAtMs: nowMs });
+  return avgEntryPrice;
 }
 
 async function fetchAsset(symbol) {
@@ -4280,7 +4354,6 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   const symbol = normalizeSymbol(rawSymbol);
   const entryPriceNum = Number(entryPrice);
   const qtyNum = Number(qty);
-  const notionalUsd = qtyNum * entryPriceNum;
 
   let entryOrderType = null;
   let entryPostOnly = null;
@@ -4325,15 +4398,20 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     console.warn('entry_spread_unknown', { symbol });
   }
 
+  const avgEntryPrice = await getAvgEntryPriceFromAlpaca(symbol);
+  const { entryBasis, entryBasisType } = resolveEntryBasis({
+    avgEntryPrice,
+    fallbackEntryPrice: entryPriceNum,
+  });
+  const entryPriceBasis = Number.isFinite(entryBasis) ? entryBasis : entryPriceNum;
+  const notionalUsd = qtyNum * entryPriceBasis;
   const entryFeeBps = inferEntryFeeBps({
     symbol,
     orderType: entryOrderType,
     postOnly: entryPostOnly,
   });
   const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-  const effectiveEntryPrice = Number.isFinite(maxFill)
-    ? maxFill
-    : (Number.isFinite(actualEntryFillPrice) ? actualEntryFillPrice : entryPriceNum);
+  const effectiveEntryPrice = entryPriceBasis;
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
   let desiredNetExitBpsValue = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
     ? desiredExitBpsBySymbol.get(symbol)
@@ -4357,7 +4435,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   }
   const exitPlan = computeUnifiedExitPlan({
     symbol,
-    entryPrice: entryPriceNum,
+    entryPrice: entryPriceBasis,
     effectiveEntryPrice,
     entryFeeBps,
     exitFeeBps,
@@ -4403,10 +4481,13 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
       }
     }
   }
+  initialLimit = applyMakerGuard(initialLimit, bookBid, exitPlan.tickSize);
 
   console.log('tp_attach_plan', {
     symbol,
-    entryPrice: entryPriceNum,
+    entryPrice: entryPriceBasis,
+    entryBasisType,
+    entryBasisValue: entryPriceBasis,
     effectiveEntryPrice,
     maxFillPriceUsed: Number.isFinite(maxFill) ? maxFill : null,
     actualEntryFillPrice,
@@ -4471,7 +4552,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   exitState.set(symbol, {
     symbol,
     qty: qtyNum,
-    entryPrice: entryPriceNum,
+    entryPrice: entryPriceBasis,
     effectiveEntryPrice,
     entryPriceUsed,
     maxFillPrice: Number.isFinite(maxFill) ? maxFill : null,
@@ -4500,7 +4581,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   logExitDecision({
     symbol,
     heldSeconds: 0,
-    entryPrice: entryPriceNum,
+    entryPrice: entryPriceBasis,
     targetPrice,
     bid: null,
     ask: null,
@@ -4745,7 +4826,13 @@ async function repairOrphanExits() {
     positionsChecked += 1;
     const symbol = normalizeSymbol(pos.symbol);
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
-    const avgEntryPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
+    const avgEntryPrice = parseAvgEntryPrice(pos, symbol);
+    const fallbackEntryPrice = exitState.get(symbol)?.entryPrice ?? null;
+    const { entryBasis, entryBasisType } = resolveEntryBasis({
+      avgEntryPrice,
+      fallbackEntryPrice,
+    });
+    const entryBasisValue = entryBasis;
     const costBasis = Number(pos.cost_basis ?? pos.costBasis ?? 0);
     const orderType = 'limit';
     const timeInForce = 'gtc';
@@ -4793,6 +4880,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -4814,6 +4903,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -4828,27 +4919,31 @@ async function repairOrphanExits() {
     }
 
     if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
-      decision = 'SKIP:missing_cost_basis';
-      skipped += 1;
-      exitsSkippedReasons.set('missing_cost_basis', (exitsSkippedReasons.get('missing_cost_basis') || 0) + 1);
-      logExitRepairDecision({
-        symbol,
-        qty,
-        avgEntryPrice,
-        costBasis,
-        bid,
-        ask,
-        targetPrice,
-        timeInForce,
-        orderType,
-        hasOpenSell,
-        gates: gateFlags,
-        decision,
-      });
-      continue;
+      if (!(Number.isFinite(entryBasisValue) && entryBasisValue > 0)) {
+        decision = 'SKIP:missing_cost_basis';
+        skipped += 1;
+        exitsSkippedReasons.set('missing_cost_basis', (exitsSkippedReasons.get('missing_cost_basis') || 0) + 1);
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          entryBasisType,
+          entryBasisValue,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
     }
 
-    const notionalUsd = qty * avgEntryPrice;
+    const notionalUsd = qty * entryBasisValue;
     const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
     const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
     const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
@@ -4862,8 +4957,9 @@ async function repairOrphanExits() {
     const requiredExitBps = feeBpsRoundTrip + fixedProfitBps;
     const minNetProfitBps = requiredExitBps;
     const netAfterFeesBps = EXIT_MODE === 'net_after_fees' ? EXIT_NET_PROFIT_AFTER_FEES_BPS : null;
-    const tickSize = getTickSize({ symbol, price: avgEntryPrice });
-    targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
+    const tickSize = getTickSize({ symbol, price: entryBasisValue });
+    targetPrice = computeTargetSellPrice(entryBasisValue, requiredExitBps, tickSize);
+    targetPrice = applyMakerGuard(targetPrice, bid, tickSize);
     const postOnly = EXIT_POST_ONLY;
 
     if (hasTrackedExit) {
@@ -4871,7 +4967,7 @@ async function repairOrphanExits() {
         const trackedState = exitState.get(symbol) || {};
         exitState.set(symbol, {
           ...trackedState,
-          effectiveEntryPrice: avgEntryPrice,
+          effectiveEntryPrice: entryBasisValue,
           requiredExitBps,
           minNetProfitBps,
           netAfterFeesBps,
@@ -4884,6 +4980,8 @@ async function repairOrphanExits() {
           symbol,
           qty,
           avgEntryPrice,
+          entryBasisType,
+          entryBasisValue,
           costBasis,
           bid,
           ask,
@@ -4902,6 +5000,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -4934,6 +5034,8 @@ async function repairOrphanExits() {
           symbol,
           qty,
           avgEntryPrice,
+          entryBasisType,
+          entryBasisValue,
           costBasis,
           bid,
           ask,
@@ -4954,6 +5056,8 @@ async function repairOrphanExits() {
           symbol,
           qty,
           avgEntryPrice,
+          entryBasisType,
+          entryBasisValue,
           costBasis,
           bid,
           ask,
@@ -4986,8 +5090,8 @@ async function repairOrphanExits() {
         exitState.set(symbol, {
           symbol,
           qty,
-          entryPrice: avgEntryPrice,
-          effectiveEntryPrice: avgEntryPrice,
+          entryPrice: entryBasisValue,
+          effectiveEntryPrice: entryBasisValue,
           entryTime: now,
           notionalUsd,
           minNetProfitBps,
@@ -5029,6 +5133,8 @@ async function repairOrphanExits() {
           symbol,
           qty,
           avgEntryPrice,
+          entryBasisType,
+          entryBasisValue,
           costBasis,
           bid,
           ask,
@@ -5051,6 +5157,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -5072,6 +5180,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -5093,6 +5203,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -5134,6 +5246,8 @@ async function repairOrphanExits() {
         symbol,
         qty,
         avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
         costBasis,
         bid,
         ask,
@@ -5149,7 +5263,9 @@ async function repairOrphanExits() {
 
     console.log('tp_attach_plan', {
       symbol,
-      entryPrice: avgEntryPrice,
+      entryPrice: entryBasisValue,
+      entryBasisType,
+      entryBasisValue,
       entryFeeBps,
       exitFeeBps,
       feeBpsRoundTrip,
@@ -5167,6 +5283,8 @@ async function repairOrphanExits() {
       symbol,
       qty,
       avgEntryPrice,
+      entryBasisType,
+      entryBasisValue,
       costBasis,
       bid,
       ask,
@@ -5425,14 +5543,16 @@ async function manageExitStates() {
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-        const exitEntryPrice = Number.isFinite(state.maxFillPrice)
-          ? state.maxFillPrice
-          : (Number.isFinite(state.actualEntryFillPrice)
-            ? state.actualEntryFillPrice
-            : (Number.isFinite(state.effectiveEntryPrice) ? state.effectiveEntryPrice : state.entryPrice));
+        const avgEntryPrice = await getAvgEntryPriceFromAlpaca(symbol);
+        const { entryBasis, entryBasisType } = resolveEntryBasis({
+          avgEntryPrice,
+          fallbackEntryPrice: state.entryPrice,
+        });
+        const entryBasisValue = Number.isFinite(entryBasis) ? entryBasis : state.entryPrice;
+        const exitEntryPrice = entryBasisValue;
         const exitPlan = computeUnifiedExitPlan({
           symbol,
-          entryPrice: Number.isFinite(state.entryPrice) ? state.entryPrice : exitEntryPrice,
+          entryPrice: exitEntryPrice,
           effectiveEntryPrice: exitEntryPrice,
           entryFeeBps,
           exitFeeBps,
@@ -5449,6 +5569,9 @@ async function manageExitStates() {
         const tickSize = exitPlan.tickSize;
         const targetPrice = exitPlan.targetPrice;
         const entryPriceUsed = exitPlan.entryPriceUsed;
+        if (Number.isFinite(entryBasisValue)) {
+          state.entryPrice = entryBasisValue;
+        }
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
@@ -5479,19 +5602,26 @@ async function manageExitStates() {
               })
             : null;
         const makerDesiredLimit = Number.isFinite(bookAnchored) ? bookAnchored : targetPrice;
-        const desiredLimit = makerDesiredLimit;
+        const desiredLimit = applyMakerGuard(makerDesiredLimit, bid, tickSize);
+        const marketToExitBps_from_entry =
+          Number.isFinite(desiredLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
+            ? ((desiredLimit - entryBasisValue) / entryBasisValue) * 10000
+            : null;
         const marketToExitBps =
           Number.isFinite(ask) && Number.isFinite(makerDesiredLimit) && ask > 0
             ? ((makerDesiredLimit - ask) / ask) * 10000
             : null;
         const exitScanBase = {
           entryPriceUsed,
+          entryBasisType,
+          entryBasisValue,
           bookAsk: ask,
           bookBid: bid,
           makerDesiredLimit,
           enforceEntryFloor: EXIT_ENFORCE_ENTRY_FLOOR,
           requiredExitBpsFinal,
           marketToExitBps,
+          marketToExitBps_from_entry,
         };
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
@@ -6840,10 +6970,7 @@ async function manageExitStates() {
           if (Number.isFinite(currentLimit)) {
             state.sellOrderLimit = currentLimit;
           }
-          const awayBps =
-            Number.isFinite(currentLimit) && Number.isFinite(makerDesiredLimit) && makerDesiredLimit > 0
-              ? Math.abs((currentLimit - makerDesiredLimit) / makerDesiredLimit) * 10000
-              : null;
+          const awayBps = computeAwayBps(currentLimit, makerDesiredLimit);
 
           if (SELL_REPRICE_ENABLED) {
             if (!shouldCancelExitSell()) {
@@ -6984,10 +7111,7 @@ async function manageExitStates() {
             if (Number.isFinite(currentLimit)) {
               state.sellOrderLimit = currentLimit;
             }
-            const awayBps =
-              Number.isFinite(currentLimit) && desiredLimit > 0
-                ? Math.abs((currentLimit - desiredLimit) / desiredLimit) * 10000
-                : null;
+            const awayBps = computeAwayBps(currentLimit, desiredLimit);
             if (SELL_REPRICE_ENABLED) {
               if (!shouldCancelExitSell()) {
                 actionTaken = 'hold_existing_order';
@@ -9041,5 +9165,8 @@ module.exports = {
   isInsufficientBalanceError,
   shouldCancelExitSell,
   computeBookAnchoredSellLimit,
+  computeTargetSellPrice,
+  resolveEntryBasis,
+  computeAwayBps,
 
 };

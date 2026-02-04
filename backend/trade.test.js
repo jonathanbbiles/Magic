@@ -112,4 +112,21 @@ assert.equal(
   130.98,
 );
 
+const tradeEntryBasis = loadTrade();
+const { resolveEntryBasis, computeTargetSellPrice, computeAwayBps } = tradeEntryBasis;
+
+const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
+assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
+assert.equal(resolvedEntry.entryBasis, 100);
+
+const desiredLimit = computeTargetSellPrice(resolvedEntry.entryBasis, 50, 0.01);
+assert.equal(desiredLimit, 100.5);
+
+const fallbackEntry = resolveEntryBasis({ avgEntryPrice: 0, fallbackEntryPrice: 101 });
+assert.equal(fallbackEntry.entryBasisType, 'fallback_local');
+assert.equal(fallbackEntry.entryBasis, 101);
+
+assert.equal(computeAwayBps(110, 100), 1000);
+assert.equal(computeAwayBps(90, 100), 1000);
+
 console.log('trade tests passed');
