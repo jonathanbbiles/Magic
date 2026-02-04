@@ -8,7 +8,13 @@ const {
   computeQuoteAgeMs,
   normalizeQuoteAgeMs,
 } = require('./quoteUtils');
-const { canonicalAsset, normalizePair, alpacaSymbol } = require('./symbolUtils');
+const {
+  canonicalAsset,
+  normalizePair,
+  alpacaSymbol,
+  normalizeSymbolInternal,
+  normalizeSymbolForAlpaca,
+} = require('./symbolUtils');
 const { predictOne } = require('./modules/predictor');
 const recorder = require('./modules/recorder');
 
@@ -815,6 +821,7 @@ const positionsSnapshot = {
   tsMs: 0,
   mapBySymbol: new Map(),
   mapByRaw: new Map(),
+  mapByNormalized: new Map(),
   loggedNoneSymbols: new Set(),
   pending: null,
 };
@@ -1277,18 +1284,25 @@ function logPositionError({ symbol, statusCode, snippet, level = 'error', extra 
 function updatePositionsSnapshot(positions = []) {
   const mapBySymbol = new Map();
   const mapByRaw = new Map();
+  const mapByNormalized = new Map();
   for (const pos of positions) {
     const rawSymbol = pos.rawSymbol ?? pos.symbol;
-    const normalizedSymbol = normalizeSymbol(rawSymbol);
+    const normalizedSymbol = normalizeSymbolInternal(rawSymbol);
+    const alpacaNormalized = normalizeSymbolForAlpaca(rawSymbol);
     if (rawSymbol) {
       mapByRaw.set(rawSymbol, pos);
     }
     if (normalizedSymbol) {
       mapBySymbol.set(normalizedSymbol, pos);
+      mapByNormalized.set(normalizedSymbol, pos);
+    }
+    if (alpacaNormalized) {
+      mapByNormalized.set(alpacaNormalized, pos);
     }
   }
   positionsSnapshot.mapBySymbol = mapBySymbol;
   positionsSnapshot.mapByRaw = mapByRaw;
+  positionsSnapshot.mapByNormalized = mapByNormalized;
   positionsSnapshot.tsMs = Date.now();
   positionsSnapshot.loggedNoneSymbols.clear();
 }
@@ -2491,8 +2505,8 @@ async function fetchPositions() {
     const normalized = positions.map((pos) => ({
       ...pos,
       rawSymbol: pos.symbol,
-      pairSymbol: normalizeSymbol(pos.symbol),
-      symbol: normalizeSymbol(pos.symbol),
+      pairSymbol: normalizeSymbolInternal(pos.symbol),
+      symbol: normalizeSymbolInternal(pos.symbol),
     }));
     updatePositionsSnapshot(normalized);
     positionsListCache.data = normalized;
@@ -2507,7 +2521,7 @@ async function fetchPositions() {
 }
 
 async function fetchPosition(symbol) {
-  const normalized = toTradeSymbol(symbol);
+  const normalized = normalizeSymbolForAlpaca(symbol);
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `positions/${encodeURIComponent(normalized)}`,
@@ -2559,51 +2573,76 @@ async function fetchPosition(symbol) {
 }
 
 async function getAvgEntryPriceFromAlpaca(symbol) {
-  const normalized = normalizeSymbol(symbol);
+  const normalized = normalizeSymbolInternal(symbol);
   const nowMs = Date.now();
   const cached = avgEntryPriceCache.get(normalized);
   if (cached && nowMs - cached.fetchedAtMs < AVG_ENTRY_CACHE_TTL_MS) {
     return cached.value;
   }
-  let position = null;
-  try {
-    position = await fetchPosition(normalized);
-  } catch (err) {
-    console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
+  const { avgEntryPrice } = await getAvgEntryPriceInfoFromAlpaca(symbol);
+  if (avgEntryPrice == null) {
     avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
-    return null;
   }
-  if (!position) {
-    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
-    return null;
-  }
-  const avgEntryRaw = extractAvgEntryRaw(position);
-  const avgEntryPrice = parseAvgEntryPrice(position, normalized);
-  avgEntryPriceCache.set(normalized, { value: avgEntryPrice, raw: avgEntryRaw, fetchedAtMs: nowMs });
   return avgEntryPrice;
 }
 
 async function getAvgEntryPriceInfoFromAlpaca(symbol) {
-  const normalized = normalizeSymbol(symbol);
+  const normalized = normalizeSymbolInternal(symbol);
+  const alpacaSymbolTried = normalizeSymbolForAlpaca(symbol);
   const nowMs = Date.now();
   const cached = avgEntryPriceCache.get(normalized);
   if (cached && nowMs - cached.fetchedAtMs < AVG_ENTRY_CACHE_TTL_MS) {
     return { avgEntryPrice: cached.value, avgEntryPriceRaw: cached.raw ?? null };
   }
   let position = null;
+  let endpointUsed = 'list_positions';
+  let positionsKeysSample = null;
   try {
-    position = await fetchPosition(normalized);
+    const snapshot = await fetchPositionsSnapshot();
+    const keySet = snapshot.mapByNormalized;
+    positionsKeysSample = Array.from(keySet.keys()).slice(0, 8);
+    position = keySet.get(normalized) || keySet.get(alpacaSymbolTried) || null;
   } catch (err) {
-    console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
-    avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
-    return { avgEntryPrice: null, avgEntryPriceRaw: null };
+    console.warn('alpaca_avg_entry_list_failed', { symbol: normalized, error: err?.message || err });
   }
   if (!position) {
+    endpointUsed = 'positions_single';
+    try {
+      position = await fetchPosition(alpacaSymbolTried || normalized);
+    } catch (err) {
+      console.warn('alpaca_avg_entry_fetch_failed', { symbol: normalized, error: err?.message || err });
+      avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
+      return { avgEntryPrice: null, avgEntryPriceRaw: null };
+    }
+  }
+  if (!position) {
+    console.warn('alpaca_avg_entry_missing', {
+      symbol,
+      internalSymbol: normalized,
+      alpacaSymbolTried,
+      positionsKeysSample,
+      endpointUsed,
+    });
     avgEntryPriceCache.set(normalized, { value: null, raw: null, fetchedAtMs: nowMs });
     return { avgEntryPrice: null, avgEntryPriceRaw: null };
   }
   const avgEntryPriceRaw = extractAvgEntryRaw(position);
   const avgEntryPrice = parseAvgEntryPrice(position, normalized);
+  if (avgEntryPriceRaw == null) {
+    console.warn('alpaca_avg_entry_missing', {
+      symbol,
+      internalSymbol: normalized,
+      alpacaSymbolTried,
+      positionsKeysSample,
+      endpointUsed,
+    });
+  } else if (Number.isFinite(avgEntryPrice) && avgEntryPrice > 0) {
+    console.log('alpaca_avg_entry_found', {
+      symbol,
+      avgEntryPriceRaw,
+      entryBasisType: 'alpaca_avg_entry',
+    });
+  }
   avgEntryPriceCache.set(normalized, { value: avgEntryPrice, raw: avgEntryPriceRaw, fetchedAtMs: nowMs });
   return { avgEntryPrice, avgEntryPriceRaw };
 }

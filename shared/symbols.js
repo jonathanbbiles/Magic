@@ -33,6 +33,14 @@ function toInternalSymbol(rawSymbol) {
   return normalizePair(rawSymbol);
 }
 
+function normalizeSymbolInternal(rawSymbol) {
+  return normalizePair(rawSymbol);
+}
+
+function normalizeSymbolForAlpaca(rawSymbol) {
+  return toAlpacaSymbol(rawSymbol);
+}
+
 function toAlpacaCryptoSymbol(rawSymbol) {
   return normalizePair(rawSymbol);
 }
@@ -65,6 +73,8 @@ const exportsObject = {
   toAlpacaSymbol,
   alpacaSymbol,
   toInternalSymbol,
+  normalizeSymbolInternal,
+  normalizeSymbolForAlpaca,
   toAlpacaCryptoSymbol,
   normalizeCryptoSymbol,
   toTradeSymbol,

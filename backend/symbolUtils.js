@@ -4,6 +4,8 @@ const {
   normalizePair,
   toAlpacaSymbol,
   alpacaSymbol,
+  normalizeSymbolInternal,
+  normalizeSymbolForAlpaca,
 } = require('../shared/symbols');
 
 module.exports = {
@@ -12,4 +14,6 @@ module.exports = {
   normalizePair,
   toAlpacaSymbol,
   alpacaSymbol,
+  normalizeSymbolInternal,
+  normalizeSymbolForAlpaca,
 };
