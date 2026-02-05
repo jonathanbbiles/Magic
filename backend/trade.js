@@ -246,6 +246,8 @@ const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
 const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
 const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.7);
+const MIN_EXPECTED_VALUE_BPS = readNumber('MIN_EXPECTED_VALUE_BPS', 5);
+const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
@@ -753,11 +755,108 @@ async function computeEntrySignal(symbol) {
   };
 
   if (predictor.probability < MIN_PROB_TO_ENTER) {
-    console.log('predictor_gate_disabled', {
+    logEntrySkip({
       symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'predictor_gate',
       probability: predictor.probability,
       minProbToEnter: MIN_PROB_TO_ENTER,
     });
+    return {
+      entryReady: false,
+      why: 'predictor_gate',
+      meta: {
+        symbol: asset.symbol,
+        probability: predictor.probability,
+        minProbToEnter: MIN_PROB_TO_ENTER,
+      },
+      record: baseRecord,
+    };
+  }
+
+  const p = clamp(Number(predictor.probability) || 0, 0, 1);
+  const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
+  const feesRoundTripBps = 2 * takerFeeBps;
+  const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
+  const costBps = feesRoundTripBps + spreadCostBps;
+  const grossWinBps = TARGET_PROFIT_BPS;
+  const grossLossBps = STOP_LOSS_BPS;
+  const netWinBps = grossWinBps - costBps;
+  const netLossBps = grossLossBps + costBps;
+  const minExpectedValueBps = MIN_EXPECTED_VALUE_BPS + EV_BUFFER_BPS;
+
+  if (netWinBps <= 0) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'ev_gate_netwin_le_zero',
+      p,
+      netWinBps,
+      netLossBps,
+      costBps,
+      minExpectedValueBps,
+    });
+    return {
+      entryReady: false,
+      why: 'ev_gate_netwin_le_zero',
+      meta: {
+        symbol: asset.symbol,
+        p,
+        netWinBps,
+        netLossBps,
+        costBps,
+        minExpectedValueBps,
+      },
+      record: baseRecord,
+    };
+  }
+
+  const evBps = (p * netWinBps) - ((1 - p) * netLossBps);
+  const breakevenP = netLossBps / (netWinBps + netLossBps);
+  console.log('entry_ev_gate', {
+    symbol: asset.symbol,
+    spreadBps,
+    requiredEdgeBps,
+    p,
+    breakevenP,
+    netWinBps,
+    netLossBps,
+    costBps,
+    evBps,
+    minExpectedValueBps,
+  });
+
+  if (evBps < minExpectedValueBps) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'ev_gate',
+      p,
+      breakevenP,
+      netWinBps,
+      netLossBps,
+      costBps,
+      evBps,
+      minExpectedValueBps,
+    });
+    return {
+      entryReady: false,
+      why: 'ev_gate',
+      meta: {
+        symbol: asset.symbol,
+        p,
+        breakevenP,
+        netWinBps,
+        netLossBps,
+        costBps,
+        evBps,
+        minExpectedValueBps,
+      },
+      record: baseRecord,
+    };
   }
 
   const desiredNetExitBpsForV22 = DESIRED_NET_PROFIT_BASIS_POINTS;
@@ -890,12 +989,13 @@ function logEntryDecision({ symbol, spreadBps, requiredEdgeBps }) {
   });
 }
 
-function logEntrySkip({ symbol, spreadBps, requiredEdgeBps, reason }) {
+function logEntrySkip({ symbol, spreadBps, requiredEdgeBps, reason, ...extra }) {
   console.log('entry_skip', {
     symbol,
     spreadBps,
     requiredEdgeBps,
     reason: reason || 'profit_gate',
+    ...extra,
   });
 }
 
