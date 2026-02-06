@@ -731,15 +731,27 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   const barKey = normalizeSymbol(asset.symbol);
   const barSeries1m =
-    bars1m?.bars?.[barKey] || bars1m?.bars?.[normalizePair(barKey)] || [];
+    bars1m?.bars?.[barKey] ||
+    bars1m?.bars?.[normalizePair(barKey)] ||
+    bars1m?.bars?.[alpacaSymbol(barKey)] ||
+    bars1m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
+    [];
   const closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
     Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
   ).filter((value) => Number.isFinite(value) && value > 0);
 
   const barSeries5m =
-    bars5m?.bars?.[barKey] || bars5m?.bars?.[normalizePair(barKey)] || [];
+    bars5m?.bars?.[barKey] ||
+    bars5m?.bars?.[normalizePair(barKey)] ||
+    bars5m?.bars?.[alpacaSymbol(barKey)] ||
+    bars5m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
+    [];
   const barSeries15m =
-    bars15m?.bars?.[barKey] || bars15m?.bars?.[normalizePair(barKey)] || [];
+    bars15m?.bars?.[barKey] ||
+    bars15m?.bars?.[normalizePair(barKey)] ||
+    bars15m?.bars?.[alpacaSymbol(barKey)] ||
+    bars15m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
+    [];
 
   let predictor;
   try {
@@ -7665,7 +7677,14 @@ function buildBarsMapFromBatch(symbols, barsResp) {
     const normalizedSymbol = normalizeSymbol(symbol);
     if (!normalizedSymbol) continue;
     const dataSymbol = toDataSymbol(normalizedSymbol);
-    const series = bars?.[dataSymbol] || bars?.[normalizedSymbol] || bars?.[normalizePair(dataSymbol)] || [];
+    const series =
+      bars?.[dataSymbol] ||
+      bars?.[normalizedSymbol] ||
+      bars?.[alpacaSymbol(dataSymbol)] ||
+      bars?.[alpacaSymbol(normalizedSymbol)] ||
+      bars?.[normalizePair(dataSymbol)] ||
+      bars?.[normalizePair(alpacaSymbol(dataSymbol))] ||
+      [];
     barsBySymbol.set(normalizedSymbol, Array.isArray(series) ? series : []);
   }
   return barsBySymbol;
