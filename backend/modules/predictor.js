@@ -200,18 +200,32 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
     const histNotStronglyNegative5m =
       Number.isFinite(hist5m) &&
       (hist5m >= 0 || hist5m > -Math.abs(Number(macd1m?.histogram) || 0) * 0.5);
-    const momentumScore = histPositive1m && histSlopePositive1m && histNotStronglyNegative5m ? 1 : 0;
+    const momentumScore = clamp(
+      0.4 * (histPositive1m ? 1 : 0) +
+        0.3 * (histSlopePositive1m ? 1 : 0) +
+        0.3 * (histNotStronglyNegative5m ? 1 : 0),
+      0,
+      1,
+    );
 
-    const meanReversionScore =
-      (Number.isFinite(zscore1m) && zscore1m <= -2) ||
-      (Number.isFinite(zscore5m) && zscore5m <= -2)
-        ? histSlopePositive1m
-          ? 1
-          : 0
-        : 0;
+    const zMin = Math.min(
+      Number.isFinite(zscore1m) ? zscore1m : 0,
+      Number.isFinite(zscore5m) ? zscore5m : 0,
+    );
+    // start credit around -1.5, full credit by -3.0
+    const oversoldScore = clamp(((-zMin) - 1.5) / 1.5, 0, 1);
+    const meanReversionScore = clamp(
+      0.7 * oversoldScore + 0.3 * (histSlopePositive1m ? 1 : 0),
+      0,
+      1,
+    );
 
     const volumeTrendMin = Number(marketContext?.volumeTrendMin ?? 1.1);
-    const volumeConfirm = Number.isFinite(volumeTrend1m) && volumeTrend1m >= volumeTrendMin ? 1 : 0;
+    const volumeConfirm = clamp(
+      (Number.isFinite(volumeTrend1m) ? volumeTrend1m : 0) / Math.max(1e-6, volumeTrendMin),
+      0,
+      1,
+    );
 
     const confirmationRequired = Math.max(1, Number(marketContext?.timeframeConfirmations ?? 2));
     const timeframeChecks = {
@@ -229,7 +243,11 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
           : Number.isFinite(hist15m) && hist15m > 0,
     };
     const confirmationCount = Object.values(timeframeChecks).filter(Boolean).length;
-    const multiTimeframeConfirm = confirmationCount >= confirmationRequired ? 1 : 0;
+    const multiTimeframeConfirm = clamp(
+      confirmationCount / Math.max(1, confirmationRequired),
+      0,
+      1,
+    );
 
     const orderbookSignals = computeOrderbookSignals(orderbook, marketContext);
     const imbalanceScore = clamp(0.5 + (Number(orderbookSignals.imbalance) || 0) / 2, 0, 1);
@@ -237,11 +255,11 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
     const branchScore = regime === 'mean_reversion' ? meanReversionScore : momentumScore;
     const probabilityRaw =
       0.05 +
-      0.35 * branchScore +
+      0.45 * branchScore +
       0.2 * multiTimeframeConfirm +
       0.15 * volumeConfirm +
-      0.2 * orderbookSignals.liquidityScore +
-      0.05 * imbalanceScore;
+      0.1 * orderbookSignals.liquidityScore +
+      0.1 * imbalanceScore;
     const probability = clamp(probabilityRaw, 0, 1);
 
     const predictorFallbackDefaults = branchScore === 0 && multiTimeframeConfirm === 0 && volumeConfirm === 0;
