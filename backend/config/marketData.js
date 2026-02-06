@@ -9,7 +9,7 @@ const MARKET_DATA_RETRIES = Math.max(0, Math.floor(readNumber('MARKET_DATA_RETRI
 const ORDERBOOK_RETRY_ATTEMPTS = Math.max(1, Math.floor(readNumber('ORDERBOOK_RETRY_ATTEMPTS', 3)));
 const ORDERBOOK_RETRY_BACKOFF_MS = [200, 500, 1200];
 
-const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.55);
+const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.53);
 
 module.exports = {
   MARKET_DATA_TIMEOUT_MS,

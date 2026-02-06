@@ -265,6 +265,26 @@ const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
 
+let printedConfigOnce = false;
+function printConfigOnce() {
+  if (printedConfigOnce) return;
+  printedConfigOnce = true;
+  console.log('runtime_config', {
+    MIN_PROB_TO_ENTER,
+    EV_GUARD_ENABLED,
+    EV_MIN_BPS,
+    EV_BUFFER_BPS,
+    TARGET_PROFIT_BPS,
+    STOP_LOSS_BPS,
+    ENTRY_BUFFER_BPS,
+    FEE_BPS_MAKER,
+    FEE_BPS_TAKER,
+    feeBpsRoundTrip: feeBpsRoundTrip(),
+    SLIPPAGE_BPS,
+    TAKER_EXIT_ON_TOUCH,
+  });
+}
+
 function getEffectiveMaxConcurrentPositions() {
   const n = Number(MAX_CONCURRENT_POSITIONS);
   if (!Number.isFinite(n) || n <= 0) return Number.POSITIVE_INFINITY;
@@ -850,10 +870,12 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   if (EV_GUARD_ENABLED) {
     const p = clamp(Number(predictor.probability) || 0, 0, 1);
-    const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
-    const feesRoundTripBps = 2 * takerFeeBps;
+    // Use the same fee model used everywhere else (maker-first unless taker-on-touch is enabled).
+    const feesRoundTripBps = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : 0;
     const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
-    const costBps = feesRoundTripBps + spreadCostBps;
+    // Optional slippage cost (bps). Default 0 unless user sets SLIPPAGE_BPS.
+    const slipBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : 0;
+    const costBps = feesRoundTripBps + spreadCostBps + slipBps;
     const grossWinBps = TARGET_PROFIT_BPS;
     const grossLossBps = STOP_LOSS_BPS;
     const netWinBps = grossWinBps - costBps;
@@ -869,6 +891,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         p,
         netWinBps,
         netLossBps,
+        feeBpsRoundTrip: feesRoundTripBps,
+        slippageBps: slipBps,
         costBps,
         minExpectedValueBps,
       });
@@ -897,6 +921,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       breakevenP,
       netWinBps,
       netLossBps,
+      feeBpsRoundTrip: feesRoundTripBps,
+      slippageBps: slipBps,
       costBps,
       evBps,
       minExpectedValueBps,
@@ -912,6 +938,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         breakevenP,
         netWinBps,
         netLossBps,
+        feeBpsRoundTrip: feesRoundTripBps,
+        slippageBps: slipBps,
         costBps,
         evBps,
         minExpectedValueBps,
@@ -1049,9 +1077,11 @@ function logSkip(reason, details = {}) {
 }
 
 function computeRequiredEntryEdgeBps() {
-  const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
+  // This threshold is used as a *max spread* gate.
+  // It must be consistent with the fee model actually used for round-trip execution.
+  const feesRoundTripBps = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : 0;
   const entryBufferBps = Number.isFinite(ENTRY_BUFFER_BPS) ? ENTRY_BUFFER_BPS : 0;
-  return TARGET_PROFIT_BPS + (2 * takerFeeBps) + entryBufferBps;
+  return TARGET_PROFIT_BPS + feesRoundTripBps + entryBufferBps;
 }
 
 function logEntryDecision({ symbol, spreadBps, requiredEdgeBps }) {
@@ -5974,7 +6004,10 @@ async function manageExitStates() {
         if (tradeGate.skip) {
           actionTaken = 'hold_existing_order';
           reasonCode = tradeGate.reasonCode;
-          const decisionPath = tradeGate.reasonCode;
+          const decisionPath =
+            actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice'
+              ? 'cancel_replace'
+              : 'hold_existing_order';
           logExitDecision({
             symbol,
             heldSeconds,
@@ -6011,7 +6044,7 @@ async function manageExitStates() {
             lastRepriceAgeMs,
             lastCancelReplaceAt: lastCancelReplaceAtMs,
             actionTaken,
-            action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
+            action: decisionPath === 'cancel_replace' ? 'cancel_replace' : 'hold',
             reasonCode,
             iocRequestedQty: null,
             iocFilledQty: null,
@@ -7767,6 +7800,7 @@ async function prefetchEntryScanMarketData(scanSymbols) {
 }
 
 async function runEntryScanOnce() {
+  printConfigOnce();
   if (entryScanRunning) return;
   entryScanRunning = true;
   try {
