@@ -684,15 +684,27 @@ async function computeEntrySignal(symbol, opts = {}) {
   const bars1mBySymbol = opts?.prefetchedBars?.bars1mBySymbol;
   const bars5mBySymbol = opts?.prefetchedBars?.bars5mBySymbol;
   const bars15mBySymbol = opts?.prefetchedBars?.bars15mBySymbol;
-  const hasPrefetchedBars =
+
+  const hasPrefetchedBarsMaps =
     bars1mBySymbol instanceof Map &&
     bars5mBySymbol instanceof Map &&
     bars15mBySymbol instanceof Map;
 
-  if (hasPrefetchedBars) {
-    bars1m = { bars: { [asset.symbol]: bars1mBySymbol.get(asset.symbol) || [] } };
-    bars5m = { bars: { [asset.symbol]: bars5mBySymbol.get(asset.symbol) || [] } };
-    bars15m = { bars: { [asset.symbol]: bars15mBySymbol.get(asset.symbol) || [] } };
+  // Only use prefetched bars if they are actually present for THIS symbol.
+  // If not, fall back to per-symbol fetch (prevents mass predictor_error: insufficient_bars_*).
+  const prefSeries1m = hasPrefetchedBarsMaps ? bars1mBySymbol.get(asset.symbol) : null;
+  const prefSeries5m = hasPrefetchedBarsMaps ? bars5mBySymbol.get(asset.symbol) : null;
+  const prefSeries15m = hasPrefetchedBarsMaps ? bars15mBySymbol.get(asset.symbol) : null;
+
+  const canUsePrefetchedBarsForSymbol =
+    Array.isArray(prefSeries1m) && prefSeries1m.length > 0 &&
+    Array.isArray(prefSeries5m) && prefSeries5m.length > 0 &&
+    Array.isArray(prefSeries15m) && prefSeries15m.length > 0;
+
+  if (canUsePrefetchedBarsForSymbol) {
+    bars1m = { bars: { [asset.symbol]: prefSeries1m } };
+    bars5m = { bars: { [asset.symbol]: prefSeries5m } };
+    bars15m = { bars: { [asset.symbol]: prefSeries15m } };
   } else {
     try {
       [bars1m, bars5m, bars15m] = await Promise.all([
