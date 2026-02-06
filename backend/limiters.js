@@ -56,18 +56,32 @@ const QUOTE_MIN_TIME_MS = (() => {
   return Number.isFinite(value) && value >= 0 ? value : 120;
 })();
 
+// BARS limiter (market-data bars endpoint is the one hitting 429 most often)
+const BARS_MAX_CONCURRENT = (() => {
+  const value = Number(process.env.BARS_MAX_CONCURRENT);
+  return Number.isFinite(value) && value > 0 ? value : 2;
+})();
+
+const BARS_MIN_TIME_MS = (() => {
+  const value = Number(process.env.BARS_MIN_TIME_MS);
+  return Number.isFinite(value) && value >= 0 ? value : 300;
+})();
+
 const alpacaLimiter = createLimiter('alpaca', 3, ALPACA_MIN_TIME_MS);
 const quoteLimiter = createLimiter('quotes', 3, QUOTE_MIN_TIME_MS);
+const barsLimiter = createLimiter('bars', BARS_MAX_CONCURRENT, BARS_MIN_TIME_MS);
 
 function getLimiterStatus() {
   return {
     alpaca: alpacaLimiter.status(),
     quotes: quoteLimiter.status(),
+    bars: barsLimiter.status(),
   };
 }
 
 module.exports = {
   alpacaLimiter,
   quoteLimiter,
+  barsLimiter,
   getLimiterStatus,
 };

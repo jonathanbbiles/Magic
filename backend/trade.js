@@ -24,6 +24,7 @@ const {
 } = require('./symbolUtils');
 const { predictOne } = require('./modules/predictor');
 const recorder = require('./modules/recorder');
+const { alpacaLimiter, quoteLimiter, barsLimiter } = require('./limiters');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -204,7 +205,9 @@ const PUP_MIN = readNumber('PUP_MIN', 0.65);
 const MAX_REQUIRED_GROSS_EXIT_BPS = readNumber('MAX_REQUIRED_GROSS_EXIT_BPS', 160);
 const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
-const ENTRY_PREFETCH_CHUNK_SIZE = readNumber('ENTRY_PREFETCH_CHUNK_SIZE', 80);
+const chunkSizeEnv = Number(process.env.ENTRY_PREFETCH_CHUNK_SIZE);
+const ENTRY_PREFETCH_CHUNK_SIZE =
+  Number.isFinite(chunkSizeEnv) ? Math.max(10, chunkSizeEnv) : 80;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const MAX_HOLD_SECONDS = readNumber('MAX_HOLD_SECONDS', 180);
@@ -1371,12 +1374,16 @@ async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', time
     throw err;
   }
 
-  const result = await httpJson({
-    method,
-    url: parsedUrl.url,
-    headers: alpacaHeaders(),
-    timeoutMs,
-    retries,
+  const limiter = type === 'BARS' ? barsLimiter : alpacaLimiter;
+
+  const result = await limiter.schedule(async () => {
+    return await httpJson({
+      method,
+      url: parsedUrl.url,
+      headers: alpacaHeaders(),
+      timeoutMs,
+      retries,
+    });
   });
 
   if (result.error) {
@@ -7703,7 +7710,7 @@ async function prefetchEntryScanMarketData(scanSymbols) {
     };
   }
 
-  const chunkSize = Math.max(1, Number(ENTRY_PREFETCH_CHUNK_SIZE) || 80);
+  const chunkSize = ENTRY_PREFETCH_CHUNK_SIZE;
   const chunks = chunkArray(symbols, chunkSize);
   const bars1mBySymbol = new Map();
   const bars5mBySymbol = new Map();
