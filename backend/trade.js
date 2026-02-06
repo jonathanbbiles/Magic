@@ -204,6 +204,7 @@ const PUP_MIN = readNumber('PUP_MIN', 0.65);
 const MAX_REQUIRED_GROSS_EXIT_BPS = readNumber('MAX_REQUIRED_GROSS_EXIT_BPS', 160);
 const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
+const ENTRY_PREFETCH_CHUNK_SIZE = readNumber('ENTRY_PREFETCH_CHUNK_SIZE', 80);
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const MAX_HOLD_SECONDS = readNumber('MAX_HOLD_SECONDS', 180);
@@ -515,7 +516,7 @@ function microMetrics({ mid, prevMid, spreadBps }) {
   };
 }
 
-async function computeEntrySignal(symbol) {
+async function computeEntrySignal(symbol, opts = {}) {
   const asset = { symbol: normalizeSymbol(symbol) };
   const requiredEdgeBps = computeRequiredEntryEdgeBps();
   const configSnapshot = {
@@ -680,13 +681,26 @@ async function computeEntrySignal(symbol) {
   let bars1m;
   let bars5m;
   let bars15m;
-  try {
-    [bars1m, bars5m, bars15m] = await Promise.all([
-      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '1Min' }),
-      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '5Min' }),
-      fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '15Min' }),
-    ]);
-  } catch (err) {
+  const bars1mBySymbol = opts?.prefetchedBars?.bars1mBySymbol;
+  const bars5mBySymbol = opts?.prefetchedBars?.bars5mBySymbol;
+  const bars15mBySymbol = opts?.prefetchedBars?.bars15mBySymbol;
+  const hasPrefetchedBars =
+    bars1mBySymbol instanceof Map &&
+    bars5mBySymbol instanceof Map &&
+    bars15mBySymbol instanceof Map;
+
+  if (hasPrefetchedBars) {
+    bars1m = { bars: { [asset.symbol]: bars1mBySymbol.get(asset.symbol) || [] } };
+    bars5m = { bars: { [asset.symbol]: bars5mBySymbol.get(asset.symbol) || [] } };
+    bars15m = { bars: { [asset.symbol]: bars15mBySymbol.get(asset.symbol) || [] } };
+  } else {
+    try {
+      [bars1m, bars5m, bars15m] = await Promise.all([
+        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '1Min' }),
+        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '5Min' }),
+        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '15Min' }),
+      ]);
+    } catch (err) {
     console.warn('predictor_error', {
       symbol: asset.symbol,
       reason: 'bars_fetch_failed',
@@ -694,12 +708,13 @@ async function computeEntrySignal(symbol) {
       errorMessage: err?.message || String(err),
       stack: String(err?.stack || '').slice(0, 600),
     });
-    return {
-      entryReady: false,
-      why: 'predictor_error',
-      meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
-      record: baseRecord,
-    };
+      return {
+        entryReady: false,
+        why: 'predictor_error',
+        meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
+        record: baseRecord,
+      };
+    }
   }
 
   const barKey = normalizeSymbol(asset.symbol);
@@ -7559,6 +7574,151 @@ async function manageExitStates() {
   }
 }
 
+
+function chunkArray(items, chunkSize) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const safeChunkSize = Math.max(1, Number(chunkSize) || 1);
+  const chunks = [];
+  for (let index = 0; index < items.length; index += safeChunkSize) {
+    chunks.push(items.slice(index, index + safeChunkSize));
+  }
+  return chunks;
+}
+
+function warmQuoteCacheFromBatch(symbols, quotesResp) {
+  if (!Array.isArray(symbols) || symbols.length === 0) return;
+  const quotes = quotesResp?.quotes;
+  if (!quotes || typeof quotes !== 'object') return;
+  const nowMs = Date.now();
+  for (const symbol of symbols) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    if (!normalizedSymbol) continue;
+    const dataSymbol = toDataSymbol(normalizedSymbol);
+    const rawQuote = quotes?.[dataSymbol] || quotes?.[normalizedSymbol] || quotes?.[normalizePair(dataSymbol)] || null;
+    if (!rawQuote) continue;
+    const bid = Number(rawQuote.bp ?? rawQuote.bid_price ?? rawQuote.bid);
+    const ask = Number(rawQuote.ap ?? rawQuote.ask_price ?? rawQuote.ask);
+    if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) continue;
+    const tsMs = parseQuoteTimestamp({ quote: rawQuote, symbol: normalizedSymbol, source: 'alpaca_quote_prefetch' });
+    quoteCache.set(normalizedSymbol, {
+      bid,
+      ask,
+      mid: (bid + ask) / 2,
+      tsMs: Number.isFinite(tsMs) ? tsMs : nowMs,
+      receivedAtMs: nowMs,
+      source: 'alpaca_prefetch',
+    });
+  }
+}
+
+function warmOrderbookCacheFromBatch(symbols, orderbooksResp) {
+  if (!Array.isArray(symbols) || symbols.length === 0) return;
+  const orderbooks = orderbooksResp?.orderbooks;
+  if (!orderbooks || typeof orderbooks !== 'object') return;
+  const nowMs = Date.now();
+  for (const symbol of symbols) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    if (!normalizedSymbol) continue;
+    const key = toDataSymbol(normalizedSymbol);
+    const book = orderbooks?.[key] || orderbooks?.[normalizePair(key)] || orderbooks?.[normalizedSymbol] || null;
+    if (!book) continue;
+    const asks = Array.isArray(book?.a) ? book.a : [];
+    const bids = Array.isArray(book?.b) ? book.b : [];
+    if (!asks.length || !bids.length) continue;
+    const priceOf = (level) => Number(level?.p ?? level?.price);
+    const sortedAsks = [...asks].sort((a, b) => priceOf(a) - priceOf(b));
+    const sortedBids = [...bids].sort((a, b) => priceOf(b) - priceOf(a));
+    const bestAsk = priceOf(sortedAsks?.[0]);
+    const bestBid = priceOf(sortedBids?.[0]);
+    if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) continue;
+    const { tsMs: parsedTsMs } = normalizeOrderbookTimestampMs(book, orderbooksResp);
+    orderbookCache.set(normalizedSymbol, {
+      asks: sortedAsks,
+      bids: sortedBids,
+      bestAsk,
+      bestBid,
+      tsMs: Number.isFinite(parsedTsMs) ? parsedTsMs : nowMs,
+      tsFallbackUsed: !Number.isFinite(parsedTsMs),
+      receivedAtMs: nowMs,
+      source: 'alpaca_prefetch',
+    });
+  }
+}
+
+function buildBarsMapFromBatch(symbols, barsResp) {
+  const barsBySymbol = new Map();
+  if (!Array.isArray(symbols) || symbols.length === 0) return barsBySymbol;
+  const bars = barsResp?.bars;
+  for (const symbol of symbols) {
+    const normalizedSymbol = normalizeSymbol(symbol);
+    if (!normalizedSymbol) continue;
+    const dataSymbol = toDataSymbol(normalizedSymbol);
+    const series = bars?.[dataSymbol] || bars?.[normalizedSymbol] || bars?.[normalizePair(dataSymbol)] || [];
+    barsBySymbol.set(normalizedSymbol, Array.isArray(series) ? series : []);
+  }
+  return barsBySymbol;
+}
+
+async function prefetchEntryScanMarketData(scanSymbols) {
+  const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  if (symbols.length === 0) {
+    return {
+      ok: true,
+      prefetchedBars: {
+        bars1mBySymbol: new Map(),
+        bars5mBySymbol: new Map(),
+        bars15mBySymbol: new Map(),
+      },
+    };
+  }
+
+  const chunkSize = Math.max(1, Number(ENTRY_PREFETCH_CHUNK_SIZE) || 80);
+  const chunks = chunkArray(symbols, chunkSize);
+  const bars1mBySymbol = new Map();
+  const bars5mBySymbol = new Map();
+  const bars15mBySymbol = new Map();
+
+  for (const chunkSymbols of chunks) {
+    try {
+      const [quotesResp, orderbooksResp, bars1mResp, bars5mResp, bars15mResp] = await Promise.all([
+        fetchCryptoQuotes({ symbols: chunkSymbols }),
+        fetchCryptoOrderbooks({ symbols: chunkSymbols }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '1Min' }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '5Min' }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '15Min' }),
+      ]);
+
+      warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+      warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
+
+      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars1mResp).entries()) {
+        bars1mBySymbol.set(symbol, series);
+      }
+      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars5mResp).entries()) {
+        bars5mBySymbol.set(symbol, series);
+      }
+      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars15mResp).entries()) {
+        bars15mBySymbol.set(symbol, series);
+      }
+    } catch (err) {
+      console.warn('entry_scan_prefetch_failed', {
+        errorName: err?.name || null,
+        errorMessage: err?.message || String(err),
+      });
+      return { ok: false, error: err?.message || String(err) };
+    }
+  }
+
+  return {
+    ok: true,
+    prefetchedBars: {
+      bars1mBySymbol,
+      bars5mBySymbol,
+      bars15mBySymbol,
+    },
+  };
+}
+
 async function runEntryScanOnce() {
   if (entryScanRunning) return;
   entryScanRunning = true;
@@ -7713,6 +7873,12 @@ async function runEntryScanOnce() {
       return reason || 'signal_skip';
     };
 
+    let prefetchedBars = null;
+    const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+    if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
+      prefetchedBars = prefetchResult.prefetchedBars;
+    }
+
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
         break;
@@ -7746,7 +7912,7 @@ async function runEntryScanOnce() {
         }
       }
 
-      const signal = await computeEntrySignal(symbol);
+      const signal = await computeEntrySignal(symbol, { prefetchedBars });
       const recordBase = signal?.record ? { ...signal.record } : null;
       if (Number.isFinite(recordBase?.predictorProbability)) {
         candidateSignals.push({
