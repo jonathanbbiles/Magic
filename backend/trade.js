@@ -161,7 +161,9 @@ const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
 const DESIRED_NET_PROFIT_BASIS_POINTS = readNumber('DESIRED_NET_PROFIT_BASIS_POINTS', 100);
 const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 150);
 const MIN_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MIN_GROSS_TAKE_PROFIT_BASIS_POINTS', 60);
-const TARGET_PROFIT_BPS = 75; // 0.75%
+// Entry-side gross take-profit target (bps). 100 = 1.00%.
+// Defaults to DESIRED_NET_PROFIT_BASIS_POINTS if provided.
+const TARGET_PROFIT_BPS = readNumber('TARGET_PROFIT_BPS', DESIRED_NET_PROFIT_BASIS_POINTS);
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 0);
 
@@ -195,7 +197,9 @@ const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20
 const REPRICE_TTL_MS = readNumber('REPRICE_TTL_MS', SELL_ORDER_TTL_MS);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
-const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', 60);
+// Stop-loss distance (bps). If unset, use a smaller default that makes EV gating realistic for scalping.
+// You can always override via STOP_LOSS_BPS in the environment.
+const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', Math.max(30, Math.round(TARGET_PROFIT_BPS * 0.5)));
 const VOL_HALF_LIFE_MIN = readNumber('VOL_HALF_LIFE_MIN', 6);
 const STOP_VOL_MULT = readNumber('STOP_VOL_MULT', 2.5);
 const TP_VOL_SCALE = readNumber('TP_VOL_SCALE', 1.0);
@@ -844,65 +848,51 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const p = clamp(Number(predictor.probability) || 0, 0, 1);
-  const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
-  const feesRoundTripBps = 2 * takerFeeBps;
-  const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
-  const costBps = feesRoundTripBps + spreadCostBps;
-  const grossWinBps = TARGET_PROFIT_BPS;
-  const grossLossBps = STOP_LOSS_BPS;
-  const netWinBps = grossWinBps - costBps;
-  const netLossBps = grossLossBps + costBps;
-  const minExpectedValueBps = MIN_EXPECTED_VALUE_BPS + EV_BUFFER_BPS;
+  if (EV_GUARD_ENABLED) {
+    const p = clamp(Number(predictor.probability) || 0, 0, 1);
+    const takerFeeBps = Number.isFinite(FEE_BPS_TAKER) ? FEE_BPS_TAKER : 0;
+    const feesRoundTripBps = 2 * takerFeeBps;
+    const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
+    const costBps = feesRoundTripBps + spreadCostBps;
+    const grossWinBps = TARGET_PROFIT_BPS;
+    const grossLossBps = STOP_LOSS_BPS;
+    const netWinBps = grossWinBps - costBps;
+    const netLossBps = grossLossBps + costBps;
+    const minExpectedValueBps = EV_MIN_BPS + EV_BUFFER_BPS;
 
-  if (netWinBps <= 0) {
-    logEntrySkip({
-      symbol: asset.symbol,
-      spreadBps,
-      requiredEdgeBps,
-      reason: 'ev_gate_netwin_le_zero',
-      p,
-      netWinBps,
-      netLossBps,
-      costBps,
-      minExpectedValueBps,
-    });
-    return {
-      entryReady: false,
-      why: 'ev_gate_netwin_le_zero',
-      meta: {
+    if (netWinBps <= 0) {
+      logEntrySkip({
         symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        reason: 'ev_gate_netwin_le_zero',
         p,
         netWinBps,
         netLossBps,
         costBps,
         minExpectedValueBps,
-      },
-      record: baseRecord,
-    };
-  }
+      });
+      return {
+        entryReady: false,
+        why: 'ev_gate_netwin_le_zero',
+        meta: {
+          symbol: asset.symbol,
+          p,
+          netWinBps,
+          netLossBps,
+          costBps,
+          minExpectedValueBps,
+        },
+        record: baseRecord,
+      };
+    }
 
-  const evBps = (p * netWinBps) - ((1 - p) * netLossBps);
-  const breakevenP = netLossBps / (netWinBps + netLossBps);
-  console.log('entry_ev_gate', {
-    symbol: asset.symbol,
-    spreadBps,
-    requiredEdgeBps,
-    p,
-    breakevenP,
-    netWinBps,
-    netLossBps,
-    costBps,
-    evBps,
-    minExpectedValueBps,
-  });
-
-  if (evBps < minExpectedValueBps) {
-    logEntrySkip({
+    const evBps = (p * netWinBps) - ((1 - p) * netLossBps);
+    const breakevenP = netLossBps / (netWinBps + netLossBps);
+    console.log('entry_ev_gate', {
       symbol: asset.symbol,
       spreadBps,
       requiredEdgeBps,
-      reason: 'ev_gate',
       p,
       breakevenP,
       netWinBps,
@@ -911,11 +901,13 @@ async function computeEntrySignal(symbol, opts = {}) {
       evBps,
       minExpectedValueBps,
     });
-    return {
-      entryReady: false,
-      why: 'ev_gate',
-      meta: {
+
+    if (evBps < minExpectedValueBps) {
+      logEntrySkip({
         symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        reason: 'ev_gate',
         p,
         breakevenP,
         netWinBps,
@@ -923,9 +915,23 @@ async function computeEntrySignal(symbol, opts = {}) {
         costBps,
         evBps,
         minExpectedValueBps,
-      },
-      record: baseRecord,
-    };
+      });
+      return {
+        entryReady: false,
+        why: 'ev_gate',
+        meta: {
+          symbol: asset.symbol,
+          p,
+          breakevenP,
+          netWinBps,
+          netLossBps,
+          costBps,
+          evBps,
+          minExpectedValueBps,
+        },
+        record: baseRecord,
+      };
+    }
   }
 
   const desiredNetExitBpsForV22 = DESIRED_NET_PROFIT_BASIS_POINTS;
@@ -6312,7 +6318,10 @@ async function manageExitStates() {
               actionTaken = 'hold_existing_order';
               reasonCode = 'no_reprice_needed';
             }
-            const decisionPath = 'cancel_replace';
+            const decisionPath =
+              actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice'
+                ? 'cancel_replace'
+                : 'hold_existing_order';
             logExitDecision({
               symbol,
               heldSeconds,
