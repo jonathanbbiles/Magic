@@ -2,6 +2,13 @@ const { randomUUID, randomBytes } = require('crypto');
 
 const { httpJson, buildHttpsUrl } = require('./httpClient');
 const {
+  MARKET_DATA_TIMEOUT_MS,
+  MARKET_DATA_RETRIES,
+  ORDERBOOK_RETRY_ATTEMPTS,
+  ORDERBOOK_RETRY_BACKOFF_MS,
+  MIN_PROB_TO_ENTER,
+} = require('./config/marketData');
+const {
   MAX_QUOTE_AGE_MS,
   ABSURD_AGE_MS,
   normalizeQuoteTsMs,
@@ -146,8 +153,6 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 );
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
-const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
-const MARKET_DATA_RETRIES = Number(process.env.MARKET_DATA_RETRIES || 2);
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -245,7 +250,6 @@ const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 2);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
 const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
-const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.7);
 const MIN_EXPECTED_VALUE_BPS = readNumber('MIN_EXPECTED_VALUE_BPS', 5);
 const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
@@ -683,10 +687,17 @@ async function computeEntrySignal(symbol) {
       fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '15Min' }),
     ]);
   } catch (err) {
+    console.warn('predictor_error', {
+      symbol: asset.symbol,
+      reason: 'bars_fetch_failed',
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      stack: String(err?.stack || '').slice(0, 600),
+    });
     return {
       entryReady: false,
       why: 'predictor_error',
-      meta: { symbol: asset.symbol, error: err?.message || err },
+      meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
       record: baseRecord,
     };
   }
@@ -697,15 +708,6 @@ async function computeEntrySignal(symbol) {
   const closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
     Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
   ).filter((value) => Number.isFinite(value) && value > 0);
-
-  if (closes1m.length < 3) {
-    return {
-      entryReady: false,
-      why: 'predictor_error',
-      meta: { symbol: asset.symbol, barCount: closes1m.length },
-      record: baseRecord,
-    };
-  }
 
   const barSeries5m =
     bars5m?.bars?.[barKey] || bars5m?.bars?.[normalizePair(barKey)] || [];
@@ -736,10 +738,35 @@ async function computeEntrySignal(symbol) {
       },
     });
   } catch (err) {
+    predictor = {
+      ok: false,
+      reason: 'predictor_exception',
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      stack: String(err?.stack || '').slice(0, 600),
+    };
+  }
+
+  if (!predictor?.ok && !Number.isFinite(predictor?.probability)) {
+    console.warn('predictor_error', {
+      symbol: asset.symbol,
+      reason: predictor?.reason || 'invalid_predictor_response',
+      bars1mLength: Array.isArray(barSeries1m) ? barSeries1m.length : 0,
+      bars5mLength: Array.isArray(barSeries5m) ? barSeries5m.length : 0,
+      bars15mLength: Array.isArray(barSeries15m) ? barSeries15m.length : 0,
+      close1mLength: closes1m.length,
+      errorName: predictor?.errorName || null,
+      errorMessage: predictor?.errorMessage || null,
+      stack: predictor?.stack || null,
+    });
     return {
       entryReady: false,
       why: 'predictor_error',
-      meta: { symbol: asset.symbol, error: err?.message || err },
+      meta: {
+        symbol: asset.symbol,
+        reason: predictor?.reason || 'invalid_predictor_response',
+        error: predictor?.errorMessage || null,
+      },
       record: baseRecord,
     };
   }
@@ -1232,6 +1259,146 @@ function getMarketDataLabel(type) {
   return normalized.toLowerCase() || 'marketdata';
 }
 
+
+function parseUrlMetadata(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return {
+      url: parsed.toString(),
+      urlHost: parsed.host,
+      urlPath: `${parsed.pathname}${parsed.search || ''}`,
+    };
+  } catch (err) {
+    return {
+      url: String(url || ''),
+      urlHost: null,
+      urlPath: null,
+    };
+  }
+}
+
+function normalizeMarketDataErrorType(error) {
+  const raw = String(error?.errorType || '').toLowerCase();
+  if (raw === 'timeout' || error?.isTimeout) return 'timeout';
+  if (raw === 'network_error' || raw === 'network' || error?.isNetworkError) return 'network_error';
+  if (raw === 'parse_error') return 'parse_error';
+  if (raw === 'ok') return 'ok';
+  return 'http_error';
+}
+
+async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', timeoutMs = MARKET_DATA_TIMEOUT_MS, retries = MARKET_DATA_RETRIES }) {
+  const label = getMarketDataLabel(type);
+  const parsedUrl = parseUrlMetadata(url);
+  const localRequestId = randomUUID();
+
+  if (DEBUG_ALPACA_HTTP) {
+    console.log('alpaca_marketdata', {
+      phase: 'start',
+      label,
+      type,
+      method,
+      url: parsedUrl.url,
+      urlHost: parsedUrl.urlHost,
+      urlPath: parsedUrl.urlPath,
+      requestId: localRequestId,
+      statusCode: null,
+      errorType: null,
+      errorMessage: null,
+      errorName: null,
+      snippet: '',
+    });
+  }
+
+  if (isMarketDataCooldown()) {
+    const err = new Error('Market data cooldown active');
+    err.errorCode = 'COOLDOWN';
+    err.errorType = 'http_error';
+    err.requestId = localRequestId;
+    err.urlHost = parsedUrl.urlHost;
+    err.urlPath = parsedUrl.urlPath;
+    logMarketDataDiagnostics({
+      type,
+      url: parsedUrl.url,
+      method,
+      statusCode: null,
+      snippet: '',
+      errorType: 'http_error',
+      requestId: localRequestId,
+      urlHost: parsedUrl.urlHost,
+      urlPath: parsedUrl.urlPath,
+      errorMessage: err.message,
+      errorName: err.name,
+    });
+    throw err;
+  }
+
+  const result = await httpJson({
+    method,
+    url: parsedUrl.url,
+    headers: alpacaHeaders(),
+    timeoutMs,
+    retries,
+  });
+
+  if (result.error) {
+    const errorType = normalizeMarketDataErrorType(result.error);
+    const normalizedRequestId = result.error.requestId || localRequestId;
+    const statusCode = result.error.statusCode ?? null;
+    logMarketDataDiagnostics({
+      type,
+      url: parsedUrl.url,
+      statusCode,
+      snippet: result.error.responseSnippet200 || '',
+      errorType,
+      requestId: normalizedRequestId,
+      urlHost: result.error.urlHost || parsedUrl.urlHost,
+      urlPath: result.error.urlPath || parsedUrl.urlPath,
+      method: result.error.method || method,
+      errorMessage: result.error.errorMessage || result.error.message || null,
+      errorName: result.error.errorName || null,
+    });
+
+    markMarketDataFailure(statusCode);
+    lastHttpError = result.error;
+    const err = new Error(result.error.errorMessage || 'Market data request failed');
+    err.errorCode = errorType === 'parse_error' ? 'PARSE_ERROR' : errorType === 'timeout' ? 'TIMEOUT' : errorType === 'network_error' ? 'NETWORK' : 'HTTP_ERROR';
+    err.errorType = errorType;
+    err.attempts = result.error.attempts ?? retries + 1;
+    err.statusCode = statusCode;
+    err.responseSnippet200 = result.error.responseSnippet200 || '';
+    err.requestId = normalizedRequestId;
+    err.urlHost = result.error.urlHost || parsedUrl.urlHost;
+    err.urlPath = result.error.urlPath || parsedUrl.urlPath;
+    if (statusCode === 429 && result.error.rateLimit) {
+      console.warn('marketdata_rate_limit', {
+        type,
+        limit: result.error.rateLimit.limit,
+        remaining: result.error.rateLimit.remaining,
+        reset: result.error.rateLimit.reset,
+      });
+    }
+    if (errorType === 'network_error' || errorType === 'timeout') {
+      logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: err.attempts });
+    }
+    throw err;
+  }
+
+  const okRequestId = result.requestId || localRequestId;
+  logMarketDataDiagnostics({
+    type,
+    url: parsedUrl.url,
+    statusCode: result.statusCode ?? 200,
+    snippet: '',
+    errorType: 'ok',
+    requestId: okRequestId,
+    urlHost: result.urlHost || parsedUrl.urlHost,
+    urlPath: result.urlPath || parsedUrl.urlPath,
+    method,
+  });
+  markMarketDataSuccess();
+  return result.data;
+}
+
 function extractErrorCodeFromBody(body) {
   if (!body) return null;
   if (typeof body === 'object') {
@@ -1616,112 +1783,7 @@ async function requestJson({
 }
 
 async function requestMarketDataJson({ type, url, symbol }) {
-  if (isMarketDataCooldown()) {
-    const err = new Error('Market data cooldown active');
-    err.errorCode = 'COOLDOWN';
-    logMarketDataDiagnostics({
-      type,
-      url,
-      statusCode: null,
-      snippet: '',
-      errorType: 'cooldown',
-      method: 'GET',
-    });
-    throw err;
-  }
-  if (isDataDegraded()) {
-    const err = new Error('Market data degraded');
-    err.errorCode = 'DEGRADED';
-    logMarketDataDiagnostics({
-      type,
-      url,
-      statusCode: null,
-      snippet: '',
-      errorType: 'degraded',
-      method: 'GET',
-    });
-    throw err;
-  }
-
-  const result = await httpJson({
-    method: 'GET',
-    url,
-    headers: alpacaHeaders(),
-    timeoutMs: MARKET_DATA_TIMEOUT_MS,
-    retries: MARKET_DATA_RETRIES,
-  });
-
-  if (result.error) {
-    const errorType = result.error.errorType
-      || (result.error.isNetworkError || result.error.isTimeout ? 'network_error' : 'http_error');
-    logMarketDataDiagnostics({
-      type,
-      url,
-      statusCode: result.error.statusCode ?? null,
-      snippet: result.error.responseSnippet200 || '',
-      errorType,
-      requestId: result.error.requestId || null,
-      urlHost: result.error.urlHost || null,
-      urlPath: result.error.urlPath || null,
-      method: result.error.method || 'GET',
-      errorMessage: result.error.errorMessage || result.error.message || null,
-      errorName: result.error.errorName || null,
-    });
-    if (errorType === 'invalid_request') {
-      console.error('marketdata_invalid_request', {
-        type,
-        url,
-        method: result.error.method || 'GET',
-        errorMessage: result.error.errorMessage || result.error.message || null,
-        errorName: result.error.errorName || null,
-      });
-    }
-    markMarketDataFailure(result.error.statusCode ?? null);
-    markDataDegraded();
-    lastHttpError = result.error;
-    const err = new Error(result.error.errorMessage || 'Market data request failed');
-    if (errorType === 'invalid_request') {
-      err.errorCode = 'INVALID_REQUEST';
-    } else if (errorType === 'empty_body') {
-      err.errorCode = 'EMPTY_BODY';
-    } else if (errorType === 'network_error') {
-      err.errorCode = 'NETWORK';
-    } else {
-      err.errorCode = 'HTTP_ERROR';
-    }
-    if (errorType === 'network_error') {
-      err.attempts = result.error.attempts ?? MARKET_DATA_RETRIES + 1;
-      logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: err.attempts });
-    }
-    err.statusCode = result.error.statusCode ?? null;
-    err.responseSnippet200 = result.error.responseSnippet200 || '';
-    err.requestId = result.error.requestId || null;
-    err.urlHost = result.error.urlHost || null;
-    err.urlPath = result.error.urlPath || null;
-    if (err.statusCode === 429 && result.error.rateLimit) {
-      console.warn('marketdata_rate_limit', {
-        type,
-        limit: result.error.rateLimit.limit,
-        remaining: result.error.rateLimit.remaining,
-        reset: result.error.rateLimit.reset,
-      });
-    }
-    throw err;
-  }
-
-  logMarketDataDiagnostics({
-    type,
-    url,
-    statusCode: result.statusCode ?? 200,
-    snippet: '',
-    errorType: 'ok',
-    requestId: result.requestId || null,
-    urlHost: result.urlHost || null,
-    urlPath: result.urlPath || null,
-    method: 'GET',
-  });
-  markMarketDataSuccess();
-  return result.data;
+  return requestAlpacaMarketData({ type, url, symbol, method: 'GET' });
 }
 
 function parseQuoteTimestamp({ quote, symbol, source }) {
@@ -3727,136 +3789,185 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     return { ok: true, orderbook: cached, source: 'cache' };
   }
 
-  let resp;
-  try {
-    resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
-  } catch (err) {
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: {
-        symbol,
-        error: err?.message || String(err),
-        rawTsCandidates: {
-          bookT: null,
-          bookTimestamp: null,
-          bookTs: null,
-          bookTime: null,
-          respT: null,
-          respTimestamp: null,
-        },
-        bookKeys: [],
-      },
-    };
-  }
-
-  const orderbooks = resp?.orderbooks;
-  if (!orderbooks || Object.keys(orderbooks).length === 0) {
-    const { rawTsCandidates } = normalizeOrderbookTimestampMs(null, resp);
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: { symbol, hasOrderbooks: Boolean(orderbooks), rawTsCandidates, bookKeys: [] },
-    };
-  }
-
-  const key = toDataSymbol(symbol);
-  const book =
-    orderbooks?.[key] ||
-    orderbooks?.[normalizePair(key)] ||
-    orderbooks?.[symbol] ||
-    null;
-
-  if (!book) {
-    const availableSymbols = Object.keys(orderbooks);
-    return {
-      ok: false,
-      reason: 'ob_symbol_not_supported',
-      details: {
-        symbol,
-        key,
-        availableSymbols: availableSymbols.slice(0, 5),
-        availableCount: availableSymbols.length,
-      },
-    };
-  }
-
-  const asks = Array.isArray(book?.a) ? book.a : [];
-  const bids = Array.isArray(book?.b) ? book.b : [];
-  if (!asks.length) {
-    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: {
-        symbol,
-        askLevels: asks.length,
-        rawTsCandidates,
-        bookKeys: Object.keys(book || {}).slice(0, 25),
-      },
-    };
-  }
-  if (!bids.length) {
-    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: {
-        symbol,
-        bidLevels: bids.length,
-        rawTsCandidates,
-        bookKeys: Object.keys(book || {}).slice(0, 25),
-      },
-    };
-  }
-
-  const priceOf = (level) => Number(level?.p ?? level?.price);
-  const sortedAsks = [...asks].sort((a, b) => priceOf(a) - priceOf(b));
-  const sortedBids = [...bids].sort((a, b) => priceOf(b) - priceOf(a));
-  const bestAsk = priceOf(sortedAsks?.[0]);
-  const bestBid = priceOf(sortedBids?.[0]);
-  if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) {
-    const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: { symbol, bestAsk, bestBid, rawTsCandidates, bookKeys: Object.keys(book || {}).slice(0, 25) },
-    };
-  }
-
-  const { tsMs: parsedTsMs, rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
-  let tsMs = parsedTsMs;
-  let tsFallbackUsed = false;
-  if (!Number.isFinite(tsMs)) {
-    tsMs = now;
-    tsFallbackUsed = true;
-  }
-
-  if (Number.isFinite(parsedTsMs) && now - tsMs > maxAgeMs) {
-    return {
-      ok: false,
-      reason: 'ob_http_empty',
-      details: {
-        symbol,
-        ageMs: now - tsMs,
-        maxAgeMs,
-        rawTsCandidates,
-        bookKeys: Object.keys(book || {}).slice(0, 25),
-      },
-    };
-  }
-
-  const normalized = {
-    asks: sortedAsks,
-    bids: sortedBids,
-    bestAsk,
-    bestBid,
-    tsMs,
-    tsFallbackUsed,
-    receivedAtMs: now,
+  let lastFailure = {
+    reason: 'ob_http_empty',
+    details: {
+      symbol,
+      error: 'unknown',
+      rawTsCandidates: null,
+      bookKeys: [],
+    },
   };
-  orderbookCache.set(symbol, normalized);
-  return { ok: true, orderbook: normalized, source: 'fresh' };
+
+  for (let attempt = 1; attempt <= ORDERBOOK_RETRY_ATTEMPTS; attempt += 1) {
+    let resp;
+    try {
+      resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
+    } catch (err) {
+      const reason = err?.errorType === 'timeout' ? 'ob_timeout' : err?.errorType === 'network_error' ? 'ob_network_error' : 'ob_http_empty';
+      lastFailure = {
+        reason,
+        details: {
+          symbol,
+          attempt,
+          error: err?.message || String(err),
+          requestId: err?.requestId || null,
+          statusCode: err?.statusCode ?? null,
+          rawTsCandidates: null,
+          bookKeys: [],
+        },
+      };
+    }
+
+    if (resp) {
+      const orderbooks = resp?.orderbooks;
+      if (!orderbooks || Object.keys(orderbooks).length === 0) {
+        const { rawTsCandidates } = normalizeOrderbookTimestampMs(null, resp);
+        lastFailure = {
+          reason: 'ob_no_levels',
+          details: { symbol, attempt, hasOrderbooks: Boolean(orderbooks), rawTsCandidates, bookKeys: [] },
+        };
+      } else {
+        const key = toDataSymbol(symbol);
+        const book =
+          orderbooks?.[key] ||
+          orderbooks?.[normalizePair(key)] ||
+          orderbooks?.[symbol] ||
+          null;
+
+        if (!book) {
+          const availableSymbols = Object.keys(orderbooks);
+          lastFailure = {
+            reason: 'ob_missing_symbol',
+            details: {
+              symbol,
+              key,
+              attempt,
+              availableSymbols: availableSymbols.slice(0, 5),
+              availableCount: availableSymbols.length,
+            },
+          };
+        } else {
+          const asks = Array.isArray(book?.a) ? book.a : [];
+          const bids = Array.isArray(book?.b) ? book.b : [];
+          if (!asks.length || !bids.length) {
+            const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+            lastFailure = {
+              reason: 'ob_no_levels',
+              details: {
+                symbol,
+                attempt,
+                askLevels: asks.length,
+                bidLevels: bids.length,
+                rawTsCandidates,
+                bookKeys: Object.keys(book || {}).slice(0, 25),
+              },
+            };
+          } else {
+            const priceOf = (level) => Number(level?.p ?? level?.price);
+            const sortedAsks = [...asks].sort((a, b) => priceOf(a) - priceOf(b));
+            const sortedBids = [...bids].sort((a, b) => priceOf(b) - priceOf(a));
+            const bestAsk = priceOf(sortedAsks?.[0]);
+            const bestBid = priceOf(sortedBids?.[0]);
+            if (!Number.isFinite(bestAsk) || !Number.isFinite(bestBid) || bestAsk <= 0 || bestBid <= 0) {
+              const { rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+              lastFailure = {
+                reason: 'ob_invalid_numbers',
+                details: {
+                  symbol,
+                  attempt,
+                  bestAsk,
+                  bestBid,
+                  rawTsCandidates,
+                  bookKeys: Object.keys(book || {}).slice(0, 25),
+                },
+              };
+            } else {
+              const { tsMs: parsedTsMs, rawTsCandidates } = normalizeOrderbookTimestampMs(book, resp);
+              let tsMs = parsedTsMs;
+              let tsFallbackUsed = false;
+              if (!Number.isFinite(tsMs)) {
+                tsMs = now;
+                tsFallbackUsed = true;
+              }
+
+              if (Number.isFinite(parsedTsMs) && now - tsMs > maxAgeMs) {
+                lastFailure = {
+                  reason: 'ob_no_levels',
+                  details: {
+                    symbol,
+                    attempt,
+                    ageMs: now - tsMs,
+                    maxAgeMs,
+                    rawTsCandidates,
+                    bookKeys: Object.keys(book || {}).slice(0, 25),
+                  },
+                };
+              } else {
+                const normalized = {
+                  asks: sortedAsks,
+                  bids: sortedBids,
+                  bestAsk,
+                  bestBid,
+                  tsMs,
+                  tsFallbackUsed,
+                  receivedAtMs: now,
+                };
+                orderbookCache.set(symbol, normalized);
+                return { ok: true, orderbook: normalized, source: 'fresh' };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (attempt < ORDERBOOK_RETRY_ATTEMPTS) {
+      const backoffMs = ORDERBOOK_RETRY_BACKOFF_MS[Math.min(attempt - 1, ORDERBOOK_RETRY_BACKOFF_MS.length - 1)] || 1200;
+      await sleep(backoffMs);
+    }
+  }
+
+  let quoteFallback = null;
+  try {
+    quoteFallback = await getLatestQuote(symbol, { maxAgeMs });
+  } catch (err) {
+    lastFailure = {
+      reason: 'ob_fallback_quotes_missing',
+      details: {
+        ...(lastFailure?.details || {}),
+        symbol,
+        fallbackError: err?.message || String(err),
+      },
+    };
+  }
+  if (quoteFallback && Number.isFinite(quoteFallback.bid) && Number.isFinite(quoteFallback.ask) && quoteFallback.bid > 0 && quoteFallback.ask > 0) {
+    const syntheticOrderbook = {
+      asks: [{ p: quoteFallback.ask, s: 1 }],
+      bids: [{ p: quoteFallback.bid, s: 1 }],
+      bestAsk: quoteFallback.ask,
+      bestBid: quoteFallback.bid,
+      tsMs: quoteFallback.tsMs || Date.now(),
+      tsFallbackUsed: true,
+      receivedAtMs: Date.now(),
+      synthetic: true,
+      source: 'quote_fallback',
+    };
+    orderbookCache.set(symbol, syntheticOrderbook);
+    return { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' };
+  }
+
+  return {
+    ok: false,
+    reason: lastFailure?.reason || 'ob_fallback_quotes_missing',
+    reasonRollup: 'ob_http_empty',
+    details: {
+      ...(lastFailure?.details || {}),
+      symbol,
+      fallback: 'quotes',
+      fallbackStatus: 'missing',
+    },
+  };
 }
 
 function sumDepthUsdWithinBand(levels, bestPrice, bandBps, side) {

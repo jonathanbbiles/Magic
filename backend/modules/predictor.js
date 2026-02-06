@@ -1,6 +1,7 @@
 const { macd, slope, zscore, volumeTrend } = require('./indicators');
 
 const BPS = 10000;
+const DEBUG_PREDICTOR_FEATURES = String(process.env.DEBUG_PREDICTOR_FEATURES || '').trim() === '1';
 
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
@@ -141,132 +142,180 @@ function computeOrderbookSignals(orderbook, options) {
 }
 
 function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, marketContext, symbol }) {
-  const targetMoveBps = Number(marketContext?.targetMoveBps ?? 100);
-  const horizonMinutes = Number(marketContext?.horizonMinutes ?? 30);
-  const fallbackBars = Array.isArray(bars) ? bars : [];
-  const series1m = Array.isArray(bars1m) && bars1m.length ? bars1m : fallbackBars;
-  const series5m = Array.isArray(bars5m) && bars5m.length ? bars5m : fallbackBars;
-  const series15m = Array.isArray(bars15m) && bars15m.length ? bars15m : fallbackBars;
+  try {
+    const targetMoveBps = Number(marketContext?.targetMoveBps ?? 100);
+    const horizonMinutes = Number(marketContext?.horizonMinutes ?? 30);
+    const fallbackBars = Array.isArray(bars) ? bars : [];
+    const series1m = Array.isArray(bars1m) && bars1m.length ? bars1m : fallbackBars;
+    const series5m = Array.isArray(bars5m) && bars5m.length ? bars5m : fallbackBars;
+    const series15m = Array.isArray(bars15m) && bars15m.length ? bars15m : fallbackBars;
 
-  const closes1m = extractCloses(series1m);
-  const closes5m = extractCloses(series5m);
-  const closes15m = extractCloses(series15m);
-  const volumes1m = extractVolumes(series1m);
+    const closes1m = extractCloses(series1m);
+    const closes5m = extractCloses(series5m);
+    const closes15m = extractCloses(series15m);
+    const volumes1m = extractVolumes(series1m);
 
-  const volatilityBps = computeVolatilityBps(closes1m);
-  const driftBps = computeDriftBps(closes1m);
-  const windowMinutes = Math.max(1, closes1m.length - 1);
-  const driftPerMinBps = driftBps / windowMinutes;
-  const projectedMoveBps = driftPerMinBps * horizonMinutes;
-  const expectedMoveBps = volatilityBps * Math.sqrt(Math.max(1, horizonMinutes));
-  const feasibilityScore = clamp(expectedMoveBps / Math.max(1, targetMoveBps), 0, 1);
-  const driftScore = clamp(0.5 + projectedMoveBps / Math.max(1, targetMoveBps * 2), 0, 1);
+    if (closes1m.length < 3) {
+      return { ok: false, reason: 'insufficient_bars_1m', probability: null, signals: null };
+    }
+    if (closes5m.length < 3) {
+      return { ok: false, reason: 'insufficient_bars_5m', probability: null, signals: null };
+    }
+    if (closes15m.length < 3) {
+      return { ok: false, reason: 'insufficient_bars_15m', probability: null, signals: null };
+    }
 
-  const macd1m = macd(closes1m);
-  const macd5m = macd(closes5m);
-  const macd15m = macd(closes15m);
-  const histSlope1m = slope(
-    closes1m.map((_, idx) => {
-      const subset = closes1m.slice(0, idx + 1);
-      return macd(subset)?.histogram ?? null;
-    }).filter((value) => Number.isFinite(value)),
-    5,
-  );
-  const zscore1m = zscore(closes1m, 20);
-  const zscore5m = zscore(closes5m, 20);
-  const zscore15m = zscore(closes15m, 20);
-  const volumeTrend1m = volumeTrend(volumes1m, 5);
+    const volatilityBps = computeVolatilityBps(closes1m);
+    const driftBps = computeDriftBps(closes1m);
+    const windowMinutes = Math.max(1, closes1m.length - 1);
+    const driftPerMinBps = driftBps / windowMinutes;
+    const projectedMoveBps = driftPerMinBps * horizonMinutes;
+    const expectedMoveBps = volatilityBps * Math.sqrt(Math.max(1, horizonMinutes));
+    const feasibilityScore = clamp(expectedMoveBps / Math.max(1, targetMoveBps), 0, 1);
+    const driftScore = clamp(0.5 + projectedMoveBps / Math.max(1, targetMoveBps * 2), 0, 1);
 
-  const zscoreThreshold = Number(marketContext?.regimeZscoreThreshold ?? 2);
-  const zscoreAbs = Math.max(Math.abs(zscore1m ?? 0), Math.abs(zscore5m ?? 0));
-  const regime = zscoreAbs >= zscoreThreshold ? 'mean_reversion' : 'momentum';
+    const macd1m = macd(closes1m);
+    const macd5m = macd(closes5m);
+    const macd15m = macd(closes15m);
+    const histSlope1m = slope(
+      closes1m.map((_, idx) => {
+        const subset = closes1m.slice(0, idx + 1);
+        return macd(subset)?.histogram ?? null;
+      }).filter((value) => Number.isFinite(value)),
+      5,
+    );
+    const zscore1m = zscore(closes1m, 20);
+    const zscore5m = zscore(closes5m, 20);
+    const zscore15m = zscore(closes15m, 20);
+    const volumeTrend1m = volumeTrend(volumes1m, 5);
 
-  const histPositive1m = Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0;
-  const histSlopePositive1m = Number.isFinite(histSlope1m) && histSlope1m > 0;
-  const hist5m = macd5m?.histogram;
-  const hist15m = macd15m?.histogram;
-  const histNotStronglyNegative5m =
-    Number.isFinite(hist5m) &&
-    (hist5m >= 0 || hist5m > -Math.abs(Number(macd1m?.histogram) || 0) * 0.5);
-  const momentumScore = histPositive1m && histSlopePositive1m && histNotStronglyNegative5m ? 1 : 0;
+    const zscoreThreshold = Number(marketContext?.regimeZscoreThreshold ?? 2);
+    const zscoreAbs = Math.max(Math.abs(zscore1m ?? 0), Math.abs(zscore5m ?? 0));
+    const regime = zscoreAbs >= zscoreThreshold ? 'mean_reversion' : 'momentum';
 
-  const meanReversionScore =
-    (Number.isFinite(zscore1m) && zscore1m <= -2) ||
-    (Number.isFinite(zscore5m) && zscore5m <= -2)
-      ? histSlopePositive1m
-        ? 1
-        : 0
-      : 0;
+    const histPositive1m = Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0;
+    const histSlopePositive1m = Number.isFinite(histSlope1m) && histSlope1m > 0;
+    const hist5m = macd5m?.histogram;
+    const hist15m = macd15m?.histogram;
+    const histNotStronglyNegative5m =
+      Number.isFinite(hist5m) &&
+      (hist5m >= 0 || hist5m > -Math.abs(Number(macd1m?.histogram) || 0) * 0.5);
+    const momentumScore = histPositive1m && histSlopePositive1m && histNotStronglyNegative5m ? 1 : 0;
 
-  const volumeTrendMin = Number(marketContext?.volumeTrendMin ?? 1.1);
-  const volumeConfirm = Number.isFinite(volumeTrend1m) && volumeTrend1m >= volumeTrendMin ? 1 : 0;
+    const meanReversionScore =
+      (Number.isFinite(zscore1m) && zscore1m <= -2) ||
+      (Number.isFinite(zscore5m) && zscore5m <= -2)
+        ? histSlopePositive1m
+          ? 1
+          : 0
+        : 0;
 
-  const confirmationRequired = Math.max(1, Number(marketContext?.timeframeConfirmations ?? 2));
-  const timeframeChecks = {
-    '1m':
-      regime === 'mean_reversion'
-        ? Number.isFinite(zscore1m) && zscore1m <= -2
-        : Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0,
-    '5m':
-      regime === 'mean_reversion'
-        ? Number.isFinite(zscore5m) && zscore5m <= -2
-        : Number.isFinite(hist5m) && hist5m > 0,
-    '15m':
-      regime === 'mean_reversion'
-        ? Number.isFinite(zscore15m) && zscore15m <= -2
-        : Number.isFinite(hist15m) && hist15m > 0,
-  };
-  const confirmationCount = Object.values(timeframeChecks).filter(Boolean).length;
-  const multiTimeframeConfirm = confirmationCount >= confirmationRequired ? 1 : 0;
+    const volumeTrendMin = Number(marketContext?.volumeTrendMin ?? 1.1);
+    const volumeConfirm = Number.isFinite(volumeTrend1m) && volumeTrend1m >= volumeTrendMin ? 1 : 0;
 
-  const orderbookSignals = computeOrderbookSignals(orderbook, marketContext);
-  const imbalanceScore = clamp(0.5 + (Number(orderbookSignals.imbalance) || 0) / 2, 0, 1);
+    const confirmationRequired = Math.max(1, Number(marketContext?.timeframeConfirmations ?? 2));
+    const timeframeChecks = {
+      '1m':
+        regime === 'mean_reversion'
+          ? Number.isFinite(zscore1m) && zscore1m <= -2
+          : Number.isFinite(macd1m?.histogram) && macd1m.histogram > 0,
+      '5m':
+        regime === 'mean_reversion'
+          ? Number.isFinite(zscore5m) && zscore5m <= -2
+          : Number.isFinite(hist5m) && hist5m > 0,
+      '15m':
+        regime === 'mean_reversion'
+          ? Number.isFinite(zscore15m) && zscore15m <= -2
+          : Number.isFinite(hist15m) && hist15m > 0,
+    };
+    const confirmationCount = Object.values(timeframeChecks).filter(Boolean).length;
+    const multiTimeframeConfirm = confirmationCount >= confirmationRequired ? 1 : 0;
 
-  const branchScore = regime === 'mean_reversion' ? meanReversionScore : momentumScore;
-  const probabilityRaw =
-    0.05 +
-    0.35 * branchScore +
-    0.2 * multiTimeframeConfirm +
-    0.15 * volumeConfirm +
-    0.2 * orderbookSignals.liquidityScore +
-    0.05 * imbalanceScore;
-  const probability = clamp(probabilityRaw, 0, 1);
+    const orderbookSignals = computeOrderbookSignals(orderbook, marketContext);
+    const imbalanceScore = clamp(0.5 + (Number(orderbookSignals.imbalance) || 0) / 2, 0, 1);
 
-  return {
-    probability,
-    signals: {
-      symbol: symbol || null,
-      refPrice: Number.isFinite(Number(refPrice)) ? Number(refPrice) : null,
-      targetMoveBps,
-      horizonMinutes,
-      windowMinutes,
-      driftBps,
-      driftPerMinBps,
-      projectedMoveBps,
-      volatilityBps,
-      expectedMoveBps,
-      feasibilityScore,
-      driftScore,
-      imbalanceScore,
-      macd1m,
-      macd5m,
-      histSlope1m,
-      zscore1m,
-      zscore5m,
-      volumeTrend1m,
-      regime,
-      checks: {
-        momentumScore,
-        meanReversionScore,
-        volumeConfirm,
-        multiTimeframeConfirm,
-        confirmationCount,
-        confirmationRequired,
-        timeframeChecks,
+    const branchScore = regime === 'mean_reversion' ? meanReversionScore : momentumScore;
+    const probabilityRaw =
+      0.05 +
+      0.35 * branchScore +
+      0.2 * multiTimeframeConfirm +
+      0.15 * volumeConfirm +
+      0.2 * orderbookSignals.liquidityScore +
+      0.05 * imbalanceScore;
+    const probability = clamp(probabilityRaw, 0, 1);
+
+    const predictorFallbackDefaults = branchScore === 0 && multiTimeframeConfirm === 0 && volumeConfirm === 0;
+    if (DEBUG_PREDICTOR_FEATURES) {
+      console.log('predictor_features', {
+        symbol: symbol || null,
+        featureSummary: {
+          zscore1m,
+          zscore5m,
+          zscore15m,
+          hist1m: macd1m?.histogram ?? null,
+          hist5m,
+          hist15m,
+          histSlope1m,
+          volumeTrend1m,
+          driftBps,
+          volatilityBps,
+          liquidityScore: orderbookSignals.liquidityScore,
+          imbalance: orderbookSignals.imbalance,
+          regime,
+          predictorFallbackDefaults,
+        },
+      });
+    }
+
+    return {
+      ok: true,
+      reason: null,
+      probability,
+      signals: {
+        symbol: symbol || null,
+        refPrice: Number.isFinite(Number(refPrice)) ? Number(refPrice) : null,
+        targetMoveBps,
+        horizonMinutes,
+        windowMinutes,
+        driftBps,
+        driftPerMinBps,
+        projectedMoveBps,
+        volatilityBps,
+        expectedMoveBps,
+        feasibilityScore,
+        driftScore,
+        imbalanceScore,
+        macd1m,
+        macd5m,
+        histSlope1m,
+        zscore1m,
+        zscore5m,
+        volumeTrend1m,
+        regime,
+        predictorFallbackDefaults,
+        checks: {
+          momentumScore,
+          meanReversionScore,
+          volumeConfirm,
+          multiTimeframeConfirm,
+          confirmationCount,
+          confirmationRequired,
+          timeframeChecks,
+        },
+        ...orderbookSignals,
       },
-      ...orderbookSignals,
-    },
-  };
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'predictor_exception',
+      probability: null,
+      signals: null,
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      stack: String(err?.stack || '').slice(0, 600),
+    };
+  }
 }
 
 module.exports = {
