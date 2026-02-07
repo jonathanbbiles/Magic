@@ -10,6 +10,9 @@ const ORDERBOOK_RETRY_ATTEMPTS = Math.max(1, Math.floor(readNumber('ORDERBOOK_RE
 const ORDERBOOK_RETRY_BACKOFF_MS = [200, 500, 1200];
 
 const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.53);
+const MIN_PROB_TO_ENTER_TP = readNumber('MIN_PROB_TO_ENTER_TP', MIN_PROB_TO_ENTER);
+// 0 disables the stretch gate entirely
+const MIN_PROB_TO_ENTER_STRETCH = readNumber('MIN_PROB_TO_ENTER_STRETCH', 0);
 
 module.exports = {
   MARKET_DATA_TIMEOUT_MS,
@@ -17,4 +20,6 @@ module.exports = {
   ORDERBOOK_RETRY_ATTEMPTS,
   ORDERBOOK_RETRY_BACKOFF_MS,
   MIN_PROB_TO_ENTER,
+  MIN_PROB_TO_ENTER_TP,
+  MIN_PROB_TO_ENTER_STRETCH,
 };

@@ -7,6 +7,8 @@ const {
   ORDERBOOK_RETRY_ATTEMPTS,
   ORDERBOOK_RETRY_BACKOFF_MS,
   MIN_PROB_TO_ENTER,
+  MIN_PROB_TO_ENTER_TP,
+  MIN_PROB_TO_ENTER_STRETCH,
 } = require('./config/marketData');
 const {
   MAX_QUOTE_AGE_MS,
@@ -258,6 +260,13 @@ const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
 const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
+// Entry gating should be aligned to the REAL take-profit you actually execute.
+// This is the "take OK profit" target.
+const ENTRY_TAKE_PROFIT_BPS = readNumber('ENTRY_TAKE_PROFIT_BPS', MAX_GROSS_TAKE_PROFIT_BASIS_POINTS);
+
+// This is the "stretch confidence" target (predict bigger than you take).
+// Default keeps existing behavior (TARGET_MOVE_BPS).
+const ENTRY_STRETCH_MOVE_BPS = readNumber('ENTRY_STRETCH_MOVE_BPS', TARGET_MOVE_BPS);
 const MIN_EXPECTED_VALUE_BPS = readNumber('MIN_EXPECTED_VALUE_BPS', 5);
 const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
@@ -550,6 +559,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     targetMoveBps: TARGET_MOVE_BPS,
     targetHorizonMinutes: TARGET_HORIZON_MINUTES,
     minProbToEnter: MIN_PROB_TO_ENTER,
+    entryTakeProfitBps: ENTRY_TAKE_PROFIT_BPS,
+    entryStretchMoveBps: ENTRY_STRETCH_MOVE_BPS,
+    minProbToEnterTp: MIN_PROB_TO_ENTER_TP,
+    minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
     maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
     requiredEdgeBps,
     targetProfitBps: TARGET_PROFIT_BPS,
@@ -574,7 +587,11 @@ async function computeEntrySignal(symbol, opts = {}) {
     orderbookLiquidityScore: null,
     orderbookUnavailableReason: null,
     predictorProbability: null,
+    predictorProbabilityTp: null,
+    predictorProbabilityStretch: null,
     predictorSignals: null,
+    predictorSignalsTp: null,
+    predictorSignalsStretch: null,
     driftBps: null,
     volatilityBps: null,
     config: configSnapshot,
@@ -780,9 +797,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     bars15m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
     [];
 
-  let predictor;
+  let predictorStretch;
+  let predictorTp;
   try {
-    predictor = predictOne({
+    predictorStretch = predictOne({
       symbol: asset.symbol,
       bars: barSeries1m,
       bars1m: barSeries1m,
@@ -792,7 +810,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       spreadBps,
       refPrice: mid,
       marketContext: {
-        targetMoveBps: TARGET_MOVE_BPS,
+        targetMoveBps: ENTRY_STRETCH_MOVE_BPS,
         horizonMinutes: TARGET_HORIZON_MINUTES,
         orderbookBandBps: ORDERBOOK_BAND_BPS,
         orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
@@ -804,7 +822,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       },
     });
   } catch (err) {
-    predictor = {
+    predictorStretch = {
       ok: false,
       reason: 'predictor_exception',
       errorName: err?.name || null,
@@ -813,63 +831,146 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  if (!predictor?.ok && !Number.isFinite(predictor?.probability)) {
+  try {
+    predictorTp = predictOne({
+      symbol: asset.symbol,
+      bars: barSeries1m,
+      bars1m: barSeries1m,
+      bars5m: barSeries5m,
+      bars15m: barSeries15m,
+      orderbook: obResult.orderbook,
+      spreadBps,
+      refPrice: mid,
+      marketContext: {
+        targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+        horizonMinutes: TARGET_HORIZON_MINUTES,
+        orderbookBandBps: ORDERBOOK_BAND_BPS,
+        orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        orderbookImpactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        volumeTrendMin: VOLUME_TREND_MIN,
+        timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
+        regimeZscoreThreshold: REGIME_ZSCORE_THRESHOLD,
+      },
+    });
+  } catch (err) {
+    predictorTp = {
+      ok: false,
+      reason: 'predictor_exception',
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      stack: String(err?.stack || '').slice(0, 600),
+    };
+  }
+
+  if (!predictorTp?.ok && !Number.isFinite(predictorTp?.probability)) {
     console.warn('predictor_error', {
       symbol: asset.symbol,
-      reason: predictor?.reason || 'invalid_predictor_response',
+      reason: predictorTp?.reason || 'invalid_predictor_response',
       bars1mLength: Array.isArray(barSeries1m) ? barSeries1m.length : 0,
       bars5mLength: Array.isArray(barSeries5m) ? barSeries5m.length : 0,
       bars15mLength: Array.isArray(barSeries15m) ? barSeries15m.length : 0,
       close1mLength: closes1m.length,
-      errorName: predictor?.errorName || null,
-      errorMessage: predictor?.errorMessage || null,
-      stack: predictor?.stack || null,
+      errorName: predictorTp?.errorName || null,
+      errorMessage: predictorTp?.errorMessage || null,
+      stack: predictorTp?.stack || null,
+      targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
     });
     return {
       entryReady: false,
       why: 'predictor_error',
       meta: {
         symbol: asset.symbol,
-        reason: predictor?.reason || 'invalid_predictor_response',
-        error: predictor?.errorMessage || null,
+        reason: predictorTp?.reason || 'invalid_predictor_response',
+        error: predictorTp?.errorMessage || null,
       },
       record: baseRecord,
     };
   }
 
-  baseRecord.predictorProbability = predictor.probability;
-  baseRecord.predictorSignals = predictor.signals;
-  baseRecord.driftBps = predictor.signals?.driftBps ?? null;
-  baseRecord.volatilityBps = predictor.signals?.volatilityBps ?? null;
+  if (!predictorStretch?.ok && !Number.isFinite(predictorStretch?.probability)) {
+    console.warn('predictor_error', {
+      symbol: asset.symbol,
+      reason: predictorStretch?.reason || 'invalid_predictor_response',
+      bars1mLength: Array.isArray(barSeries1m) ? barSeries1m.length : 0,
+      bars5mLength: Array.isArray(barSeries5m) ? barSeries5m.length : 0,
+      bars15mLength: Array.isArray(barSeries15m) ? barSeries15m.length : 0,
+      close1mLength: closes1m.length,
+      errorName: predictorStretch?.errorName || null,
+      errorMessage: predictorStretch?.errorMessage || null,
+      stack: predictorStretch?.stack || null,
+      targetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+    });
+  }
+
+  baseRecord.predictorProbabilityTp = predictorTp?.probability ?? null;
+  baseRecord.predictorProbabilityStretch = predictorStretch?.probability ?? null;
+  baseRecord.predictorSignalsTp = predictorTp?.signals ?? null;
+  baseRecord.predictorSignalsStretch = predictorStretch?.signals ?? null;
+  baseRecord.predictorProbability = baseRecord.predictorProbabilityTp;
+  baseRecord.predictorSignals = baseRecord.predictorSignalsTp;
+  baseRecord.driftBps = predictorTp?.signals?.driftBps ?? null;
+  baseRecord.volatilityBps = predictorTp?.signals?.volatilityBps ?? null;
 
   symStats[asset.symbol] = {
     lastMid: mid,
     lastTs: quote.tsMs,
   };
 
-  if (predictor.probability < MIN_PROB_TO_ENTER) {
+  if ((predictorTp?.probability ?? -1) < MIN_PROB_TO_ENTER_TP) {
     logEntrySkip({
       symbol: asset.symbol,
       spreadBps,
       requiredEdgeBps,
       reason: 'predictor_gate',
-      probability: predictor.probability,
-      minProbToEnter: MIN_PROB_TO_ENTER,
+      probability: predictorTp?.probability ?? null,
+      minProbToEnter: MIN_PROB_TO_ENTER_TP,
+      stretchProbability: predictorStretch?.probability ?? null,
+      stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+      tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
     });
     return {
       entryReady: false,
       why: 'predictor_gate',
       meta: {
         symbol: asset.symbol,
-        probability: predictor.probability,
-        minProbToEnter: MIN_PROB_TO_ENTER,
+        probability: predictorTp?.probability ?? null,
+        minProbToEnter: MIN_PROB_TO_ENTER_TP,
+        stretchProbability: predictorStretch?.probability ?? null,
+      },
+      record: baseRecord,
+    };
+  }
+
+  if (MIN_PROB_TO_ENTER_STRETCH > 0 && (predictorStretch?.probability ?? -1) < MIN_PROB_TO_ENTER_STRETCH) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'predictor_stretch_gate',
+      probability: predictorTp?.probability ?? null,
+      minProbToEnter: MIN_PROB_TO_ENTER_TP,
+      stretchProbability: predictorStretch?.probability ?? null,
+      minStretchProbToEnter: MIN_PROB_TO_ENTER_STRETCH,
+      stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+      tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+    });
+    return {
+      entryReady: false,
+      why: 'predictor_stretch_gate',
+      meta: {
+        symbol: asset.symbol,
+        probability: predictorTp?.probability ?? null,
+        minProbToEnter: MIN_PROB_TO_ENTER_TP,
+        stretchProbability: predictorStretch?.probability ?? null,
+        minStretchProbToEnter: MIN_PROB_TO_ENTER_STRETCH,
       },
       record: baseRecord,
     };
   }
 
   if (EV_GUARD_ENABLED) {
-    const p = clamp(Number(predictor.probability) || 0, 0, 1);
+    const p = clamp(Number(predictorTp?.probability) || 0, 0, 1);
     // Use the same fee model used everywhere else (maker-first unless taker-on-touch is enabled).
     const feesRoundTripBps = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : 0;
     const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
@@ -976,7 +1077,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     desiredNetExitBpsForV22,
     spreadBps,
     meta: {
-      predictorProbability: predictor.probability,
+      predictorProbability: predictorTp?.probability ?? null,
       orderbookAskDepthUsd: orderbookMeta?.askDepthUsd,
       orderbookBidDepthUsd: orderbookMeta?.bidDepthUsd,
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
