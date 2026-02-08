@@ -36,14 +36,24 @@ function normalizeUrl(raw) {
 }
 
 function getBaseUrl() {
-  const v =
+  const env =
     process.env.EXPO_PUBLIC_BACKEND_URL ||
     process.env.EXPO_PUBLIC_API_BASE_URL ||
     process.env.BACKEND_BASE_URL ||
     process.env.BACKEND_URL ||
     process.env.API_BASE_URL ||
     '';
-  return normalizeUrl(v);
+
+  const raw = String(env || '').trim();
+
+  if (raw) {
+    const normalized = raw.endsWith('/') ? raw.slice(0, -1) : raw;
+    if (/^https?:\/\//i.test(normalized)) return normalized;
+    return `https://${normalized}`;
+  }
+
+  // HARD DEFAULT — never empty
+  return 'https://magic-lw8t.onrender.com';
 }
 
 function getApiToken() {
