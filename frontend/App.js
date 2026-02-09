@@ -1,5 +1,9 @@
-// Set your backend URL below.
-// If you use the gradient, install: npx expo install expo-linear-gradient
+/*
+Quick smoke test:
+- Install deps: cd frontend && npx expo install expo-linear-gradient
+- Start: npx expo start
+- Set backend URL in Settings to your Render URL, e.g. https://magic-lw8t.onrender.com
+*/
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   SafeAreaView,
@@ -10,6 +14,10 @@ import {
   Text,
   RefreshControl,
   Pressable,
+  Modal,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 
@@ -35,7 +43,7 @@ const theme = {
 
 const endpointConfig = [
   { key: 'health', path: '/health' },
-  { key: 'status', path: '/status' },
+  { key: 'status', path: '/debug/status' },
   { key: 'account', path: '/account' },
   { key: 'positions', path: '/positions' },
   { key: 'orders', path: '/orders' },
@@ -56,12 +64,12 @@ function normalizeBase(raw) {
   return `https://${trimmed}`;
 }
 
-async function fetchJsonSafe(url) {
+async function fetchJsonSafe(url, token) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
   const headers = { Accept: 'application/json' };
-  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
+  if (token) headers.Authorization = `Bearer ${token}`;
 
   try {
     const res = await fetch(url, { signal: controller.signal, headers });
@@ -186,7 +194,9 @@ function MetricRow({ label, value, valueStyle }) {
 }
 
 export default function App() {
-  const baseUrl = useMemo(() => normalizeBase(API_BASE), []);
+  const [apiBase, setApiBase] = useState(API_BASE);
+  const [apiToken, setApiToken] = useState(API_TOKEN);
+  const baseUrl = useMemo(() => normalizeBase(apiBase), [apiBase]);
   const [responses, setResponses] = useState(() => ({
     health: emptyResponse,
     status: emptyResponse,
@@ -197,42 +207,80 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [draftBase, setDraftBase] = useState(API_BASE);
+  const [draftToken, setDraftToken] = useState(API_TOKEN);
   const intervalRef = useRef(null);
 
-  const fetchAll = useCallback(async () => {
-    if (!baseUrl) {
-      setResponses((prev) => ({
-        ...prev,
-        health: { ...prev.health, ok: false, status: 0, error: 'Missing API base URL' },
-      }));
-      return;
-    }
+  const fetchAll = useCallback(
+    async (overrideBase, overrideToken) => {
+      const activeBase = normalizeBase(overrideBase ?? apiBase);
+      const activeToken = overrideToken ?? apiToken;
+      if (!activeBase) {
+        setResponses((prev) => ({
+          ...prev,
+          health: { ...prev.health, ok: false, status: 0, error: 'Missing API base URL' },
+        }));
+        return;
+      }
 
-    const tasks = endpointConfig.map(({ key, path }) => {
-      const url = `${baseUrl}${path}`;
-      return fetchJsonSafe(url).then((result) => ({ key, result }));
-    });
-
-    const settled = await Promise.allSettled(tasks);
-    let hadSuccess = false;
-
-    setResponses((prev) => {
-      const next = { ...prev };
-      settled.forEach((item) => {
-        if (item.status !== 'fulfilled') return;
-        const { key, result } = item.value;
-        if (result.status === 404) {
-          next[key] = { ...prev[key], ok: false, status: 404, data: null, error: 'Not Found' };
-          return;
-        }
-        if (result.ok) hadSuccess = true;
-        next[key] = result;
+      const tasks = endpointConfig.map(({ key, path }) => {
+        const url = `${activeBase}${path}`;
+        return fetchJsonSafe(url, activeToken).then((result) => ({ key, result }));
       });
-      return next;
-    });
 
-    if (hadSuccess) setLastSuccessAt(new Date());
-  }, [baseUrl]);
+      const settled = await Promise.allSettled(tasks);
+      let hadSuccess = false;
+
+      setResponses((prev) => {
+        const next = { ...prev };
+        settled.forEach((item) => {
+          if (item.status !== 'fulfilled') return;
+          const { key, result } = item.value;
+          if (result.status === 404) {
+            next[key] = { ...prev[key], ok: false, status: 404, data: null, error: 'Not Found' };
+            return;
+          }
+          if (result.ok) hadSuccess = true;
+          next[key] = result;
+        });
+        return next;
+      });
+
+      if (hadSuccess) setLastSuccessAt(new Date());
+    },
+    [apiBase, apiToken],
+  );
+
+  const resetPolling = useCallback(
+    (nextBase, nextToken) => {
+      clearInterval(intervalRef.current);
+      intervalRef.current = setInterval(() => fetchAll(nextBase, nextToken), POLL_MS);
+    },
+    [fetchAll],
+  );
+
+  const handleSaveSettings = useCallback(() => {
+    const normalizedBase = normalizeBase(draftBase);
+    setApiBase(normalizedBase);
+    setApiToken(draftToken);
+    setSettingsOpen(false);
+    fetchAll(normalizedBase, draftToken);
+    resetPolling(normalizedBase, draftToken);
+  }, [draftBase, draftToken, fetchAll, resetPolling]);
+
+  const openSettings = useCallback(() => {
+    setDraftBase(apiBase);
+    setDraftToken(apiToken);
+    setSettingsOpen(true);
+  }, [apiBase, apiToken]);
+
+  const cancelSettings = useCallback(() => {
+    setSettingsOpen(false);
+  }, []);
+
+  const hasMissingBase =
+    !apiBase?.trim() || apiBase.includes('YOUR_BACKEND_URL_HERE');
 
   useEffect(() => {
     fetchAll();
@@ -337,7 +385,9 @@ export default function App() {
     : null;
 
   const friendlyError = !anySuccess
-    ? 'Offline right now. Check your connection or backend URL and try again.'
+    ? hasMissingBase
+      ? 'Set your backend URL in Settings ⚙️'
+      : 'Offline right now. Check your connection or backend URL and try again.'
     : null;
 
   const rawDetails = {
@@ -357,10 +407,17 @@ export default function App() {
           refreshControl={<RefreshControl tintColor={theme.text} refreshing={refreshing} onRefresh={onRefresh} />}
         >
           <View style={styles.header}>
-            <Text style={styles.title}>✨ Magic Money Dashboard</Text>
-            <Text style={styles.subtitle}>
-              {baseUrl ? `Backend: ${baseUrl}` : 'Backend: set API_BASE to your URL'}
-            </Text>
+            <View style={styles.headerRow}>
+              <View>
+                <Text style={styles.title}>✨ Magic Money Dashboard</Text>
+                <Text style={styles.subtitle}>
+                  {baseUrl ? `Backend: ${baseUrl}` : 'Backend: set in Settings ⚙️'}
+                </Text>
+              </View>
+              <Pressable onPress={openSettings} style={styles.settingsButton}>
+                <Text style={styles.settingsButtonText}>⚙️ Settings</Text>
+              </Pressable>
+            </View>
           </View>
 
           <View style={styles.statusRow}>
@@ -442,6 +499,54 @@ export default function App() {
           <Text style={styles.footer}>If it’s red, it might just be spread. Breathe.</Text>
         </ScrollView>
       </LinearGradient>
+      <Modal
+        visible={settingsOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={cancelSettings}
+      >
+        <View style={styles.modalOverlay}>
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.modalContainer}
+          >
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Settings</Text>
+              <Text style={styles.modalLabel}>Backend URL</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={draftBase}
+                onChangeText={setDraftBase}
+                placeholder="https://your-backend-url.com"
+                placeholderTextColor={theme.soft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                keyboardType="url"
+                textContentType="URL"
+              />
+              <Text style={styles.modalLabel}>API Token (optional)</Text>
+              <TextInput
+                style={styles.modalInput}
+                value={draftToken}
+                onChangeText={setDraftToken}
+                placeholder="Bearer token"
+                placeholderTextColor={theme.soft}
+                autoCapitalize="none"
+                autoCorrect={false}
+                secureTextEntry
+              />
+              <View style={styles.modalActions}>
+                <Pressable onPress={cancelSettings} style={styles.modalButton}>
+                  <Text style={styles.modalButtonText}>Cancel</Text>
+                </Pressable>
+                <Pressable onPress={handleSaveSettings} style={styles.modalButtonPrimary}>
+                  <Text style={styles.modalButtonPrimaryText}>Save &amp; Refresh</Text>
+                </Pressable>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -452,8 +557,23 @@ const styles = StyleSheet.create({
   content: { padding: 20, paddingBottom: 40 },
 
   header: { marginBottom: 16 },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
   title: { color: theme.text, fontSize: 28, fontWeight: '800' },
   subtitle: { color: theme.muted, fontSize: 12, marginTop: 6 },
+  settingsButton: {
+    backgroundColor: theme.cardElevated,
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  settingsButtonText: { color: theme.text, fontSize: 12, fontWeight: '700' },
 
   statusRow: {
     flexDirection: 'row',
@@ -514,4 +634,54 @@ const styles = StyleSheet.create({
   detailsText: { color: theme.soft, fontSize: 10, fontFamily: 'Courier', lineHeight: 16 },
 
   footer: { color: theme.soft, fontSize: 12, textAlign: 'center', marginTop: 20 },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(8,11,20,0.7)',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalContainer: { flex: 1, justifyContent: 'center' },
+  modalCard: {
+    backgroundColor: theme.card,
+    borderRadius: 18,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  modalTitle: { color: theme.text, fontSize: 18, fontWeight: '700', marginBottom: 12 },
+  modalLabel: { color: theme.muted, fontSize: 12, marginTop: 10, marginBottom: 6 },
+  modalInput: {
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: theme.border,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: theme.text,
+    backgroundColor: theme.cardElevated,
+    fontSize: 13,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 18,
+  },
+  modalButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  modalButtonText: { color: theme.text, fontSize: 12, fontWeight: '600' },
+  modalButtonPrimary: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: theme.cardElevated,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  modalButtonPrimaryText: { color: theme.text, fontSize: 12, fontWeight: '700' },
 });
