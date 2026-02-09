@@ -46,6 +46,14 @@ Entry scans apply multiple gates before placing a trade:
 - **pUp + EV gates**: requires probability of upside (pUp) to exceed `PUP_MIN` and expected value to exceed `EV_MIN_BPS`.
 - **Required gross exit cap**: skips symbols when the modeled gross take-profit bps for a +1% net move exceeds `MAX_REQUIRED_GROSS_EXIT_BPS`.
 
+## Signal Enhancers
+
+Optional entry refinements (all Alpaca data only, toggleable via env vars):
+- **TIME_OF_DAY_\***: adjust entry strictness based on a local-hour multiplier profile.
+- **SPREAD_ELASTICITY_\***: skip entries during sudden spread blowouts versus the recent baseline.
+- **VOL_COMPRESSION_\***: avoid dead-chop regimes when short-term realized volatility compresses.
+- **ORDERBOOK_ABSORPTION_\***: prefer entries with improving orderbook imbalance and bid replenishment.
+
 ## Exit Policy
 
 - Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).
