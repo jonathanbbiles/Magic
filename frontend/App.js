@@ -1,6 +1,7 @@
 /*
 Quick smoke test:
 - Install deps: cd frontend && npx expo install expo-linear-gradient
+- Install chart deps: cd frontend && npx expo install react-native-svg
 - Start: npx expo start
 - Set backend URL in Settings to your Render URL, e.g. https://magic-lw8t.onrender.com
 */
@@ -20,6 +21,7 @@ import {
   Platform,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import Svg, { Path, Circle, Defs, LinearGradient as SvgGradient, Stop } from 'react-native-svg';
 
 const API_BASE = 'https://magic-lw8t.onrender.com';
 const API_TOKEN = ''; // optional
@@ -28,17 +30,21 @@ const POLL_MS = 10000;
 const REQUEST_TIMEOUT = 7000;
 
 const theme = {
-  background: '#080B14',
-  card: '#0E1627',
-  cardElevated: '#121D33',
-  border: 'rgba(255,255,255,0.10)',
-  text: 'rgba(255,255,255,0.94)',
-  muted: 'rgba(255,255,255,0.60)',
-  soft: 'rgba(255,255,255,0.40)',
-  success: '#35E39A',
-  warning: '#F6C453',
-  danger: '#FF6B6B',
-  neutral: '#7A8AA0',
+  background: '#0B1020',
+  surface: '#10182C',
+  surfaceElevated: '#18233B',
+  border: 'rgba(255,255,255,0.08)',
+  text: '#F7F8FF',
+  muted: 'rgba(255,255,255,0.72)',
+  soft: 'rgba(255,255,255,0.55)',
+  mint: '#C3F3E8',
+  lavender: '#D5C8FF',
+  peach: '#FFD6B3',
+  sky: '#B7E3FF',
+  blush: '#FFC5E6',
+  success: '#9CF1C8',
+  warning: '#FFE2A8',
+  danger: '#FFB3C2',
 };
 
 const endpointConfig = [
@@ -119,21 +125,14 @@ function formatCurrency(value) {
 }
 
 function formatPercent(value) {
-  if (value == null || Number.isNaN(Number(value))) return null;
+  if (value == null || Number.isNaN(Number(value))) return '—';
   const number = Number(value);
   return `${number.toFixed(2)}%`;
 }
 
-function formatMaybeNumber(value) {
+function formatAge(value) {
   if (value == null || Number.isNaN(Number(value))) return '—';
-  return Number(value).toLocaleString();
-}
-
-function formatTimestamp(value) {
-  if (!value) return '—';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '—';
-  return date.toLocaleString();
+  return `${Number(value).toFixed(1)}h`;
 }
 
 function toBoolean(value) {
@@ -148,47 +147,116 @@ function toBoolean(value) {
   return null;
 }
 
+function getChangePct(nowEquity, pastEquity) {
+  if (nowEquity == null || pastEquity == null) return null;
+  const now = Number(nowEquity);
+  const past = Number(pastEquity);
+  if (!Number.isFinite(now) || !Number.isFinite(past) || past === 0) return null;
+  return ((now - past) / past) * 100;
+}
+
+function getPastPoint(series, targetTime) {
+  if (!series.length) return null;
+  for (let i = series.length - 1; i >= 0; i -= 1) {
+    if (series[i].t <= targetTime) return series[i];
+  }
+  return null;
+}
+
+function buildSparklinePath(points, width, height) {
+  if (points.length < 2) return '';
+  const values = points.map((point) => point.equity);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const step = width / (points.length - 1);
+  return points
+    .map((point, index) => {
+      const x = index * step;
+      const y = height - ((point.equity - min) / range) * height;
+      return `${index === 0 ? 'M' : 'L'}${x},${y}`;
+    })
+    .join(' ');
+}
+
+function Sparkline({ points }) {
+  const width = 240;
+  const height = 60;
+  if (points.length < 2) {
+    return (
+      <View style={styles.sparklineEmpty}>
+        <Text style={styles.sparklineEmptyText}>Collecting equity trail…</Text>
+      </View>
+    );
+  }
+  const path = buildSparklinePath(points, width, height);
+  const lastPoint = points[points.length - 1];
+  const values = points.map((point) => point.equity);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const lastX = width;
+  const lastY = height - ((lastPoint.equity - min) / range) * height;
+
+  return (
+    <Svg width={width} height={height} style={styles.sparklineSvg}>
+      <Defs>
+        <SvgGradient id="sparklineGradient" x1="0" y1="0" x2="1" y2="0">
+          <Stop offset="0%" stopColor={theme.mint} stopOpacity="0.9" />
+          <Stop offset="100%" stopColor={theme.lavender} stopOpacity="0.9" />
+        </SvgGradient>
+      </Defs>
+      <Path d={path} stroke="url(#sparklineGradient)" strokeWidth={3} fill="none" />
+      <Circle cx={lastX} cy={lastY} r={4} fill={theme.blush} />
+    </Svg>
+  );
+}
+
 function Chip({ label, tone }) {
-  const background =
+  const palette =
     tone === 'success'
-      ? 'rgba(53,227,154,0.18)'
+      ? { bg: 'rgba(156,241,200,0.2)', fg: theme.mint }
       : tone === 'warning'
-        ? 'rgba(246,196,83,0.18)'
+        ? { bg: 'rgba(255,226,168,0.2)', fg: theme.peach }
         : tone === 'danger'
-          ? 'rgba(255,107,107,0.18)'
-          : 'rgba(122,138,160,0.16)';
-  const color =
-    tone === 'success'
-      ? theme.success
-      : tone === 'warning'
-        ? theme.warning
-        : tone === 'danger'
-          ? theme.danger
-          : theme.neutral;
+          ? { bg: 'rgba(255,179,194,0.2)', fg: theme.blush }
+          : { bg: 'rgba(183,227,255,0.18)', fg: theme.sky };
 
   return (
-    <View style={[styles.chip, { backgroundColor: background, borderColor: color }]}>
-      <Text style={[styles.chipText, { color }]}>{label}</Text>
+    <View style={[styles.chip, { backgroundColor: palette.bg, borderColor: palette.fg }]}>
+      <Text style={[styles.chipText, { color: palette.fg }]}>{label}</Text>
     </View>
   );
 }
 
-function Card({ title, children }) {
+function GrowthPill({ label, value, tone }) {
+  const palette =
+    tone === 'up'
+      ? { bg: 'rgba(195,243,232,0.2)', fg: theme.mint }
+      : tone === 'down'
+        ? { bg: 'rgba(255,197,230,0.2)', fg: theme.blush }
+        : { bg: 'rgba(213,200,255,0.18)', fg: theme.lavender };
+  const arrow = tone === 'up' ? '▲' : tone === 'down' ? '▼' : '•';
+
   return (
-    <View style={styles.card}>
-      <Text style={styles.cardTitle}>{title}</Text>
-      {children}
+    <View style={[styles.growthPill, { backgroundColor: palette.bg, borderColor: palette.fg }]}>
+      <Text style={styles.growthLabel}>{label}</Text>
+      <Text style={[styles.growthValue, { color: palette.fg }]}>{`${arrow} ${value}`}</Text>
     </View>
   );
 }
 
-function MetricRow({ label, value, valueStyle }) {
+function PositionRow({ symbol, ageHours }) {
+  const progress = ageHours == null ? 0 : Math.min(ageHours / 24, 1);
   return (
-    <View style={styles.metricRow}>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <Text style={[styles.metricValue, valueStyle]} numberOfLines={2}>
-        {value ?? '—'}
-      </Text>
+    <View style={styles.positionRow}>
+      <View style={styles.positionMeta}>
+        <Text style={styles.positionSymbol}>{symbol}</Text>
+        <Text style={styles.positionAge}>{formatAge(ageHours)}</Text>
+      </View>
+      <View style={styles.positionBar}>
+        <View style={[styles.positionFill, { width: `${progress * 100}%` }]} />
+      </View>
     </View>
   );
 }
@@ -206,11 +274,30 @@ export default function App() {
   }));
   const [refreshing, setRefreshing] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [draftBase, setDraftBase] = useState(API_BASE);
   const [draftToken, setDraftToken] = useState(API_TOKEN);
+  const [equitySeries, setEquitySeries] = useState([]);
+  const [showAllPositions, setShowAllPositions] = useState(false);
   const intervalRef = useRef(null);
+
+  const addEquityPoint = useCallback((equityValue) => {
+    const equityNumber = Number(equityValue);
+    if (!Number.isFinite(equityNumber)) return;
+    const now = Date.now();
+    setEquitySeries((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.equity === equityNumber && now - last.t < 60000) {
+        return prev;
+      }
+      const cutoff = now - 14 * 24 * 60 * 60 * 1000;
+      let next = [...prev, { t: now, equity: equityNumber }].filter((point) => point.t >= cutoff);
+      if (next.length > 2000) {
+        next = next.slice(next.length - 2000);
+      }
+      return next;
+    });
+  }, []);
 
   const fetchAll = useCallback(
     async (overrideBase, overrideToken) => {
@@ -231,6 +318,7 @@ export default function App() {
 
       const settled = await Promise.allSettled(tasks);
       let hadSuccess = false;
+      let accountEquity = null;
 
       setResponses((prev) => {
         const next = { ...prev };
@@ -242,14 +330,20 @@ export default function App() {
             return;
           }
           if (result.ok) hadSuccess = true;
+          if (key === 'account' && result.ok && result.data) {
+            accountEquity = result.data.equity ?? result.data.accountEquity ?? null;
+          }
           next[key] = result;
         });
         return next;
       });
 
+      if (accountEquity != null) {
+        addEquityPoint(accountEquity);
+      }
       if (hadSuccess) setLastSuccessAt(new Date());
     },
-    [apiBase, apiToken],
+    [addEquityPoint, apiBase, apiToken],
   );
 
   const resetPolling = useCallback(
@@ -301,14 +395,6 @@ export default function App() {
     ? responses.positions.data
     : [];
 
-  const openOrdersCount =
-    responses.orders.data?.openOrdersCount ??
-    responses.orders.data?.count ??
-    responses.orders.data?.open ??
-    statusData?.openOrdersCount ??
-    statusData?.openOrders ??
-    '—';
-
   const tradingEnabled =
     toBoolean(healthData?.autoTradeEnabled) ??
     toBoolean(healthData?.tradingEnabled) ??
@@ -337,80 +423,140 @@ export default function App() {
     overallText = 'Degraded connectivity';
   }
 
-  const positionsCount = positionsData.length;
-
-  const sortedByPl = [...positionsData]
-    .map((pos) => {
-      const plPercent =
-        pos?.unrealizedPlPercent ?? pos?.unrealized_pl_percent ?? pos?.unrealizedPlPct;
-      const plValue = pos?.unrealizedPl ?? pos?.unrealized_pl;
-      return {
-        ...pos,
-        plScore: plPercent ?? plValue ?? 0,
-        plPercent,
-      };
-    })
-    .sort((a, b) => (b.plScore || 0) - (a.plScore || 0));
-
-  const biggestWinner = sortedByPl[0];
-  const biggestLoser = sortedByPl[sortedByPl.length - 1];
-
-  const stuckPositions = positionsData.filter((pos) => {
-    const plPercent =
-      pos?.unrealizedPlPercent ?? pos?.unrealized_pl_percent ?? pos?.unrealizedPlPct;
-    if (plPercent == null) return false;
-    const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
-    if (heldSeconds != null) return plPercent < -1.5 && heldSeconds > 3600;
-    return plPercent < -3;
-  });
-
-  const dayPl =
-    accountData?.dayPl ??
-    accountData?.day_pl ??
-    accountData?.dayPL ??
-    accountData?.pnlDay ??
-    null;
-
-  const dayPlTone =
-    dayPl == null
-      ? theme.neutral
-      : Number(dayPl) > 0
-        ? theme.success
-        : Number(dayPl) < 0
-          ? theme.danger
-          : theme.neutral;
-
   const dataAgeSeconds = lastSuccessAt
     ? Math.floor((Date.now() - lastSuccessAt.getTime()) / 1000)
     : null;
 
+  const statusHeldBySymbol = useMemo(() => {
+    const map = {};
+    if (Array.isArray(statusData?.positions)) {
+      statusData.positions.forEach((pos) => {
+        const symbol = pos?.symbol ?? pos?.asset;
+        const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
+        if (symbol && heldSeconds != null) {
+          map[String(symbol)] = heldSeconds;
+        }
+      });
+    }
+    if (statusData?.exitState && typeof statusData.exitState === 'object') {
+      Object.entries(statusData.exitState).forEach(([symbol, value]) => {
+        const heldSeconds = value?.heldSeconds ?? value?.held_seconds;
+        if (heldSeconds != null) {
+          map[String(symbol)] = heldSeconds;
+        }
+      });
+    }
+    return map;
+  }, [statusData]);
+
+  const positionsWithAge = positionsData
+    .map((pos) => {
+      const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
+      if (heldSeconds != null) {
+        return { ...pos, ageHours: heldSeconds / 3600 };
+      }
+      const timeValue = pos?.openedAt ?? pos?.opened_at ?? pos?.entryTime ?? pos?.created_at;
+      if (timeValue) {
+        const parsed = new Date(timeValue);
+        if (!Number.isNaN(parsed.getTime())) {
+          return { ...pos, ageHours: (Date.now() - parsed.getTime()) / 3600000 };
+        }
+      }
+      const symbolKey = pos?.symbol ?? pos?.asset;
+      const statusHeld = symbolKey ? statusHeldBySymbol[String(symbolKey)] : null;
+      if (statusHeld != null) {
+        return { ...pos, ageHours: statusHeld / 3600 };
+      }
+      return { ...pos, ageHours: null };
+    })
+    .sort((a, b) => {
+      if (a.ageHours == null && b.ageHours == null) return 0;
+      if (a.ageHours == null) return 1;
+      if (b.ageHours == null) return -1;
+      return b.ageHours - a.ageHours;
+    });
+
+  const visiblePositions = showAllPositions
+    ? positionsWithAge
+    : positionsWithAge.slice(0, 12);
+
+  const equityValue = Number(accountData?.equity);
+  const currentEquity = Number.isFinite(equityValue) ? equityValue : null;
+  const sparklinePoints = equitySeries.slice(-50);
+
+  const now = Date.now();
+  const dailyPoint = getPastPoint(equitySeries, now - 24 * 60 * 60 * 1000);
+  const weeklyPoint = getPastPoint(equitySeries, now - 7 * 24 * 60 * 60 * 1000);
+  const monthlyPoint = getPastPoint(equitySeries, now - 30 * 24 * 60 * 60 * 1000);
+  const yearStart = new Date(new Date().getFullYear(), 0, 1).getTime();
+  const ytdPoint =
+    equitySeries.find((point) => point.t >= yearStart) ?? equitySeries[0] ?? null;
+
+  const dailyPct = getChangePct(currentEquity, dailyPoint?.equity ?? null);
+  const weeklyPct = getChangePct(currentEquity, weeklyPoint?.equity ?? null);
+  const monthlyPct = getChangePct(currentEquity, monthlyPoint?.equity ?? null);
+  const ytdPct = getChangePct(currentEquity, ytdPoint?.equity ?? null);
+
+  const moodBadge =
+    dailyPct == null
+      ? '😌 Chill Mode'
+      : dailyPct > 0
+        ? '✨ Green Day Energy'
+        : dailyPct < 0
+          ? '🫧 It’s just a dip, babe'
+          : '😌 Chill Mode';
+
+  const growthItems = [
+    {
+      key: 'daily',
+      label: 'Daily',
+      value: formatPercent(dailyPct),
+      tone: dailyPct == null ? 'flat' : dailyPct > 0 ? 'up' : dailyPct < 0 ? 'down' : 'flat',
+    },
+    {
+      key: 'weekly',
+      label: 'Weekly',
+      value: formatPercent(weeklyPct),
+      tone: weeklyPct == null ? 'flat' : weeklyPct > 0 ? 'up' : weeklyPct < 0 ? 'down' : 'flat',
+    },
+    {
+      key: 'monthly',
+      label: 'Monthly',
+      value: formatPercent(monthlyPct),
+      tone: monthlyPct == null ? 'flat' : monthlyPct > 0 ? 'up' : monthlyPct < 0 ? 'down' : 'flat',
+    },
+    {
+      key: 'ytd',
+      label: 'YTD',
+      value: formatPercent(ytdPct),
+      tone: ytdPct == null ? 'flat' : ytdPct > 0 ? 'up' : ytdPct < 0 ? 'down' : 'flat',
+    },
+  ];
+
   const friendlyError = !anySuccess
     ? hasMissingBase
       ? 'Set your backend URL in Settings ⚙️'
-      : 'Offline right now. Check your connection or backend URL and try again.'
+      : 'Can’t reach the mothership 🛸'
     : null;
-
-  const rawDetails = {
-    health: responses.health,
-    status: responses.status,
-    account: responses.account,
-    positions: responses.positions,
-    orders: responses.orders,
-  };
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={['#0C1222', '#090E1A']} style={styles.gradient}>
+      <LinearGradient colors={['#0B1020', '#121A2E']} style={styles.gradient}>
         <ScrollView
           contentContainerStyle={styles.content}
-          refreshControl={<RefreshControl tintColor={theme.text} refreshing={refreshing} onRefresh={onRefresh} />}
+          refreshControl={
+            <RefreshControl tintColor={theme.text} refreshing={refreshing} onRefresh={onRefresh} />
+          }
         >
           <View style={styles.header}>
             <View style={styles.headerRow}>
               <View>
                 <Text style={styles.title}>✨ Magic Money Dashboard</Text>
                 <Text style={styles.subtitle}>
+                  Your bot is doing the boring work so you don’t have to.
+                </Text>
+                <Text style={styles.backendLabel}>
                   {baseUrl ? `Backend: ${baseUrl}` : 'Backend: set in Settings ⚙️'}
                 </Text>
               </View>
@@ -421,15 +567,25 @@ export default function App() {
           </View>
 
           <View style={styles.statusRow}>
-            <Text style={[styles.statusLabel, { color: overallTone === 'success' ? theme.success : overallTone === 'warning' ? theme.warning : theme.danger }]}>
+            <Text
+              style={[
+                styles.statusLabel,
+                {
+                  color:
+                    overallTone === 'success'
+                      ? theme.mint
+                      : overallTone === 'warning'
+                        ? theme.peach
+                        : theme.blush,
+                },
+              ]}
+            >
               Overall Status: {overallText}
             </Text>
             <Text style={styles.statusMeta}>
               Data age: {dataAgeSeconds != null ? `${dataAgeSeconds}s` : '—'}
             </Text>
           </View>
-
-          {friendlyError ? <Text style={styles.offline}>{friendlyError}</Text> : null}
 
           <View style={styles.chipRow}>
             <Chip
@@ -443,58 +599,70 @@ export default function App() {
             <Chip label={`Health: ${healthOk ? 'OK' : 'DEGRADED'}`} tone={healthOk ? 'success' : 'danger'} />
           </View>
 
-          <Card title="Portfolio Snapshot">
-            <Text style={styles.bigValue}>{formatCurrency(accountData?.equity)}</Text>
-            <Text style={styles.bigLabel}>Equity</Text>
-            <View style={styles.divider} />
-            <MetricRow
-              label="Buying Power / Cash"
-              value={formatCurrency(accountData?.buyingPower ?? accountData?.cash ?? accountData?.buying_power)}
-            />
-            <MetricRow
-              label="Day P/L"
-              value={dayPl == null ? '—' : formatCurrency(dayPl)}
-              valueStyle={{ color: dayPlTone, fontWeight: '700' }}
-            />
-          </Card>
-
-          <Card title="Positions Summary">
-            <MetricRow label="Positions" value={formatMaybeNumber(positionsCount)} />
-            <MetricRow
-              label="Biggest Winner"
-              value={
-                biggestWinner
-                  ? `${biggestWinner.symbol ?? biggestWinner.asset ?? '—'} ${formatPercent(biggestWinner.plPercent) ?? ''}`.trim()
-                  : '—'
-              }
-            />
-            <MetricRow
-              label="Biggest Loser"
-              value={
-                biggestLoser
-                  ? `${biggestLoser.symbol ?? biggestLoser.asset ?? '—'} ${formatPercent(biggestLoser.plPercent) ?? ''}`.trim()
-                  : '—'
-              }
-            />
-            <MetricRow label="Stuck Positions" value={formatMaybeNumber(stuckPositions.length)} />
-          </Card>
-
-          <Card title="Bot Activity">
-            <MetricRow label="Last Run" value={formatTimestamp(statusData?.lastLoopAt ?? statusData?.lastRunAt)} />
-            <MetricRow label="Last Action" value={statusData?.lastAction ?? statusData?.lastDecision ?? statusData?.lastDecision?.action ?? '—'} />
-            <MetricRow label="Last Skip" value={statusData?.lastSkipReason ?? statusData?.skipReason ?? '—'} />
-            <MetricRow label="Open Orders" value={formatMaybeNumber(openOrdersCount)} />
-          </Card>
-
-          <Pressable onPress={() => setDetailsOpen((prev) => !prev)} style={styles.detailsToggle}>
-            <Text style={styles.detailsToggleText}>{detailsOpen ? 'Hide Details' : 'Show Details'}</Text>
-            <Text style={styles.detailsToggleHint}>Raw JSON</Text>
-          </Pressable>
-          {detailsOpen ? (
-            <View style={styles.detailsBox}>
-              <Text style={styles.detailsText}>{JSON.stringify(rawDetails, null, 2)}</Text>
+          {friendlyError ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>{friendlyError}</Text>
+              <Text style={styles.emptySubtitle}>
+                We’ll keep checking in the background. Want to try again?
+              </Text>
+              <View style={styles.emptyActions}>
+                <Pressable onPress={onRefresh} style={styles.emptyButton}>
+                  <Text style={styles.emptyButtonText}>Retry</Text>
+                </Pressable>
+                <Pressable onPress={openSettings} style={styles.emptyButtonGhost}>
+                  <Text style={styles.emptyButtonGhostText}>Settings</Text>
+                </Pressable>
+              </View>
             </View>
-          ) : null}
+          ) : (
+            <>
+              <View style={styles.portfolioCard}>
+                <Text style={styles.portfolioLabel}>Portfolio Value</Text>
+                <Text style={styles.portfolioValue}>{formatCurrency(accountData?.equity)}</Text>
+                <Sparkline points={sparklinePoints} />
+              </View>
+
+              <View style={styles.growthHeader}>
+                <Text style={styles.sectionTitle}>Growth</Text>
+                <View style={styles.moodBadge}>
+                  <Text style={styles.moodText}>{moodBadge}</Text>
+                </View>
+              </View>
+              <View style={styles.growthGrid}>
+                {growthItems.map((item) => (
+                  <GrowthPill key={item.key} label={item.label} value={item.value} tone={item.tone} />
+                ))}
+              </View>
+
+              <View style={styles.sectionHeaderRow}>
+                <Text style={styles.sectionTitle}>Positions</Text>
+                <Text style={styles.sectionMeta}>Age in hours</Text>
+              </View>
+              <View style={styles.positionsCard}>
+                {visiblePositions.length ? (
+                  visiblePositions.map((pos, index) => (
+                    <PositionRow
+                      key={`${pos.symbol ?? pos.asset ?? index}`}
+                      symbol={pos.symbol ?? pos.asset ?? '—'}
+                      ageHours={pos.ageHours}
+                    />
+                  ))
+                ) : (
+                  <Text style={styles.positionsEmpty}>No positions yet.</Text>
+                )}
+                {positionsWithAge.length > 12 ? (
+                  <Pressable
+                    onPress={() => setShowAllPositions((prev) => !prev)}
+                    style={styles.showAllButton}
+                  >
+                    <Text style={styles.showAllText}>
+                      {showAllPositions ? 'Show less' : 'Show all'}
+                    </Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            </>
+          )}
 
           <Text style={styles.footer}>If it’s red, it might just be spread. Breathe.</Text>
         </ScrollView>
@@ -556,17 +724,18 @@ const styles = StyleSheet.create({
   gradient: { flex: 1 },
   content: { padding: 20, paddingBottom: 40 },
 
-  header: { marginBottom: 16 },
+  header: { marginBottom: 12 },
   headerRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
     gap: 12,
   },
-  title: { color: theme.text, fontSize: 28, fontWeight: '800' },
-  subtitle: { color: theme.muted, fontSize: 12, marginTop: 6 },
+  title: { color: theme.text, fontSize: 26, fontWeight: '800' },
+  subtitle: { color: theme.muted, fontSize: 13, marginTop: 6, maxWidth: 260 },
+  backendLabel: { color: theme.soft, fontSize: 11, marginTop: 6 },
   settingsButton: {
-    backgroundColor: theme.cardElevated,
+    backgroundColor: theme.surfaceElevated,
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -581,57 +750,133 @@ const styles = StyleSheet.create({
     alignItems: 'baseline',
     marginBottom: 8,
   },
-  statusLabel: { fontSize: 15, fontWeight: '700' },
-  statusMeta: { color: theme.soft, fontSize: 12 },
-  offline: { color: theme.warning, fontSize: 12, marginBottom: 10 },
+  statusLabel: { fontSize: 14, fontWeight: '700' },
+  statusMeta: { color: theme.soft, fontSize: 11 },
 
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 18 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 16 },
   chip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
     borderRadius: 999,
     borderWidth: 1,
   },
-  chipText: { fontSize: 11, fontWeight: '700', letterSpacing: 0.3 },
+  chipText: { fontSize: 10, fontWeight: '700', letterSpacing: 0.2 },
 
-  card: {
-    backgroundColor: theme.card,
-    borderRadius: 18,
-    padding: 18,
+  emptyState: {
+    backgroundColor: theme.surface,
+    borderRadius: 20,
+    padding: 20,
     borderWidth: 1,
     borderColor: theme.border,
-    marginBottom: 16,
+    marginTop: 10,
   },
-  cardTitle: { color: theme.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 1.2 },
-  bigValue: { color: theme.text, fontSize: 32, fontWeight: '800', marginTop: 10 },
-  bigLabel: { color: theme.soft, fontSize: 12, marginTop: 4 },
-  divider: { height: 1, backgroundColor: theme.border, marginVertical: 12 },
-
-  metricRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
-  metricLabel: { color: theme.muted, fontSize: 12 },
-  metricValue: { color: theme.text, fontSize: 13, fontWeight: '600', maxWidth: '55%', textAlign: 'right' },
-
-  detailsToggle: {
-    backgroundColor: theme.cardElevated,
-    borderRadius: 14,
-    paddingVertical: 12,
+  emptyTitle: { color: theme.text, fontSize: 18, fontWeight: '700' },
+  emptySubtitle: { color: theme.soft, fontSize: 12, marginTop: 6 },
+  emptyActions: { flexDirection: 'row', gap: 12, marginTop: 16 },
+  emptyButton: {
+    backgroundColor: theme.surfaceElevated,
     paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+  },
+  emptyButtonText: { color: theme.text, fontWeight: '700', fontSize: 12 },
+  emptyButtonGhost: {
     borderWidth: 1,
     borderColor: theme.border,
-    marginTop: 4,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
   },
-  detailsToggleText: { color: theme.text, fontSize: 13, fontWeight: '700' },
-  detailsToggleHint: { color: theme.soft, fontSize: 11, marginTop: 4 },
+  emptyButtonGhostText: { color: theme.text, fontWeight: '600', fontSize: 12 },
 
-  detailsBox: {
-    backgroundColor: 'rgba(10,16,28,0.9)',
-    borderRadius: 14,
+  portfolioCard: {
+    backgroundColor: theme.surface,
+    borderRadius: 22,
+    padding: 20,
     borderWidth: 1,
     borderColor: theme.border,
-    padding: 12,
-    marginTop: 8,
+    marginBottom: 18,
   },
-  detailsText: { color: theme.soft, fontSize: 10, fontFamily: 'Courier', lineHeight: 16 },
+  portfolioLabel: { color: theme.soft, fontSize: 12, textTransform: 'uppercase', letterSpacing: 1.2 },
+  portfolioValue: { color: theme.text, fontSize: 34, fontWeight: '800', marginTop: 8 },
+
+  sparklineSvg: { marginTop: 12 },
+  sparklineEmpty: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: 12,
+    padding: 10,
+  },
+  sparklineEmptyText: { color: theme.soft, fontSize: 11 },
+
+  growthHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  sectionTitle: { color: theme.text, fontSize: 16, fontWeight: '700' },
+  sectionMeta: { color: theme.soft, fontSize: 11 },
+  moodBadge: {
+    backgroundColor: 'rgba(183,227,255,0.2)',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  moodText: { color: theme.sky, fontSize: 11, fontWeight: '700' },
+
+  growthGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 18 },
+  growthPill: {
+    width: '47%',
+    backgroundColor: 'rgba(213,200,255,0.18)',
+    borderRadius: 16,
+    padding: 12,
+    borderWidth: 1,
+  },
+  growthLabel: { color: theme.soft, fontSize: 11 },
+  growthValue: { fontSize: 15, fontWeight: '700', marginTop: 6 },
+
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  positionsCard: {
+    backgroundColor: theme.surface,
+    borderRadius: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: theme.border,
+    marginBottom: 18,
+  },
+  positionRow: { marginBottom: 12 },
+  positionMeta: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  positionSymbol: { color: theme.text, fontSize: 13, fontWeight: '700' },
+  positionAge: { color: theme.soft, fontSize: 12 },
+  positionBar: {
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+    overflow: 'hidden',
+  },
+  positionFill: {
+    height: '100%',
+    borderRadius: 999,
+    backgroundColor: theme.mint,
+  },
+  positionsEmpty: { color: theme.soft, fontSize: 12, textAlign: 'center', marginVertical: 10 },
+
+  showAllButton: {
+    alignSelf: 'flex-start',
+    marginTop: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: theme.surfaceElevated,
+  },
+  showAllText: { color: theme.text, fontSize: 11, fontWeight: '700' },
 
   footer: { color: theme.soft, fontSize: 12, textAlign: 'center', marginTop: 20 },
 
@@ -643,7 +888,7 @@ const styles = StyleSheet.create({
   },
   modalContainer: { flex: 1, justifyContent: 'center' },
   modalCard: {
-    backgroundColor: theme.card,
+    backgroundColor: theme.surface,
     borderRadius: 18,
     padding: 20,
     borderWidth: 1,
@@ -658,7 +903,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 10,
     color: theme.text,
-    backgroundColor: theme.cardElevated,
+    backgroundColor: theme.surfaceElevated,
     fontSize: 13,
   },
   modalActions: {
@@ -679,7 +924,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 12,
-    backgroundColor: theme.cardElevated,
+    backgroundColor: theme.surfaceElevated,
     borderWidth: 1,
     borderColor: theme.border,
   },
