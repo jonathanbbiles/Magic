@@ -1,4 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+// Set your backend URL below.
+// If you use the gradient, install: npx expo install expo-linear-gradient
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   SafeAreaView,
   StatusBar,
@@ -6,321 +8,510 @@ import {
   ScrollView,
   View,
   Text,
+  RefreshControl,
+  Pressable,
 } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
+
+const API_BASE = 'https://YOUR_BACKEND_URL_HERE';
+const API_TOKEN = ''; // optional
+
+const POLL_MS = 10000;
+const REQUEST_TIMEOUT = 7000;
 
 const theme = {
-  background: '#070A12',
-  card: '#0B1220',
+  background: '#080B14',
+  card: '#0E1627',
+  cardElevated: '#121D33',
   border: 'rgba(255,255,255,0.10)',
-  text: 'rgba(255,255,255,0.92)',
-  muted: 'rgba(255,255,255,0.55)',
-  danger: 'rgba(255,120,120,0.95)',
+  text: 'rgba(255,255,255,0.94)',
+  muted: 'rgba(255,255,255,0.60)',
+  soft: 'rgba(255,255,255,0.40)',
+  success: '#35E39A',
+  warning: '#F6C453',
+  danger: '#FF6B6B',
+  neutral: '#7A8AA0',
 };
 
-const POLL_MS = 2000;
+const endpointConfig = [
+  { key: 'health', path: '/health' },
+  { key: 'status', path: '/status' },
+  { key: 'account', path: '/account' },
+  { key: 'positions', path: '/positions' },
+  { key: 'orders', path: '/orders' },
+];
 
-const initial = {
-  loading: true,
+const emptyResponse = {
   ok: false,
   status: 0,
   data: null,
   error: null,
-  url: null,
-  updatedAt: null,
 };
 
-function normalizeUrl(raw) {
+function normalizeBase(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
-  return s.endsWith('/') ? s.slice(0, -1) : s;
+  const trimmed = s.endsWith('/') ? s.slice(0, -1) : s;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
 }
 
-function getBaseUrl() {
-  const env =
-    process.env.EXPO_PUBLIC_BACKEND_URL ||
-    process.env.EXPO_PUBLIC_API_BASE_URL ||
-    process.env.BACKEND_BASE_URL ||
-    process.env.BACKEND_URL ||
-    process.env.API_BASE_URL ||
-    '';
-
-  const raw = String(env || '').trim();
-
-  if (raw) {
-    const normalized = raw.endsWith('/') ? raw.slice(0, -1) : raw;
-    if (/^https?:\/\//i.test(normalized)) return normalized;
-    return `https://${normalized}`;
-  }
-
-  // HARD DEFAULT — never empty
-  return 'https://magic-lw8t.onrender.com';
-}
-
-function getApiToken() {
-  const v =
-    process.env.EXPO_PUBLIC_API_TOKEN ||
-    process.env.API_TOKEN ||
-    process.env.AUTH_TOKEN ||
-    '';
-  return String(v || '').trim();
-}
-
-async function fetchJson(path, timeoutMs = 6000) {
-  const baseUrl = getBaseUrl();
-  if (!baseUrl) {
-    return {
-      ok: false,
-      url: null,
-      status: 0,
-      data: null,
-      error:
-        'Backend URL missing. Set EXPO_PUBLIC_BACKEND_URL (or BACKEND_BASE_URL) to your Render https URL.',
-    };
-  }
-
-  const url = `${baseUrl}${path.startsWith('/') ? '' : '/'}${path}`;
+async function fetchJsonSafe(url) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
   const headers = { Accept: 'application/json' };
-  const token = getApiToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
+  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
 
   try {
     const res = await fetch(url, { signal: controller.signal, headers });
     const status = res.status;
-    const text = await res.text();
+    if (status === 204) {
+      return { ok: true, status, data: null, error: null };
+    }
 
+    const text = await res.text();
     let data = null;
     if (text) {
       try {
         data = JSON.parse(text);
       } catch {
-        data = { text };
+        data = text;
       }
     }
 
     if (!res.ok) {
-      const hint =
-        status === 401
-          ? 'Unauthorized (token missing/mismatch). Ensure EXPO_PUBLIC_API_TOKEN or API_TOKEN matches backend.'
-          : '';
       return {
         ok: false,
-        url,
         status,
         data,
-        error: `HTTP ${status}${hint ? ` — ${hint}` : ''}`,
+        error: status === 404 ? 'Not Found' : `HTTP ${status}`,
       };
     }
 
-    return { ok: true, url, status, data, error: null };
-  } catch (e) {
-    const msg =
-      e?.name === 'AbortError'
+    return { ok: true, status, data, error: null };
+  } catch (error) {
+    const message =
+      error?.name === 'AbortError'
         ? 'Request timed out'
-        : e?.message || 'Network request failed';
-    return { ok: false, url, status: 0, data: null, error: msg };
+        : error?.message || 'Network request failed';
+    return { ok: false, status: 0, data: null, error: message };
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-function Section({ title, children }) {
+function formatCurrency(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  const number = Number(value);
+  return `$${number.toLocaleString(undefined, {
+    maximumFractionDigits: 2,
+    minimumFractionDigits: 2,
+  })}`;
+}
+
+function formatPercent(value) {
+  if (value == null || Number.isNaN(Number(value))) return null;
+  const number = Number(value);
+  return `${number.toFixed(2)}%`;
+}
+
+function formatMaybeNumber(value) {
+  if (value == null || Number.isNaN(Number(value))) return '—';
+  return Number(value).toLocaleString();
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleString();
+}
+
+function toBoolean(value) {
+  if (value == null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value > 0;
+  if (typeof value === 'string') {
+    const normalized = value.toLowerCase();
+    if (['true', 'yes', 'on', 'enabled', 'live'].includes(normalized)) return true;
+    if (['false', 'no', 'off', 'disabled', 'paper'].includes(normalized)) return false;
+  }
+  return null;
+}
+
+function Chip({ label, tone }) {
+  const background =
+    tone === 'success'
+      ? 'rgba(53,227,154,0.18)'
+      : tone === 'warning'
+        ? 'rgba(246,196,83,0.18)'
+        : tone === 'danger'
+          ? 'rgba(255,107,107,0.18)'
+          : 'rgba(122,138,160,0.16)';
+  const color =
+    tone === 'success'
+      ? theme.success
+      : tone === 'warning'
+        ? theme.warning
+        : tone === 'danger'
+          ? theme.danger
+          : theme.neutral;
+
   return (
-    <View style={styles.section}>
-      <Text style={styles.sectionTitle}>{title}</Text>
-      <View style={styles.sectionCard}>{children}</View>
+    <View style={[styles.chip, { backgroundColor: background, borderColor: color }]}>
+      <Text style={[styles.chipText, { color }]}>{label}</Text>
     </View>
   );
 }
 
-function Row({ label, value }) {
+function Card({ title, children }) {
   return (
-    <View style={styles.row}>
-      <Text style={styles.rowLabel}>{label}</Text>
-      <Text style={styles.rowValue} numberOfLines={2}>
-        {String(value ?? '—')}
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>{title}</Text>
+      {children}
+    </View>
+  );
+}
+
+function MetricRow({ label, value, valueStyle }) {
+  return (
+    <View style={styles.metricRow}>
+      <Text style={styles.metricLabel}>{label}</Text>
+      <Text style={[styles.metricValue, valueStyle]} numberOfLines={2}>
+        {value ?? '—'}
       </Text>
     </View>
   );
 }
 
-function summarize(value) {
-  if (value == null) return '—';
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number') return String(value);
-  if (Array.isArray(value)) return `${value.length} items`;
-  if (typeof value === 'object') {
-    if (value?.equity != null) return `Equity: ${value.equity}`;
-    if (value?.cash != null) return `Cash: ${value.cash}`;
-    if (value?.buying_power != null) return `BP: ${value.buying_power}`;
-    return `${Object.keys(value).length} fields`;
-  }
-  return String(value);
-}
-
 export default function App() {
-  const baseUrl = useMemo(() => getBaseUrl(), []);
-  const [health, setHealth] = useState(initial);
-  const [account, setAccount] = useState(initial);
-  const [positions, setPositions] = useState(initial);
-  const [orders, setOrders] = useState(initial);
+  const baseUrl = useMemo(() => normalizeBase(API_BASE), []);
+  const [responses, setResponses] = useState(() => ({
+    health: emptyResponse,
+    status: emptyResponse,
+    account: emptyResponse,
+    positions: emptyResponse,
+    orders: emptyResponse,
+  }));
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const intervalRef = useRef(null);
 
-  const inFlight = useRef({});
-
-  const load = async (key, path, setter) => {
-    if (inFlight.current[key]) return;
-    inFlight.current[key] = true;
-    try {
-      setter((p) => ({ ...p, loading: true }));
-      const res = await fetchJson(path);
-      setter({
-        loading: false,
-        ok: res.ok,
-        status: res.status || 0,
-        data: res.data,
-        error: res.ok ? null : res.error,
-        url: res.url,
-        updatedAt: new Date(),
-      });
-    } finally {
-      inFlight.current[key] = false;
+  const fetchAll = useCallback(async () => {
+    if (!baseUrl) {
+      setResponses((prev) => ({
+        ...prev,
+        health: { ...prev.health, ok: false, status: 0, error: 'Missing API base URL' },
+      }));
+      return;
     }
-  };
+
+    const tasks = endpointConfig.map(({ key, path }) => {
+      const url = `${baseUrl}${path}`;
+      return fetchJsonSafe(url).then((result) => ({ key, result }));
+    });
+
+    const settled = await Promise.allSettled(tasks);
+    let hadSuccess = false;
+
+    setResponses((prev) => {
+      const next = { ...prev };
+      settled.forEach((item) => {
+        if (item.status !== 'fulfilled') return;
+        const { key, result } = item.value;
+        if (result.status === 404) {
+          next[key] = { ...prev[key], ok: false, status: 404, data: null, error: 'Not Found' };
+          return;
+        }
+        if (result.ok) hadSuccess = true;
+        next[key] = result;
+      });
+      return next;
+    });
+
+    if (hadSuccess) setLastSuccessAt(new Date());
+  }, [baseUrl]);
 
   useEffect(() => {
-    let mounted = true;
+    fetchAll();
+    intervalRef.current = setInterval(fetchAll, POLL_MS);
+    return () => clearInterval(intervalRef.current);
+  }, [fetchAll]);
 
-    const tick = () => {
-      if (!mounted) return;
-      load('health', '/health', setHealth);
-      load('account', '/account', setAccount);
-      load('positions', '/positions', setPositions);
-      load('orders', '/orders', setOrders);
-    };
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    await fetchAll();
+    setRefreshing(false);
+  }, [fetchAll]);
 
-    tick();
-    const id = setInterval(tick, POLL_MS);
-    return () => {
-      mounted = false;
-      clearInterval(id);
-    };
-  }, []);
+  const healthData = responses.health.data || {};
+  const statusData = responses.status.data || {};
+  const accountData = responses.account.data || {};
+  const positionsData = Array.isArray(responses.positions.data)
+    ? responses.positions.data
+    : [];
 
-  const updatedAt =
-    health.updatedAt || account.updatedAt || positions.updatedAt || orders.updatedAt;
+  const openOrdersCount =
+    responses.orders.data?.openOrdersCount ??
+    responses.orders.data?.count ??
+    responses.orders.data?.open ??
+    statusData?.openOrdersCount ??
+    statusData?.openOrders ??
+    '—';
+
+  const tradingEnabled =
+    toBoolean(healthData?.autoTradeEnabled) ??
+    toBoolean(healthData?.tradingEnabled) ??
+    toBoolean(statusData?.autoTradeEnabled) ??
+    toBoolean(statusData?.tradingEnabled) ??
+    null;
+
+  const liveMode =
+    toBoolean(healthData?.liveMode) ?? toBoolean(statusData?.liveMode) ?? null;
+
+  const healthOk = responses.health.ok || responses.status.ok;
+  const anySuccess = Object.values(responses).some((item) => item.ok);
+
+  let overallTone = 'danger';
+  let overallText = 'Backend unreachable';
+  if (anySuccess && healthOk) {
+    if (tradingEnabled) {
+      overallTone = 'success';
+      overallText = 'Healthy & Trading';
+    } else {
+      overallTone = 'warning';
+      overallText = 'Healthy, Trading Paused';
+    }
+  } else if (anySuccess) {
+    overallTone = 'danger';
+    overallText = 'Degraded connectivity';
+  }
+
+  const positionsCount = positionsData.length;
+
+  const sortedByPl = [...positionsData]
+    .map((pos) => {
+      const plPercent =
+        pos?.unrealizedPlPercent ?? pos?.unrealized_pl_percent ?? pos?.unrealizedPlPct;
+      const plValue = pos?.unrealizedPl ?? pos?.unrealized_pl;
+      return {
+        ...pos,
+        plScore: plPercent ?? plValue ?? 0,
+        plPercent,
+      };
+    })
+    .sort((a, b) => (b.plScore || 0) - (a.plScore || 0));
+
+  const biggestWinner = sortedByPl[0];
+  const biggestLoser = sortedByPl[sortedByPl.length - 1];
+
+  const stuckPositions = positionsData.filter((pos) => {
+    const plPercent =
+      pos?.unrealizedPlPercent ?? pos?.unrealized_pl_percent ?? pos?.unrealizedPlPct;
+    if (plPercent == null) return false;
+    const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
+    if (heldSeconds != null) return plPercent < -1.5 && heldSeconds > 3600;
+    return plPercent < -3;
+  });
+
+  const dayPl =
+    accountData?.dayPl ??
+    accountData?.day_pl ??
+    accountData?.dayPL ??
+    accountData?.pnlDay ??
+    null;
+
+  const dayPlTone =
+    dayPl == null
+      ? theme.neutral
+      : Number(dayPl) > 0
+        ? theme.success
+        : Number(dayPl) < 0
+          ? theme.danger
+          : theme.neutral;
+
+  const dataAgeSeconds = lastSuccessAt
+    ? Math.floor((Date.now() - lastSuccessAt.getTime()) / 1000)
+    : null;
+
+  const friendlyError = !anySuccess
+    ? 'Offline right now. Check your connection or backend URL and try again.'
+    : null;
+
+  const rawDetails = {
+    health: responses.health,
+    status: responses.status,
+    account: responses.account,
+    positions: responses.positions,
+    orders: responses.orders,
+  };
 
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
-      <ScrollView contentContainerStyle={styles.content}>
-        <Text style={styles.title}>Magic Money</Text>
-        <Text style={styles.subtitle}>
-          {baseUrl ? `Backend: ${baseUrl}` : 'Backend: (not set) — set EXPO_PUBLIC_BACKEND_URL'}
-        </Text>
-        <Text style={styles.updated}>
-          Updated: {updatedAt ? updatedAt.toLocaleTimeString() : '—'}
-        </Text>
-
-        <View style={styles.cardsRow}>
-          <View style={styles.cardWrap}>
-            <Text style={styles.cardTitle}>Health</Text>
-            <Text style={styles.cardValue}>{health.ok ? 'OK' : 'ERR'}</Text>
-            <Text style={styles.cardHint}>via /health</Text>
-          </View>
-          <View style={styles.cardWrap}>
-            <Text style={styles.cardTitle}>Positions</Text>
-            <Text style={styles.cardValue}>
-              {positions.ok ? summarize(positions.data) : '—'}
+      <LinearGradient colors={['#0C1222', '#090E1A']} style={styles.gradient}>
+        <ScrollView
+          contentContainerStyle={styles.content}
+          refreshControl={<RefreshControl tintColor={theme.text} refreshing={refreshing} onRefresh={onRefresh} />}
+        >
+          <View style={styles.header}>
+            <Text style={styles.title}>✨ Magic Money Dashboard</Text>
+            <Text style={styles.subtitle}>
+              {baseUrl ? `Backend: ${baseUrl}` : 'Backend: set API_BASE to your URL'}
             </Text>
-            <Text style={styles.cardHint}>via /positions</Text>
           </View>
-          <View style={styles.cardWrap}>
-            <Text style={styles.cardTitle}>Orders</Text>
-            <Text style={styles.cardValue}>{orders.ok ? summarize(orders.data) : '—'}</Text>
-            <Text style={styles.cardHint}>via /orders</Text>
+
+          <View style={styles.statusRow}>
+            <Text style={[styles.statusLabel, { color: overallTone === 'success' ? theme.success : overallTone === 'warning' ? theme.warning : theme.danger }]}>
+              Overall Status: {overallText}
+            </Text>
+            <Text style={styles.statusMeta}>
+              Data age: {dataAgeSeconds != null ? `${dataAgeSeconds}s` : '—'}
+            </Text>
           </View>
-        </View>
 
-        <Section title="Health details">
-          <Row label="Endpoint" value="/health" />
-          <Row label="Status" value={health.status || 0} />
-          <Row label="Body" value={health.ok ? summarize(health.data) : (health.error || '—')} />
-        </Section>
+          {friendlyError ? <Text style={styles.offline}>{friendlyError}</Text> : null}
 
-        <Section title="Portfolio summary">
-          {!account.ok ? (
-            <Text style={styles.errorLine}>{account.error || 'Error: Network request failed'}</Text>
+          <View style={styles.chipRow}>
+            <Chip
+              label={`Trading: ${tradingEnabled == null ? '—' : tradingEnabled ? 'ON' : 'OFF'}`}
+              tone={tradingEnabled == null ? 'neutral' : tradingEnabled ? 'success' : 'warning'}
+            />
+            <Chip
+              label={`Live: ${liveMode == null ? '—' : liveMode ? 'YES' : 'NO'}`}
+              tone={liveMode == null ? 'neutral' : liveMode ? 'success' : 'warning'}
+            />
+            <Chip label={`Health: ${healthOk ? 'OK' : 'DEGRADED'}`} tone={healthOk ? 'success' : 'danger'} />
+          </View>
+
+          <Card title="Portfolio Snapshot">
+            <Text style={styles.bigValue}>{formatCurrency(accountData?.equity)}</Text>
+            <Text style={styles.bigLabel}>Equity</Text>
+            <View style={styles.divider} />
+            <MetricRow
+              label="Buying Power / Cash"
+              value={formatCurrency(accountData?.buyingPower ?? accountData?.cash ?? accountData?.buying_power)}
+            />
+            <MetricRow
+              label="Day P/L"
+              value={dayPl == null ? '—' : formatCurrency(dayPl)}
+              valueStyle={{ color: dayPlTone, fontWeight: '700' }}
+            />
+          </Card>
+
+          <Card title="Positions Summary">
+            <MetricRow label="Positions" value={formatMaybeNumber(positionsCount)} />
+            <MetricRow
+              label="Biggest Winner"
+              value={
+                biggestWinner
+                  ? `${biggestWinner.symbol ?? biggestWinner.asset ?? '—'} ${formatPercent(biggestWinner.plPercent) ?? ''}`.trim()
+                  : '—'
+              }
+            />
+            <MetricRow
+              label="Biggest Loser"
+              value={
+                biggestLoser
+                  ? `${biggestLoser.symbol ?? biggestLoser.asset ?? '—'} ${formatPercent(biggestLoser.plPercent) ?? ''}`.trim()
+                  : '—'
+              }
+            />
+            <MetricRow label="Stuck Positions" value={formatMaybeNumber(stuckPositions.length)} />
+          </Card>
+
+          <Card title="Bot Activity">
+            <MetricRow label="Last Run" value={formatTimestamp(statusData?.lastLoopAt ?? statusData?.lastRunAt)} />
+            <MetricRow label="Last Action" value={statusData?.lastAction ?? statusData?.lastDecision ?? statusData?.lastDecision?.action ?? '—'} />
+            <MetricRow label="Last Skip" value={statusData?.lastSkipReason ?? statusData?.skipReason ?? '—'} />
+            <MetricRow label="Open Orders" value={formatMaybeNumber(openOrdersCount)} />
+          </Card>
+
+          <Pressable onPress={() => setDetailsOpen((prev) => !prev)} style={styles.detailsToggle}>
+            <Text style={styles.detailsToggleText}>{detailsOpen ? 'Hide Details' : 'Show Details'}</Text>
+            <Text style={styles.detailsToggleHint}>Raw JSON</Text>
+          </Pressable>
+          {detailsOpen ? (
+            <View style={styles.detailsBox}>
+              <Text style={styles.detailsText}>{JSON.stringify(rawDetails, null, 2)}</Text>
+            </View>
           ) : null}
-          {account.ok ? (
-            <>
-              <Row label="Equity" value={account.data?.equity} />
-              <Row label="Cash" value={account.data?.cash} />
-              <Row label="Buying Power" value={account.data?.buying_power} />
-            </>
-          ) : null}
-        </Section>
 
-        <Section title="Positions">
-          {!positions.ok ? (
-            <Text style={styles.errorLine}>{positions.error || 'Error: Network request failed'}</Text>
-          ) : null}
-          {positions.ok ? <Row label="Positions" value={summarize(positions.data)} /> : null}
-        </Section>
-
-        <Section title="Open orders">
-          {!orders.ok ? (
-            <Text style={styles.errorLine}>{orders.error || 'Error: Network request failed'}</Text>
-          ) : null}
-          {orders.ok ? <Row label="Orders" value={summarize(orders.data)} /> : null}
-        </Section>
-
-        <Text style={styles.footer}>
-          Display-only dashboard. No trading controls.
-          {'\n'}
-          Uses EXPO_PUBLIC_BACKEND_URL / BACKEND_BASE_URL and EXPO_PUBLIC_API_TOKEN / API_TOKEN automatically.
-        </Text>
-      </ScrollView>
+          <Text style={styles.footer}>If it’s red, it might just be spread. Breathe.</Text>
+        </ScrollView>
+      </LinearGradient>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: theme.background },
-  content: { padding: 20, paddingBottom: 34 },
+  gradient: { flex: 1 },
+  content: { padding: 20, paddingBottom: 40 },
 
-  title: { color: theme.text, fontSize: 36, fontWeight: '800', marginBottom: 6 },
-  subtitle: { color: theme.muted, fontSize: 13, marginBottom: 2 },
-  updated: { color: theme.muted, fontSize: 12, marginBottom: 16 },
+  header: { marginBottom: 16 },
+  title: { color: theme.text, fontSize: 28, fontWeight: '800' },
+  subtitle: { color: theme.muted, fontSize: 12, marginTop: 6 },
 
-  cardsRow: { flexDirection: 'row', gap: 12, marginBottom: 18 },
-  cardWrap: {
-    flex: 1,
+  statusRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: 8,
+  },
+  statusLabel: { fontSize: 15, fontWeight: '700' },
+  statusMeta: { color: theme.soft, fontSize: 12 },
+  offline: { color: theme.warning, fontSize: 12, marginBottom: 10 },
+
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 18 },
+  chip: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  chipText: { fontSize: 11, fontWeight: '700', letterSpacing: 0.3 },
+
+  card: {
     backgroundColor: theme.card,
     borderRadius: 18,
-    padding: 14,
+    padding: 18,
     borderWidth: 1,
     borderColor: theme.border,
+    marginBottom: 16,
   },
-  cardTitle: { color: theme.muted, fontSize: 13, marginBottom: 8 },
-  cardValue: { color: theme.text, fontSize: 26, fontWeight: '800' },
-  cardHint: { color: theme.muted, fontSize: 12, marginTop: 6 },
+  cardTitle: { color: theme.muted, fontSize: 12, textTransform: 'uppercase', letterSpacing: 1.2 },
+  bigValue: { color: theme.text, fontSize: 32, fontWeight: '800', marginTop: 10 },
+  bigLabel: { color: theme.soft, fontSize: 12, marginTop: 4 },
+  divider: { height: 1, backgroundColor: theme.border, marginVertical: 12 },
 
-  section: { marginBottom: 14 },
-  sectionTitle: { color: theme.text, fontSize: 16, fontWeight: '700', marginBottom: 8 },
-  sectionCard: {
-    backgroundColor: theme.card,
-    borderRadius: 18,
+  metricRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
+  metricLabel: { color: theme.muted, fontSize: 12 },
+  metricValue: { color: theme.text, fontSize: 13, fontWeight: '600', maxWidth: '55%', textAlign: 'right' },
+
+  detailsToggle: {
+    backgroundColor: theme.cardElevated,
+    borderRadius: 14,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
     borderWidth: 1,
     borderColor: theme.border,
-    padding: 14,
+    marginTop: 4,
   },
+  detailsToggleText: { color: theme.text, fontSize: 13, fontWeight: '700' },
+  detailsToggleHint: { color: theme.soft, fontSize: 11, marginTop: 4 },
 
-  row: { flexDirection: 'row', justifyContent: 'space-between', gap: 10, paddingVertical: 8 },
-  rowLabel: { color: theme.muted, fontSize: 12 },
-  rowValue: { color: theme.text, fontSize: 12, flex: 1, textAlign: 'right' },
+  detailsBox: {
+    backgroundColor: 'rgba(10,16,28,0.9)',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: theme.border,
+    padding: 12,
+    marginTop: 8,
+  },
+  detailsText: { color: theme.soft, fontSize: 10, fontFamily: 'Courier', lineHeight: 16 },
 
-  errorLine: { color: theme.danger, fontSize: 12, marginBottom: 8 },
-  footer: { color: theme.muted, fontSize: 12, marginTop: 12, textAlign: 'center' },
+  footer: { color: theme.soft, fontSize: 12, textAlign: 'center', marginTop: 20 },
 });
