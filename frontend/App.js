@@ -21,7 +21,7 @@ import {
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 
-const API_BASE = 'https://YOUR_BACKEND_URL_HERE';
+const API_BASE = 'https://magic-lw8t.onrender.com';
 const API_TOKEN = ''; // optional
 
 const POLL_MS = 10000;
