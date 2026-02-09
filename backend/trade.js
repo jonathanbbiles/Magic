@@ -216,6 +216,32 @@ const ENTRY_PREFETCH_CHUNK_SIZE =
   Number.isFinite(chunkSizeEnv) ? Math.max(10, chunkSizeEnv) : 80;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
+// 1) Time-of-day conditioning
+const TIME_OF_DAY_ENABLED = readFlag('TIME_OF_DAY_ENABLED', false);
+const TIME_OF_DAY_PROFILE_JSON = String(process.env.TIME_OF_DAY_PROFILE_JSON || '').trim();
+const TIME_OF_DAY_PROB_ADJ_MAX = readNumber('TIME_OF_DAY_PROB_ADJ_MAX', 0.03);
+const TIME_OF_DAY_EV_ADJ_MAX_BPS = readNumber('TIME_OF_DAY_EV_ADJ_MAX_BPS', 5);
+
+// 2) Spread elasticity
+const SPREAD_ELASTICITY_ENABLED = readFlag('SPREAD_ELASTICITY_ENABLED', true);
+const SPREAD_ELASTICITY_WINDOW_MS = readNumber('SPREAD_ELASTICITY_WINDOW_MS', 300000);
+const SPREAD_ELASTICITY_MAX_RATIO = readNumber('SPREAD_ELASTICITY_MAX_RATIO', 1.8);
+const SPREAD_ELASTICITY_MIN_BASELINE_BPS = readNumber('SPREAD_ELASTICITY_MIN_BASELINE_BPS', 5);
+
+// 3) Volatility compression
+const VOL_COMPRESSION_ENABLED = readFlag('VOL_COMPRESSION_ENABLED', true);
+const VOL_COMPRESSION_LOOKBACK_SHORT = readNumber('VOL_COMPRESSION_LOOKBACK_SHORT', 20);
+const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG', 60);
+const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.55);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 12);
+
+// 4) Orderbook absorption
+const ORDERBOOK_ABSORPTION_ENABLED = readFlag('ORDERBOOK_ABSORPTION_ENABLED', true);
+const ORDERBOOK_ABSORPTION_WINDOW_MS = readNumber('ORDERBOOK_ABSORPTION_WINDOW_MS', 120000);
+const ORDERBOOK_ABSORPTION_MIN_SAMPLES = readNumber('ORDERBOOK_ABSORPTION_MIN_SAMPLES', 3);
+const ORDERBOOK_ABSORPTION_MIN_IMBALANCE_DELTA = readNumber('ORDERBOOK_ABSORPTION_MIN_IMBALANCE_DELTA', 0.15);
+const ORDERBOOK_ABSORPTION_MIN_BID_REPLENISH_USD = readNumber('ORDERBOOK_ABSORPTION_MIN_BID_REPLENISH_USD', 200);
+
 const MAX_HOLD_SECONDS = readNumber('MAX_HOLD_SECONDS', 180);
 const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
@@ -426,6 +452,125 @@ const ORIGINAL_TOKENS = [
 const CRYPTO_CORE_TRACKED = ORIGINAL_TOKENS.filter((sym) => !String(sym).includes('USD/USD'));
 
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const LA_TIMEZONE = 'America/Los_Angeles';
+const laHourFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: LA_TIMEZONE });
+const DEFAULT_TIME_OF_DAY_PROFILE = Array.from({ length: 24 }, () => 1);
+let cachedTimeOfDayProfile = { raw: null, profile: DEFAULT_TIME_OF_DAY_PROFILE, ok: true };
+
+function parseTimeOfDayProfile(raw) {
+  if (!raw) {
+    return { raw: '', profile: DEFAULT_TIME_OF_DAY_PROFILE, ok: true };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { raw, profile: DEFAULT_TIME_OF_DAY_PROFILE, ok: false };
+    }
+    const profile = Array.from({ length: 24 }, (_, hour) => {
+      const value = parsed[String(hour)];
+      const num = Number(value);
+      return Number.isFinite(num) ? num : 1;
+    });
+    return { raw, profile, ok: true };
+  } catch (err) {
+    return { raw, profile: DEFAULT_TIME_OF_DAY_PROFILE, ok: false };
+  }
+}
+
+function getTimeOfDayContext(nowMs) {
+  const cached = cachedTimeOfDayProfile.raw === TIME_OF_DAY_PROFILE_JSON
+    ? cachedTimeOfDayProfile
+    : parseTimeOfDayProfile(TIME_OF_DAY_PROFILE_JSON);
+  cachedTimeOfDayProfile = cached;
+  const date = new Date(Number.isFinite(nowMs) ? nowMs : Date.now());
+  let hourLocal = Number(laHourFormatter.format(date));
+  if (!Number.isFinite(hourLocal)) {
+    hourLocal = date.getHours();
+  }
+  const multiplier = cached.profile[hourLocal] ?? 1;
+  return {
+    hourLocal,
+    bucketLabel: String(hourLocal),
+    multiplier: Number.isFinite(multiplier) ? multiplier : 1,
+    profileOk: cached.ok,
+  };
+}
+
+function computeMedian(values) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function updateSpreadHistory(symbol, spreadBps, nowMs) {
+  const history = spreadHistoryBySymbol.get(symbol) || [];
+  if (Number.isFinite(spreadBps)) {
+    history.push({ tMs: nowMs, spreadBps });
+  }
+  const cutoff = nowMs - SPREAD_ELASTICITY_WINDOW_MS;
+  while (history.length && history[0].tMs < cutoff) {
+    history.shift();
+  }
+  spreadHistoryBySymbol.set(symbol, history);
+  return history;
+}
+
+function getSpreadElasticityMeta(symbol, spreadBps, nowMs) {
+  const history = updateSpreadHistory(symbol, spreadBps, nowMs);
+  const spreads = history.map((point) => point.spreadBps).filter((value) => Number.isFinite(value));
+  const insufficientSamples = spreads.length < 3;
+  const baselineSpreadBps = insufficientSamples ? null : computeMedian(spreads);
+  const baseline = Number.isFinite(baselineSpreadBps) ? baselineSpreadBps : null;
+  const elasticityRatio = Number.isFinite(spreadBps) && Number.isFinite(baseline)
+    ? spreadBps / Math.max(baseline, SPREAD_ELASTICITY_MIN_BASELINE_BPS)
+    : null;
+  return {
+    samples: spreads.length,
+    windowMs: SPREAD_ELASTICITY_WINDOW_MS,
+    baselineSpreadBps: baseline,
+    currentSpreadBps: Number.isFinite(spreadBps) ? spreadBps : null,
+    elasticityRatio,
+    insufficientSamples,
+    status: insufficientSamples ? 'insufficient_samples' : 'ok',
+  };
+}
+
+function computeRealizedVolBps(closes, lookback) {
+  if (!Array.isArray(closes) || closes.length < lookback + 1) return null;
+  const start = closes.length - (lookback + 1);
+  const returns = [];
+  for (let i = start + 1; i < closes.length; i += 1) {
+    const prev = Number(closes[i - 1]);
+    const next = Number(closes[i]);
+    if (!Number.isFinite(prev) || !Number.isFinite(next) || prev <= 0 || next <= 0) continue;
+    const r = Math.log(next / prev);
+    if (Number.isFinite(r)) returns.push(r);
+  }
+  if (returns.length < 2) return null;
+  const mean = returns.reduce((acc, value) => acc + value, 0) / returns.length;
+  const variance = returns.reduce((acc, value) => acc + ((value - mean) ** 2), 0) / returns.length;
+  return Math.sqrt(Math.max(variance, 0)) * BPS;
+}
+
+function updateOrderbookFeatureHistory(symbol, orderbookMeta, orderbook, nowMs) {
+  const history = orderbookFeatureHistory.get(symbol) || [];
+  history.push({
+    tMs: nowMs,
+    imbalance: Number(orderbookMeta?.imbalance ?? 0),
+    bidDepthUsd: Number(orderbookMeta?.bidDepthUsd ?? 0),
+    askDepthUsd: Number(orderbookMeta?.askDepthUsd ?? 0),
+    bestBid: Number(orderbook?.bestBid ?? 0),
+    bestAsk: Number(orderbook?.bestAsk ?? 0),
+  });
+  const cutoff = nowMs - ORDERBOOK_ABSORPTION_WINDOW_MS;
+  while (history.length && history[0].tMs < cutoff) {
+    history.shift();
+  }
+  orderbookFeatureHistory.set(symbol, history);
+  return history;
+}
 
 const emaArr = (arr, span) => {
   if (!arr?.length) return [];
@@ -623,6 +768,34 @@ async function computeEntrySignal(symbol, opts = {}) {
   const spreadBps = ((ask - bid) / mid) * BPS;
   baseRecord.refPrice = mid;
   baseRecord.spreadBps = spreadBps;
+  const nowMs = Date.now();
+  const spreadElasticityMeta = getSpreadElasticityMeta(asset.symbol, spreadBps, nowMs);
+
+  if (
+    SPREAD_ELASTICITY_ENABLED &&
+    !spreadElasticityMeta.insufficientSamples &&
+    Number.isFinite(spreadElasticityMeta.elasticityRatio) &&
+    spreadElasticityMeta.elasticityRatio > SPREAD_ELASTICITY_MAX_RATIO
+  ) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'spread_elasticity_gate',
+      spreadElasticity: spreadElasticityMeta,
+    });
+    return {
+      entryReady: false,
+      why: 'spread_elasticity_gate',
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        spreadElasticity: spreadElasticityMeta,
+      },
+      record: baseRecord,
+    };
+  }
 
   if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
     logEntrySkip({
@@ -722,6 +895,62 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
+  const orderbookHistory = updateOrderbookFeatureHistory(asset.symbol, orderbookMeta, obResult.orderbook, nowMs);
+  const hasOrderbookAbsorptionSamples = orderbookHistory.length >= ORDERBOOK_ABSORPTION_MIN_SAMPLES;
+  const orderbookOldest = hasOrderbookAbsorptionSamples ? orderbookHistory[0] : null;
+  const orderbookLatest = hasOrderbookAbsorptionSamples ? orderbookHistory[orderbookHistory.length - 1] : null;
+  const imbalanceDelta = hasOrderbookAbsorptionSamples ? (orderbookLatest.imbalance - orderbookOldest.imbalance) : null;
+  const bidReplenishUsd = hasOrderbookAbsorptionSamples ? (orderbookLatest.bidDepthUsd - orderbookOldest.bidDepthUsd) : null;
+  const askReplenishUsd = hasOrderbookAbsorptionSamples ? (orderbookLatest.askDepthUsd - orderbookOldest.askDepthUsd) : null;
+  const weakLiquidity = Number.isFinite(spreadBps) && Number.isFinite(requiredEdgeBps)
+    ? spreadBps > (requiredEdgeBps * 0.25)
+    : false;
+  const orderbookAbsorptionMeta = {
+    samples: orderbookHistory.length,
+    windowMs: ORDERBOOK_ABSORPTION_WINDOW_MS,
+    imbalanceOld: orderbookOldest?.imbalance ?? null,
+    imbalanceNew: orderbookLatest?.imbalance ?? null,
+    imbalanceDelta,
+    bidDepthOld: orderbookOldest?.bidDepthUsd ?? null,
+    bidDepthNew: orderbookLatest?.bidDepthUsd ?? null,
+    bidReplenishUsd,
+    askDepthOld: orderbookOldest?.askDepthUsd ?? null,
+    askDepthNew: orderbookLatest?.askDepthUsd ?? null,
+    askReplenishUsd,
+    weakLiquidity,
+    status: hasOrderbookAbsorptionSamples ? 'ok' : 'insufficient_samples',
+  };
+
+  if (ORDERBOOK_ABSORPTION_ENABLED && hasOrderbookAbsorptionSamples) {
+    const minDelta = ORDERBOOK_ABSORPTION_MIN_IMBALANCE_DELTA;
+    const minBidReplenish = ORDERBOOK_ABSORPTION_MIN_BID_REPLENISH_USD;
+    const absorptionOk =
+      Number.isFinite(imbalanceDelta) &&
+      Number.isFinite(bidReplenishUsd) &&
+      imbalanceDelta >= minDelta &&
+      bidReplenishUsd >= minBidReplenish;
+    if (weakLiquidity && !absorptionOk) {
+      logEntrySkip({
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        reason: 'orderbook_absorption_gate',
+        orderbookAbsorption: orderbookAbsorptionMeta,
+      });
+      return {
+        entryReady: false,
+        why: 'orderbook_absorption_gate',
+        meta: {
+          symbol: asset.symbol,
+          spreadBps,
+          requiredEdgeBps,
+          orderbookAbsorption: orderbookAbsorptionMeta,
+        },
+        record: baseRecord,
+      };
+    }
+  }
+
   let bars1m;
   let bars5m;
   let bars15m;
@@ -783,6 +1012,42 @@ async function computeEntrySignal(symbol, opts = {}) {
   const closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
     Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
   ).filter((value) => Number.isFinite(value) && value > 0);
+  const shortVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_SHORT);
+  const longVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_LONG);
+  const compressionRatio = Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)
+    ? shortVolBps / Math.max(longVolBps, 1e-6)
+    : null;
+  const volCompressionMeta = {
+    shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
+    longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
+    compressionRatio,
+    lookbackShort: VOL_COMPRESSION_LOOKBACK_SHORT,
+    lookbackLong: VOL_COMPRESSION_LOOKBACK_LONG,
+    status: (Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)) ? 'ok' : 'insufficient_samples',
+  };
+
+  if (VOL_COMPRESSION_ENABLED && Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)) {
+    if (longVolBps < VOL_COMPRESSION_MIN_LONG_VOL_BPS || compressionRatio < VOL_COMPRESSION_MIN_RATIO) {
+      logEntrySkip({
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        reason: 'vol_compression_gate',
+        volCompression: volCompressionMeta,
+      });
+      return {
+        entryReady: false,
+        why: 'vol_compression_gate',
+        meta: {
+          symbol: asset.symbol,
+          spreadBps,
+          requiredEdgeBps,
+          volCompression: volCompressionMeta,
+        },
+        record: baseRecord,
+      };
+    }
+  }
 
   const barSeries5m =
     bars5m?.bars?.[barKey] ||
@@ -917,26 +1182,55 @@ async function computeEntrySignal(symbol, opts = {}) {
     lastTs: quote.tsMs,
   };
 
-  if ((predictorTp?.probability ?? -1) < MIN_PROB_TO_ENTER_TP) {
+  const baseMinProbToEnter = MIN_PROB_TO_ENTER_TP;
+  const baseMinExpectedValueBps = EV_MIN_BPS + EV_BUFFER_BPS;
+  const timeOfDayContext = getTimeOfDayContext(nowMs);
+  const timeOfDayMultiplier =
+    TIME_OF_DAY_ENABLED && timeOfDayContext.profileOk ? timeOfDayContext.multiplier : 1;
+  const effectiveMinProbToEnter = clamp(
+    baseMinProbToEnter + ((1 - timeOfDayMultiplier) * TIME_OF_DAY_PROB_ADJ_MAX),
+    0.0,
+    0.99,
+  );
+  const effectiveMinExpectedValueBps =
+    baseMinExpectedValueBps + Math.round(((1 - timeOfDayMultiplier) * TIME_OF_DAY_EV_ADJ_MAX_BPS));
+  const timeOfDayMeta = {
+    hourLocal: timeOfDayContext.hourLocal,
+    multiplier: timeOfDayMultiplier,
+    baseMinProbToEnter,
+    effectiveMinProbToEnter,
+    baseMinExpectedValueBps,
+    effectiveMinExpectedValueBps,
+    profileOk: timeOfDayContext.profileOk,
+    enabled: TIME_OF_DAY_ENABLED,
+  };
+  const timeOfDayMakesStricter = TIME_OF_DAY_ENABLED && timeOfDayMultiplier < 1;
+
+  if ((predictorTp?.probability ?? -1) < effectiveMinProbToEnter) {
+    const isTimeOfDayGate = timeOfDayMakesStricter && (predictorTp?.probability ?? -1) >= baseMinProbToEnter;
     logEntrySkip({
       symbol: asset.symbol,
       spreadBps,
       requiredEdgeBps,
-      reason: 'predictor_gate',
+      reason: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
       probability: predictorTp?.probability ?? null,
-      minProbToEnter: MIN_PROB_TO_ENTER_TP,
+      minProbToEnter: effectiveMinProbToEnter,
+      baseMinProbToEnter,
       stretchProbability: predictorStretch?.probability ?? null,
       stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
       tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+      timeOfDay: timeOfDayMeta,
     });
     return {
       entryReady: false,
-      why: 'predictor_gate',
+      why: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
       meta: {
         symbol: asset.symbol,
         probability: predictorTp?.probability ?? null,
-        minProbToEnter: MIN_PROB_TO_ENTER_TP,
+        minProbToEnter: effectiveMinProbToEnter,
+        baseMinProbToEnter,
         stretchProbability: predictorStretch?.probability ?? null,
+        timeOfDay: timeOfDayMeta,
       },
       record: baseRecord,
     };
@@ -981,7 +1275,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     const grossLossBps = STOP_LOSS_BPS;
     const netWinBps = grossWinBps - costBps;
     const netLossBps = grossLossBps + costBps;
-    const minExpectedValueBps = EV_MIN_BPS + EV_BUFFER_BPS;
+    const minExpectedValueBps = effectiveMinExpectedValueBps;
 
     if (netWinBps <= 0) {
       logEntrySkip({
@@ -996,6 +1290,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         slippageBps: slipBps,
         costBps,
         minExpectedValueBps,
+        baseMinExpectedValueBps,
+        timeOfDay: timeOfDayMeta,
       });
       return {
         entryReady: false,
@@ -1007,6 +1303,8 @@ async function computeEntrySignal(symbol, opts = {}) {
           netLossBps,
           costBps,
           minExpectedValueBps,
+          baseMinExpectedValueBps,
+          timeOfDay: timeOfDayMeta,
         },
         record: baseRecord,
       };
@@ -1027,14 +1325,17 @@ async function computeEntrySignal(symbol, opts = {}) {
       costBps,
       evBps,
       minExpectedValueBps,
+      baseMinExpectedValueBps,
+      timeOfDay: timeOfDayMeta,
     });
 
     if (evBps < minExpectedValueBps) {
+      const isTimeOfDayGate = timeOfDayMakesStricter && evBps >= baseMinExpectedValueBps;
       logEntrySkip({
         symbol: asset.symbol,
         spreadBps,
         requiredEdgeBps,
-        reason: 'ev_gate',
+        reason: isTimeOfDayGate ? 'time_of_day_gate' : 'ev_gate',
         p,
         breakevenP,
         netWinBps,
@@ -1044,10 +1345,12 @@ async function computeEntrySignal(symbol, opts = {}) {
         costBps,
         evBps,
         minExpectedValueBps,
+        baseMinExpectedValueBps,
+        timeOfDay: timeOfDayMeta,
       });
       return {
         entryReady: false,
-        why: 'ev_gate',
+        why: isTimeOfDayGate ? 'time_of_day_gate' : 'ev_gate',
         meta: {
           symbol: asset.symbol,
           p,
@@ -1057,6 +1360,8 @@ async function computeEntrySignal(symbol, opts = {}) {
           costBps,
           evBps,
           minExpectedValueBps,
+          baseMinExpectedValueBps,
+          timeOfDay: timeOfDayMeta,
         },
         record: baseRecord,
       };
@@ -1083,6 +1388,10 @@ async function computeEntrySignal(symbol, opts = {}) {
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
       orderbookImbalance: orderbookMeta?.imbalance,
       orderbookLiquidityScore: orderbookMeta?.liquidityScore,
+      timeOfDay: timeOfDayMeta,
+      spreadElasticity: spreadElasticityMeta,
+      volCompression: volCompressionMeta,
+      orderbookAbsorption: orderbookAbsorptionMeta,
     },
     record: baseRecord,
   };
@@ -1108,6 +1417,8 @@ const inFlightBySymbol = new Map();
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
+const spreadHistoryBySymbol = new Map(); // symbol -> [{ tMs, spreadBps }]
+const orderbookFeatureHistory = new Map(); // symbol -> [{ tMs, imbalance, bidDepthUsd, askDepthUsd, bestBid, bestAsk }]
 const AVG_ENTRY_CACHE_TTL_MS = 20000;
 const avgEntryPriceCache = new Map();
 const QUOTE_FAILURE_WINDOW_MS = 120000;
