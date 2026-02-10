@@ -26,8 +26,8 @@ import Svg, { Path, Circle, Defs, LinearGradient as SvgGradient, Stop } from 're
 const API_BASE = 'https://magic-lw8t.onrender.com';
 const API_TOKEN = ''; // optional
 
-const POLL_MS = 10000;
-const REQUEST_TIMEOUT = 7000;
+const POLL_MS = 15000;
+const REQUEST_TIMEOUT = 20000;
 
 const theme = {
   background: '#0B1020',
@@ -109,10 +109,30 @@ async function fetchJsonSafe(url, token) {
       error?.name === 'AbortError'
         ? 'Request timed out'
         : error?.message || 'Network request failed';
-    return { ok: false, status: 0, data: null, error: message };
+    return { ok: false, status: 0, data: null, error: message, errorName: error?.name || null };
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function isReachableResult(result) {
+  if (!result) return false;
+  if (result.status > 0) return true;
+  const errorText = String(result.error || '').toLowerCase();
+  return errorText.includes('http');
+}
+
+function isAuthError(result) {
+  return result?.status === 401 || result?.status === 403;
+}
+
+function isTimeoutError(result) {
+  if (!result) return false;
+  const errorText = String(result.error || '').toLowerCase();
+  return (
+    errorText.includes('timed out') ||
+    (result.errorName === 'AbortError' && errorText.includes('abort'))
+  );
 }
 
 function formatCurrency(value) {
@@ -406,11 +426,18 @@ export default function App() {
     toBoolean(healthData?.liveMode) ?? toBoolean(statusData?.liveMode) ?? null;
 
   const healthOk = responses.health.ok || responses.status.ok;
-  const anySuccess = Object.values(responses).some((item) => item.ok);
+  const responseList = Object.values(responses);
+  const anySuccess = responseList.some((item) => item?.ok);
+  const anyReachable = responseList.some((result) => isReachableResult(result) || result?.ok);
+  const anyAuthError = responseList.some((result) => isAuthError(result));
+  const anyTimeout = responseList.some((result) => isTimeoutError(result));
 
   let overallTone = 'danger';
   let overallText = 'Backend unreachable';
-  if (anySuccess && healthOk) {
+  if (anyAuthError && !anySuccess) {
+    overallTone = 'warning';
+    overallText = 'Auth required';
+  } else if (anyReachable && healthOk) {
     if (tradingEnabled) {
       overallTone = 'success';
       overallText = 'Healthy & Trading';
@@ -418,9 +445,9 @@ export default function App() {
       overallTone = 'warning';
       overallText = 'Healthy, Trading Paused';
     }
-  } else if (anySuccess) {
-    overallTone = 'danger';
-    overallText = 'Degraded connectivity';
+  } else if (anyReachable) {
+    overallTone = 'warning';
+    overallText = 'Reachable, partial data';
   }
 
   const dataAgeSeconds = lastSuccessAt
@@ -533,11 +560,21 @@ export default function App() {
     },
   ];
 
-  const friendlyError = !anySuccess
+  const friendlyError = !anyReachable
     ? hasMissingBase
       ? 'Set your backend URL in Settings ⚙️'
-      : 'Can’t reach the mothership 🛸'
-    : null;
+      : anyTimeout
+        ? 'Waking backend… 💤 (cold start)'
+        : 'Can’t reach the mothership 🛸'
+    : anyAuthError && !anySuccess
+      ? 'Token required 🔐 (add API token in Settings)'
+      : null;
+
+  const emptyStateSubtitle = anyTimeout
+    ? 'Render might be waking up. Try again in a few seconds.'
+    : anyAuthError && !anySuccess
+      ? 'Add your API token in Settings and we’ll light up.'
+      : 'We’ll keep checking in the background. Want to try again?';
 
   return (
     <SafeAreaView style={styles.container}>
@@ -603,7 +640,7 @@ export default function App() {
             <View style={styles.emptyState}>
               <Text style={styles.emptyTitle}>{friendlyError}</Text>
               <Text style={styles.emptySubtitle}>
-                We’ll keep checking in the background. Want to try again?
+                {emptyStateSubtitle}
               </Text>
               <View style={styles.emptyActions}>
                 <Pressable onPress={onRefresh} style={styles.emptyButton}>
