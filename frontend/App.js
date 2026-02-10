@@ -71,14 +71,17 @@ function normalizeBase(raw) {
 }
 
 async function fetchJsonSafe(url, token) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
   const headers = { Accept: 'application/json' };
   if (token) headers.Authorization = `Bearer ${token}`;
 
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('timeout')), REQUEST_TIMEOUT)
+  );
+
+  const fetchPromise = fetch(url, { headers });
+
   try {
-    const res = await fetch(url, { signal: controller.signal, headers });
+    const res = await Promise.race([fetchPromise, timeoutPromise]);
     const status = res.status;
     if (status === 204) {
       return { ok: true, status, data: null, error: null };
@@ -99,19 +102,18 @@ async function fetchJsonSafe(url, token) {
         ok: false,
         status,
         data,
-        error: status === 404 ? 'Not Found' : `HTTP ${status}`,
+        error: text || `HTTP ${status}`,
       };
     }
 
     return { ok: true, status, data, error: null };
   } catch (error) {
-    const message =
-      error?.name === 'AbortError'
-        ? 'Request timed out'
-        : error?.message || 'Network request failed';
-    return { ok: false, status: 0, data: null, error: message, errorName: error?.name || null };
-  } finally {
-    clearTimeout(timeoutId);
+    const message = error?.message || 'Network request failed';
+    if (message.toLowerCase().includes('timeout')) {
+      return { ok: false, status: 0, data: null, error: 'Request timed out' };
+    }
+
+    return { ok: false, status: 0, data: null, error: message };
   }
 }
 
