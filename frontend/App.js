@@ -19,6 +19,7 @@ import {
   TextInput,
   KeyboardAvoidingView,
   Platform,
+  Linking,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import Svg, { Path, Circle, Defs, LinearGradient as SvgGradient, Stop } from 'react-native-svg';
@@ -70,51 +71,53 @@ function normalizeBase(raw) {
   return `https://${trimmed}`;
 }
 
-async function fetchJsonSafe(url, token) {
-  const headers = { Accept: 'application/json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
+function fetchJsonSafe(url, token) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.timeout = REQUEST_TIMEOUT;
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.setRequestHeader('Cache-Control', 'no-cache');
+    xhr.setRequestHeader('Pragma', 'no-cache');
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
 
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('timeout')), REQUEST_TIMEOUT)
-  );
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState !== 4) return;
+      const status = xhr.status || 0;
+      const text = xhr.responseText || '';
 
-  const fetchPromise = fetch(url, { headers });
-
-  try {
-    const res = await Promise.race([fetchPromise, timeoutPromise]);
-    const status = res.status;
-    if (status === 204) {
-      return { ok: true, status, data: null, error: null };
-    }
-
-    const text = await res.text();
-    let data = null;
-    if (text) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = text;
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = text;
+        }
       }
-    }
 
-    if (!res.ok) {
-      return {
+      if (status >= 200 && status <= 299) {
+        resolve({ ok: true, status, data, error: null });
+        return;
+      }
+
+      resolve({
         ok: false,
         status,
         data,
-        error: text || `HTTP ${status}`,
-      };
-    }
+        error: text ? text.slice(0, 200) : `HTTP ${status}`,
+      });
+    };
 
-    return { ok: true, status, data, error: null };
-  } catch (error) {
-    const message = error?.message || 'Network request failed';
-    if (message.toLowerCase().includes('timeout')) {
-      return { ok: false, status: 0, data: null, error: 'Request timed out' };
-    }
+    xhr.ontimeout = () => {
+      resolve({ ok: false, status: 0, data: null, error: 'Request timed out' });
+    };
 
-    return { ok: false, status: 0, data: null, error: message };
-  }
+    xhr.onerror = () => {
+      resolve({ ok: false, status: 0, data: null, error: 'Network request failed' });
+    };
+
+    xhr.send(null);
+  });
 }
 
 function isReachableResult(result) {
@@ -301,6 +304,7 @@ export default function App() {
   const [draftToken, setDraftToken] = useState(API_TOKEN);
   const [equitySeries, setEquitySeries] = useState([]);
   const [showAllPositions, setShowAllPositions] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const intervalRef = useRef(null);
 
   const addEquityPoint = useCallback((equityValue) => {
@@ -578,6 +582,14 @@ export default function App() {
       ? 'Add your API token in Settings and we’ll light up.'
       : 'We’ll keep checking in the background. Want to try again?';
 
+  const diag = endpointConfig.map(({ key, path }) => ({
+    key,
+    url: baseUrl ? `${baseUrl}${path}` : '',
+    ok: responses[key]?.ok,
+    status: responses[key]?.status,
+    error: responses[key]?.error,
+  }));
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
@@ -637,6 +649,38 @@ export default function App() {
             />
             <Chip label={`Health: ${healthOk ? 'OK' : 'DEGRADED'}`} tone={healthOk ? 'success' : 'danger'} />
           </View>
+
+          <View style={styles.toolsRow}>
+            <Pressable
+              onPress={() => {
+                if (!baseUrl) return;
+                Linking.openURL(`${baseUrl}/health`);
+              }}
+              style={styles.toolButton}
+            >
+              <Text style={styles.toolButtonText}>Open /health in Safari</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => setShowDiagnostics((prev) => !prev)}
+              style={styles.toolButton}
+            >
+              <Text style={styles.toolButtonText}>{showDiagnostics ? 'Hide Diagnostics' : 'Diagnostics'}</Text>
+            </Pressable>
+          </View>
+
+          {showDiagnostics ? (
+            <View style={styles.diagnosticsCard}>
+              {diag.map((item) => (
+                <View key={item.key} style={styles.diagnosticsLineWrap}>
+                  <Text style={styles.diagnosticsLine}>
+                    {item.key} status={item.status ?? '—'} ok={String(item.ok)}
+                    {item.error ? ` err=${String(item.error).slice(0, 120)}` : ''}
+                  </Text>
+                  <Text style={styles.diagnosticsUrl}>{item.url || 'URL not set'}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
 
           {friendlyError ? (
             <View style={styles.emptyState}>
@@ -800,6 +844,28 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   chipText: { fontSize: 10, fontWeight: '700', letterSpacing: 0.2 },
+
+  toolsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: -8, marginBottom: 12 },
+  toolButton: {
+    backgroundColor: theme.surfaceElevated,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: theme.border,
+  },
+  toolButtonText: { color: theme.text, fontSize: 11, fontWeight: '700' },
+  diagnosticsCard: {
+    backgroundColor: theme.surface,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: theme.border,
+    padding: 12,
+    marginBottom: 12,
+  },
+  diagnosticsLineWrap: { marginBottom: 8 },
+  diagnosticsLine: { color: theme.muted, fontSize: 11, fontWeight: '600' },
+  diagnosticsUrl: { color: theme.soft, fontSize: 10, marginTop: 2 },
 
   emptyState: {
     backgroundColor: theme.surface,
