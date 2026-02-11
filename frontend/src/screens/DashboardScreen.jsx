@@ -39,7 +39,7 @@ export default function DashboardScreen() {
     inFlight.current[key] = true;
     try {
       setter((prev) => ({ ...prev, loading: true }));
-      const res = await fetchJson(path, 4500);
+      const res = await fetchJson(path);
       setter({
         loading: false,
         ok: res.ok,
@@ -114,7 +114,9 @@ export default function DashboardScreen() {
       </Section>
 
       <Section title="Portfolio summary">
-        <Text style={styles.errorLine}>{account.ok ? '' : (account.error || 'Error: Network request failed')}</Text>
+        {account.error ? (<Text style={styles.errorLine}>
+          {`⚠️ ${account.error}${account.status ? ` (status ${account.status})` : ''}${account.url ? ` – ${account.url}` : ''}`}
+        </Text>) : null}
         {account.ok ? (
           <>
             <MetricCard label="Equity" value={summarizeValue(account.data?.equity)} />
@@ -125,12 +127,16 @@ export default function DashboardScreen() {
       </Section>
 
       <Section title="Positions">
-        <Text style={styles.errorLine}>{positions.ok ? '' : (positions.error || 'Error: Network request failed')}</Text>
+        {positions.error ? (<Text style={styles.errorLine}>
+          {`⚠️ ${positions.error}${positions.status ? ` (status ${positions.status})` : ''}${positions.url ? ` – ${positions.url}` : ''}`}
+        </Text>) : null}
         {positions.ok ? <MetricCard label="Positions" value={summarizeValue(positions.data)} /> : null}
       </Section>
 
       <Section title="Open orders">
-        <Text style={styles.errorLine}>{orders.ok ? '' : (orders.error || 'Error: Network request failed')}</Text>
+        {orders.error ? (<Text style={styles.errorLine}>
+          {`⚠️ ${orders.error}${orders.status ? ` (status ${orders.status})` : ''}${orders.url ? ` – ${orders.url}` : ''}`}
+        </Text>) : null}
         {orders.ok ? <MetricCard label="Orders" value={summarizeValue(orders.data)} /> : null}
       </Section>
 

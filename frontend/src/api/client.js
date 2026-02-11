@@ -20,7 +20,7 @@ export function getApiToken() {
   return token ? String(token).trim() : '';
 }
 
-export async function fetchJson(path, timeoutMs = 4500) {
+export async function fetchJson(path, timeoutMs = 15000) {
   const baseUrl = getBaseUrl();
 
   if (!baseUrl) {
@@ -59,16 +59,12 @@ export async function fetchJson(path, timeoutMs = 4500) {
     }
 
     if (!response.ok) {
-      const hint =
-        status === 401
-          ? 'Unauthorized. Set EXPO_PUBLIC_API_TOKEN to match API_TOKEN on your backend (or unset API_TOKEN on server).'
-          : '';
       return {
         ok: false,
         url,
         status,
+        error: (data && (data.hint || data.error)) || `HTTP ${status}`,
         data,
-        error: `HTTP ${status}${hint ? ` — ${hint}` : ''}`,
       };
     }
 
