@@ -43,10 +43,15 @@ const buildCorsError = (origin) => {
   return err;
 };
 
+const buildCorsOptions = () => ({
+  origin: true,
+  credentials: false,
+});
+
 const corsOptionsDelegate = (req, callback) => {
   const origin = req.header('Origin');
   if (!origin) {
-    return callback(null, { origin: true });
+    return callback(null, buildCorsOptions());
   }
 
   const allowedOrigins = parseAllowedOrigins(process.env.CORS_ALLOWED_ORIGINS);
@@ -57,19 +62,19 @@ const corsOptionsDelegate = (req, callback) => {
   const hasLan = allowLan;
 
   if (!hasAllowlist && !hasRegex && !hasLan) {
-    return callback(null, { origin: true });
+    return callback(null, buildCorsOptions());
   }
 
   if (allowedOrigins.includes(origin)) {
-    return callback(null, { origin: true });
+    return callback(null, buildCorsOptions());
   }
 
   if (allowedRegexes.some((regex) => regex.test(origin))) {
-    return callback(null, { origin: true });
+    return callback(null, buildCorsOptions());
   }
 
   if (allowLan && allowLanOrigins(origin)) {
-    return callback(null, { origin: true });
+    return callback(null, buildCorsOptions());
   }
 
   return callback(buildCorsError(origin));
