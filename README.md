@@ -13,8 +13,12 @@
 
 ### Frontend
 1. `cd frontend`
-2. `cp .env.example .env` and set `BACKEND_BASE_URL` + `API_TOKEN`.
+2. `cp .env.example .env` and set:
+   - `EXPO_PUBLIC_BACKEND_URL` (MUST be https for iOS Expo Go)
+   - `EXPO_PUBLIC_API_TOKEN` (only if your backend requires API_TOKEN)
 3. `npx expo start`
+
+If you change .env values, restart with `npx expo start --clear` and reload the app.
 
 ## Node version
 - Local: `cd backend && nvm use`

@@ -24,11 +24,19 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import Svg, { Path, Circle, Defs, LinearGradient as SvgGradient, Stop } from 'react-native-svg';
 
-const API_BASE = 'https://magic-lw8t.onrender.com';
-const API_TOKEN = ''; // optional
+// Expo env vars must be referenced via dot notation to be inlined.
+const ENV_BASE =
+  process.env.EXPO_PUBLIC_BACKEND_URL ||
+  process.env.EXPO_PUBLIC_API_BASE_URL ||
+  '';
+const ENV_TOKEN = process.env.EXPO_PUBLIC_API_TOKEN || '';
+
+const API_BASE = ENV_BASE || 'https://magic-lw8t.onrender.com';
+const API_TOKEN = ENV_TOKEN || ''; // optional
 
 const POLL_MS = 15000;
 const REQUEST_TIMEOUT = 20000;
+const FIRST_LOAD_TIMEOUT = 65000; // tolerate sleeping backends (Render cold start)
 
 const theme = {
   background: '#0B1020',
@@ -71,11 +79,30 @@ function normalizeBase(raw) {
   return `https://${trimmed}`;
 }
 
+function looksLikeLocalhost(url) {
+  const u = String(url || '').toLowerCase();
+  return u.includes('://localhost') || u.includes('://127.0.0.1');
+}
+
+function looksLikePrivateLan(url) {
+  const u = String(url || '').toLowerCase();
+  return (
+    u.includes('://192.168.') ||
+    u.includes('://10.') ||
+    u.includes('://172.16.') ||
+    u.includes('://172.17.') ||
+    u.includes('://172.18.') ||
+    u.includes('://172.19.') ||
+    u.includes('://172.2') ||
+    u.includes('://172.3')
+  );
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchJsonSafe(url, token) {
+async function fetchJsonSafe(url, token, timeoutMs = REQUEST_TIMEOUT) {
   const headers = {
     Accept: 'application/json',
     'Cache-Control': 'no-cache',
@@ -85,7 +112,7 @@ async function fetchJsonSafe(url, token) {
 
   const attemptFetch = async () => {
     const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(url, {
         method: 'GET',
@@ -327,6 +354,7 @@ export default function App() {
   const [showAllPositions, setShowAllPositions] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const intervalRef = useRef(null);
+  const lastSuccessRef = useRef(null);
 
   const addEquityPoint = useCallback((equityValue) => {
     const equityNumber = Number(equityValue);
@@ -358,9 +386,11 @@ export default function App() {
         return;
       }
 
+      const timeoutMs = lastSuccessRef.current ? REQUEST_TIMEOUT : FIRST_LOAD_TIMEOUT;
+
       const tasks = endpointConfig.map(({ key, path }) => {
         const url = `${activeBase}${path}`;
-        return fetchJsonSafe(url, activeToken).then((result) => ({ key, result }));
+        return fetchJsonSafe(url, activeToken, timeoutMs).then((result) => ({ key, result }));
       });
 
       const settled = await Promise.allSettled(tasks);
@@ -388,7 +418,11 @@ export default function App() {
       if (accountEquity != null) {
         addEquityPoint(accountEquity);
       }
-      if (hadSuccess) setLastSuccessAt(new Date());
+      if (hadSuccess) {
+        const when = new Date();
+        lastSuccessRef.current = when;
+        setLastSuccessAt(when);
+      }
     },
     [addEquityPoint, apiBase, apiToken],
   );
@@ -611,6 +645,21 @@ export default function App() {
     error: responses[key]?.error,
   }));
 
+  const localHostWarning =
+    Platform.OS === 'ios' && looksLikeLocalhost(baseUrl)
+      ? '⚠️ localhost detected. On a physical iPhone, localhost points to the phone (not your laptop). Use your Render HTTPS URL or a proper HTTPS tunnel.'
+      : null;
+
+  const lanWarning =
+    Platform.OS === 'ios' && looksLikePrivateLan(baseUrl)
+      ? '⚠️ Private LAN URL detected. Ensure iOS Local Network permission is enabled for Expo Go and both devices are on the same Wi-Fi.'
+      : null;
+
+  const schemeWarning =
+    baseUrl && !/^https:\/\//i.test(baseUrl)
+      ? '⚠️ Non-HTTPS URL detected. iOS/Expo Go may block cleartext HTTP (ATS). Prefer HTTPS.'
+      : null;
+
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" />
@@ -695,6 +744,9 @@ export default function App() {
                 <Text style={styles.diagnosticsLine}>platform: {Platform.OS}</Text>
                 <Text style={styles.diagnosticsUrl}>using baseUrl: {baseUrl || 'not set'}</Text>
               </View>
+              {localHostWarning ? <Text style={styles.diagnosticsLine}>{localHostWarning}</Text> : null}
+              {lanWarning ? <Text style={styles.diagnosticsLine}>{lanWarning}</Text> : null}
+              {schemeWarning ? <Text style={styles.diagnosticsLine}>{schemeWarning}</Text> : null}
               {diag.map((item) => (
                 <View key={item.key} style={styles.diagnosticsLineWrap}>
                   <Text style={styles.diagnosticsLine}>
