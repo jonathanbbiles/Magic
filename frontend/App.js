@@ -71,21 +71,29 @@ function normalizeBase(raw) {
   return `https://${trimmed}`;
 }
 
-function fetchJsonSafe(url, token) {
-  return new Promise((resolve) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
-    xhr.timeout = REQUEST_TIMEOUT;
-    xhr.setRequestHeader('Accept', 'application/json');
-    xhr.setRequestHeader('Cache-Control', 'no-cache');
-    xhr.setRequestHeader('Pragma', 'no-cache');
-    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-    xhr.onreadystatechange = () => {
-      if (xhr.readyState !== 4) return;
-      const status = xhr.status || 0;
-      const text = xhr.responseText || '';
+async function fetchJsonSafe(url, token) {
+  const headers = {
+    Accept: 'application/json',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
 
+  const attemptFetch = async () => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+      });
+
+      const text = await res.text();
       let data = null;
       if (text) {
         try {
@@ -95,29 +103,45 @@ function fetchJsonSafe(url, token) {
         }
       }
 
-      if (status >= 200 && status <= 299) {
-        resolve({ ok: true, status, data, error: null });
-        return;
+      if (res.ok) {
+        return { ok: true, status: res.status, data, error: null };
       }
 
-      resolve({
+      const fallback = text ? String(text).slice(0, 200) : `HTTP ${res.status}`;
+      const error = typeof data === 'string' && data.trim() ? data.slice(0, 200) : fallback;
+      return { ok: false, status: res.status, data, error };
+    } catch (error) {
+      const name = error?.name || 'Error';
+      const message = error?.message || 'Network request failed';
+      return {
         ok: false,
-        status,
-        data,
-        error: text ? text.slice(0, 200) : `HTTP ${status}`,
-      });
-    };
+        status: 0,
+        data: null,
+        error: `${name}: ${message} (url: ${url})`,
+      };
+    } finally {
+      clearTimeout(id);
+    }
+  };
 
-    xhr.ontimeout = () => {
-      resolve({ ok: false, status: 0, data: null, error: 'Request timed out' });
-    };
+  const retryDelays = [400, 900];
+  let result = await attemptFetch();
 
-    xhr.onerror = () => {
-      resolve({ ok: false, status: 0, data: null, error: 'Network request failed' });
-    };
+  for (let i = 0; i < retryDelays.length; i += 1) {
+    const errorText = String(result?.error || '').toLowerCase();
+    const isRetryable =
+      result?.status === 0 &&
+      (errorText.includes('network request failed') ||
+        errorText.includes('abort') ||
+        errorText.includes('timed out') ||
+        errorText.includes('timeout'));
 
-    xhr.send(null);
-  });
+    if (!isRetryable) break;
+    await sleep(retryDelays[i]);
+    result = await attemptFetch();
+  }
+
+  return result;
 }
 
 function isReachableResult(result) {
@@ -134,10 +158,7 @@ function isAuthError(result) {
 function isTimeoutError(result) {
   if (!result) return false;
   const errorText = String(result.error || '').toLowerCase();
-  return (
-    errorText.includes('timed out') ||
-    (result.errorName === 'AbortError' && errorText.includes('abort'))
-  );
+  return errorText.includes('timed out') || errorText.includes('timeout') || errorText.includes('abort');
 }
 
 function formatCurrency(value) {
@@ -670,11 +691,15 @@ export default function App() {
 
           {showDiagnostics ? (
             <View style={styles.diagnosticsCard}>
+              <View style={styles.diagnosticsLineWrap}>
+                <Text style={styles.diagnosticsLine}>platform: {Platform.OS}</Text>
+                <Text style={styles.diagnosticsUrl}>using baseUrl: {baseUrl || 'not set'}</Text>
+              </View>
               {diag.map((item) => (
                 <View key={item.key} style={styles.diagnosticsLineWrap}>
                   <Text style={styles.diagnosticsLine}>
                     {item.key} status={item.status ?? '—'} ok={String(item.ok)}
-                    {item.error ? ` err=${String(item.error).slice(0, 120)}` : ''}
+                    {item.error ? ` err=${String(item.error).slice(0, 140)}` : ''}
                   </Text>
                   <Text style={styles.diagnosticsUrl}>{item.url || 'URL not set'}</Text>
                 </View>
