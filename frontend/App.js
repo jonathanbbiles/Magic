@@ -74,9 +74,63 @@ const emptyResponse = {
 function normalizeBase(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
-  const trimmed = s.endsWith('/') ? s.slice(0, -1) : s;
+  const trimmed = s.replace(/\/+$/, '');
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   return `https://${trimmed}`;
+}
+
+function validateBaseUrl(raw) {
+  const normalized = normalizeBase(raw);
+  if (!normalized) {
+    return {
+      normalized,
+      isValid: false,
+      error: 'Invalid backend URL (check Settings)',
+      typoWarning: null,
+    };
+  }
+
+  if (/\s/.test(normalized)) {
+    return {
+      normalized,
+      isValid: false,
+      error: 'Invalid backend URL (check Settings)',
+      typoWarning: null,
+    };
+  }
+
+  let parsed = null;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    return {
+      normalized,
+      isValid: false,
+      error: 'Invalid backend URL (check Settings)',
+      typoWarning: null,
+    };
+  }
+
+  const hostname = String(parsed.hostname || '').toLowerCase();
+  const typoWarning = hostname.includes('onrenderder.com')
+    ? 'Typo detected: onrenderder.com. Did you mean onrender.com?'
+    : null;
+
+  if (!hostname || !hostname.includes('.') || typoWarning) {
+    return {
+      normalized,
+      isValid: false,
+      error: typoWarning || 'Invalid backend URL (check Settings)',
+      typoWarning,
+    };
+  }
+
+  return {
+    normalized,
+    isValid: true,
+    error: null,
+    typoWarning,
+  };
 }
 
 function looksLikeLocalhost(url) {
@@ -337,7 +391,9 @@ function PositionRow({ symbol, ageHours }) {
 export default function App() {
   const [apiBase, setApiBase] = useState(API_BASE);
   const [apiToken, setApiToken] = useState(API_TOKEN);
-  const baseUrl = useMemo(() => normalizeBase(apiBase), [apiBase]);
+  const [settingsError, setSettingsError] = useState(null);
+  const baseValidation = useMemo(() => validateBaseUrl(apiBase), [apiBase]);
+  const baseUrl = baseValidation.normalized;
   const [responses, setResponses] = useState(() => ({
     health: emptyResponse,
     status: emptyResponse,
@@ -376,12 +432,18 @@ export default function App() {
 
   const fetchAll = useCallback(
     async (overrideBase, overrideToken) => {
-      const activeBase = normalizeBase(overrideBase ?? apiBase);
+      const baseValidationResult = validateBaseUrl(overrideBase ?? apiBase);
+      const activeBase = baseValidationResult.normalized;
       const activeToken = overrideToken ?? apiToken;
-      if (!activeBase) {
+      if (!baseValidationResult.isValid) {
         setResponses((prev) => ({
           ...prev,
-          health: { ...prev.health, ok: false, status: 0, error: 'Missing API base URL' },
+          health: {
+            ok: false,
+            status: 0,
+            data: null,
+            error: 'Invalid backend URL (check Settings)',
+          },
         }));
         return;
       }
@@ -436,26 +498,33 @@ export default function App() {
   );
 
   const handleSaveSettings = useCallback(() => {
-    const normalizedBase = normalizeBase(draftBase);
-    setApiBase(normalizedBase);
+    const validation = validateBaseUrl(draftBase);
+    if (!validation.isValid) {
+      setSettingsError(validation.error || 'Invalid backend URL (check Settings)');
+      return;
+    }
+
+    setSettingsError(null);
+    setApiBase(validation.normalized);
     setApiToken(draftToken);
     setSettingsOpen(false);
-    fetchAll(normalizedBase, draftToken);
-    resetPolling(normalizedBase, draftToken);
+    fetchAll(validation.normalized, draftToken);
+    resetPolling(validation.normalized, draftToken);
   }, [draftBase, draftToken, fetchAll, resetPolling]);
 
   const openSettings = useCallback(() => {
     setDraftBase(apiBase);
     setDraftToken(apiToken);
+    setSettingsError(null);
     setSettingsOpen(true);
   }, [apiBase, apiToken]);
 
   const cancelSettings = useCallback(() => {
+    setSettingsError(null);
     setSettingsOpen(false);
   }, []);
 
-  const hasMissingBase =
-    !apiBase?.trim() || apiBase.includes('YOUR_BACKEND_URL_HERE');
+  const hasMissingBase = !apiBase?.trim() || apiBase.includes('YOUR_BACKEND_URL_HERE');
 
   useEffect(() => {
     fetchAll();
@@ -624,6 +693,8 @@ export default function App() {
   const friendlyError = !anyReachable
     ? hasMissingBase
       ? 'Set your backend URL in Settings ⚙️'
+      : !baseValidation.isValid
+        ? 'Invalid backend URL (check Settings)'
       : anyTimeout
         ? 'Waking backend… 💤 (cold start)'
         : 'Can’t reach the mothership 🛸'
@@ -659,6 +730,8 @@ export default function App() {
     baseUrl && !/^https:\/\//i.test(baseUrl)
       ? '⚠️ Non-HTTPS URL detected. iOS/Expo Go may block cleartext HTTP (ATS). Prefer HTTPS.'
       : null;
+
+  const typoWarning = baseValidation.typoWarning;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -747,6 +820,7 @@ export default function App() {
               {localHostWarning ? <Text style={styles.diagnosticsLine}>{localHostWarning}</Text> : null}
               {lanWarning ? <Text style={styles.diagnosticsLine}>{lanWarning}</Text> : null}
               {schemeWarning ? <Text style={styles.diagnosticsLine}>{schemeWarning}</Text> : null}
+              {typoWarning ? <Text style={styles.diagnosticsLine}>{typoWarning}</Text> : null}
               {diag.map((item) => (
                 <View key={item.key} style={styles.diagnosticsLineWrap}>
                   <Text style={styles.diagnosticsLine}>
@@ -844,7 +918,10 @@ export default function App() {
               <TextInput
                 style={styles.modalInput}
                 value={draftBase}
-                onChangeText={setDraftBase}
+                onChangeText={(value) => {
+                  setDraftBase(value);
+                  if (settingsError) setSettingsError(null);
+                }}
                 placeholder="https://your-backend-url.com"
                 placeholderTextColor={theme.soft}
                 autoCapitalize="none"
@@ -852,6 +929,7 @@ export default function App() {
                 keyboardType="url"
                 textContentType="URL"
               />
+              {settingsError ? <Text style={styles.modalError}>{settingsError}</Text> : null}
               <Text style={styles.modalLabel}>API Token (optional)</Text>
               <TextInput
                 style={styles.modalInput}
@@ -1088,6 +1166,7 @@ const styles = StyleSheet.create({
     backgroundColor: theme.surfaceElevated,
     fontSize: 13,
   },
+  modalError: { color: theme.danger, fontSize: 11, marginTop: 6 },
   modalActions: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
