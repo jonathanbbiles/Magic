@@ -100,6 +100,13 @@ function bps(v) {
   return `${n.toFixed(1)}bps`;
 }
 
+function minsSince(isoTs) {
+  const ms = Date.parse(String(isoTs || ''));
+  if (!Number.isFinite(ms)) return '—';
+  const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000));
+  return `${mins}m`;
+}
+
 function ageLabel(seconds) {
   const s = toNum(seconds);
   if (!Number.isFinite(s) || s < 0) return '—';
@@ -164,6 +171,10 @@ function PositionCard({ position }) {
     : null;
 
   const statusPill = pnlPositive ? '✨' : '🩸';
+  const forensics = position?.forensics || null;
+  const probabilityPct = Number.isFinite(toNum(forensics?.decision?.predictor?.probability))
+    ? `${(toNum(forensics?.decision?.predictor?.probability) * 100).toFixed(1)}%`
+    : '—';
 
   return (
     <LinearGradient
@@ -210,6 +221,23 @@ function PositionCard({ position }) {
         <Stat icon="Δ🎯" value={pct(distToTargetPct)} valueStyle={{ color: theme.colors.warning }} />
         <Stat icon="🧩" value={position?.sell?.source || '—'} valueStyle={{ color: theme.colors.faint }} />
       </View>
+
+      {forensics ? (
+        <View style={cardStyles.forensicsWrap}>
+          <Text style={cardStyles.forensicsTitle}>Forensics</Text>
+          <View style={cardStyles.grid}>
+            <Stat icon="🎲" value={probabilityPct} />
+            <Stat icon="🧭" value={forensics?.decision?.predictor?.regime || '—'} />
+            <Stat icon="↔️" value={bps(forensics?.decision?.spreadBps)} />
+            <Stat icon="📍" value={usd(forensics?.decision?.mid)} />
+            <Stat icon="✅" value={usd(forensics?.fill?.avgFillPrice)} />
+            <Stat icon="🎯slip" value={bps(forensics?.fill?.slippageBps)} />
+            <Stat icon="⬇️MAE" value={bps(forensics?.postEntry?.maeBps)} />
+            <Stat icon="⬆️MFE" value={bps(forensics?.postEntry?.mfeBps)} />
+            <Stat icon="⏱️" value={minsSince(forensics?.tsDecision)} />
+          </View>
+        </View>
+      ) : null}
     </LinearGradient>
   );
 }
@@ -272,6 +300,18 @@ export default function App() {
 
   const openPLPositive = (openPL || 0) >= 0;
 
+  const latestForensics = useMemo(() => {
+    let latest = null;
+    positions.forEach((p) => {
+      const f = p?.forensics;
+      if (!f) return;
+      const ts = Date.parse(String(f?.tsDecision || ''));
+      if (!Number.isFinite(ts)) return;
+      if (!latest || ts > latest.ts) latest = { ts, symbol: p?.symbol || f?.symbol || '—', slippageBps: f?.fill?.slippageBps };
+    });
+    return latest;
+  }, [positions]);
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
@@ -294,6 +334,10 @@ export default function App() {
                 <Chip icon="💰" value={usd(account?.buying_power)} />
                 <Chip icon="🏦" value={usd(account?.cash)} />
                 <Chip icon="📆" value={`${signedUsd(dayChange)} ${pct(dayChangePct)}`} tint={theme.colors.warning} />
+                <Chip
+                  icon="🧪"
+                  value={`Last trade slippage: ${bps(latestForensics?.slippageBps)} ${latestForensics?.symbol || ''}`.trim()}
+                />
               </View>
 
               <View style={headerStyles.openRow}>
@@ -453,4 +497,11 @@ const cardStyles = StyleSheet.create({
   statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
 
   bigRow: { marginBottom: theme.spacing.sm },
+  forensicsWrap: {
+    marginTop: theme.spacing.xs,
+    paddingTop: theme.spacing.xs,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+  },
+  forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
 });
