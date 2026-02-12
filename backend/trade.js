@@ -26,6 +26,7 @@ const {
 } = require('./symbolUtils');
 const { predictOne } = require('./modules/predictor');
 const recorder = require('./modules/recorder');
+const tradeForensics = require('./modules/tradeForensics');
 const { alpacaLimiter, quoteLimiter, barsLimiter } = require('./limiters');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
@@ -174,6 +175,8 @@ const ENTRY_BUFFER_BPS = readNumber('ENTRY_BUFFER_BPS', 10);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
+const FORENSICS_POST_WINDOW_MS = readNumber('FORENSICS_POST_WINDOW_MS', 600000);
+const FORENSICS_POST_INTERVAL_MS = readNumber('FORENSICS_POST_INTERVAL_MS', 15000);
 const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', 50);
 const BOOK_EXIT_ANCHOR = String(process.env.BOOK_EXIT_ANCHOR || 'ask').trim().toLowerCase();
 const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', false);
@@ -1397,6 +1400,154 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
 }
 
+
+
+function safeIso(ts) {
+  if (!ts) return null;
+  if (typeof ts === 'string') {
+    const ms = Date.parse(ts);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  }
+  const ms = Number(ts);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+function toFiniteOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function shallowHash(value) {
+  const raw = JSON.stringify(value || null);
+  if (!raw) return null;
+  let hash = 2166136261;
+  for (let i = 0; i < raw.length; i += 1) {
+    hash ^= raw.charCodeAt(i);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function buildForensicsDecisionSnapshot({ normalizedSymbol, quote, signalRecord }) {
+  const bid = toFiniteOrNull(quote?.bid);
+  const ask = toFiniteOrNull(quote?.ask);
+  const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : null;
+  const spreadBps = Number.isFinite(bid) && Number.isFinite(ask) && Number.isFinite(mid) && mid > 0
+    ? ((ask - bid) / mid) * 10000
+    : toFiniteOrNull(signalRecord?.spreadBps);
+  const quoteTsMs = toFiniteOrNull(quote?.tsMs);
+  const quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+  const predictorSignals = signalRecord?.predictorSignals ?? null;
+  return {
+    bid,
+    ask,
+    mid,
+    spreadBps,
+    quoteTs: safeIso(quoteTsMs),
+    quoteAgeMs,
+    orderbook: {
+      bestBidSize: null,
+      bestAskSize: null,
+      depthUsdTopN:
+        Number.isFinite(signalRecord?.orderbookAskDepthUsd) && Number.isFinite(signalRecord?.orderbookBidDepthUsd)
+          ? signalRecord.orderbookAskDepthUsd + signalRecord.orderbookBidDepthUsd
+          : null,
+      imbalance: toFiniteOrNull(signalRecord?.orderbookImbalance),
+    },
+    bars: {
+      timeframe1m: {
+        lastClose: toFiniteOrNull(predictorSignals?.lastClose1m),
+        lastNHash: shallowHash(predictorSignals?.timeframeChecks),
+      },
+      timeframe5m: {
+        lastClose: toFiniteOrNull(predictorSignals?.lastClose5m),
+        lastNHash: shallowHash(predictorSignals?.zscore5m),
+      },
+    },
+    predictor: {
+      probability: toFiniteOrNull(signalRecord?.predictorProbability),
+      signals: predictorSignals,
+      regime: predictorSignals?.regime || null,
+      checks: predictorSignals?.timeframeChecks || null,
+    },
+    gates: {
+      requiredEdgeBps: computeRequiredEntryEdgeBps(),
+      evGuardEnabled: EV_GUARD_ENABLED,
+      maxSpreadBpsToTrade: MAX_SPREAD_BPS_TO_TRADE,
+      maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
+    },
+    thresholds: {
+      targetProfitBps: TARGET_PROFIT_BPS,
+      minProbToEnter: MIN_PROB_TO_ENTER,
+      minProbToEnterTp: MIN_PROB_TO_ENTER_TP,
+      minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
+      feeBpsMaker: FEE_BPS_MAKER,
+      feeBpsTaker: FEE_BPS_TAKER,
+    },
+  };
+}
+
+function startPostEntryForensicsSampler({ tradeId, symbol, avgFillPrice }) {
+  const windowMs = Number.isFinite(FORENSICS_POST_WINDOW_MS) && FORENSICS_POST_WINDOW_MS > 0
+    ? FORENSICS_POST_WINDOW_MS
+    : 600000;
+  const intervalMs = Number.isFinite(FORENSICS_POST_INTERVAL_MS) && FORENSICS_POST_INTERVAL_MS > 0
+    ? FORENSICS_POST_INTERVAL_MS
+    : 15000;
+  const maxSamples = 100;
+  const startMs = Date.now();
+  let maeBps = null;
+  let mfeBps = null;
+  let timeToMaeMs = null;
+  let timeToMfeMs = null;
+  const samples = [];
+
+  const collect = async () => {
+    try {
+      const quote = await getLatestQuote(symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+      const bid = toFiniteOrNull(quote?.bid);
+      const ask = toFiniteOrNull(quote?.ask);
+      const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : null;
+      const spreadBps = Number.isFinite(mid) && mid > 0 && Number.isFinite(bid) && Number.isFinite(ask)
+        ? ((ask - bid) / mid) * 10000
+        : null;
+      if (!Number.isFinite(mid) || !Number.isFinite(avgFillPrice) || avgFillPrice <= 0) return;
+      const ts = new Date().toISOString();
+      samples.push({ ts, bid, ask, mid, spreadBps });
+      if (samples.length > maxSamples) samples.shift();
+      const retBps = ((mid - avgFillPrice) / avgFillPrice) * 10000;
+      if (!Number.isFinite(maeBps) || retBps < maeBps) {
+        maeBps = retBps;
+        timeToMaeMs = Date.now() - startMs;
+      }
+      if (!Number.isFinite(mfeBps) || retBps > mfeBps) {
+        mfeBps = retBps;
+        timeToMfeMs = Date.now() - startMs;
+      }
+    } catch (err) {
+      // non-blocking best effort
+    }
+  };
+
+  (async () => {
+    const endMs = startMs + windowMs;
+    while (Date.now() < endMs) {
+      await collect();
+      await sleep(intervalMs);
+    }
+    tradeForensics.update(tradeId, {
+      postEntry: {
+        windowMs,
+        intervalMs,
+        samples,
+        maeBps,
+        mfeBps,
+        timeToMaeMs,
+        timeToMfeMs,
+      },
+    });
+  })().catch(() => null);
+}
 const inventoryState = new Map();
 
 const exitState = new Map();
@@ -2805,8 +2956,9 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   let bid = null;
   let ask = null;
   let spreadBps = null;
+  let quote = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -8459,10 +8611,10 @@ async function runEntryScanOnce() {
 
       let result = null;
       if (SIMPLE_SCALPER_ENABLED) {
-        result = await placeSimpleScalperEntry(symbol);
+        result = await placeSimpleScalperEntry(symbol, { forensicsRecord: recordBase });
       } else {
         desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
-        result = await placeMakerLimitBuyThenSell(symbol);
+        result = await placeMakerLimitBuyThenSell(symbol, { forensicsRecord: recordBase });
       }
       attempts += 1;
       if (result?.submitted) {
@@ -8641,8 +8793,9 @@ async function waitForOrderFill({ symbol, orderId, timeoutMs, intervalMs = 1000 
   return { filled: false, timeout: true, order };
 }
 
-async function placeSimpleScalperEntry(symbol) {
+async function placeSimpleScalperEntry(symbol, options = {}) {
   const normalizedSymbol = normalizeSymbol(symbol);
+  const forensicsRecord = options?.forensicsRecord || null;
   if (HALT_ON_ORPHANS) {
     const orphanReport1 = await getCachedOrphanScan();
     const orphans1 = Array.isArray(orphanReport1?.orphans) ? orphanReport1.orphans : [];
@@ -8744,6 +8897,13 @@ async function placeSimpleScalperEntry(symbol) {
   }
   const finalQty = sizeGuard.qty ?? qty;
 
+  const tradeId = randomUUID();
+  const decisionSnapshot = buildForensicsDecisionSnapshot({
+    normalizedSymbol,
+    quote,
+    signalRecord: forensicsRecord,
+  });
+
   const buyOrderUrl = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'orders',
@@ -8765,6 +8925,25 @@ async function placeSimpleScalperEntry(symbol) {
       time_in_force: isCryptoSymbol(normalizedSymbol) ? ENTRY_BUY_TIF_SAFE : 'gtc',
       client_order_id: buildEntryClientOrderId(normalizedSymbol),
     };
+    tradeForensics.append({
+      tsDecision: new Date().toISOString(),
+      tradeId,
+      symbol: normalizedSymbol,
+      decision: decisionSnapshot,
+      order: {
+        side: 'buy',
+        orderType: payload.type,
+        tif: payload.time_in_force,
+        submittedAt: null,
+        clientOrderId: payload.client_order_id || null,
+        orderId: null,
+        limitPrice: null,
+        qty: finalQty,
+        notional: notionalUsd,
+      },
+      fill: null,
+      postEntry: null,
+    });
     buyOrder = await placeOrderUnified({
       symbol: normalizedSymbol,
       url: buyOrderUrl,
@@ -8792,6 +8971,19 @@ async function placeSimpleScalperEntry(symbol) {
         limit_price: roundedAsk,
         client_order_id: buildEntryClientOrderId(normalizedSymbol),
       };
+      tradeForensics.update(tradeId, {
+        order: {
+          side: 'buy',
+          orderType: payload.type,
+          tif: payload.time_in_force,
+          submittedAt: null,
+          clientOrderId: payload.client_order_id || null,
+          orderId: null,
+          limitPrice: roundedAsk,
+          qty: finalQty,
+          notional: notionalUsd,
+        },
+      });
       buyOrder = await placeOrderUnified({
         symbol: normalizedSymbol,
         url: buyOrderUrl,
@@ -8822,6 +9014,20 @@ async function placeSimpleScalperEntry(symbol) {
     limitPrice,
   });
 
+  tradeForensics.update(tradeId, {
+    order: {
+      side: 'buy',
+      orderType: buyType,
+      tif: buyType === 'market' ? (isCryptoSymbol(normalizedSymbol) ? ENTRY_BUY_TIF_SAFE : 'gtc') : 'gtc',
+      submittedAt: buyOrder?.submitted_at || new Date().toISOString(),
+      clientOrderId: buyOrder?.client_order_id || buyOrder?.clientOrderId || null,
+      orderId: buyOrder?.id || null,
+      limitPrice,
+      qty: finalQty,
+      notional: notionalUsd,
+    },
+  });
+
   const buyOrderId = buyOrder?.id;
   if (!buyOrderId) {
     setInFlightStatus(normalizedSymbol, { reason: 'entry_not_submitted', untilMs: Date.now() + SIMPLE_SCALPER_RETRY_COOLDOWN_MS });
@@ -8849,6 +9055,23 @@ async function placeSimpleScalperEntry(symbol) {
   const filledQty = Number(filledOrder?.filled_qty || 0);
   const avgPrice = Number(filledOrder?.filled_avg_price || 0);
   console.log('simple_scalper_buy_fill', { symbol: normalizedSymbol, filledQty, avgPrice });
+  const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
+  const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgPrice)
+    ? ((avgPrice - decisionMid) / decisionMid) * 10000
+    : null;
+  const feeEstimateUsd = Number.isFinite(filledQty) && Number.isFinite(avgPrice)
+    ? (filledQty * avgPrice) * (FEE_BPS_TAKER / 10000)
+    : null;
+  tradeForensics.update(tradeId, {
+    fill: {
+      filledAt: filledOrder?.filled_at || new Date().toISOString(),
+      avgFillPrice: Number.isFinite(avgPrice) ? avgPrice : null,
+      filledQty: Number.isFinite(filledQty) ? filledQty : null,
+      slippageBps,
+      feeEstimateUsd,
+    },
+  });
+  startPostEntryForensicsSampler({ tradeId, symbol: normalizedSymbol, avgFillPrice: avgPrice });
   if (Number.isFinite(filledQty) && Number.isFinite(avgPrice) && filledQty > 0 && avgPrice > 0) {
     updateInventoryFromBuy(normalizedSymbol, filledQty, avgPrice);
   }
@@ -8887,8 +9110,9 @@ async function placeSimpleScalperEntry(symbol) {
 
 // covering taker fees and profit target
 
-async function placeMakerLimitBuyThenSell(symbol) {
+async function placeMakerLimitBuyThenSell(symbol, options = {}) {
   const normalizedSymbol = normalizeSymbol(symbol);
+  const forensicsRecord = options?.forensicsRecord || null;
   const openOrders = await fetchOrders({ status: 'open' });
   if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
     console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
@@ -8897,8 +9121,9 @@ async function placeMakerLimitBuyThenSell(symbol) {
   let bid = null;
   let ask = null;
   let spreadBps = null;
+  let quote = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -8974,6 +9199,13 @@ async function placeMakerLimitBuyThenSell(symbol) {
   }
   const finalQty = sizeGuard.qty ?? qty;
 
+  const tradeId = randomUUID();
+  const decisionSnapshot = buildForensicsDecisionSnapshot({
+    normalizedSymbol,
+    quote,
+    signalRecord: forensicsRecord,
+  });
+
   const buyOrderUrl = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'orders',
@@ -8991,6 +9223,25 @@ async function placeMakerLimitBuyThenSell(symbol) {
   if (POST_ONLY_BUY && isCryptoSymbol(normalizedSymbol)) {
     buyPayload.post_only = true;
   }
+  tradeForensics.append({
+    tsDecision: new Date().toISOString(),
+    tradeId,
+    symbol: normalizedSymbol,
+    decision: decisionSnapshot,
+    order: {
+      side: 'buy',
+      orderType: buyPayload.type,
+      tif: buyPayload.time_in_force,
+      submittedAt: null,
+      clientOrderId: buyPayload.client_order_id || null,
+      orderId: null,
+      limitPrice: limitBuyPrice,
+      qty: finalQty,
+      notional: amountToSpend,
+    },
+    fill: null,
+    postEntry: null,
+  });
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
     url: buyOrderUrl,
@@ -8999,6 +9250,19 @@ async function placeMakerLimitBuyThenSell(symbol) {
     reason: 'maker_limit_buy',
     context: 'maker_limit_buy',
     intent: 'entry',
+  });
+  tradeForensics.update(tradeId, {
+    order: {
+      side: 'buy',
+      orderType: buyPayload.type,
+      tif: buyPayload.time_in_force,
+      submittedAt: buyOrder?.submitted_at || new Date().toISOString(),
+      clientOrderId: buyOrder?.client_order_id || buyOrder?.clientOrderId || buyPayload.client_order_id || null,
+      orderId: buyOrder?.id || null,
+      limitPrice: limitBuyPrice,
+      qty: finalQty,
+      notional: amountToSpend,
+    },
   });
   const submitted = Boolean(buyOrder?.id);
 
@@ -9041,12 +9305,30 @@ async function placeMakerLimitBuyThenSell(symbol) {
     }
     if (ENTRY_FALLBACK_MARKET && Number.isFinite(spreadBps) && spreadBps <= requiredEdgeBps) {
       console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps, requiredEdgeBps });
-      return placeMarketBuyThenSell(normalizedSymbol);
+      return placeMarketBuyThenSell(normalizedSymbol, { forensicsRecord });
     }
     return { skipped: true, reason: 'entry_not_filled', submitted };
   }
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
+  const filledQty = Number(filledOrder?.filled_qty || 0);
+  const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
+  const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgPrice)
+    ? ((avgPrice - decisionMid) / decisionMid) * 10000
+    : null;
+  const feeEstimateUsd = Number.isFinite(filledQty) && Number.isFinite(avgPrice)
+    ? (filledQty * avgPrice) * (FEE_BPS_MAKER / 10000)
+    : null;
+  tradeForensics.update(tradeId, {
+    fill: {
+      filledAt: filledOrder?.filled_at || new Date().toISOString(),
+      avgFillPrice: Number.isFinite(avgPrice) ? avgPrice : null,
+      filledQty: Number.isFinite(filledQty) ? filledQty : null,
+      slippageBps,
+      feeEstimateUsd,
+    },
+  });
+  startPostEntryForensicsSampler({ tradeId, symbol: normalizedSymbol, avgFillPrice: avgPrice });
   updateInventoryFromBuy(normalizedSymbol, filledOrder.filled_qty, avgPrice);
   const inventory = inventoryState.get(normalizedSymbol);
   if (!inventory || inventory.qty <= 0) {
@@ -9067,9 +9349,10 @@ async function placeMakerLimitBuyThenSell(symbol) {
   return { buy: filledOrder, sell: sellOrder, submitted };
 }
 
-async function placeMarketBuyThenSell(symbol) {
+async function placeMarketBuyThenSell(symbol, options = {}) {
 
   const normalizedSymbol = normalizeSymbol(symbol);
+  const forensicsRecord = options?.forensicsRecord || null;
   const openOrders = await fetchOrders({ status: 'open' });
   if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
     console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
@@ -9078,8 +9361,9 @@ async function placeMarketBuyThenSell(symbol) {
   let bid = null;
   let ask = null;
   let spreadBps = null;
+  let quote = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -9179,6 +9463,13 @@ async function placeMarketBuyThenSell(symbol) {
   }
   const finalQty = sizeGuard.qty ?? qty;
 
+  const tradeId = randomUUID();
+  const decisionSnapshot = buildForensicsDecisionSnapshot({
+    normalizedSymbol,
+    quote,
+    signalRecord: forensicsRecord,
+  });
+
   const buyOrderUrl = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'orders',
@@ -9192,6 +9483,25 @@ async function placeMarketBuyThenSell(symbol) {
     time_in_force: isCryptoSymbol(normalizedSymbol) ? ENTRY_BUY_TIF_SAFE : 'gtc',
     client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
+  tradeForensics.append({
+    tsDecision: new Date().toISOString(),
+    tradeId,
+    symbol: normalizedSymbol,
+    decision: decisionSnapshot,
+    order: {
+      side: 'buy',
+      orderType: buyPayload.type,
+      tif: buyPayload.time_in_force,
+      submittedAt: null,
+      clientOrderId: buyPayload.client_order_id || null,
+      orderId: null,
+      limitPrice: null,
+      qty: finalQty,
+      notional: amountToSpend,
+    },
+    fill: null,
+    postEntry: null,
+  });
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
     url: buyOrderUrl,
@@ -9200,6 +9510,19 @@ async function placeMarketBuyThenSell(symbol) {
     reason: 'market_buy',
     context: 'market_buy',
     intent: 'entry',
+  });
+  tradeForensics.update(tradeId, {
+    order: {
+      side: 'buy',
+      orderType: buyPayload.type,
+      tif: buyPayload.time_in_force,
+      submittedAt: buyOrder?.submitted_at || new Date().toISOString(),
+      clientOrderId: buyOrder?.client_order_id || buyOrder?.clientOrderId || buyPayload.client_order_id || null,
+      orderId: buyOrder?.id || null,
+      limitPrice: null,
+      qty: finalQty,
+      notional: amountToSpend,
+    },
   });
   const submitted = Boolean(buyOrder?.id);
   if (buyOrder?.id) {
@@ -9252,6 +9575,25 @@ async function placeMarketBuyThenSell(symbol) {
 
   }
 
+  const avgFillPrice = Number(filled?.filled_avg_price);
+  const filledQty = Number(filled?.filled_qty);
+  const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
+  const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgFillPrice)
+    ? ((avgFillPrice - decisionMid) / decisionMid) * 10000
+    : null;
+  const feeEstimateUsd = Number.isFinite(filledQty) && Number.isFinite(avgFillPrice)
+    ? (filledQty * avgFillPrice) * (FEE_BPS_TAKER / 10000)
+    : null;
+  tradeForensics.update(tradeId, {
+    fill: {
+      filledAt: filled?.filled_at || new Date().toISOString(),
+      avgFillPrice: Number.isFinite(avgFillPrice) ? avgFillPrice : null,
+      filledQty: Number.isFinite(filledQty) ? filledQty : null,
+      slippageBps,
+      feeEstimateUsd,
+    },
+  });
+  startPostEntryForensicsSampler({ tradeId, symbol: normalizedSymbol, avgFillPrice });
   updateInventoryFromBuy(normalizedSymbol, filled.filled_qty, filled.filled_avg_price);
 
   const inventory = inventoryState.get(normalizedSymbol);

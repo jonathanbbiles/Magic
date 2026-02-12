@@ -55,6 +55,7 @@ const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
 const { normalizePair } = require('./symbolUtils');
 const recorder = require('./modules/recorder');
+const tradeForensics = require('./modules/tradeForensics');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
 validateEnv();
@@ -407,6 +408,7 @@ app.get('/dashboard', async (req, res) => {
     });
 
     const exitStateBySymbol = getExitStateSnapshot();
+    const latestForensicsBySymbol = tradeForensics.getLatestBySymbol();
     const nowMs = Date.now();
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
@@ -458,6 +460,7 @@ app.get('/dashboard', async (req, res) => {
           expectedMoveBps,
           source: sellSource,
         },
+        forensics: latestForensicsBySymbol[symbol] || null,
         bot: {
           requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBps),
           minNetProfitBps: toFiniteNumberOrNull(botState?.minNetProfitBps),
@@ -504,6 +507,23 @@ app.get('/diagnostics/orphans', async (req, res) => {
 app.get('/debug/predictor/recent', (req, res) => {
   const limit = Number(req.query?.limit || 200);
   res.json({ items: recorder.getRecent(limit) });
+});
+
+app.get('/debug/forensics/recent', (req, res) => {
+  const limit = Number(req.query?.limit || 200);
+  res.json({ items: tradeForensics.getRecent(limit) });
+});
+
+app.get('/debug/forensics/latestBySymbol', (req, res) => {
+  res.json({ items: tradeForensics.getLatestBySymbol() });
+});
+
+app.get('/debug/forensics/:tradeId', (req, res) => {
+  const item = tradeForensics.getByTradeId(req.params.tradeId);
+  if (!item) {
+    return res.status(404).json({ error: 'forensics_not_found' });
+  }
+  return res.json(item);
 });
 
 app.get('/debug/labels/recent', (req, res) => {
