@@ -60,6 +60,7 @@ const endpointConfig = [
   { key: 'health', path: '/health' },
   { key: 'status', path: '/debug/status' },
   { key: 'account', path: '/account' },
+  { key: 'portfolioHistory', path: '/account/portfolio/history?timeframe=1D&period=1Y' },
   { key: 'positions', path: '/positions' },
   { key: 'orders', path: '/orders' },
 ];
@@ -290,6 +291,37 @@ function getPastPoint(series, targetTime) {
   return null;
 }
 
+function normalizePortfolioHistory(data) {
+  if (!data || typeof data !== 'object') return [];
+  if (Array.isArray(data.history)) {
+    return data.history
+      .map((point) => {
+        const ts = point?.t ?? point?.timestamp ?? point?.time;
+        const eq = point?.equity ?? point?.value;
+        const tMs = Number.isFinite(Number(ts)) ? Number(ts) * 1000 : Date.parse(String(ts || ''));
+        const equity = Number(eq);
+        if (!Number.isFinite(tMs) || !Number.isFinite(equity)) return null;
+        return { t: tMs, equity };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.t - b.t);
+  }
+
+  const timestamps = Array.isArray(data.timestamp) ? data.timestamp : [];
+  const equities = Array.isArray(data.equity) ? data.equity : [];
+  const size = Math.min(timestamps.length, equities.length);
+  const points = [];
+  for (let i = 0; i < size; i += 1) {
+    const tsRaw = timestamps[i];
+    const eqRaw = equities[i];
+    const tMs = Number.isFinite(Number(tsRaw)) ? Number(tsRaw) * 1000 : Date.parse(String(tsRaw || ''));
+    const equity = Number(eqRaw);
+    if (!Number.isFinite(tMs) || !Number.isFinite(equity)) continue;
+    points.push({ t: tMs, equity });
+  }
+  return points.sort((a, b) => a.t - b.t);
+}
+
 function buildSparklinePath(points, width, height) {
   if (points.length < 2) return '';
   const values = points.map((point) => point.equity);
@@ -398,6 +430,7 @@ export default function App() {
     health: emptyResponse,
     status: emptyResponse,
     account: emptyResponse,
+    portfolioHistory: emptyResponse,
     positions: emptyResponse,
     orders: emptyResponse,
   }));
@@ -547,13 +580,20 @@ export default function App() {
 
   const tradingEnabled =
     toBoolean(healthData?.autoTradeEnabled) ??
+    toBoolean(statusData?.trading?.TRADING_ENABLED) ??
     toBoolean(healthData?.tradingEnabled) ??
     toBoolean(statusData?.autoTradeEnabled) ??
     toBoolean(statusData?.tradingEnabled) ??
     null;
 
   const liveMode =
-    toBoolean(healthData?.liveMode) ?? toBoolean(statusData?.liveMode) ?? null;
+    toBoolean(healthData?.liveMode) ??
+    toBoolean(statusData?.liveMode) ??
+    (() => {
+      const tradeBase = String(statusData?.alpaca?.tradeBase || statusData?.tradeBase || '').toLowerCase();
+      if (!tradeBase) return null;
+      return !tradeBase.includes('paper');
+    })();
 
   const healthOk = responses.health.ok || responses.status.ok;
   const responseList = Object.values(responses);
@@ -584,45 +624,11 @@ export default function App() {
     ? Math.floor((Date.now() - lastSuccessAt.getTime()) / 1000)
     : null;
 
-  const statusHeldBySymbol = useMemo(() => {
-    const map = {};
-    if (Array.isArray(statusData?.positions)) {
-      statusData.positions.forEach((pos) => {
-        const symbol = pos?.symbol ?? pos?.asset;
-        const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
-        if (symbol && heldSeconds != null) {
-          map[String(symbol)] = heldSeconds;
-        }
-      });
-    }
-    if (statusData?.exitState && typeof statusData.exitState === 'object') {
-      Object.entries(statusData.exitState).forEach(([symbol, value]) => {
-        const heldSeconds = value?.heldSeconds ?? value?.held_seconds;
-        if (heldSeconds != null) {
-          map[String(symbol)] = heldSeconds;
-        }
-      });
-    }
-    return map;
-  }, [statusData]);
-
   const positionsWithAge = positionsData
     .map((pos) => {
       const heldSeconds = pos?.heldSeconds ?? pos?.held_seconds;
       if (heldSeconds != null) {
         return { ...pos, ageHours: heldSeconds / 3600 };
-      }
-      const timeValue = pos?.openedAt ?? pos?.opened_at ?? pos?.entryTime ?? pos?.created_at;
-      if (timeValue) {
-        const parsed = new Date(timeValue);
-        if (!Number.isNaN(parsed.getTime())) {
-          return { ...pos, ageHours: (Date.now() - parsed.getTime()) / 3600000 };
-        }
-      }
-      const symbolKey = pos?.symbol ?? pos?.asset;
-      const statusHeld = symbolKey ? statusHeldBySymbol[String(symbolKey)] : null;
-      if (statusHeld != null) {
-        return { ...pos, ageHours: statusHeld / 3600 };
       }
       return { ...pos, ageHours: null };
     })
@@ -639,15 +645,17 @@ export default function App() {
 
   const equityValue = Number(accountData?.equity);
   const currentEquity = Number.isFinite(equityValue) ? equityValue : null;
+  const portfolioHistorySeries = normalizePortfolioHistory(responses.portfolioHistory.data);
+  const growthSeries = portfolioHistorySeries.length ? portfolioHistorySeries : equitySeries;
   const sparklinePoints = equitySeries.slice(-50);
 
   const now = Date.now();
-  const dailyPoint = getPastPoint(equitySeries, now - 24 * 60 * 60 * 1000);
-  const weeklyPoint = getPastPoint(equitySeries, now - 7 * 24 * 60 * 60 * 1000);
-  const monthlyPoint = getPastPoint(equitySeries, now - 30 * 24 * 60 * 60 * 1000);
+  const dailyPoint = getPastPoint(growthSeries, now - 24 * 60 * 60 * 1000);
+  const weeklyPoint = getPastPoint(growthSeries, now - 7 * 24 * 60 * 60 * 1000);
+  const monthlyPoint = getPastPoint(growthSeries, now - 30 * 24 * 60 * 60 * 1000);
   const yearStart = new Date(new Date().getFullYear(), 0, 1).getTime();
   const ytdPoint =
-    equitySeries.find((point) => point.t >= yearStart) ?? equitySeries[0] ?? null;
+    growthSeries.find((point) => point.t >= yearStart) ?? growthSeries[0] ?? null;
 
   const dailyPct = getChangePct(currentEquity, dailyPoint?.equity ?? null);
   const weeklyPct = getChangePct(currentEquity, weeklyPoint?.equity ?? null);
