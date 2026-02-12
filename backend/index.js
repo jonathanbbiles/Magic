@@ -63,6 +63,13 @@ const VERSION =
 
 const app = express();
 
+const ACTIVITY_FILLS_CACHE_TTL_MS = 60 * 1000;
+const activityFillsCache = {
+  tsMs: 0,
+  bySymbol: {},
+  pending: null,
+};
+
 app.set('trust proxy', 1);
 app.use((req, res, next) => {
   res.set('x-server-version', VERSION);
@@ -149,6 +156,65 @@ const sendError = (res, error, fallbackMessage) => {
   return res.status(statusCode).json(payload);
 };
 
+const getFillTimestampMs = (fill) => {
+  const timeValue = fill?.transaction_time || fill?.timestamp || fill?.created_at;
+  if (!timeValue) {
+    return null;
+  }
+  const parsed = Date.parse(timeValue);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildLatestBuyFillLookup = (items) => {
+  const bySymbol = {};
+  const nowMs = Date.now();
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    const side = String(item?.side || item?.order_side || '').toUpperCase();
+    if (side !== 'BUY') {
+      return;
+    }
+    const symbol = String(item?.symbol || item?.asset_symbol || '').toUpperCase();
+    if (!symbol) {
+      return;
+    }
+    const tsMs = getFillTimestampMs(item);
+    if (!Number.isFinite(tsMs) || tsMs > nowMs) {
+      return;
+    }
+    const prev = bySymbol[symbol];
+    if (!Number.isFinite(prev) || tsMs > prev) {
+      bySymbol[symbol] = tsMs;
+    }
+  });
+  return bySymbol;
+};
+
+async function getRecentBuyFillLookup() {
+  const nowMs = Date.now();
+  if (activityFillsCache.tsMs && nowMs - activityFillsCache.tsMs < ACTIVITY_FILLS_CACHE_TTL_MS) {
+    return activityFillsCache.bySymbol;
+  }
+  if (activityFillsCache.pending) {
+    return activityFillsCache.pending;
+  }
+  activityFillsCache.pending = (async () => {
+    const result = await fetchActivities({
+      activity_types: 'FILL',
+      direction: 'desc',
+      page_size: '200',
+    });
+    const bySymbol = buildLatestBuyFillLookup(result?.items || []);
+    activityFillsCache.bySymbol = bySymbol;
+    activityFillsCache.tsMs = Date.now();
+    return bySymbol;
+  })();
+  try {
+    return await activityFillsCache.pending;
+  } finally {
+    activityFillsCache.pending = null;
+  }
+}
+
 function extractOrderSummary(order) {
   if (!order) {
     return { orderId: null, status: null, submittedAt: null };
@@ -177,11 +243,23 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
+  const baseStatus = getAlpacaBaseStatus();
+  const tradingStatus = getTradingManagerStatus();
+  const tradeBase = String(baseStatus?.tradeBase || '');
+  const corsAllowedOrigins = parseCorsOrigins(process.env.CORS_ALLOWED_ORIGINS);
+  const corsAllowedRegexes = parseCorsRegexes(process.env.CORS_ALLOWED_ORIGIN_REGEX);
+  const corsAllowLan = String(process.env.CORS_ALLOW_LAN || '').toLowerCase() === 'true';
   res.json({
     ok: true,
     uptimeSec: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
     version: VERSION,
+    autoTradeEnabled: Boolean(tradingStatus?.tradingEnabled),
+    liveMode: !tradeBase.includes('paper'),
+    apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
+    corsAllowLan,
+    corsAllowedOrigins,
+    corsAllowedOriginRegex: corsAllowedRegexes.map((regex) => regex.source),
   });
 });
 
@@ -240,7 +318,25 @@ app.get('/clock', async (req, res) => {
 app.get('/positions', async (req, res) => {
   try {
     const positions = await fetchPositions();
-    res.json(Array.isArray(positions) ? positions : []);
+    let recentBuyFillBySymbol = {};
+    try {
+      recentBuyFillBySymbol = await getRecentBuyFillLookup();
+    } catch (fillError) {
+      console.warn('Position fills lookup error:', fillError?.responseSnippet || fillError?.message);
+    }
+    const nowMs = Date.now();
+    const withHeldSeconds = (Array.isArray(positions) ? positions : []).map((position) => {
+      const symbol = String(position?.symbol || position?.asset || '').toUpperCase();
+      const fillTsMs = symbol ? recentBuyFillBySymbol[symbol] : null;
+      const heldSeconds = Number.isFinite(fillTsMs)
+        ? Math.max(0, Math.floor((nowMs - fillTsMs) / 1000))
+        : null;
+      return {
+        ...position,
+        heldSeconds,
+      };
+    });
+    res.json(withHeldSeconds);
   } catch (error) {
     console.error('Positions fetch error:', error?.responseSnippet || error.message);
     return sendError(res, error, 'Positions fetch failed');
