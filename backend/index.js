@@ -56,6 +56,7 @@ const { getFailureSnapshot } = require('./symbolFailures');
 const { normalizePair } = require('./symbolUtils');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
+const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
 validateEnv();
@@ -69,6 +70,10 @@ const VERSION =
 const app = express();
 
 const ACTIVITY_FILLS_CACHE_TTL_MS = 60 * 1000;
+const EQUITY_SNAPSHOT_MS_RAW = Number(process.env.EQUITY_SNAPSHOT_MS || 30 * 60 * 1000);
+const EQUITY_SNAPSHOT_MS = Number.isFinite(EQUITY_SNAPSHOT_MS_RAW) && EQUITY_SNAPSHOT_MS_RAW > 0
+  ? Math.floor(EQUITY_SNAPSHOT_MS_RAW)
+  : 30 * 60 * 1000;
 const activityFillsCache = {
   tsMs: 0,
   bySymbol: {},
@@ -256,6 +261,43 @@ function extractOrderSummary(order) {
   return { orderId, status, submittedAt };
 }
 
+const normalizeForensicsSymbolKey = (value) => {
+  const upper = String(value || '').toUpperCase().trim();
+  if (!upper) {
+    return '';
+  }
+  return normalizePair(upper).toUpperCase();
+};
+
+const getForensicsForPositionSymbol = (latestBySymbol, rawSymbol) => {
+  const normalizedRaw = normalizeForensicsSymbolKey(rawSymbol);
+  const direct = latestBySymbol[normalizedRaw] || latestBySymbol[String(rawSymbol || '').toUpperCase()] || null;
+  if (direct) {
+    return direct;
+  }
+
+  if (!normalizedRaw) {
+    return null;
+  }
+
+  const slashVariant = normalizedRaw.includes('/') ? normalizedRaw : normalizedRaw.replace(/USD$/, '/USD');
+  const plainVariant = normalizedRaw.replace('/', '');
+  return latestBySymbol[slashVariant] || latestBySymbol[plainVariant] || null;
+};
+
+async function recordEquitySnapshot() {
+  try {
+    const account = await fetchAccount();
+    equitySnapshots.appendSnapshot({
+      ts: Date.now(),
+      equity: account?.equity,
+      portfolio_value: account?.portfolio_value,
+    });
+  } catch (error) {
+    console.warn('equity_snapshot_record_failed', error?.responseSnippet || error?.message || error);
+  }
+}
+
 app.use((req, res, next) => {
   if (isPublicEndpoint(req)) {
     return next();
@@ -408,7 +450,18 @@ app.get('/dashboard', async (req, res) => {
     });
 
     const exitStateBySymbol = getExitStateSnapshot();
-    const latestForensicsBySymbol = tradeForensics.getLatestBySymbol();
+    const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
+    const latestForensicsBySymbol = {};
+    Object.keys(latestBySymbolRaw || {}).forEach((key) => {
+      const normalizedKey = normalizeForensicsSymbolKey(key);
+      if (normalizedKey && !latestForensicsBySymbol[normalizedKey]) {
+        latestForensicsBySymbol[normalizedKey] = latestBySymbolRaw[key];
+      }
+      const plainKey = String(key || '').toUpperCase();
+      if (plainKey && !latestForensicsBySymbol[plainKey]) {
+        latestForensicsBySymbol[plainKey] = latestBySymbolRaw[key];
+      }
+    });
     const nowMs = Date.now();
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
@@ -460,7 +513,7 @@ app.get('/dashboard', async (req, res) => {
           expectedMoveBps,
           source: sellSource,
         },
-        forensics: latestForensicsBySymbol[symbol] || null,
+        forensics: getForensicsForPositionSymbol(latestForensicsBySymbol, rawSymbol),
         bot: {
           requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBps),
           minNetProfitBps: toFiniteNumberOrNull(botState?.minNetProfitBps),
@@ -476,12 +529,20 @@ app.get('/dashboard', async (req, res) => {
       };
     });
 
+    const latestEquity = toFiniteNumberOrNull(account?.equity) ?? toFiniteNumberOrNull(account?.portfolio_value);
+    const weekly = equitySnapshots.getWeeklyChangePct(latestEquity, nowMs);
+
     res.json({
       ok: true,
       ts: new Date().toISOString(),
       version: VERSION,
       account,
       positions,
+      meta: {
+        weeklyChangePct: toFiniteNumberOrNull(weekly?.weeklyPct),
+        weekAgoEquity: toFiniteNumberOrNull(weekly?.weekAgoEquity),
+        latestEquity: toFiniteNumberOrNull(weekly?.latestEquity),
+      },
     });
   } catch (error) {
     console.error('Dashboard fetch error:', error?.responseSnippet || error.message);
@@ -1076,6 +1137,11 @@ async function bootstrapTrading() {
 const server = app.listen(port, () => {
   console.log('server_start', { env: process.env.NODE_ENV || 'development', port });
 });
+
+recordEquitySnapshot();
+setInterval(() => {
+  recordEquitySnapshot();
+}, EQUITY_SNAPSHOT_MS);
 
 bootstrapTrading().catch((err) => {
   console.error('bootstrap_step_failed', {
