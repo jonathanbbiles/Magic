@@ -47,6 +47,9 @@ const {
   getSupportedCryptoPairsSnapshot,
   filterSupportedCryptoSymbols,
   scanOrphanPositions,
+  expandNestedOrders,
+  isOpenLikeOrderStatus,
+  getExitStateSnapshot,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -217,6 +220,31 @@ async function getRecentBuyFillLookup() {
   }
 }
 
+
+const toFiniteNumberOrNull = (value) => {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
+const pickLowestSellLimit = (orders) => {
+  let lowest = null;
+  (Array.isArray(orders) ? orders : []).forEach((order) => {
+    const side = String(order?.side || '').toLowerCase();
+    const status = String(order?.status || '').toLowerCase();
+    if (side !== 'sell' || !isOpenLikeOrderStatus(status)) {
+      return;
+    }
+    const limit = toFiniteNumberOrNull(order?.limit_price);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      return;
+    }
+    if (!Number.isFinite(lowest) || limit < lowest) {
+      lowest = limit;
+    }
+  });
+  return Number.isFinite(lowest) ? lowest : null;
+};
+
 function extractOrderSummary(order) {
   if (!order) {
     return { orderId: null, status: null, submittedAt: null };
@@ -342,6 +370,119 @@ app.get('/positions', async (req, res) => {
   } catch (error) {
     console.error('Positions fetch error:', error?.responseSnippet || error.message);
     return sendError(res, error, 'Positions fetch failed');
+  }
+});
+
+
+app.get('/dashboard', async (req, res) => {
+  try {
+    const [account, positionsRaw, openOrdersRaw] = await Promise.all([
+      fetchAccount(),
+      fetchPositions(),
+      fetchOrders({ status: 'open', nested: true, limit: 500 }),
+    ]);
+
+    let recentBuyFillBySymbol = {};
+    try {
+      recentBuyFillBySymbol = await getRecentBuyFillLookup();
+    } catch (fillError) {
+      console.warn('Dashboard fills lookup error:', fillError?.responseSnippet || fillError?.message);
+    }
+
+    const expandedOrders = expandNestedOrders(openOrdersRaw);
+    const openSellOrdersBySymbol = new Map();
+
+    expandedOrders.forEach((order) => {
+      const side = String(order?.side || '').toLowerCase();
+      const status = String(order?.status || '').toLowerCase();
+      if (side !== 'sell' || !isOpenLikeOrderStatus(status)) return;
+
+      const rawSymbol = String(order?.symbol || '').toUpperCase();
+      const normalizedSymbol = normalizePair(rawSymbol).toUpperCase();
+      if (!normalizedSymbol) return;
+
+      const list = openSellOrdersBySymbol.get(normalizedSymbol) || [];
+      list.push(order);
+      openSellOrdersBySymbol.set(normalizedSymbol, list);
+    });
+
+    const exitStateBySymbol = getExitStateSnapshot();
+    const nowMs = Date.now();
+
+    const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
+      const rawSymbol = String(position?.symbol || position?.asset || '').toUpperCase();
+      const symbol = normalizePair(rawSymbol).toUpperCase();
+      const avgEntryPrice = toFiniteNumberOrNull(position?.avg_entry_price);
+      const fillTsMs = symbol ? recentBuyFillBySymbol[symbol] : null;
+      const heldSeconds = Number.isFinite(fillTsMs)
+        ? Math.max(0, Math.floor((nowMs - fillTsMs) / 1000))
+        : null;
+
+      const symbolOpenSellOrders = openSellOrdersBySymbol.get(symbol) || [];
+      const activeSellLimitFromOrders = pickLowestSellLimit(symbolOpenSellOrders);
+
+      const botState = exitStateBySymbol[symbol] || null;
+      const sellOrderLimitFromState = toFiniteNumberOrNull(botState?.sellOrderLimit);
+      const activeSellLimit = Number.isFinite(activeSellLimitFromOrders)
+        ? activeSellLimitFromOrders
+        : Number.isFinite(sellOrderLimitFromState)
+          ? sellOrderLimitFromState
+          : null;
+
+      const expectedMovePct = Number.isFinite(activeSellLimit) && Number.isFinite(avgEntryPrice) && avgEntryPrice > 0
+        ? ((activeSellLimit / avgEntryPrice) - 1) * 100
+        : null;
+
+      const expectedMoveBps = Number.isFinite(activeSellLimit) && Number.isFinite(avgEntryPrice) && avgEntryPrice > 0
+        ? ((activeSellLimit / avgEntryPrice) - 1) * 10000
+        : null;
+
+      const sellSource = Number.isFinite(activeSellLimitFromOrders)
+        ? 'open_orders'
+        : Number.isFinite(sellOrderLimitFromState)
+          ? 'exit_state'
+          : null;
+
+      return {
+        symbol: rawSymbol || symbol,
+        qty: position?.qty ?? null,
+        avg_entry_price: position?.avg_entry_price ?? null,
+        current_price: position?.current_price ?? null,
+        market_value: position?.market_value ?? null,
+        unrealized_pl: position?.unrealized_pl ?? null,
+        unrealized_plpc: position?.unrealized_plpc ?? null,
+        heldSeconds,
+        sell: {
+          activeLimit: activeSellLimit,
+          expectedMovePct,
+          expectedMoveBps,
+          source: sellSource,
+        },
+        bot: {
+          requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBps),
+          minNetProfitBps: toFiniteNumberOrNull(botState?.minNetProfitBps),
+          targetPrice: toFiniteNumberOrNull(botState?.targetPrice),
+          breakevenPrice: toFiniteNumberOrNull(botState?.breakevenPrice),
+          feeBpsRoundTrip: toFiniteNumberOrNull(botState?.feeBpsRoundTrip),
+          entrySpreadBpsUsed: toFiniteNumberOrNull(botState?.entrySpreadBpsUsed),
+          desiredNetExitBps: toFiniteNumberOrNull(botState?.desiredNetExitBps),
+          entryPriceUsed: toFiniteNumberOrNull(botState?.entryPriceUsed),
+          sellOrderId: botState?.sellOrderId || null,
+          sellOrderSubmittedAt: botState?.sellOrderSubmittedAt || null,
+        },
+      };
+    });
+
+    res.json({
+      ok: true,
+      ts: new Date().toISOString(),
+      version: VERSION,
+      account,
+      positions,
+    });
+  } catch (error) {
+    console.error('Dashboard fetch error:', error?.responseSnippet || error.message);
+    return sendError(res, error, 'Dashboard fetch failed');
   }
 });
 
