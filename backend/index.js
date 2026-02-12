@@ -50,6 +50,7 @@ const {
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
+const { normalizePair } = require('./symbolUtils');
 const recorder = require('./modules/recorder');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
@@ -173,7 +174,8 @@ const buildLatestBuyFillLookup = (items) => {
     if (side !== 'BUY') {
       return;
     }
-    const symbol = String(item?.symbol || item?.asset_symbol || '').toUpperCase();
+    const rawSymbol = String(item?.symbol || item?.asset_symbol || '').toUpperCase();
+    const symbol = normalizePair(rawSymbol).toUpperCase();
     if (!symbol) {
       return;
     }
