@@ -1414,6 +1414,31 @@ const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
 const SIMPLE_SCALPER_RETRY_COOLDOWN_MS = 120000;
 const inFlightBySymbol = new Map();
 
+function toJsonSafePrimitive(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (value instanceof Date) return value.toISOString();
+  return null;
+}
+
+function getExitStateSnapshot() {
+  const snapshot = {};
+  for (const [rawSymbol, state] of exitState.entries()) {
+    const symbol = String(rawSymbol || '').toUpperCase();
+    if (!symbol || !state || typeof state !== 'object') {
+      continue;
+    }
+    const entry = {};
+    Object.entries(state).forEach(([key, value]) => {
+      const normalized = toJsonSafePrimitive(value);
+      entry[key] = normalized;
+    });
+    snapshot[symbol] = entry;
+  }
+  return snapshot;
+}
+
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
@@ -10105,5 +10130,8 @@ module.exports = {
   computeTargetSellPrice,
   resolveEntryBasis,
   computeAwayBps,
+  expandNestedOrders,
+  isOpenLikeOrderStatus,
+  getExitStateSnapshot,
 
 };
