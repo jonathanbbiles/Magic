@@ -15,15 +15,19 @@ const theme = {
   colors: {
     bg: '#070A12',
     text: 'rgba(255,255,255,0.92)',
-    muted: 'rgba(255,255,255,0.62)',
+    muted: 'rgba(255,255,255,0.65)',
+    faint: 'rgba(255,255,255,0.45)',
     card: '#0B1220',
     cardAlt: '#0F1730',
     positive: '#72FFB6',
     negative: '#FF5C8A',
     warning: '#FFD36E',
+    border: 'rgba(255,255,255,0.10)',
+    glowPos: 'rgba(114,255,182,0.55)',
+    glowNeg: 'rgba(255,92,138,0.55)',
     errorBg: 'rgba(255,60,90,0.18)',
     errorText: 'rgba(255,220,230,0.95)',
-    border: 'rgba(255,255,255,0.10)',
+    barTrack: 'rgba(255,255,255,0.10)',
   },
   spacing: { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 },
   radius: { md: 14, lg: 18, xl: 24 },
@@ -48,9 +52,10 @@ async function fetchDashboard() {
   let json = null;
   try {
     json = text ? JSON.parse(text) : null;
-  } catch (e) {
+  } catch {
     // ignore
   }
+
   if (!res.ok) {
     const err = new Error(json?.error || json?.message || text || 'Request failed');
     err.status = res.status;
@@ -59,34 +64,40 @@ async function fetchDashboard() {
   return json;
 }
 
-function toNum(value) {
-  const n = Number(value);
+function toNum(v) {
+  const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-function usd(value) {
-  const n = toNum(value);
+function clamp(x, a, b) {
+  const n = toNum(x);
+  if (!Number.isFinite(n)) return a;
+  return Math.min(b, Math.max(a, n));
+}
+
+function usd(v) {
+  const n = toNum(v);
   if (!Number.isFinite(n)) return '—';
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-function signedUsd(value) {
-  const n = toNum(value);
+function signedUsd(v) {
+  const n = toNum(v);
   if (!Number.isFinite(n)) return '—';
   const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return `${n >= 0 ? '+' : '-'}$${abs}`;
 }
 
-function pct(value) {
-  const n = toNum(value);
+function pct(v) {
+  const n = toNum(v);
   if (!Number.isFinite(n)) return '—';
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function bps(value) {
-  const n = toNum(value);
+function bps(v) {
+  const n = toNum(v);
   if (!Number.isFinite(n)) return '—';
-  return `${n.toFixed(1)} bps`;
+  return `${n.toFixed(1)}bps`;
 }
 
 function ageLabel(seconds) {
@@ -97,14 +108,36 @@ function ageLabel(seconds) {
   return `${mins}m ${rem}s`;
 }
 
-function Stat({ label, value, valueStyle, playful }) {
+function MomentumBar({ valuePct }) {
+  // valuePct is like +1.23 (%). We'll map [-5%, +5%] to a full bar.
+  const pctVal = toNum(valuePct);
+  const cap = 5;
+  const normalized = Number.isFinite(pctVal) ? clamp((pctVal + cap) / (2 * cap), 0, 1) : 0.5;
+
+  return (
+    <View style={headerStyles.barTrack}>
+      <View style={[headerStyles.barFill, { width: `${normalized * 100}%` }]} />
+      <View style={headerStyles.barMid} />
+    </View>
+  );
+}
+
+function Chip({ icon, value, tint }) {
+  return (
+    <View style={[headerStyles.chip, tint ? { borderColor: tint } : null]}>
+      <Text style={headerStyles.chipIcon}>{icon}</Text>
+      <Text style={headerStyles.chipValue} numberOfLines={1}>
+        {value}
+      </Text>
+    </View>
+  );
+}
+
+function Stat({ icon, value, valueStyle }) {
   return (
     <View style={cardStyles.stat}>
-      <Text style={cardStyles.label}>
-        {playful ? `${playful} ` : ''}
-        {label}
-      </Text>
-      <Text style={[cardStyles.value, valueStyle]} numberOfLines={1}>
+      <Text style={cardStyles.statIcon}>{icon}</Text>
+      <Text style={[cardStyles.statValue, valueStyle]} numberOfLines={1}>
         {value}
       </Text>
     </View>
@@ -115,41 +148,67 @@ function PositionCard({ position }) {
   const upnl = toNum(position?.unrealized_pl);
   const upnlPctRaw = toNum(position?.unrealized_plpc);
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
+
   const pnlPositive = (upnl || 0) >= 0;
+  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
+
+  const avgEntry = toNum(position?.avg_entry_price);
+  const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
+  const toSellPct = Number.isFinite(avgEntry) && Number.isFinite(sellLimit)
+    ? ((sellLimit / avgEntry) - 1) * 100
+    : null;
+
+  const current = toNum(position?.current_price);
+  const distToTargetPct = Number.isFinite(current) && Number.isFinite(sellLimit) && current !== 0
+    ? ((sellLimit - current) / current) * 100
+    : null;
+
+  const statusPill = pnlPositive ? '✨' : '🩸';
 
   return (
-    <LinearGradient colors={[theme.colors.cardAlt, theme.colors.card]} style={cardStyles.card}>
+    <LinearGradient
+      colors={[theme.colors.cardAlt, theme.colors.card]}
+      style={[cardStyles.card, { borderColor: glow }]}
+    >
       <View style={cardStyles.headerRow}>
-        <Text style={cardStyles.symbol}>{position?.symbol || '—'}</Text>
-        <Text style={cardStyles.qty}>Qty {position?.qty ?? '—'}</Text>
+        <View style={cardStyles.symWrap}>
+          <Text style={cardStyles.symbol}>{position?.symbol || '—'}</Text>
+          <View style={[cardStyles.pill, { borderColor: glow }]}>
+            <Text style={[cardStyles.pillText, { color: glow }]}>{statusPill}</Text>
+            <Text style={cardStyles.pillText}>{ageLabel(position?.heldSeconds)}</Text>
+          </View>
+        </View>
+        <Text style={cardStyles.qty}>× {position?.qty ?? '—'}</Text>
       </View>
 
-      <View style={cardStyles.row}>
-        <Stat label="Avg Entry" value={usd(position?.avg_entry_price)} />
-        <Stat label="Current" value={usd(position?.current_price)} />
-      </View>
-
-      <View style={cardStyles.row}>
+      <View style={cardStyles.grid}>
+        <Stat icon="🧾" value={usd(position?.avg_entry_price)} />
+        <Stat icon="💸" value={usd(position?.current_price)} />
         <Stat
-          label="Unrealized P/L"
-          value={`${signedUsd(upnl)} (${pct(upnlPct)})`}
-          valueStyle={{ color: pnlPositive ? theme.colors.positive : theme.colors.negative }}
+          icon="🧠"
+          value={bps(position?.bot?.entrySpreadBpsUsed)}
+          valueStyle={{ color: theme.colors.muted }}
+        />
+        <Stat
+          icon="🚪"
+          value={bps(position?.bot?.requiredExitBps)}
+          valueStyle={{ color: theme.colors.muted }}
         />
       </View>
 
-      <View style={cardStyles.row}>
-        <Stat label="SELL LIMIT" value={usd(position?.sell?.activeLimit)} playful="🎯" />
-        <Stat label="To Sell" value={pct(position?.sell?.expectedMovePct)} />
+      <View style={cardStyles.bigRow}>
+        <Stat
+          icon="📌"
+          value={`${signedUsd(upnl)}  ${pct(upnlPct)}`}
+          valueStyle={{ color: pnlPositive ? theme.colors.positive : theme.colors.negative, fontSize: 16 }}
+        />
       </View>
 
-      <View style={cardStyles.row}>
-        <Stat label="Entry Spread" value={bps(position?.bot?.entrySpreadBpsUsed)} />
-        <Stat label="Required Exit" value={bps(position?.bot?.requiredExitBps)} />
-      </View>
-
-      <View style={cardStyles.row}>
-        <Stat label="Age" value={ageLabel(position?.heldSeconds)} playful="⏳" />
-        <Stat label="Sell Source" value={position?.sell?.source || '—'} />
+      <View style={cardStyles.grid}>
+        <Stat icon="🎯" value={usd(sellLimit)} />
+        <Stat icon="↗️" value={pct(toSellPct)} />
+        <Stat icon="Δ🎯" value={pct(distToTargetPct)} valueStyle={{ color: theme.colors.warning }} />
+        <Stat icon="🧩" value={position?.sell?.source || '—'} valueStyle={{ color: theme.colors.faint }} />
       </View>
     </LinearGradient>
   );
@@ -201,6 +260,18 @@ export default function App() {
       ? ((equity - lastEquity) / lastEquity) * 100
       : null;
 
+  const openPL = useMemo(() => {
+    return positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0);
+  }, [positions]);
+
+  const openPLPct = useMemo(() => {
+    const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
+    if (!Number.isFinite(mv) || mv <= 0) return null;
+    return (openPL / mv) * 100;
+  }, [positions, openPL]);
+
+  const openPLPositive = (openPL || 0) >= 0;
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
@@ -213,28 +284,45 @@ export default function App() {
             <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
           }
           ListHeaderComponent={
-            <View>
-              <Text style={styles.title}>Magic Money</Text>
-              <Text style={styles.portfolioLabel}>Portfolio Value</Text>
-              <Text style={styles.portfolioValue}>{usd(portfolioValue)}</Text>
-              <Text style={styles.subline}>
-                Buying Power {usd(account?.buying_power)}  •  Cash {usd(account?.cash)}
-              </Text>
-              <Text style={styles.dayLine}>
-                Day Change {signedUsd(dayChange)} ({pct(dayChangePct)})
-              </Text>
+            <View style={headerStyles.wrap}>
+              <View style={headerStyles.topRow}>
+                <Text style={headerStyles.title}>🎩 Magic Money</Text>
+                <Text style={headerStyles.titleRight}>{usd(portfolioValue)}</Text>
+              </View>
+
+              <View style={headerStyles.chipsRow}>
+                <Chip icon="💰" value={usd(account?.buying_power)} />
+                <Chip icon="🏦" value={usd(account?.cash)} />
+                <Chip icon="📆" value={`${signedUsd(dayChange)} ${pct(dayChangePct)}`} tint={theme.colors.warning} />
+              </View>
+
+              <View style={headerStyles.openRow}>
+                <Text style={headerStyles.openLine}>
+                  🌡️ {signedUsd(openPL)} {pct(openPLPct)}
+                </Text>
+                <Text
+                  style={[
+                    headerStyles.openHint,
+                    { color: openPLPositive ? theme.colors.positive : theme.colors.negative },
+                  ]}
+                >
+                  {openPLPositive ? '✨ warm' : '🩸 cold'}
+                </Text>
+              </View>
+
+              <MomentumBar valuePct={openPLPct} />
 
               {error ? (
                 <View style={styles.errorBanner}>
                   <Text style={styles.errorText}>{error}</Text>
                   <Text style={styles.errorHint}>
-                    Check EXPO_PUBLIC_API_TOKEN matches backend API_TOKEN and BASE_URL is correct.
+                    🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
                   </Text>
                 </View>
               ) : null}
 
               {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
-              {!loading && positions.length === 0 ? <Text style={styles.empty}>No open positions. 🎩</Text> : null}
+              {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
             </View>
           }
           renderItem={({ item }) => <PositionCard position={item} />}
@@ -248,30 +336,74 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
   screen: { flex: 1 },
   content: { padding: theme.spacing.lg, paddingBottom: 100 },
-  title: { color: theme.colors.text, fontSize: 42, fontWeight: '900', letterSpacing: 1.2 },
-  portfolioLabel: {
-    marginTop: theme.spacing.md,
-    color: theme.colors.muted,
-    textTransform: 'uppercase',
-    fontWeight: '700',
-    letterSpacing: 1,
-    fontSize: 12,
-  },
-  portfolioValue: { color: '#fff', fontSize: 36, fontWeight: '900', marginBottom: theme.spacing.xs },
-  subline: { color: theme.colors.muted, fontSize: 13, marginBottom: 4, fontWeight: '600' },
-  dayLine: { color: theme.colors.warning, fontSize: 13, marginBottom: theme.spacing.md, fontWeight: '700' },
   errorBanner: {
     backgroundColor: theme.colors.errorBg,
     borderColor: '#8A2A3C',
     borderWidth: 1,
     borderRadius: theme.radius.md,
     padding: theme.spacing.sm,
-    marginBottom: theme.spacing.md,
+    marginTop: theme.spacing.md,
   },
   errorText: { color: theme.colors.errorText, fontWeight: '900' },
   errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
   loader: { marginVertical: theme.spacing.md },
-  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '700' },
+  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
+});
+
+const headerStyles = StyleSheet.create({
+  wrap: { paddingBottom: theme.spacing.md },
+  topRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: theme.spacing.sm,
+  },
+  title: { color: theme.colors.text, fontSize: 26, fontWeight: '900', letterSpacing: 0.6 },
+  titleRight: { color: theme.colors.text, fontSize: 26, fontWeight: '900' },
+
+  chipsRow: {
+    flexDirection: 'row',
+    gap: theme.spacing.sm,
+    flexWrap: 'wrap',
+    marginBottom: theme.spacing.sm,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  chipIcon: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
+  chipValue: { color: theme.colors.text, fontSize: 14, fontWeight: '800' },
+
+  openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
+  openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
+  openHint: { fontSize: 14, fontWeight: '900', opacity: 0.95 },
+
+  barTrack: {
+    height: 10,
+    borderRadius: 999,
+    backgroundColor: theme.colors.barTrack,
+    overflow: 'hidden',
+    marginTop: theme.spacing.sm,
+  },
+  barFill: {
+    height: '100%',
+    backgroundColor: 'rgba(255,255,255,0.55)',
+  },
+  barMid: {
+    position: 'absolute',
+    left: '50%',
+    top: 0,
+    bottom: 0,
+    width: 1,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+  },
 });
 
 const cardStyles = StyleSheet.create({
@@ -279,8 +411,7 @@ const cardStyles = StyleSheet.create({
     borderRadius: theme.radius.lg,
     padding: theme.spacing.md,
     marginBottom: theme.spacing.md,
-    borderWidth: 1,
-    borderColor: '#34245E',
+    borderWidth: 1.25,
   },
   headerRow: {
     flexDirection: 'row',
@@ -288,31 +419,38 @@ const cardStyles = StyleSheet.create({
     alignItems: 'baseline',
     marginBottom: theme.spacing.sm,
   },
-  symbol: {
-    color: theme.colors.text,
-    fontSize: 30,
-    fontWeight: '900',
-    letterSpacing: 1,
-  },
-  qty: {
-    color: theme.colors.muted,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  row: {
+  symWrap: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  symbol: { color: theme.colors.text, fontSize: 24, fontWeight: '900', letterSpacing: 0.8 },
+  qty: { color: theme.colors.muted, fontSize: 14, fontWeight: '800' },
+
+  pill: {
     flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  pillText: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
+
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
-    gap: theme.spacing.md,
-    marginBottom: theme.spacing.xs,
+    gap: theme.spacing.sm,
+    marginBottom: theme.spacing.sm,
   },
-  stat: { flex: 1 },
-  label: {
-    color: theme.colors.muted,
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    marginBottom: 2,
+  stat: {
+    minWidth: '48%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
   },
-  value: { color: theme.colors.text, fontSize: 15, fontWeight: '800' },
+  statIcon: { color: theme.colors.muted, fontSize: 14, fontWeight: '900' },
+  statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
+
+  bigRow: { marginBottom: theme.spacing.sm },
 });
