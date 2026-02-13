@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Pressable,
   RefreshControl,
   SafeAreaView,
   StatusBar,
@@ -123,6 +124,17 @@ function ageLabelFromPosition(position) {
   return '—';
 }
 
+
+function distToTargetPct(position) {
+  const current = toNum(position?.current_price);
+  const sellLimit =
+    toNum(position?.sell?.activeLimit) ??
+    toNum(position?.bot?.sellOrderLimit);
+
+  if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) return null;
+  return ((sellLimit - current) / current) * 100;
+}
+
 function Stat({ icon, value, valueStyle }) {
   return (
     <View style={cardStyles.stat}>
@@ -142,27 +154,12 @@ function Chip({ value }) {
   );
 }
 
-function PositionCard({ position }) {
-  const upnl = toNum(position?.unrealized_pl);
-  const upnlPctRaw = toNum(position?.unrealized_plpc);
-  const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
-
-  const pnlPositive = (upnl || 0) >= 0;
-  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
-
+function ExpandedDetails({ position }) {
   const avgEntry = toNum(position?.avg_entry_price);
   const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
   const toSellPct = Number.isFinite(avgEntry) && Number.isFinite(sellLimit)
     ? ((sellLimit / avgEntry) - 1) * 100
     : null;
-
-  const current = toNum(position?.current_price);
-  const distToTargetPct = Number.isFinite(current) && Number.isFinite(sellLimit) && current !== 0
-    ? ((sellLimit - current) / current) * 100
-    : null;
-
-  const qtyNum = toNum(position?.qty);
-  const qtyText = Number.isFinite(qtyNum) ? qtyNum.toFixed(2) : '—';
 
   const forensics = position?.forensics || null;
   const probabilityRaw = toNum(forensics?.decision?.predictor?.probability) ?? toNum(forensics?.predictor?.probability);
@@ -170,62 +167,73 @@ function PositionCard({ position }) {
   const regime = forensics?.decision?.predictor?.regime || forensics?.predictor?.regime || '—';
   const decisionSpread = toNum(forensics?.decision?.spreadBps) ?? toNum(forensics?.decisionSpreadBps);
   const decisionMid = toNum(forensics?.decision?.mid) ?? toNum(forensics?.decisionMid);
-  const forensicsKeys = forensics ? Object.keys(forensics).slice(0, 8).join(', ') : '';
 
   return (
-    <LinearGradient
-      colors={[theme.colors.cardAlt, theme.colors.card]}
-      style={[cardStyles.card, { borderColor: glow }]}
-    >
-      <View style={cardStyles.headerRow}>
-        <View style={cardStyles.symWrap}>
-          <Text style={cardStyles.symbol}>{position?.symbol || '—'}</Text>
-          <View style={[cardStyles.pill, { borderColor: glow }]}>
-            <Text style={cardStyles.pillText}>{ageLabelFromPosition(position)}</Text>
-          </View>
-        </View>
-        <Text style={cardStyles.qty}>× {qtyText}</Text>
-      </View>
-
-      <View style={cardStyles.grid}>
-        <Stat icon="🧾" value={usd(position?.avg_entry_price)} />
-        <Stat icon="💸" value={usd(position?.current_price)} />
-      </View>
-
-      <View style={cardStyles.bigRow}>
-        <Stat
-          icon="📌"
-          value={`${signedUsd(upnl)}  ${pct(upnlPct)}`}
-          valueStyle={{ color: pnlPositive ? theme.colors.positive : theme.colors.negative, fontSize: 16 }}
-        />
-      </View>
-
-      <View style={cardStyles.grid}>
-        <Stat icon="🎯" value={usd(sellLimit)} />
-        <Stat icon="Δ🎯" value={pct(distToTargetPct)} valueStyle={{ color: theme.colors.warning }} />
-        <Stat icon="↗️" value={pct(toSellPct)} />
+    <View style={compactStyles.expanded}>
+      <View style={compactStyles.expandedRow}>
+        <Text style={compactStyles.k}>🧾</Text><Text style={compactStyles.v}>{usd(avgEntry)}</Text>
+        <Text style={compactStyles.k}>↗️</Text><Text style={compactStyles.v}>{pct(toSellPct)}</Text>
       </View>
 
       {forensics ? (
-        <View style={cardStyles.forensicsWrap}>
-          <Text style={cardStyles.forensicsTitle}>Forensics</Text>
-          <View style={cardStyles.grid}>
-            <Stat icon="🎲" value={probabilityPct} />
-            <Stat icon="🧭" value={regime} />
-            <Stat icon="↔️" value={bps(decisionSpread)} />
-            <Stat icon="📍" value={usd(decisionMid)} />
-            <Stat icon="✅" value={usd(forensics?.fill?.avgFillPrice)} />
-            <Stat icon="🎯slip" value={bps(forensics?.fill?.slippageBps)} />
-            <Stat icon="⬇️MAE" value={bps(forensics?.postEntry?.maeBps)} />
-            <Stat icon="⬆️MFE" value={bps(forensics?.postEntry?.mfeBps)} />
-            <Stat icon="⏱️" value={minsSince(forensics?.tsDecision)} />
-          </View>
-          {probabilityPct === '—' ? (
-            <Text style={cardStyles.forensicsDebug}>Forensics present (keys: {forensicsKeys || 'none'})</Text>
-          ) : null}
+        <View style={compactStyles.expandedRow}>
+          <Text style={compactStyles.k}>🎲</Text><Text style={compactStyles.v}>{probabilityPct}</Text>
+          <Text style={compactStyles.k}>🧭</Text><Text style={compactStyles.v}>{regime}</Text>
+          <Text style={compactStyles.k}>↔️</Text><Text style={compactStyles.v}>{bps(decisionSpread)}</Text>
+          <Text style={compactStyles.k}>📍</Text><Text style={compactStyles.v}>{usd(decisionMid)}</Text>
         </View>
-      ) : null}
-    </LinearGradient>
+      ) : (
+        <Text style={compactStyles.expandedHint}>no forensics</Text>
+      )}
+    </View>
+  );
+}
+
+function CompactPositionRow({ position, expanded, onToggle }) {
+  const symbol = position?.symbol || '—';
+
+  const upnl = toNum(position?.unrealized_pl);
+  const upnlPctRaw = toNum(position?.unrealized_plpc);
+  const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
+
+  const pnlPositive = (upnl || 0) >= 0;
+
+  const current = toNum(position?.current_price);
+  const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
+  const dist = distToTargetPct(position);
+
+  const qtyNum = toNum(position?.qty);
+  const qtyText = Number.isFinite(qtyNum) ? qtyNum.toFixed(2) : '—';
+
+  // tighter formatting for scan
+  const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
+  const pnlText = `${signedUsd(upnl)} ${pct(upnlPct)}`;
+
+  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
+
+  return (
+    <Pressable onPress={onToggle} style={({ pressed }) => [compactStyles.row, { borderColor: glow, opacity: pressed ? 0.8 : 1 }]}>
+      <View style={compactStyles.rowTop}>
+        <Text style={compactStyles.sym}>{symbol}</Text>
+
+        <View style={compactStyles.rightCluster}>
+          <Text style={[compactStyles.delta, { color: theme.colors.warning }]} numberOfLines={1}>Δ🎯 {distText}</Text>
+          <Text style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]} numberOfLines={1}>
+            📌 {pnlText}
+          </Text>
+        </View>
+      </View>
+
+      <View style={compactStyles.rowBottom}>
+        <Text style={compactStyles.mini} numberOfLines={1}>💸 {usd(current)}</Text>
+        <Text style={compactStyles.mini} numberOfLines={1}>🎯 {usd(sellLimit)}</Text>
+        <Text style={compactStyles.mini} numberOfLines={1}>⏱️ {ageLabelFromPosition(position)}</Text>
+        <Text style={compactStyles.mini} numberOfLines={1}>× {qtyText}</Text>
+        <Text style={compactStyles.caret}>{expanded ? '▾' : '▸'}</Text>
+      </View>
+
+      {expanded ? <ExpandedDetails position={position} /> : null}
+    </Pressable>
   );
 }
 
@@ -234,6 +242,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const [expandedKey, setExpandedKey] = useState(null);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
@@ -261,22 +270,11 @@ export default function App() {
   const positions = useMemo(() => {
     const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
 
-    function distanceToTargetPct(position) {
-      const current = toNum(position?.current_price);
-      const sellLimit =
-        toNum(position?.sell?.activeLimit) ??
-        toNum(position?.bot?.sellOrderLimit);
-
-      if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) {
-        return Number.POSITIVE_INFINITY;
-      }
-
-      return ((sellLimit - current) / current) * 100;
-    }
-
     list.sort((a, b) => {
-      const aDist = distanceToTargetPct(a);
-      const bDist = distanceToTargetPct(b);
+      const aDist = distToTargetPct(a);
+      const bDist = distToTargetPct(b);
+      if (!Number.isFinite(aDist)) return 1;
+      if (!Number.isFinite(bDist)) return -1;
       return aDist - bDist; // closest to fill first
     });
 
@@ -302,7 +300,7 @@ export default function App() {
       <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
         <FlatList
           data={positions}
-          keyExtractor={(item, index) => `${item?.symbol || 'unknown'}-${index}`}
+          keyExtractor={(item) => String(item?.symbol || 'unknown')}
           contentContainerStyle={styles.content}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
@@ -335,7 +333,17 @@ export default function App() {
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
             </View>
           }
-          renderItem={({ item }) => <PositionCard position={item} />}
+          renderItem={({ item }) => {
+            const key = String(item?.symbol || 'unknown');
+            const expanded = expandedKey === key;
+            return (
+              <CompactPositionRow
+                position={item}
+                expanded={expanded}
+                onToggle={() => setExpandedKey(expanded ? null : key)}
+              />
+            );
+          }}
         />
       </LinearGradient>
     </SafeAreaView>
@@ -345,7 +353,7 @@ export default function App() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
   screen: { flex: 1 },
-  content: { padding: theme.spacing.lg, paddingBottom: 100 },
+  content: { padding: theme.spacing.md, paddingBottom: 100 },
   errorBanner: {
     backgroundColor: theme.colors.errorBg,
     borderColor: '#8A2A3C',
@@ -443,4 +451,48 @@ const cardStyles = StyleSheet.create({
   },
   forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
   forensicsDebug: { color: theme.colors.faint, fontSize: 11, marginTop: 2 },
+});
+
+
+const compactStyles = StyleSheet.create({
+  row: {
+    borderWidth: 1.1,
+    borderRadius: theme.radius.md,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 10,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+  },
+  rowTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: 12,
+  },
+  sym: { color: theme.colors.text, fontSize: 16, fontWeight: '900', letterSpacing: 0.6 },
+  rightCluster: { flex: 1, alignItems: 'flex-end', gap: 2 },
+  delta: { fontSize: 13, fontWeight: '900' },
+  pnl: { fontSize: 13, fontWeight: '900' },
+
+  rowBottom: {
+    marginTop: 6,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    alignItems: 'center',
+  },
+  mini: { color: theme.colors.muted, fontSize: 12, fontWeight: '800' },
+  caret: { marginLeft: 'auto', color: theme.colors.faint, fontSize: 14, fontWeight: '900' },
+
+  expanded: {
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+    gap: 6,
+  },
+  expandedRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, alignItems: 'center' },
+  k: { color: theme.colors.faint, fontWeight: '900' },
+  v: { color: theme.colors.text, fontWeight: '900' },
+  expandedHint: { color: theme.colors.faint, fontSize: 12, fontWeight: '800' },
 });
