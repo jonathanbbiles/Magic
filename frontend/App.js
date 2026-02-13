@@ -260,7 +260,26 @@ export default function App() {
 
   const positions = useMemo(() => {
     const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
-    list.sort((a, b) => (toNum(b?.market_value) || 0) - (toNum(a?.market_value) || 0));
+
+    function distanceToTargetPct(position) {
+      const current = toNum(position?.current_price);
+      const sellLimit =
+        toNum(position?.sell?.activeLimit) ??
+        toNum(position?.bot?.sellOrderLimit);
+
+      if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) {
+        return Number.POSITIVE_INFINITY;
+      }
+
+      return ((sellLimit - current) / current) * 100;
+    }
+
+    list.sort((a, b) => {
+      const aDist = distanceToTargetPct(a);
+      const bDist = distanceToTargetPct(b);
+      return aDist - bDist; // closest to fill first
+    });
+
     return list;
   }, [dashboard]);
 
