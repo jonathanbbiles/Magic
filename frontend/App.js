@@ -2,10 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
-  Pressable,
   RefreshControl,
   SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -89,12 +87,6 @@ function pct(v) {
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function bps(v) {
-  const n = toNum(v);
-  if (!Number.isFinite(n)) return '—';
-  return `${n.toFixed(1)}bps`;
-}
-
 function minsSince(isoTs) {
   const ms = Date.parse(String(isoTs || ''));
   if (!Number.isFinite(ms)) return '—';
@@ -136,17 +128,6 @@ function distToTargetPct(position) {
   return ((sellLimit - current) / current) * 100;
 }
 
-function Stat({ icon, value, valueStyle }) {
-  return (
-    <View style={cardStyles.stat}>
-      <Text style={cardStyles.statIcon}>{icon}</Text>
-      <Text style={[cardStyles.statValue, valueStyle]} numberOfLines={1}>
-        {value}
-      </Text>
-    </View>
-  );
-}
-
 function Chip({ value }) {
   return (
     <View style={headerStyles.chip}>
@@ -155,42 +136,7 @@ function Chip({ value }) {
   );
 }
 
-function ExpandedDetails({ position }) {
-  const avgEntry = toNum(position?.avg_entry_price);
-  const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
-  const toSellPct = Number.isFinite(avgEntry) && Number.isFinite(sellLimit)
-    ? ((sellLimit / avgEntry) - 1) * 100
-    : null;
-
-  const forensics = position?.forensics || null;
-  const probabilityRaw = toNum(forensics?.decision?.predictor?.probability) ?? toNum(forensics?.predictor?.probability);
-  const probabilityPct = Number.isFinite(probabilityRaw) ? `${(probabilityRaw * 100).toFixed(1)}%` : '—';
-  const regime = forensics?.decision?.predictor?.regime || forensics?.predictor?.regime || '—';
-  const decisionSpread = toNum(forensics?.decision?.spreadBps) ?? toNum(forensics?.decisionSpreadBps);
-  const decisionMid = toNum(forensics?.decision?.mid) ?? toNum(forensics?.decisionMid);
-
-  return (
-    <View style={compactStyles.expanded}>
-      <View style={compactStyles.expandedRow}>
-        <Text style={compactStyles.k}>🧾</Text><Text style={compactStyles.v}>{usd(avgEntry)}</Text>
-        <Text style={compactStyles.k}>↗️</Text><Text style={compactStyles.v}>{pct(toSellPct)}</Text>
-      </View>
-
-      {forensics ? (
-        <View style={compactStyles.expandedRow}>
-          <Text style={compactStyles.k}>🎲</Text><Text style={compactStyles.v}>{probabilityPct}</Text>
-          <Text style={compactStyles.k}>🧭</Text><Text style={compactStyles.v}>{regime}</Text>
-          <Text style={compactStyles.k}>↔️</Text><Text style={compactStyles.v}>{bps(decisionSpread)}</Text>
-          <Text style={compactStyles.k}>📍</Text><Text style={compactStyles.v}>{usd(decisionMid)}</Text>
-        </View>
-      ) : (
-        <Text style={compactStyles.expandedHint}>no forensics</Text>
-      )}
-    </View>
-  );
-}
-
-function CompactPositionRow({ position, expanded, onToggle }) {
+function CompactPositionRow({ position }) {
   const symbol = position?.symbol || '—';
 
   const upnl = toNum(position?.unrealized_pl);
@@ -198,13 +144,7 @@ function CompactPositionRow({ position, expanded, onToggle }) {
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
   const pnlPositive = (upnl || 0) >= 0;
 
-  const avgEntry = toNum(position?.avg_entry_price);
-  const current = toNum(position?.current_price);
-  const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
   const dist = distToTargetPct(position);
-
-  const qtyNum = toNum(position?.qty);
-  const qtyText = Number.isFinite(qtyNum) ? qtyNum.toFixed(2) : '—';
 
   const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
   const pnlText = `${signedUsd(upnl)} ${pct(upnlPct)}`;
@@ -212,42 +152,26 @@ function CompactPositionRow({ position, expanded, onToggle }) {
   const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
 
   return (
-    <Pressable
-      onPress={onToggle}
-      style={({ pressed }) => [
-        compactStyles.row,
-        { borderColor: glow, opacity: pressed ? 0.8 : 1 },
-      ]}
+    <View style={[compactStyles.tile, { borderColor: glow }]}
     >
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={compactStyles.line}
-      >
+      <View style={compactStyles.tileTop}>
         <Text style={compactStyles.sym} numberOfLines={1}>{symbol}</Text>
-
-        <Text style={[compactStyles.item, { color: theme.colors.warning }]} numberOfLines={1}>
+        <Text style={[compactStyles.delta, { color: theme.colors.warning }]} numberOfLines={1}>
           Δ🎯 {distText}
         </Text>
+      </View>
 
-        <Text
-          style={[compactStyles.item, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
-          numberOfLines={1}
-        >
-            📌 {pnlText}
-        </Text>
+      <Text
+        style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
+        numberOfLines={1}
+      >
+        📌 {pnlText}
+      </Text>
 
-        <Text style={compactStyles.item} numberOfLines={1}>💸 {usd(current)}</Text>
-        <Text style={compactStyles.item} numberOfLines={1}>🎯 {usd(sellLimit)}</Text>
-        <Text style={compactStyles.item} numberOfLines={1}>🧾 {usd(avgEntry)}</Text>
-        <Text style={compactStyles.item} numberOfLines={1}>⏱️ {ageLabelFromPosition(position)}</Text>
-        <Text style={compactStyles.item} numberOfLines={1}>× {qtyText}</Text>
-
-        <Text style={compactStyles.caretInline} numberOfLines={1}>{expanded ? '▾' : '▸'}</Text>
-      </ScrollView>
-
-      {expanded ? <ExpandedDetails position={position} /> : null}
-    </Pressable>
+      <Text style={compactStyles.time} numberOfLines={1}>
+        ⏱️ {ageLabelFromPosition(position)}
+      </Text>
+    </View>
   );
 }
 
@@ -256,8 +180,6 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
-  const [expandedKey, setExpandedKey] = useState(null);
-
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
     if (!isRefresh) setLoading(true);
@@ -314,6 +236,8 @@ export default function App() {
       <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
         <FlatList
           data={positions}
+          numColumns={2}
+          columnWrapperStyle={styles.gridRow}
           keyExtractor={(item) => String(item?.symbol || 'unknown')}
           contentContainerStyle={styles.content}
           refreshControl={
@@ -347,17 +271,7 @@ export default function App() {
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
             </View>
           }
-          renderItem={({ item }) => {
-            const key = String(item?.symbol || 'unknown');
-            const expanded = expandedKey === key;
-            return (
-              <CompactPositionRow
-                position={item}
-                expanded={expanded}
-                onToggle={() => setExpandedKey(expanded ? null : key)}
-              />
-            );
-          }}
+          renderItem={({ item }) => <CompactPositionRow position={item} />}
         />
       </LinearGradient>
     </SafeAreaView>
@@ -368,6 +282,10 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
   screen: { flex: 1 },
   content: { padding: theme.spacing.md, paddingBottom: 100 },
+  gridRow: {
+    justifyContent: 'space-between',
+    gap: 10,
+  },
   errorBanner: {
     backgroundColor: theme.colors.errorBg,
     borderColor: '#8A2A3C',
@@ -469,47 +387,43 @@ const cardStyles = StyleSheet.create({
 
 
 const compactStyles = StyleSheet.create({
-  row: {
+  tile: {
+    flex: 1,
     borderWidth: 1.1,
     borderRadius: theme.radius.md,
     paddingVertical: 10,
     paddingHorizontal: 12,
     marginBottom: 10,
     backgroundColor: 'rgba(255,255,255,0.04)',
+    minHeight: 72,
   },
-  line: {
+  tileTop: {
     flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: 8,
   },
   sym: {
+    flex: 1,
     color: theme.colors.text,
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '900',
-    letterSpacing: 0.6,
-    marginRight: 6,
+    letterSpacing: 0.4,
   },
-  item: {
-    color: theme.colors.muted,
+  delta: {
+    color: theme.colors.warning,
     fontSize: 12,
     fontWeight: '900',
   },
-  caretInline: {
-    color: theme.colors.faint,
-    fontSize: 14,
+  pnl: {
+    marginTop: 6,
+    fontSize: 12,
     fontWeight: '900',
-    marginLeft: 6,
   },
-
-  expanded: {
-    marginTop: 8,
-    paddingTop: 8,
-    borderTopWidth: 1,
-    borderTopColor: theme.colors.border,
-    gap: 6,
+  time: {
+    marginTop: 6,
+    color: theme.colors.muted,
+    fontSize: 11,
+    fontWeight: '800',
   },
-  expandedRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, alignItems: 'center' },
-  k: { color: theme.colors.faint, fontWeight: '900' },
-  v: { color: theme.colors.text, fontWeight: '900' },
-  expandedHint: { color: theme.colors.faint, fontSize: 12, fontWeight: '800' },
 });
