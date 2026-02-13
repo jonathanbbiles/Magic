@@ -117,6 +117,23 @@ function ageLabelFromPosition(position) {
   return '—';
 }
 
+function ageLabelShort(position) {
+  const heldDirect = toNum(position?.heldSeconds);
+  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
+    return `${Math.floor(heldDirect / 60)}m`;
+  }
+  const heldSnake = toNum(position?.held_seconds);
+  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
+    return `${Math.floor(heldSnake / 60)}m`;
+  }
+  const createdMs = Date.parse(String(position?.created_at || ''));
+  if (Number.isFinite(createdMs)) {
+    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
+    return `${Math.floor(seconds / 60)}m`;
+  }
+  return '—';
+}
+
 
 function distToTargetPct(position) {
   const current = toNum(position?.current_price);
@@ -147,30 +164,36 @@ function CompactPositionRow({ position }) {
   const dist = distToTargetPct(position);
 
   const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
-  const pnlText = `${signedUsd(upnl)} ${pct(upnlPct)}`;
+  const pnlDollar = signedUsd(upnl);
+  const pnlPercent = pct(upnlPct);
+  const timeShort = ageLabelShort(position);
 
   const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
 
   return (
-    <View style={[compactStyles.tile, { borderColor: glow }]}
-    >
-      <View style={compactStyles.tileTop}>
-        <Text style={compactStyles.sym} numberOfLines={1}>{symbol}</Text>
-        <Text style={[compactStyles.delta, { color: theme.colors.warning }]} numberOfLines={1}>
+    <View style={[compactStyles.tile, { borderColor: glow }]}>
+      <View style={compactStyles.line1}>
+        <Text style={compactStyles.sym} numberOfLines={1} ellipsizeMode="tail">
+          {symbol}
+        </Text>
+        <Text style={compactStyles.delta} numberOfLines={1} ellipsizeMode="tail">
           Δ🎯 {distText}
         </Text>
       </View>
 
-      <Text
-        style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
-        numberOfLines={1}
-      >
-        📌 {pnlText}
-      </Text>
+      <View style={compactStyles.line2}>
+        <Text
+          style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
+          numberOfLines={1}
+          ellipsizeMode="tail"
+        >
+          📌 {pnlDollar} ({pnlPercent})
+        </Text>
 
-      <Text style={compactStyles.time} numberOfLines={1}>
-        ⏱️ {ageLabelFromPosition(position)}
-      </Text>
+        <Text style={compactStyles.timeInline} numberOfLines={1} ellipsizeMode="tail">
+          ⏱️ {timeShort}
+        </Text>
+      </View>
     </View>
   );
 }
@@ -395,12 +418,19 @@ const compactStyles = StyleSheet.create({
     paddingHorizontal: 12,
     marginBottom: 10,
     backgroundColor: 'rgba(255,255,255,0.04)',
-    minHeight: 72,
+    minHeight: 0,
   },
-  tileTop: {
+  line1: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  line2: {
+    marginTop: 6,
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
     gap: 8,
   },
   sym: {
@@ -416,12 +446,11 @@ const compactStyles = StyleSheet.create({
     fontWeight: '900',
   },
   pnl: {
-    marginTop: 6,
+    flex: 1,
     fontSize: 12,
     fontWeight: '900',
   },
-  time: {
-    marginTop: 6,
+  timeInline: {
     color: theme.colors.muted,
     fontSize: 11,
     fontWeight: '800',
