@@ -5,6 +5,7 @@ import {
   Pressable,
   RefreshControl,
   SafeAreaView,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -195,9 +196,9 @@ function CompactPositionRow({ position, expanded, onToggle }) {
   const upnl = toNum(position?.unrealized_pl);
   const upnlPctRaw = toNum(position?.unrealized_plpc);
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
-
   const pnlPositive = (upnl || 0) >= 0;
 
+  const avgEntry = toNum(position?.avg_entry_price);
   const current = toNum(position?.current_price);
   const sellLimit = toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.sellOrderLimit);
   const dist = distToTargetPct(position);
@@ -205,32 +206,45 @@ function CompactPositionRow({ position, expanded, onToggle }) {
   const qtyNum = toNum(position?.qty);
   const qtyText = Number.isFinite(qtyNum) ? qtyNum.toFixed(2) : '—';
 
-  // tighter formatting for scan
   const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
   const pnlText = `${signedUsd(upnl)} ${pct(upnlPct)}`;
 
   const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
 
   return (
-    <Pressable onPress={onToggle} style={({ pressed }) => [compactStyles.row, { borderColor: glow, opacity: pressed ? 0.8 : 1 }]}>
-      <View style={compactStyles.rowTop}>
-        <Text style={compactStyles.sym}>{symbol}</Text>
+    <Pressable
+      onPress={onToggle}
+      style={({ pressed }) => [
+        compactStyles.row,
+        { borderColor: glow, opacity: pressed ? 0.8 : 1 },
+      ]}
+    >
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={compactStyles.line}
+      >
+        <Text style={compactStyles.sym} numberOfLines={1}>{symbol}</Text>
 
-        <View style={compactStyles.rightCluster}>
-          <Text style={[compactStyles.delta, { color: theme.colors.warning }]} numberOfLines={1}>Δ🎯 {distText}</Text>
-          <Text style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]} numberOfLines={1}>
+        <Text style={[compactStyles.item, { color: theme.colors.warning }]} numberOfLines={1}>
+          Δ🎯 {distText}
+        </Text>
+
+        <Text
+          style={[compactStyles.item, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
+          numberOfLines={1}
+        >
             📌 {pnlText}
-          </Text>
-        </View>
-      </View>
+        </Text>
 
-      <View style={compactStyles.rowBottom}>
-        <Text style={compactStyles.mini} numberOfLines={1}>💸 {usd(current)}</Text>
-        <Text style={compactStyles.mini} numberOfLines={1}>🎯 {usd(sellLimit)}</Text>
-        <Text style={compactStyles.mini} numberOfLines={1}>⏱️ {ageLabelFromPosition(position)}</Text>
-        <Text style={compactStyles.mini} numberOfLines={1}>× {qtyText}</Text>
-        <Text style={compactStyles.caret}>{expanded ? '▾' : '▸'}</Text>
-      </View>
+        <Text style={compactStyles.item} numberOfLines={1}>💸 {usd(current)}</Text>
+        <Text style={compactStyles.item} numberOfLines={1}>🎯 {usd(sellLimit)}</Text>
+        <Text style={compactStyles.item} numberOfLines={1}>🧾 {usd(avgEntry)}</Text>
+        <Text style={compactStyles.item} numberOfLines={1}>⏱️ {ageLabelFromPosition(position)}</Text>
+        <Text style={compactStyles.item} numberOfLines={1}>× {qtyText}</Text>
+
+        <Text style={compactStyles.caretInline} numberOfLines={1}>{expanded ? '▾' : '▸'}</Text>
+      </ScrollView>
 
       {expanded ? <ExpandedDetails position={position} /> : null}
     </Pressable>
@@ -463,26 +477,29 @@ const compactStyles = StyleSheet.create({
     marginBottom: 10,
     backgroundColor: 'rgba(255,255,255,0.04)',
   },
-  rowTop: {
+  line: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
+    alignItems: 'center',
     gap: 12,
   },
-  sym: { color: theme.colors.text, fontSize: 16, fontWeight: '900', letterSpacing: 0.6 },
-  rightCluster: { flex: 1, alignItems: 'flex-end', gap: 2 },
-  delta: { fontSize: 13, fontWeight: '900' },
-  pnl: { fontSize: 13, fontWeight: '900' },
-
-  rowBottom: {
-    marginTop: 6,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-    alignItems: 'center',
+  sym: {
+    color: theme.colors.text,
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 0.6,
+    marginRight: 6,
   },
-  mini: { color: theme.colors.muted, fontSize: 12, fontWeight: '800' },
-  caret: { marginLeft: 'auto', color: theme.colors.faint, fontSize: 14, fontWeight: '900' },
+  item: {
+    color: theme.colors.muted,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  caretInline: {
+    color: theme.colors.faint,
+    fontSize: 14,
+    fontWeight: '900',
+    marginLeft: 6,
+  },
 
   expanded: {
     marginTop: 8,
