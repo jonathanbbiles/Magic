@@ -263,8 +263,11 @@ const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const ENTRY_INTENT_TTL_MS = readNumber('ENTRY_INTENT_TTL_MS', 45000);
 const ENTRY_BUY_TIF = String(process.env.ENTRY_BUY_TIF || 'ioc').trim().toLowerCase();
 const ENTRY_BUY_TIF_SAFE = ['gtc', 'ioc', 'fok'].includes(ENTRY_BUY_TIF) ? ENTRY_BUY_TIF : 'ioc';
-const POST_ONLY_BUY = readFlag('POST_ONLY_BUY', true);
-const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
+const ENTRY_MAX_SLIPPAGE_BPS = readNumber('ENTRY_MAX_SLIPPAGE_BPS', 15);
+const ENTRY_PRICE_MODE_RAW = String(process.env.ENTRY_PRICE_MODE || 'mid').trim().toLowerCase();
+const ENTRY_PRICE_MODE = ['mid', 'ask'].includes(ENTRY_PRICE_MODE_RAW) ? ENTRY_PRICE_MODE_RAW : 'mid';
+const ENTRY_IOC_LIMIT = readEnvFlag('ENTRY_IOC_LIMIT', true);
+const ENTRY_POST_ONLY = readEnvFlag('ENTRY_POST_ONLY', false);
 const ALLOW_TAKER_BEFORE_TARGET = readFlag('ALLOW_TAKER_BEFORE_TARGET', false);
 const TAKER_TOUCH_MIN_INTERVAL_MS = readNumber('TAKER_TOUCH_MIN_INTERVAL_MS', 5000);
 
@@ -319,6 +322,10 @@ function printConfigOnce() {
     FEE_BPS_TAKER,
     feeBpsRoundTrip: feeBpsRoundTrip(),
     SLIPPAGE_BPS,
+    ENTRY_MAX_SLIPPAGE_BPS,
+    ENTRY_PRICE_MODE,
+    ENTRY_IOC_LIMIT,
+    ENTRY_POST_ONLY,
     TAKER_EXIT_ON_TOUCH,
   });
 }
@@ -1546,6 +1553,41 @@ function startPostEntryForensicsSampler({ tradeId, symbol, avgFillPrice }) {
         timeToMfeMs,
       },
     });
+  })().catch(() => null);
+}
+
+function startEntryMarkoutSnapshots({ symbol, filledAvgPrice }) {
+  const filled = Number(filledAvgPrice);
+  if (!Number.isFinite(filled) || filled <= 0) return;
+  const captureDelaysMs = [10000, 30000];
+
+  (async () => {
+    for (const delayMs of captureDelaysMs) {
+      await sleep(delayMs);
+      try {
+        const quote = await getLatestQuote(symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+        const bid = toFiniteOrNull(quote?.bid);
+        const ask = toFiniteOrNull(quote?.ask);
+        const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : null;
+        const markoutBps = Number.isFinite(mid) ? ((mid - filled) / filled) * 10000 : null;
+        const key = delayMs === 10000 ? 'markout10sBps' : 'markout30sBps';
+        console.log('entry_markout_snapshot', {
+          symbol,
+          delayMs,
+          filled_avg_price: filled,
+          bid,
+          ask,
+          mid,
+          [key]: markoutBps,
+        });
+      } catch (err) {
+        console.warn('entry_markout_snapshot_failed', {
+          symbol,
+          delayMs,
+          error: err?.message || err,
+        });
+      }
+    }
   })().catch(() => null);
 }
 const inventoryState = new Map();
@@ -3619,6 +3661,27 @@ function roundToTick(price, symbolOrTick = PRICE_TICK, direction = 'up') {
 
 function roundDownToTick(price, symbolOrTick = PRICE_TICK) {
   return roundToTick(price, symbolOrTick, 'down');
+}
+
+function computeEntryLimitPrice(bid, ask, tickSize) {
+  const bidNum = Number(bid);
+  const askNum = Number(ask);
+  if (!Number.isFinite(bidNum) || !Number.isFinite(askNum) || bidNum <= 0 || askNum <= 0) {
+    return null;
+  }
+  const slipBps = Number.isFinite(ENTRY_MAX_SLIPPAGE_BPS) ? Math.max(0, ENTRY_MAX_SLIPPAGE_BPS) : 15;
+  const slippageMultiplier = 1 + (slipBps / 10000);
+  const mid = (bidNum + askNum) / 2;
+  const basePrice = ENTRY_PRICE_MODE === 'ask' ? askNum : mid;
+  const capPrice = basePrice * slippageMultiplier;
+  const askCapPrice = askNum * slippageMultiplier;
+  const boundedCap = Math.min(capPrice, askCapPrice);
+  const roundedCap = roundToTick(boundedCap, tickSize, 'up');
+  const askBoundTick = roundToTick(askCapPrice, tickSize, 'down');
+  const cappedRounded = Number.isFinite(askBoundTick) && askBoundTick > 0
+    ? Math.min(roundedCap, askBoundTick)
+    : Math.min(roundedCap, askCapPrice);
+  return Number.isFinite(cappedRounded) && cappedRounded > 0 ? cappedRounded : null;
 }
 
 function getFeeBps({ orderType, isMaker }) {
@@ -9173,16 +9236,16 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     return { skipped: true, reason: 'notional_too_small', notionalUsd: amountToSpend };
   }
 
-  const tickSize = getTickSize({ symbol: normalizedSymbol, price: bid });
-  const limitBuyPrice = roundToTick(Number(bid), tickSize, 'down');
-  if (!Number.isFinite(limitBuyPrice) || limitBuyPrice <= 0) {
-    logSkip('invalid_quote', { symbol: normalizedSymbol, bid, ask });
+  const tickSize = getTickSize({ symbol: normalizedSymbol, price: ask || bid });
+  const entryLimitPrice = computeEntryLimitPrice(bid, ask, tickSize);
+  if (!Number.isFinite(entryLimitPrice) || entryLimitPrice <= 0) {
+    logSkip('invalid_quote', { symbol: normalizedSymbol, bid, ask, entryPriceMode: ENTRY_PRICE_MODE });
     return { skipped: true, reason: 'invalid_quote' };
   }
 
-  const qty = roundQty(amountToSpend / limitBuyPrice);
+  const qty = roundQty(amountToSpend / entryLimitPrice);
   if (!Number.isFinite(qty) || qty <= 0) {
-    logSkip('invalid_qty', { symbol: normalizedSymbol, qty });
+    logSkip('invalid_qty', { symbol: normalizedSymbol, qty, entryLimitPrice });
     return { skipped: true, reason: 'invalid_qty' };
   }
 
@@ -9190,9 +9253,9 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     symbol: normalizedSymbol,
     qty,
     notional: amountToSpend,
-    price: limitBuyPrice,
+    price: entryLimitPrice,
     side: 'buy',
-    context: 'maker_limit_buy',
+    context: 'entry_ioc_limit_buy',
   });
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
@@ -9216,13 +9279,11 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     qty: finalQty,
     side: 'buy',
     type: 'limit',
-    time_in_force: 'gtc',
-    limit_price: limitBuyPrice,
+    time_in_force: ENTRY_IOC_LIMIT ? 'ioc' : ENTRY_BUY_TIF_SAFE,
+    limit_price: entryLimitPrice,
     client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
-  if (POST_ONLY_BUY && isCryptoSymbol(normalizedSymbol)) {
-    buyPayload.post_only = true;
-  }
+  buyPayload.post_only = Boolean(ENTRY_POST_ONLY);
   tradeForensics.append({
     tsDecision: new Date().toISOString(),
     tradeId,
@@ -9235,7 +9296,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
       submittedAt: null,
       clientOrderId: buyPayload.client_order_id || null,
       orderId: null,
-      limitPrice: limitBuyPrice,
+      limitPrice: entryLimitPrice,
       qty: finalQty,
       notional: amountToSpend,
     },
@@ -9247,8 +9308,8 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     url: buyOrderUrl,
     payload: buyPayload,
     label: 'orders_limit_buy',
-    reason: 'maker_limit_buy',
-    context: 'maker_limit_buy',
+    reason: 'entry_ioc_limit_buy',
+    context: 'entry_ioc_limit_buy',
     intent: 'entry',
   });
   tradeForensics.update(tradeId, {
@@ -9259,7 +9320,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
       submittedAt: buyOrder?.submitted_at || new Date().toISOString(),
       clientOrderId: buyOrder?.client_order_id || buyOrder?.clientOrderId || buyPayload.client_order_id || null,
       orderId: buyOrder?.id || null,
-      limitPrice: limitBuyPrice,
+      limitPrice: entryLimitPrice,
       qty: finalQty,
       notional: amountToSpend,
     },
@@ -9303,22 +9364,38 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     if (buyOrder?.id) {
       await cancelOrderSafe(buyOrder.id);
     }
-    if (ENTRY_FALLBACK_MARKET && Number.isFinite(spreadBps) && spreadBps <= requiredEdgeBps) {
-      console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps, requiredEdgeBps });
-      return placeMarketBuyThenSell(normalizedSymbol, { forensicsRecord });
-    }
     return { skipped: true, reason: 'entry_not_filled', submitted };
   }
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
   const filledQty = Number(filledOrder?.filled_qty || 0);
+  const decisionBid = toFiniteOrNull(decisionSnapshot?.bid);
+  const decisionAsk = toFiniteOrNull(decisionSnapshot?.ask);
   const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
+  const entrySpreadBps = Number.isFinite(decisionBid) && Number.isFinite(decisionAsk) && decisionBid > 0
+    ? ((decisionAsk - decisionBid) / decisionBid) * 10000
+    : null;
   const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgPrice)
     ? ((avgPrice - decisionMid) / decisionMid) * 10000
+    : null;
+  const immediateMarkoutCostBps = Number.isFinite(decisionBid) && Number.isFinite(avgPrice) && avgPrice > 0
+    ? ((avgPrice - decisionBid) / avgPrice) * 10000
     : null;
   const feeEstimateUsd = Number.isFinite(filledQty) && Number.isFinite(avgPrice)
     ? (filledQty * avgPrice) * (FEE_BPS_MAKER / 10000)
     : null;
+  console.log('entry_fill_diagnostics', {
+    symbol: normalizedSymbol,
+    decisionBid,
+    decisionAsk,
+    decisionMid,
+    entryPriceMode: ENTRY_PRICE_MODE,
+    entryLimitPrice,
+    filled_avg_price: Number.isFinite(avgPrice) ? avgPrice : null,
+    entrySpreadBps,
+    slippageBps,
+    immediateMarkoutCostBps,
+  });
   tradeForensics.update(tradeId, {
     fill: {
       filledAt: filledOrder?.filled_at || new Date().toISOString(),
@@ -9329,6 +9406,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     },
   });
   startPostEntryForensicsSampler({ tradeId, symbol: normalizedSymbol, avgFillPrice: avgPrice });
+  startEntryMarkoutSnapshots({ symbol: normalizedSymbol, filledAvgPrice: avgPrice });
   updateInventoryFromBuy(normalizedSymbol, filledOrder.filled_qty, avgPrice);
   const inventory = inventoryState.get(normalizedSymbol);
   if (!inventory || inventory.qty <= 0) {
