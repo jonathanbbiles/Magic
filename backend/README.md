@@ -54,6 +54,20 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - **VOL_COMPRESSION_\***: avoid dead-chop regimes when short-term realized volatility compresses.
 - **ORDERBOOK_ABSORPTION_\***: prefer entries with improving orderbook imbalance and bid replenishment.
 
+
+## Tuning knobs
+
+- `EXIT_REFRESH_MODE` = `material|age` (default `material`; `age` keeps legacy behavior)
+- `EXIT_REFRESH_MIN_ORDER_AGE_MS` (default `300000`)
+- `EXIT_REFRESH_MIN_AWAY_BPS` (default `12`)
+- `EXIT_REFRESH_MIN_ABS_TICKS` (default `1`)
+- `PROFIT_BUFFER_BPS_BASE` (default `10`)
+- `PROFIT_BUFFER_BPS_SPREAD_MULT` (default `0.25`)
+- `PROFIT_BUFFER_BPS_VOL_MULT` (default `0.10`)
+- `SIMPLIFY_GATES` (default `false`; bypasses non-core optional gates)
+- `RISK_MAX_CONSEC_LOSSES` (default `3`)
+- `RISK_COOLDOWN_MS` (default `1800000`)
+
 ## Exit Policy
 
 - Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).

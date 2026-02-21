@@ -93,10 +93,22 @@ function getByTradeId(tradeId) {
   return null;
 }
 
+function getLatestTradeIdForSymbol(symbol) {
+  if (!symbol) return null;
+  for (let i = recentRecords.length - 1; i >= 0; i -= 1) {
+    const rec = recentRecords[i];
+    if (rec?.symbol === symbol && rec?.tradeId) {
+      return rec.tradeId;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   append,
   update,
   getRecent,
   getLatestBySymbol,
   getByTradeId,
+  getLatestTradeIdForSymbol,
 };
