@@ -107,10 +107,42 @@ function volumeTrend(volumes, window) {
   return recentAvg / priorAvg;
 }
 
+function computeATR(candles, period = 14) {
+  if (!Array.isArray(candles)) return null;
+  const span = Math.max(1, Math.floor(Number(period) || 14));
+  if (candles.length < span + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i += 1) {
+    const prevClose = Number(candles[i - 1]?.c ?? candles[i - 1]?.close);
+    const high = Number(candles[i]?.h ?? candles[i]?.high);
+    const low = Number(candles[i]?.l ?? candles[i]?.low);
+    if (!Number.isFinite(prevClose) || !Number.isFinite(high) || !Number.isFinite(low)) continue;
+    const tr = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose),
+    );
+    if (Number.isFinite(tr) && tr >= 0) trs.push(tr);
+  }
+  if (trs.length < span) return null;
+  const recent = trs.slice(-span);
+  const atr = recent.reduce((sum, v) => sum + v, 0) / recent.length;
+  return Number.isFinite(atr) ? atr : null;
+}
+
+function atrToBps(atr, price) {
+  const a = Number(atr);
+  const p = Number(price);
+  if (!Number.isFinite(a) || !Number.isFinite(p) || p <= 0) return null;
+  return (a / p) * 10000;
+}
+
 module.exports = {
   ema,
   macd,
   slope,
   zscore,
   volumeTrend,
+  computeATR,
+  atrToBps,
 };

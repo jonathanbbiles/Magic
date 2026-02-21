@@ -1,7 +1,17 @@
 const { macd, slope, zscore, volumeTrend } = require('./indicators');
+const fs = require('fs');
+const path = require('path');
 
 const BPS = 10000;
 const DEBUG_PREDICTOR_FEATURES = String(process.env.DEBUG_PREDICTOR_FEATURES || '').trim() === '1';
+const PREDICTOR_CALIBRATION_ENABLED = String(process.env.PREDICTOR_CALIBRATION_ENABLED || '').trim().toLowerCase() === 'true';
+const CALIBRATION_FILE = String(process.env.CALIBRATION_FILE || './data/calibration.json').trim() || './data/calibration.json';
+const CALIBRATION_RELOAD_MS = 5 * 60 * 1000;
+const calibrationCache = {
+  loadedAtMs: 0,
+  mtimeMs: 0,
+  model: null,
+};
 
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
@@ -141,6 +151,52 @@ function computeOrderbookSignals(orderbook, options) {
   };
 }
 
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function logit(p) {
+  const clamped = clamp(Number(p), 1e-6, 1 - 1e-6);
+  return Math.log(clamped / (1 - clamped));
+}
+
+function maybeLoadCalibration() {
+  if (!PREDICTOR_CALIBRATION_ENABLED) return null;
+  const now = Date.now();
+  if (now - calibrationCache.loadedAtMs < CALIBRATION_RELOAD_MS && calibrationCache.model) {
+    return calibrationCache.model;
+  }
+  try {
+    const resolved = path.resolve(CALIBRATION_FILE);
+    const stat = fs.statSync(resolved);
+    if (calibrationCache.model && calibrationCache.mtimeMs === stat.mtimeMs) {
+      calibrationCache.loadedAtMs = now;
+      return calibrationCache.model;
+    }
+    const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+    if (!parsed || typeof parsed !== 'object') return null;
+    calibrationCache.model = parsed;
+    calibrationCache.loadedAtMs = now;
+    calibrationCache.mtimeMs = stat.mtimeMs;
+    return calibrationCache.model;
+  } catch (_) {
+    return null;
+  }
+}
+
+function applyCalibration(probabilityRaw) {
+  const p = clamp(Number(probabilityRaw), 0, 1);
+  const model = maybeLoadCalibration();
+  if (!model) return p;
+  if (model.type === 'logistic') {
+    const a = Number(model.a);
+    const b = Number(model.b);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return p;
+    return clamp(sigmoid(a + b * logit(p)), 0, 1);
+  }
+  return p;
+}
+
 function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, marketContext, symbol }) {
   try {
     const targetMoveBps = Number(marketContext?.targetMoveBps ?? 100);
@@ -260,7 +316,8 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
       0.15 * volumeConfirm +
       0.1 * orderbookSignals.liquidityScore +
       0.1 * imbalanceScore;
-    const probability = clamp(probabilityRaw, 0, 1);
+    const probabilityUncalibrated = clamp(probabilityRaw, 0, 1);
+    const probability = applyCalibration(probabilityUncalibrated);
 
     const predictorFallbackDefaults = branchScore === 0 && multiTimeframeConfirm === 0 && volumeConfirm === 0;
     if (DEBUG_PREDICTOR_FEATURES) {
@@ -321,6 +378,7 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
           timeframeChecks,
         },
         ...orderbookSignals,
+        probabilityUncalibrated,
       },
     };
   } catch (err) {

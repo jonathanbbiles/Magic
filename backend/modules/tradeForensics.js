@@ -11,6 +11,7 @@ const dirPath = path.resolve(FORENSICS_DIR);
 const filePath = path.join(dirPath, 'trade_forensics.jsonl');
 
 const recentRecords = [];
+const latestTradeIdBySymbol = new Map();
 
 function ensureFileReady() {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -42,6 +43,9 @@ function append(record) {
   };
   appendLine(normalized);
   pushRecent(normalized);
+  if (normalized?.symbol && normalized?.tradeId) {
+    latestTradeIdBySymbol.set(normalized.symbol, normalized.tradeId);
+  }
   return normalized;
 }
 
@@ -95,6 +99,7 @@ function getByTradeId(tradeId) {
 
 function getLatestTradeIdForSymbol(symbol) {
   if (!symbol) return null;
+  if (latestTradeIdBySymbol.has(symbol)) return latestTradeIdBySymbol.get(symbol);
   for (let i = recentRecords.length - 1; i >= 0; i -= 1) {
     const rec = recentRecords[i];
     if (rec?.symbol === symbol && rec?.tradeId) {

@@ -24,7 +24,13 @@ const {
   normalizeSymbolInternal,
   normalizeSymbolForAlpaca,
 } = require('./symbolUtils');
+const fs = require('fs');
+const path = require('path');
 const { predictOne } = require('./modules/predictor');
+const { computeATR, atrToBps } = require('./modules/indicators');
+const { computeCorrelationMatrix, clusterSymbols } = require('./modules/correlation');
+const { planTwap, computeNextLimitPrice } = require('./modules/twap');
+const quoteRouter = require('./modules/quotes');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
 const { alpacaLimiter, quoteLimiter, barsLimiter } = require('./limiters');
@@ -205,6 +211,50 @@ const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 // Stop-loss distance (bps). If unset, use a smaller default that makes EV gating realistic for scalping.
 // You can always override via STOP_LOSS_BPS in the environment.
 const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', Math.max(30, Math.round(TARGET_PROFIT_BPS * 0.5)));
+const STOPS_ENABLED = readEnvFlag('STOPS_ENABLED', true);
+const STOPLOSS_ENABLED = readEnvFlag('STOPLOSS_ENABLED', true);
+const STOPLOSS_MODE = String(process.env.STOPLOSS_MODE || 'atr').trim().toLowerCase();
+const STOPLOSS_ATR_PERIOD = readNumber('STOPLOSS_ATR_PERIOD', 14);
+const STOPLOSS_ATR_MULT = readNumber('STOPLOSS_ATR_MULT', 2.0);
+const TRAILING_STOP_ENABLED = readEnvFlag('TRAILING_STOP_ENABLED', true);
+const TRAILING_STOP_ATR_MULT = readNumber('TRAILING_STOP_ATR_MULT', 2.0);
+const STOPLOSS_MIN_DISTANCE_BPS = readNumber('STOPLOSS_MIN_DISTANCE_BPS', 50);
+const STOPLOSS_MAX_DISTANCE_BPS = readNumber('STOPLOSS_MAX_DISTANCE_BPS', 400);
+const STOPLOSS_CHECK_INTERVAL_MS = readNumber('STOPLOSS_CHECK_INTERVAL_MS', 5000);
+const POSITION_SIZING_MODE = String(process.env.POSITION_SIZING_MODE || 'fixed').trim().toLowerCase();
+const RISK_PER_TRADE_BPS = readNumber('RISK_PER_TRADE_BPS', 50);
+const SIZING_VOL_TARGET_BPS = readNumber('SIZING_VOL_TARGET_BPS', 120);
+const SIZING_VOL_MIN_MULT = readNumber('SIZING_VOL_MIN_MULT', 0.25);
+const SIZING_VOL_MAX_MULT = readNumber('SIZING_VOL_MAX_MULT', 1.25);
+const SIZING_EDGE_MULT = readNumber('SIZING_EDGE_MULT', 0.50);
+const SIZING_LOSS_STREAK_MULT = readNumber('SIZING_LOSS_STREAK_MULT', 0.70);
+const CORRELATION_GUARD_ENABLED = readEnvFlag('CORRELATION_GUARD_ENABLED', false);
+const CORRELATION_LOOKBACK_BARS = readNumber('CORRELATION_LOOKBACK_BARS', 120);
+const CORRELATION_MAX = readNumber('CORRELATION_MAX', 0.75);
+const CORRELATION_MAX_CLUSTER_EXPOSURE_PCT = readNumber('CORRELATION_MAX_CLUSTER_EXPOSURE_PCT', 0.35);
+const CORRELATION_METHOD = String(process.env.CORRELATION_METHOD || 'pearson').trim().toLowerCase();
+const TWAP_ENABLED = readEnvFlag('TWAP_ENABLED', false);
+const TWAP_MIN_NOTIONAL_USD = readNumber('TWAP_MIN_NOTIONAL_USD', 50);
+const TWAP_SLICES = readNumber('TWAP_SLICES', 5);
+const TWAP_SLICE_INTERVAL_MS = readNumber('TWAP_SLICE_INTERVAL_MS', 15000);
+const TWAP_MAX_TOTAL_MS = readNumber('TWAP_MAX_TOTAL_MS', 180000);
+const TWAP_PRICE_MODE = String(process.env.TWAP_PRICE_MODE || 'maker').trim().toLowerCase();
+const TWAP_MAX_CHASE_BPS = readNumber('TWAP_MAX_CHASE_BPS', 15);
+const LIQUIDITY_WINDOW_ENABLED = readEnvFlag('LIQUIDITY_WINDOW_ENABLED', false);
+const LIQUIDITY_WINDOW_UTC_START = readNumber('LIQUIDITY_WINDOW_UTC_START', 12);
+const LIQUIDITY_WINDOW_UTC_END = readNumber('LIQUIDITY_WINDOW_UTC_END', 16);
+const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
+const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
+const VOLATILITY_FILTER_ENABLED = readEnvFlag('VOLATILITY_FILTER_ENABLED', false);
+const VOLATILITY_BPS_MAX = readNumber('VOLATILITY_BPS_MAX', 250);
+const VOLATILITY_BPS_SHRINK_START = readNumber('VOLATILITY_BPS_SHRINK_START', 160);
+const VOLATILITY_SHRINK_MULT_MIN = readNumber('VOLATILITY_SHRINK_MULT_MIN', 0.25);
+const DRAWDOWN_GUARD_ENABLED = readEnvFlag('DRAWDOWN_GUARD_ENABLED', true);
+const MAX_DRAWDOWN_PCT = readNumber('MAX_DRAWDOWN_PCT', 7);
+const DAILY_DRAWDOWN_PCT = readNumber('DAILY_DRAWDOWN_PCT', 4);
+const RISK_KILL_SWITCH_ENABLED = readEnvFlag('RISK_KILL_SWITCH_ENABLED', true);
+const RISK_KILL_SWITCH_FILE = String(process.env.RISK_KILL_SWITCH_FILE || './data/KILL_SWITCH').trim();
+const RISK_METRICS_LOG_INTERVAL_MS = readNumber('RISK_METRICS_LOG_INTERVAL_MS', 60000);
 const VOL_HALF_LIFE_MIN = readNumber('VOL_HALF_LIFE_MIN', 6);
 const STOP_VOL_MULT = readNumber('STOP_VOL_MULT', 2.5);
 const TP_VOL_SCALE = readNumber('TP_VOL_SCALE', 1.0);
@@ -775,7 +825,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
   let quote;
   try {
-    quote = await getLatestQuote(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
   } catch (err) {
     return {
       entryReady: false,
@@ -1715,6 +1765,11 @@ const marketDataState = {
 };
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
+let equityPeak = null;
+let equityTodayOpen = null;
+let equityTodayKey = null;
+let lastRiskMetricsLogAt = 0;
+let tradingHaltedByGuard = false;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
 
  
@@ -2765,6 +2820,95 @@ function readNumber(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+
+function computeNotionalForEntry({ portfolioValueUsd, baseNotionalUsd, volatilityBps, probability, minProbToEnter, consecutiveLosses: lossCount }) {
+  const base = Number(baseNotionalUsd);
+  if (!Number.isFinite(base) || base <= 0) {
+    return { mode: POSITION_SIZING_MODE, baseNotionalUsd: baseNotionalUsd ?? null, finalNotionalUsd: null, volMult: 1, edgeMult: 1, lossMult: 1 };
+  }
+  if (POSITION_SIZING_MODE === 'fixed') {
+    return { mode: 'fixed', baseNotionalUsd: base, finalNotionalUsd: base, volMult: 1, edgeMult: 1, lossMult: 1, volatilityBps: Number(volatilityBps) || null, probability: Number(probability) || null };
+  }
+  const vol = Math.max(1e-6, Number(volatilityBps) || 0);
+  const volMultRaw = SIZING_VOL_TARGET_BPS / vol;
+  const volMult = clamp(volMultRaw, SIZING_VOL_MIN_MULT, SIZING_VOL_MAX_MULT);
+  const p = clamp(Number(probability) || 0, 0, 1);
+  const minP = clamp(Number(minProbToEnter) || 0, 0, 0.99);
+  const edge = clamp((p - minP) / Math.max(1e-6, 1 - minP), 0, 1);
+  const edgeMult = 1 - SIZING_EDGE_MULT + SIZING_EDGE_MULT * edge;
+  const losses = Math.max(0, Math.floor(Number(lossCount) || 0));
+  const lossMult = Math.max(0.2, SIZING_LOSS_STREAK_MULT ** losses);
+  const riskCap = Number.isFinite(Number(portfolioValueUsd)) && portfolioValueUsd > 0
+    ? portfolioValueUsd * (RISK_PER_TRADE_BPS / 10000)
+    : Number.POSITIVE_INFINITY;
+  const finalNotionalUsd = Math.min(base * volMult * edgeMult * lossMult, riskCap);
+  return { mode: POSITION_SIZING_MODE, baseNotionalUsd: base, finalNotionalUsd, volMult, edgeMult, lossMult, volatilityBps: Number(volatilityBps) || null, probability: p };
+}
+
+async function getQuoteForTrading(symbol, opts = {}) {
+  if (!readEnvFlag('SECONDARY_QUOTE_ENABLED', false)) {
+    return getLatestQuote(symbol, opts);
+  }
+  const best = await quoteRouter.getBestQuote(symbol, opts);
+  if (!best || !Number.isFinite(best.bid) || !Number.isFinite(best.ask)) {
+    throw new Error(`Quote unavailable for ${symbol}`);
+  }
+  const quoteAgeMs = Number.isFinite(best.ts) ? Math.max(0, Date.now() - best.ts) : null;
+  console.log('quote_source', { symbol: normalizeSymbol(symbol), source: best.source || 'unknown', quoteAgeMs });
+  return {
+    bid: best.bid,
+    ask: best.ask,
+    tsMs: Number.isFinite(best.ts) ? best.ts : Date.now(),
+    source: best.source || 'best_quote',
+  };
+}
+
+function computeStopDistanceBps({ atr, price }) {
+  const atrBps = atrToBps(atr, price);
+  if (!Number.isFinite(atrBps)) return null;
+  const raw = atrBps * STOPLOSS_ATR_MULT;
+  return clamp(raw, STOPLOSS_MIN_DISTANCE_BPS, STOPLOSS_MAX_DISTANCE_BPS);
+}
+
+async function maybeUpdateRiskGuards() {
+  const account = await getAccountInfo().catch(() => null);
+  const portfolioValue = Number(account?.portfolioValue);
+  if (!Number.isFinite(portfolioValue) || portfolioValue <= 0) {
+    tradingHaltedReason = 'portfolio_unavailable';
+    return { ok: false, reason: 'portfolio_unavailable' };
+  }
+  const now = new Date();
+  const dayKey = now.toISOString().slice(0, 10);
+  if (equityTodayKey !== dayKey || !Number.isFinite(equityTodayOpen)) {
+    equityTodayKey = dayKey;
+    equityTodayOpen = portfolioValue;
+  }
+  equityPeak = Number.isFinite(equityPeak) ? Math.max(equityPeak, portfolioValue) : portfolioValue;
+  const drawdownPct = equityPeak > 0 ? ((equityPeak - portfolioValue) / equityPeak) * 100 : 0;
+  const dailyDrawdownPct = equityTodayOpen > 0 ? ((equityTodayOpen - portfolioValue) / equityTodayOpen) * 100 : 0;
+  if (RISK_KILL_SWITCH_ENABLED && fs.existsSync(path.resolve(RISK_KILL_SWITCH_FILE))) {
+    tradingHaltedReason = 'kill_switch_file';
+    tradingHaltedByGuard = true;
+  }
+  if (DRAWDOWN_GUARD_ENABLED && (drawdownPct >= MAX_DRAWDOWN_PCT || dailyDrawdownPct >= DAILY_DRAWDOWN_PCT)) {
+    tradingHaltedReason = 'drawdown_guard';
+    tradingHaltedByGuard = true;
+  }
+  if (Date.now() - lastRiskMetricsLogAt >= RISK_METRICS_LOG_INTERVAL_MS) {
+    lastRiskMetricsLogAt = Date.now();
+    console.log('risk_metrics', {
+      portfolioValue,
+      equityPeak,
+      drawdownPct,
+      dailyDrawdownPct,
+      consecutiveLosses,
+      openPositions: exitState.size,
+      tradingHaltedReason: tradingHaltedReason || null,
+    });
+  }
+  return { ok: true, portfolioValue, drawdownPct, dailyDrawdownPct };
+}
+
 function parseAvgEntryPrice(position, symbol) {
   if (!position) return null;
   const avgEntryRaw = position?.avg_entry_price ?? position?.avgEntryPrice ?? null;
@@ -3074,7 +3218,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   let spreadBps = null;
   let quote = null;
   try {
-    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getQuoteForTrading(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -3144,6 +3288,20 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     path: 'orders',
     label: 'orders_limit_buy',
   });
+  if (TWAP_ENABLED && amountToSpend >= TWAP_MIN_NOTIONAL_USD) {
+    const plannedSlices = planTwap({ totalQty: finalQty, slices: TWAP_SLICES });
+    tradeForensics.update(tradeId, {
+      twap: {
+        enabled: true,
+        totalQty: finalQty,
+        filledQty: null,
+        slices: plannedSlices.length,
+        sliceFills: [],
+        durationMs: 0,
+      },
+    });
+    console.log('twap_plan', { symbol: normalizedSymbol, slices: plannedSlices.length, mode: TWAP_PRICE_MODE, maxChaseBps: TWAP_MAX_CHASE_BPS });
+  }
   const buyPayload = {
     symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
@@ -4472,6 +4630,8 @@ async function getLatestQuote(rawSymbol, opts = {}) {
 
 }
 
+quoteRouter.setPrimaryQuoteFetcher(async (symbol, opts = {}) => getLatestQuote(symbol, opts));
+
 async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   const symbol = normalizeSymbol(rawSymbol);
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
@@ -5777,6 +5937,51 @@ async function handleBuyFill({
     entryOrderId,
     maxFill,
   });
+
+  if (STOPS_ENABLED && STOPLOSS_ENABLED && STOPLOSS_MODE === 'atr') {
+    try {
+      const barsResp = await fetchCryptoBars({ symbols: [symbol], limit: Math.max(30, STOPLOSS_ATR_PERIOD + 2), timeframe: '1Min' });
+      const key = Object.keys(barsResp?.bars || {})[0];
+      const candles = key ? barsResp.bars[key] : [];
+      const atr = computeATR(candles, STOPLOSS_ATR_PERIOD);
+      if (!Number.isFinite(atr) || atr <= 0) {
+        console.warn('stoploss_unavailable', { symbol, reason: 'atr_unavailable' });
+      } else {
+        const stopDistanceBps = computeStopDistanceBps({ atr, price: entryPriceNum });
+        const stopPrice = Number.isFinite(stopDistanceBps)
+          ? entryPriceNum * (1 - stopDistanceBps / 10000)
+          : null;
+        const state = exitState.get(symbol) || {};
+        exitState.set(symbol, {
+          ...state,
+          atrAtEntry: atr,
+          atrBpsAtEntry: atrToBps(atr, entryPriceNum),
+          stopDistanceBps,
+          stopPrice,
+          trailingStopPrice: TRAILING_STOP_ENABLED ? stopPrice : null,
+          peakPriceSinceEntry: entryPriceNum,
+          stopInitializedAt: Date.now(),
+          lastStopCheckAt: 0,
+        });
+        const tradeId = tradeForensics.getLatestTradeIdForSymbol(symbol);
+        if (tradeId) {
+          tradeForensics.update(tradeId, {
+            stop: {
+              atr,
+              atrBps: atrToBps(atr, entryPriceNum),
+              stopPrice,
+              trailingStopPrice: TRAILING_STOP_ENABLED ? stopPrice : null,
+              stopDistanceBps,
+              triggeredAt: null,
+              type: null,
+            },
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('stoploss_unavailable', { symbol, error: err?.message || err });
+    }
+  }
 
   return sellOrder;
 
@@ -7672,6 +7877,52 @@ async function manageExitStates() {
           }
         }
 
+        const stopsEnabled = STOPS_ENABLED && STOPLOSS_ENABLED;
+        const canRunStopCheck = Number.isFinite(state.lastStopCheckAt)
+          ? now - state.lastStopCheckAt >= STOPLOSS_CHECK_INTERVAL_MS
+          : true;
+        if (stopsEnabled && canRunStopCheck && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
+          state.lastStopCheckAt = now;
+          state.peakPriceSinceEntry = Number.isFinite(state.peakPriceSinceEntry)
+            ? Math.max(state.peakPriceSinceEntry, bid)
+            : bid;
+          if (TRAILING_STOP_ENABLED && Number.isFinite(state.atrAtEntry)) {
+            const trailCandidate = state.peakPriceSinceEntry - (state.atrAtEntry * TRAILING_STOP_ATR_MULT);
+            if (Number.isFinite(trailCandidate)) {
+              state.trailingStopPrice = Number.isFinite(state.trailingStopPrice)
+                ? Math.max(state.trailingStopPrice, trailCandidate)
+                : trailCandidate;
+            }
+          }
+          const effectiveStop = TRAILING_STOP_ENABLED
+            ? Math.max(Number(state.stopPrice) || -Infinity, Number(state.trailingStopPrice) || -Infinity)
+            : Number(state.stopPrice);
+          if (Number.isFinite(effectiveStop) && bid <= effectiveStop) {
+            const stopType = Number.isFinite(state.trailingStopPrice) && state.trailingStopPrice >= state.stopPrice ? 'trailing' : 'initial';
+            console.log('stoploss_trigger', { symbol, stopTriggered: true, stopType, stopPrice: effectiveStop, bid, atr: state.atrAtEntry, reason: 'stoploss' });
+            if (state.sellOrderId) {
+              await maybeCancelExitSell({ symbol, orderId: state.sellOrderId, reason: 'stoploss_trigger' });
+            }
+            await submitIocLimitSell({ symbol, qty: state.qty, limitPrice: roundDownToTick(bid, symbol), reason: 'stoploss', allowSellBelowMin: false });
+            const tradeId = tradeForensics.getLatestTradeIdForSymbol(symbol);
+            if (tradeId) {
+              tradeForensics.update(tradeId, {
+                stop: {
+                  atr: state.atrAtEntry || null,
+                  atrBps: state.atrBpsAtEntry || null,
+                  stopPrice: state.stopPrice || null,
+                  trailingStopPrice: state.trailingStopPrice || null,
+                  stopDistanceBps: state.stopDistanceBps || null,
+                  triggeredAt: new Date().toISOString(),
+                  type: stopType,
+                },
+              });
+            }
+            exitState.delete(symbol);
+            continue;
+          }
+        }
+
         const slBps = STOP_LOSS_BPS;
         if (EXIT_MARKET_EXITS_ENABLED && slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
           const stopTrigger = state.entryPrice * (1 - slBps / 10000);
@@ -8819,12 +9070,96 @@ async function runEntryScanOnce() {
         continue;
       }
 
+      const riskGuard = await maybeUpdateRiskGuards();
+      if (!riskGuard.ok || tradingHaltedReason || tradingHaltedByGuard) {
+        skipped += 1;
+        const reason = tradingHaltedReason || riskGuard.reason || 'risk_guard';
+        recordSkip(reason, symbol, null);
+        console.log('entry_risk_guard', { symbol, reason });
+        continue;
+      }
+
+      const volBps = Number(recordBase?.volatilityBps);
+      let externalSizeMult = 1;
+      if (LIQUIDITY_WINDOW_ENABLED) {
+        const hour = new Date().getUTCHours();
+        const inWindow = hour >= LIQUIDITY_WINDOW_UTC_START && hour < LIQUIDITY_WINDOW_UTC_END;
+        if (!inWindow && OUTSIDE_WINDOW_MODE === 'skip') {
+          skipped += 1;
+          recordSkip('liquidity_window_skip', symbol, { hour });
+          console.log('liquidity_window', { inWindow, mode: OUTSIDE_WINDOW_MODE, sizeMult: 0 });
+          continue;
+        }
+        if (!inWindow && OUTSIDE_WINDOW_MODE === 'shrink') {
+          externalSizeMult *= OUTSIDE_WINDOW_SIZE_MULT;
+        }
+        console.log('liquidity_window', { inWindow, mode: OUTSIDE_WINDOW_MODE, sizeMult: externalSizeMult });
+      }
+      if (VOLATILITY_FILTER_ENABLED && Number.isFinite(volBps)) {
+        if (volBps > VOLATILITY_BPS_MAX) {
+          skipped += 1;
+          recordSkip('volatility_filter_skip', symbol, { volBps });
+          console.log('vol_filter', { volatilityBps: volBps, action: 'skip', sizeMult: 0 });
+          continue;
+        }
+        if (volBps >= VOLATILITY_BPS_SHRINK_START) {
+          const ratio = (VOLATILITY_BPS_MAX - volBps) / Math.max(1e-6, VOLATILITY_BPS_MAX - VOLATILITY_BPS_SHRINK_START);
+          const mult = clamp(VOLATILITY_SHRINK_MULT_MIN + (1 - VOLATILITY_SHRINK_MULT_MIN) * ratio, VOLATILITY_SHRINK_MULT_MIN, 1);
+          externalSizeMult *= mult;
+          console.log('vol_filter', { volatilityBps: volBps, action: 'shrink', sizeMult: mult });
+        }
+      }
+
+      let correlationBlock = null;
+      if (CORRELATION_GUARD_ENABLED && CORRELATION_METHOD === 'pearson') {
+        try {
+          const candidateBars = await fetchCryptoBars({ symbols: [symbol], limit: CORRELATION_LOOKBACK_BARS, timeframe: '1Min' });
+          const held = Array.from(heldSymbols.values());
+          const heldBarsResp = held.length
+            ? await fetchCryptoBars({ symbols: held, limit: CORRELATION_LOOKBACK_BARS, timeframe: '1Min' })
+            : { bars: {} };
+          const toCloses = (series) => (Array.isArray(series) ? series.map((b) => Number(b?.c ?? b?.close)).filter((v) => Number.isFinite(v) && v > 0) : []);
+          const priceMap = {};
+          priceMap[symbol] = toCloses((candidateBars?.bars && Object.values(candidateBars.bars)[0]) || []);
+          for (const hs of held) {
+            const key = Object.keys(heldBarsResp?.bars || {}).find((k) => normalizeSymbol(k) === normalizeSymbol(hs));
+            priceMap[hs] = toCloses(key ? heldBarsResp.bars[key] : []);
+          }
+          const matrix = computeCorrelationMatrix(priceMap);
+          let maxCorr = null;
+          let correlatedWith = null;
+          for (const hs of held) {
+            const c = matrix?.[symbol]?.[hs];
+            if (Number.isFinite(c) && (!Number.isFinite(maxCorr) || c > maxCorr)) {
+              maxCorr = c;
+              correlatedWith = hs;
+            }
+          }
+          const cluster = clusterSymbols(held, symbol, matrix, CORRELATION_MAX);
+          const clusterExposureUsd = (Array.isArray(positions) ? positions : [])
+            .filter((pos) => cluster.includes(normalizeSymbol(pos.symbol || '')))
+            .reduce((sum, pos) => sum + Math.abs(Number(pos.market_value ?? pos.marketValueUsd ?? pos.notional) || 0), 0);
+          const clusterCapUsd = (riskGuard.portfolioValue || 0) * CORRELATION_MAX_CLUSTER_EXPOSURE_PCT;
+          const block = (Number.isFinite(maxCorr) && maxCorr > CORRELATION_MAX) || (clusterExposureUsd > clusterCapUsd && clusterCapUsd > 0);
+          correlationBlock = { maxCorr, correlatedWith, clusterSymbols: cluster, clusterExposureUsd };
+          console.log('correlation_guard', { candidate: symbol, maxCorr, correlatedWith, clusterExposureUsd, clusterCapUsd, action: block ? 'skip' : 'allow' });
+          if (block) {
+            skipped += 1;
+            recordSkip('correlation_guard_skip', symbol, correlationBlock);
+            continue;
+          }
+        } catch (err) {
+          console.warn('correlation_guard_unavailable', { symbol, error: err?.message || err });
+        }
+      }
+
       let result = null;
+      const entryOptions = { forensicsRecord: recordBase, externalSizeMult, correlationMeta: correlationBlock };
       if (SIMPLE_SCALPER_ENABLED) {
-        result = await placeSimpleScalperEntry(symbol, { forensicsRecord: recordBase });
+        result = await placeSimpleScalperEntry(symbol, entryOptions);
       } else {
         desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
-        result = await placeMakerLimitBuyThenSell(symbol, { forensicsRecord: recordBase });
+        result = await placeMakerLimitBuyThenSell(symbol, entryOptions);
       }
       attempts += 1;
       if (result?.submitted) {
@@ -9003,6 +9338,62 @@ async function waitForOrderFill({ symbol, orderId, timeoutMs, intervalMs = 1000 
   return { filled: false, timeout: true, order };
 }
 
+
+async function executeTwapBuy({ normalizedSymbol, totalQty, bid, ask, tickSize, tradeId }) {
+  const slices = planTwap({ totalQty, slices: TWAP_SLICES });
+  const startedAt = Date.now();
+  const sliceFills = [];
+  let filledQty = 0;
+  for (let i = 0; i < slices.length; i += 1) {
+    if (Date.now() - startedAt > TWAP_MAX_TOTAL_MS) break;
+    const sliceQty = roundQty(slices[i]);
+    if (!Number.isFinite(sliceQty) || sliceQty <= 0) continue;
+    const limitPrice = computeNextLimitPrice({
+      side: 'buy',
+      bid,
+      ask,
+      refPrice: Number.isFinite(ask) ? ask : bid,
+      sliceIndex: i,
+      maxChaseBps: TWAP_MAX_CHASE_BPS,
+      tickSize,
+    });
+    const order = await placeOrderUnified({
+      symbol: normalizedSymbol,
+      url: buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_twap_buy' }),
+      payload: {
+        symbol: toTradeSymbol(normalizedSymbol),
+        qty: sliceQty,
+        side: 'buy',
+        type: 'limit',
+        time_in_force: 'ioc',
+        limit_price: limitPrice,
+        client_order_id: buildEntryClientOrderId(normalizedSymbol),
+      },
+      label: 'orders_twap_buy',
+      reason: 'entry_twap_buy',
+      context: 'entry_twap_buy',
+      intent: 'entry',
+    });
+    const filled = Number(order?.filled_qty || 0);
+    filledQty += Math.max(0, filled);
+    sliceFills.push({ index: i, qty: sliceQty, filledQty: filled, limitPrice });
+    if (order?.id && filled < sliceQty) {
+      await cancelOrderSafe(order.id);
+    }
+    if (i < slices.length - 1) {
+      await sleep(Math.min(TWAP_SLICE_INTERVAL_MS, 5000));
+    }
+  }
+  const done = filledQty >= totalQty * 0.999;
+  const twapMeta = { enabled: true, totalQty, filledQty, slices: slices.length, sliceFills, durationMs: Date.now() - startedAt };
+  if (tradeId) tradeForensics.update(tradeId, { twap: twapMeta });
+  if (!done) {
+    console.warn('twap_incomplete', { symbol: normalizedSymbol, ...twapMeta });
+    return { ok: false, reason: 'twap_incomplete', twapMeta };
+  }
+  return { ok: true, twapMeta };
+}
+
 async function placeSimpleScalperEntry(symbol, options = {}) {
   const normalizedSymbol = normalizeSymbol(symbol);
   const forensicsRecord = options?.forensicsRecord || null;
@@ -9042,7 +9433,7 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
 
   let quote;
   try {
-    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getQuoteForTrading(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
   } catch (err) {
     logSimpleScalperSkip(normalizedSymbol, 'stale_quote', { error: err?.message || err });
     return { skipped: true, reason: 'stale_quote' };
@@ -9369,7 +9760,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
   let spreadBps = null;
   let quote = null;
   try {
-    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getQuoteForTrading(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -9405,7 +9796,19 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     return { skipped: true, reason: 'invalid_account_values' };
   }
   const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
-  const amountToSpend = Math.min(targetTradeAmount, buyingPower);
+  const baseNotionalUsd = Math.min(targetTradeAmount, buyingPower);
+  const sizing = computeNotionalForEntry({
+    portfolioValueUsd: portfolioValue,
+    baseNotionalUsd,
+    volatilityBps: forensicsRecord?.volatilityBps,
+    probability: forensicsRecord?.predictorProbability,
+    minProbToEnter: MIN_PROB_TO_ENTER,
+    consecutiveLosses,
+  });
+  const externalSizeMult = Number(options?.externalSizeMult);
+  const sizeMult = Number.isFinite(externalSizeMult) && externalSizeMult > 0 ? externalSizeMult : 1;
+  const amountToSpend = Math.min((sizing.finalNotionalUsd || baseNotionalUsd) * sizeMult, buyingPower);
+  console.log('position_sizing', { symbol: normalizedSymbol, ...sizing, externalSizeMult: sizeMult, finalNotionalUsd: amountToSpend });
   const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
   logBuyDecision(normalizedSymbol, amountToSpend, decision);
@@ -9485,6 +9888,8 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     },
     fill: null,
     postEntry: null,
+    sizing: { ...sizing, finalNotionalUsd: amountToSpend },
+    correlation: options?.correlationMeta || null,
   });
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
@@ -9631,7 +10036,7 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
   let spreadBps = null;
   let quote = null;
   try {
-    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    quote = await getQuoteForTrading(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
