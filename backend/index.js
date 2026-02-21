@@ -1,6 +1,9 @@
 require('dotenv').config();
 
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 const cors = require('cors');
 const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
@@ -66,6 +69,43 @@ const VERSION =
   process.env.RENDER_GIT_COMMIT ||
   process.env.COMMIT_SHA ||
   'dev';
+
+
+function maskConfigValue(key, value) {
+  const k = String(key || '').toLowerCase();
+  if (k.includes('secret') || k.includes('token') || k.includes('key')) return value ? '***' : null;
+  return value;
+}
+
+function resolveGitCommit() {
+  if (process.env.RENDER_GIT_COMMIT) return process.env.RENDER_GIT_COMMIT;
+  if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+  try {
+    return String(execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeRunSnapshot() {
+  const tracked = [
+    'TRADING_ENABLED', 'STOPS_ENABLED', 'STOPLOSS_ENABLED', 'POSITION_SIZING_MODE', 'TWAP_ENABLED',
+    'CORRELATION_GUARD_ENABLED', 'VOLATILITY_FILTER_ENABLED', 'LIQUIDITY_WINDOW_ENABLED',
+    'DRAWDOWN_GUARD_ENABLED', 'RISK_KILL_SWITCH_ENABLED', 'SECONDARY_QUOTE_ENABLED',
+    'PREDICTOR_CALIBRATION_ENABLED',
+  ];
+  const config = {};
+  for (const key of tracked) config[key] = maskConfigValue(key, process.env[key] ?? null);
+  const snapshot = { ts: new Date().toISOString(), gitCommit: resolveGitCommit(), config };
+  console.log('app_boot', snapshot);
+  try {
+    const out = path.resolve('./data/run_snapshot.json');
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, JSON.stringify(snapshot, null, 2));
+  } catch (err) {
+    console.warn('run_snapshot_write_failed', { error: err?.message || err });
+  }
+}
 
 const app = express();
 
@@ -1133,6 +1173,8 @@ async function bootstrapTrading() {
   }
   console.log('bootstrap_done');
 }
+
+writeRunSnapshot();
 
 const server = app.listen(port, () => {
   console.log('server_start', { env: process.env.NODE_ENV || 'development', port });
