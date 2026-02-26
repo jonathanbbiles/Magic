@@ -156,6 +156,85 @@ function alpacaJsonHeaders() {
   };
 }
 
+async function placeOrderUnified({
+  symbol,
+  url,
+  payload,
+  label = 'orders_submit',
+  reason = null,
+  context = null,
+  intent = null,
+}) {
+  if (!url) throw new Error('placeOrderUnified: missing url');
+  if (!payload) throw new Error('placeOrderUnified: missing payload');
+
+  try {
+    const resp = await requestJson({
+      url,
+      method: 'POST',
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify(payload),
+    });
+
+    const order = resp?.json ?? resp;
+    console.log('order_submitted', {
+      symbol,
+      id: order?.id ?? null,
+      client_order_id: payload?.client_order_id ?? null,
+      label,
+      reason,
+      context,
+      intent,
+    });
+
+    return order;
+  } catch (err) {
+    const statusCode = err?.statusCode ?? err?.status ?? null;
+    const responseText = err?.responseText ?? err?.snippet ?? null;
+
+    if (typeof logHttpError === 'function') {
+      logHttpError({
+        context: 'placeOrderUnified',
+        url,
+        method: 'POST',
+        statusCode,
+        error: err?.message ?? String(err),
+        responseText,
+        responseHeaders: err?.responseHeaders ?? null,
+        extra: {
+          symbol,
+          label,
+          reason,
+          context,
+          intent,
+          payloadPreview: {
+            type: payload?.type,
+            side: payload?.side,
+            time_in_force: payload?.time_in_force,
+            qty: payload?.qty,
+            notional: payload?.notional,
+            limit_price: payload?.limit_price,
+            client_order_id: payload?.client_order_id,
+          },
+        },
+      });
+    } else {
+      console.log('order_submit_failed', {
+        symbol,
+        label,
+        reason,
+        context,
+        intent,
+        statusCode,
+        error: err?.message ?? String(err),
+        responseText,
+      });
+    }
+
+    throw err;
+  }
+}
+
 const TRADE_PORTFOLIO_PCT = Number(process.env.TRADE_PORTFOLIO_PCT || 0.10);
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 1);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
