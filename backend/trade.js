@@ -8821,6 +8821,8 @@ async function runEntryScanOnce() {
       }
     });
     const heldPositionsCount = heldSymbols.size;
+    let warmupReadyCount = 0;
+    let warmupNotReadyCount = 0;
 
     const openBuySymbols = new Set();
     (Array.isArray(openOrders) ? openOrders : []).forEach((order) => {
@@ -11054,5 +11056,6 @@ module.exports = {
   isOpenLikeOrderStatus,
   getExitStateSnapshot,
   prefetchBarsForUniverse,
+  runEntryScanOnce,
 
 };
