@@ -26,7 +26,8 @@ const {
 } = require('./symbolUtils');
 const fs = require('fs');
 const path = require('path');
-const { predictOne } = require('./modules/predictor');
+const { predictOne, logBarsDebug } = require('./modules/predictor');
+const { evaluatePredictorWarmupGate } = require('./modules/predictorWarmup');
 const { computeATR, atrToBps } = require('./modules/indicators');
 const { computeCorrelationMatrix, clusterSymbols } = require('./modules/correlation');
 const { planTwap, computeNextLimitPrice } = require('./modules/twap');
@@ -268,6 +269,14 @@ const chunkSizeEnv = Number(process.env.ENTRY_PREFETCH_CHUNK_SIZE);
 const ENTRY_PREFETCH_CHUNK_SIZE =
   Number.isFinite(chunkSizeEnv) ? Math.max(10, chunkSizeEnv) : 80;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
+
+const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
+const PREDICTOR_WARMUP_MIN_1M_BARS = readNumber('PREDICTOR_WARMUP_MIN_1M_BARS', 200);
+const PREDICTOR_WARMUP_MIN_5M_BARS = readNumber('PREDICTOR_WARMUP_MIN_5M_BARS', 200);
+const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS', 100);
+const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', true);
+const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS', 60000);
+const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 4));
 
 // 1) Time-of-day conditioning
 const TIME_OF_DAY_ENABLED = readFlag('TIME_OF_DAY_ENABLED', false);
@@ -1062,20 +1071,21 @@ async function computeEntrySignal(symbol, opts = {}) {
     bars5m = { bars: { [asset.symbol]: prefSeries5m } };
     bars15m = { bars: { [asset.symbol]: prefSeries15m } };
   } else {
-    try {
-      [bars1m, bars5m, bars15m] = await Promise.all([
-        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '1Min' }),
-        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '5Min' }),
-        fetchCryptoBars({ symbols: [asset.symbol], limit: 60, timeframe: '15Min' }),
-      ]);
-    } catch (err) {
-    console.warn('predictor_error', {
-      symbol: asset.symbol,
-      reason: 'bars_fetch_failed',
-      errorName: err?.name || null,
-      errorMessage: err?.message || String(err),
-      stack: String(err?.stack || '').slice(0, 600),
-    });
+    const warmupThresholds = getBarsWarmupThresholds();
+    const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: Math.max(60, warmupThresholds['1m']) }),
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: Math.max(60, warmupThresholds['5m']) }),
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: Math.max(60, warmupThresholds['15m']) }),
+    ]);
+    if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
+      const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
+      console.warn('predictor_error', {
+        symbol: asset.symbol,
+        reason: 'bars_fetch_failed',
+        errorName: err?.name || null,
+        errorMessage: err?.message || String(err),
+        stack: String(err?.stack || '').slice(0, 600),
+      });
       return {
         entryReady: false,
         why: 'predictor_error',
@@ -1083,6 +1093,9 @@ async function computeEntrySignal(symbol, opts = {}) {
         record: baseRecord,
       };
     }
+    bars1m = bars1mResult.response;
+    bars5m = bars5mResult.response;
+    bars15m = bars15mResult.response;
   }
 
   const barKey = normalizeSymbol(asset.symbol);
@@ -1144,6 +1157,45 @@ async function computeEntrySignal(symbol, opts = {}) {
     bars15m?.bars?.[alpacaSymbol(barKey)] ||
     bars15m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
     [];
+
+  const warmupGate = evaluatePredictorWarmupGate({
+    enabled: PREDICTOR_WARMUP_ENABLED,
+    blockTrades: PREDICTOR_WARMUP_BLOCK_TRADES,
+    lengths: {
+      '1m': Array.isArray(barSeries1m) ? barSeries1m.length : 0,
+      '5m': Array.isArray(barSeries5m) ? barSeries5m.length : 0,
+      '15m': Array.isArray(barSeries15m) ? barSeries15m.length : 0,
+    },
+    thresholds: getBarsWarmupThresholds(),
+  });
+  if (PREDICTOR_WARMUP_ENABLED && warmupGate.missing.length) {
+    for (const missing of warmupGate.missing) {
+      logPredictorBarsDebug({
+        symbol: asset.symbol,
+        timeframe: missing.timeframe,
+        provider: 'alpaca',
+        limit: warmupGate.thresholds[missing.timeframe],
+        responseCount: warmupGate.lengths[missing.timeframe],
+        status: 'insufficient',
+        error: null,
+      });
+    }
+    if (warmupGate.skip) {
+      return {
+        entryReady: false,
+        why: 'predictor_warmup',
+        meta: {
+          symbol: asset.symbol,
+          reason: 'predictor_warmup',
+          blockTrades: warmupGate.blockTrades,
+          lengths: warmupGate.lengths,
+          thresholds: warmupGate.thresholds,
+          missing: warmupGate.missing,
+        },
+        record: baseRecord,
+      };
+    }
+  }
 
   let predictorStretch;
   let predictorTp;
@@ -1223,6 +1275,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       errorMessage: predictorTp?.errorMessage || null,
       stack: predictorTp?.stack || null,
       targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+      barsDebug: predictorTp?.barsDebug || null,
     });
     return {
       entryReady: false,
@@ -1248,6 +1301,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       errorMessage: predictorStretch?.errorMessage || null,
       stack: predictorStretch?.stack || null,
       targetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+      barsDebug: predictorStretch?.barsDebug || null,
     });
   }
 
@@ -2820,6 +2874,106 @@ function readNumber(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+
+
+function getBarsWarmupThresholds() {
+  return {
+    '1m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_1M_BARS) || 200),
+    '5m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_5M_BARS) || 200),
+    '15m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_15M_BARS) || 100),
+  };
+}
+
+function normalizeBarsDebugError(errorLike) {
+  if (!errorLike) return null;
+  if (typeof errorLike === 'string') return errorLike;
+  return errorLike?.errorMessage || errorLike?.message || String(errorLike);
+}
+
+function logPredictorBarsDebug({ symbol, timeframe, provider, start, end, limit, responseCount, status, error }) {
+  logBarsDebug({
+    symbol,
+    timeframe,
+    provider,
+    start,
+    end,
+    limit,
+    responseCount,
+    status,
+    error: normalizeBarsDebugError(error),
+  });
+}
+
+async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca', start, end }) {
+  try {
+    const resp = await fetchCryptoBars({ symbols: [symbol], limit, timeframe, start, end });
+    const normalizedSymbol = normalizeSymbol(symbol);
+    const dataSymbol = toDataSymbol(normalizedSymbol);
+    const series =
+      resp?.bars?.[normalizedSymbol] ||
+      resp?.bars?.[dataSymbol] ||
+      resp?.bars?.[normalizePair(normalizedSymbol)] ||
+      resp?.bars?.[alpacaSymbol(dataSymbol)] ||
+      resp?.bars?.[alpacaSymbol(normalizePair(dataSymbol))] ||
+      [];
+    const count = Array.isArray(series) ? series.length : 0;
+    return { ok: true, response: resp, responseCount: count };
+  } catch (error) {
+    logPredictorBarsDebug({
+      symbol,
+      timeframe,
+      provider,
+      start,
+      end,
+      limit,
+      responseCount: 0,
+      status: 'provider_error',
+      error,
+    });
+    return { ok: false, error };
+  }
+}
+
+async function prefetchBarsForUniverse(universe) {
+  const symbols = Array.isArray(universe) ? universe.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  if (!symbols.length) return;
+  const thresholds = getBarsWarmupThresholds();
+  const timeframes = [
+    { timeframe: '1Min', key: '1m', limit: Math.max(60, thresholds['1m']) },
+    { timeframe: '5Min', key: '5m', limit: Math.max(60, thresholds['5m']) },
+    { timeframe: '15Min', key: '15m', limit: Math.max(60, thresholds['15m']) },
+  ];
+  const queue = [...symbols];
+  const workers = new Array(Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, queue.length)).fill(null).map(async () => {
+    while (queue.length) {
+      const symbol = queue.shift();
+      if (!symbol) continue;
+      for (const tf of timeframes) {
+        const result = await fetchBarsWithDebug({ symbol, timeframe: tf.timeframe, limit: tf.limit });
+        if (!result.ok) {
+          console.warn('predictor_warmup_prefetch_failed', {
+            symbol,
+            timeframe: tf.key,
+            error: normalizeBarsDebugError(result.error),
+          });
+          continue;
+        }
+        if (result.responseCount < thresholds[tf.key]) {
+          logPredictorBarsDebug({
+            symbol,
+            timeframe: tf.key,
+            provider: 'alpaca',
+            limit: tf.limit,
+            responseCount: result.responseCount,
+            status: 'insufficient',
+            error: null,
+          });
+        }
+      }
+    }
+  });
+  await Promise.allSettled(workers);
+}
 
 function computeNotionalForEntry({ portfolioValueUsd, baseNotionalUsd, volatilityBps, probability, minProbToEnter, consecutiveLosses: lossCount }) {
   const base = Number(baseNotionalUsd);
@@ -8923,6 +9077,16 @@ async function runEntryScanOnce() {
       .filter((sym) => sym && !stableSymbols.has(sym));
     const universeSize = scanSymbols.length;
 
+    if (PREDICTOR_WARMUP_ENABLED && scanSymbols.length) {
+      setTimeout(() => {
+        prefetchBarsForUniverse(scanSymbols).catch((err) => {
+          console.warn('predictor_warmup_prefetch_failed', {
+            error: normalizeBarsDebugError(err),
+          });
+        });
+      }, 0);
+    }
+
     let positions = [];
     let openOrders = [];
     try {
@@ -9279,12 +9443,25 @@ function startExitManager() {
 function startEntryManager() {
   if (entryManagerRunning) return;
   entryManagerRunning = true;
+  if (PREDICTOR_WARMUP_ENABLED) {
+    setTimeout(async () => {
+      try {
+        await loadSupportedCryptoPairs();
+        const universe = Array.from(supportedCryptoPairsState.pairs || []);
+        await prefetchBarsForUniverse(universe);
+      } catch (err) {
+        console.warn('predictor_warmup_prefetch_failed', {
+          error: normalizeBarsDebugError(err),
+        });
+      }
+    }, 0);
+  }
   setInterval(() => {
     runEntryScanOnce().catch((err) => {
       console.error('entry_manager_failed', err?.message || err);
     });
   }, ENTRY_SCAN_INTERVAL_MS);
-  console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS });
+  console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS, predictorWarmupEnabled: PREDICTOR_WARMUP_ENABLED, predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, predictorWarmupLogEveryMs: PREDICTOR_WARMUP_LOG_EVERY_MS });
 }
 
 function monitorSimpleScalperTpFill({ symbol, orderId, maxMs = 600000, intervalMs = 5000 }) {
@@ -11148,5 +11325,6 @@ module.exports = {
   expandNestedOrders,
   isOpenLikeOrderStatus,
   getExitStateSnapshot,
+  prefetchBarsForUniverse,
 
 };

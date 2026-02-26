@@ -13,6 +13,34 @@ const calibrationCache = {
   model: null,
 };
 
+const PREDICTOR_WARMUP_LOG_EVERY_MS = Math.max(1000, Number(process.env.PREDICTOR_WARMUP_LOG_EVERY_MS || 60000));
+const predictorWarmupLogState = new Map();
+
+function shouldEmitWarmupDebugLog(symbol, timeframe) {
+  const key = `${String(symbol || '').toUpperCase()}|${String(timeframe || '').toLowerCase()}`;
+  const now = Date.now();
+  const last = predictorWarmupLogState.get(key) || 0;
+  if (now - last < PREDICTOR_WARMUP_LOG_EVERY_MS) return false;
+  predictorWarmupLogState.set(key, now);
+  return true;
+}
+
+function logBarsDebug({ symbol, timeframe, start, end, limit, provider, responseCount, status, error }) {
+  const tf = String(timeframe || '').toLowerCase();
+  if (!shouldEmitWarmupDebugLog(symbol, tf)) return;
+  console.warn('predictor_bars_debug', {
+    symbol: symbol || null,
+    timeframe: tf || null,
+    provider: provider || null,
+    start: start || null,
+    end: end || null,
+    limit: Number.isFinite(Number(limit)) ? Number(limit) : null,
+    responseCount: Number.isFinite(Number(responseCount)) ? Number(responseCount) : null,
+    status: status || null,
+    error: error || null,
+  });
+}
+
 function clamp(value, min, max) {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, value));
@@ -212,13 +240,13 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
     const volumes1m = extractVolumes(series1m);
 
     if (closes1m.length < 3) {
-      return { ok: false, reason: 'insufficient_bars_1m', probability: null, signals: null };
+      return { ok: false, reason: 'insufficient_bars_1m', probability: null, signals: null, barsDebug: { timeframe: '1m', responseCount: closes1m.length, minRequired: 3, status: 'insufficient' } };
     }
     if (closes5m.length < 3) {
-      return { ok: false, reason: 'insufficient_bars_5m', probability: null, signals: null };
+      return { ok: false, reason: 'insufficient_bars_5m', probability: null, signals: null, barsDebug: { timeframe: '5m', responseCount: closes5m.length, minRequired: 3, status: 'insufficient' } };
     }
     if (closes15m.length < 3) {
-      return { ok: false, reason: 'insufficient_bars_15m', probability: null, signals: null };
+      return { ok: false, reason: 'insufficient_bars_15m', probability: null, signals: null, barsDebug: { timeframe: '15m', responseCount: closes15m.length, minRequired: 3, status: 'insufficient' } };
     }
 
     const volatilityBps = computeVolatilityBps(closes1m);
@@ -396,4 +424,5 @@ function predictOne({ bars, bars1m, bars5m, bars15m, orderbook, refPrice, market
 
 module.exports = {
   predictOne,
+  logBarsDebug,
 };
