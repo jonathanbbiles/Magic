@@ -1,6 +1,8 @@
 const { randomUUID, randomBytes } = require('crypto');
 
 const { httpJson, buildHttpsUrl } = require('./httpClient');
+const { requestJson, logHttpError } = require('./modules/http');
+const { withAlpacaMdLimit } = require('./modules/alpacaRateLimiter');
 const {
   MARKET_DATA_TIMEOUT_MS,
   MARKET_DATA_RETRIES,
@@ -267,7 +269,7 @@ const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
 const chunkSizeEnv = Number(process.env.ENTRY_PREFETCH_CHUNK_SIZE);
 const ENTRY_PREFETCH_CHUNK_SIZE =
-  Number.isFinite(chunkSizeEnv) ? Math.max(10, chunkSizeEnv) : 80;
+  Number.isFinite(chunkSizeEnv) ? Math.max(1, chunkSizeEnv) : 8;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
@@ -279,12 +281,8 @@ const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS'
 const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 4));
 const BARS_PREFETCH_INTERVAL_MS = readNumber('BARS_PREFETCH_INTERVAL_MS', 60000);
 const ALLOW_PER_SYMBOL_BARS_FALLBACK = readEnvFlag('ALLOW_PER_SYMBOL_BARS_FALLBACK', false);
-const PER_SCAN_BARS_FALLBACK_BUDGET = Math.max(0, readNumber('PER_SCAN_BARS_FALLBACK_BUDGET', 2));
+const PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN = Math.max(0, readNumber('PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN', 2));
 const ALPACA_BARS_USE_TIME_RANGE = readEnvFlag('ALPACA_BARS_USE_TIME_RANGE', true);
-const ALPACA_MD_MAX_CONCURRENCY = Math.max(1, readNumber('ALPACA_MD_MAX_CONCURRENCY', 2));
-const ALPACA_MD_MIN_DELAY_MS = Math.max(0, readNumber('ALPACA_MD_MIN_DELAY_MS', 200));
-const ALPACA_MD_MAX_RETRIES = Math.max(0, readNumber('ALPACA_MD_MAX_RETRIES', 6));
-const ALPACA_MD_BASE_BACKOFF_MS = Math.max(1, readNumber('ALPACA_MD_BASE_BACKOFF_MS', 500));
 
 // 1) Time-of-day conditioning
 const TIME_OF_DAY_ENABLED = readFlag('TIME_OF_DAY_ENABLED', false);
@@ -1858,9 +1856,6 @@ let lastPrefetchedBars = {
   bars15mBySymbol: new Map(),
 };
 let predictorWarmupCompletedLogged = false;
-let alpacaMdActiveRequests = 0;
-let alpacaMdLastRequestAt = 0;
-const alpacaMdPendingQueue = [];
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
 let equityPeak = null;
@@ -2184,48 +2179,6 @@ function normalizeMarketDataErrorType(error) {
   return 'http_error';
 }
 
-function readRateLimitHeaders(rateLimit = {}, headers = {}) {
-  return {
-    limit: rateLimit?.limit || headers?.limit || headers?.['x-ratelimit-limit'] || headers?.['x-ratelimit-requests-limit'] || null,
-    remaining: rateLimit?.remaining || headers?.remaining || headers?.['x-ratelimit-remaining'] || headers?.['x-ratelimit-requests-remaining'] || null,
-    reset: rateLimit?.reset || headers?.reset || headers?.['x-ratelimit-reset'] || headers?.['x-ratelimit-requests-reset'] || null,
-  };
-}
-
-function scheduleAlpacaMarketDataRequest(task) {
-  return new Promise((resolve, reject) => {
-    alpacaMdPendingQueue.push({ task, resolve, reject });
-    drainAlpacaMarketDataQueue();
-  });
-}
-
-function drainAlpacaMarketDataQueue() {
-  if (alpacaMdActiveRequests >= ALPACA_MD_MAX_CONCURRENCY) return;
-  const next = alpacaMdPendingQueue.shift();
-  if (!next) return;
-  const sinceLastMs = Date.now() - alpacaMdLastRequestAt;
-  const waitMs = Math.max(0, ALPACA_MD_MIN_DELAY_MS - sinceLastMs);
-  alpacaMdActiveRequests += 1;
-  setTimeout(async () => {
-    try {
-      alpacaMdLastRequestAt = Date.now();
-      const result = await next.task();
-      next.resolve(result);
-    } catch (err) {
-      next.reject(err);
-    } finally {
-      alpacaMdActiveRequests = Math.max(0, alpacaMdActiveRequests - 1);
-      setTimeout(drainAlpacaMarketDataQueue, 0);
-    }
-  }, waitMs);
-}
-
-function getRetryDelayMs(attempt) {
-  const base = ALPACA_MD_BASE_BACKOFF_MS;
-  const jitter = Math.floor(Math.random() * base);
-  return base * (2 ** attempt) + jitter;
-}
-
 async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', timeoutMs = MARKET_DATA_TIMEOUT_MS }) {
   const label = getMarketDataLabel(type);
   const parsedUrl = parseUrlMetadata(url);
@@ -2273,101 +2226,70 @@ async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', time
     throw err;
   }
 
-  let lastError = null;
-  for (let attempt = 0; attempt <= ALPACA_MD_MAX_RETRIES; attempt += 1) {
-    const result = await scheduleAlpacaMarketDataRequest(() => httpJson({
-      method,
-      url: parsedUrl.url,
-      headers: alpacaHeaders(),
-      timeoutMs,
-      retries: 0,
-    }));
+  try {
+    const result = await withAlpacaMdLimit(async () => {
+      const data = await requestJson({
+        method,
+        url: parsedUrl.url,
+        headers: alpacaHeaders(),
+        timeoutMs,
+      });
+      return { data, statusCode: 200, responseSnippet200: '', requestId: localRequestId };
+    }, { endpointLabel: endpoint, type: String(type || 'BARS').toUpperCase() });
 
-    if (!result.error) {
-      markMarketDataSuccess();
-      if (DEBUG_ALPACA_HTTP_OK) {
-        console.log('alpaca_marketdata', {
-          phase: 'ok',
-          label,
-          type,
-          method,
-          url: parsedUrl.url,
-          urlHost: parsedUrl.urlHost,
-          urlPath: parsedUrl.urlPath,
-          requestId: result.requestId || localRequestId,
-          statusCode: result.statusCode ?? 200,
-          errorType: 'ok',
-          errorMessage: null,
-          errorName: null,
-          snippet: result.responseSnippet200 || '',
-        });
-      }
-      return result.data;
-    }
-
-    const statusCode = result.error.statusCode ?? null;
-    const errorType = normalizeMarketDataErrorType(result.error);
-    const requestId = result.error.requestId || localRequestId;
-    const rateLimitHeaders = readRateLimitHeaders(result.error.rateLimit, result.error.headers);
-    const retriable = statusCode === 429 || (Number.isFinite(statusCode) && statusCode >= 500) || errorType === 'timeout' || errorType === 'network_error';
-
-    if (statusCode === 429) {
-      const retryInMs = attempt < ALPACA_MD_MAX_RETRIES ? getRetryDelayMs(attempt) : null;
-      console.warn('marketdata_rate_limit', {
+    markMarketDataSuccess();
+    if (DEBUG_ALPACA_HTTP_OK) {
+      console.log('alpaca_marketdata', {
+        phase: 'ok',
+        label,
         type,
-        limit: rateLimitHeaders.limit,
-        remaining: rateLimitHeaders.remaining,
-        reset: rateLimitHeaders.reset,
-        retryInMs,
-        endpoint,
+        method,
+        url: parsedUrl.url,
+        urlHost: parsedUrl.urlHost,
+        urlPath: parsedUrl.urlPath,
+        requestId: result.requestId || localRequestId,
+        statusCode: result.statusCode ?? 200,
+        errorType: 'ok',
+        errorMessage: null,
+        errorName: null,
+        snippet: result.responseSnippet200 || '',
       });
     }
-
-    if (attempt < ALPACA_MD_MAX_RETRIES && retriable) {
-      const retryInMs = getRetryDelayMs(attempt);
-      console.warn('marketdata_retry', {
-        endpoint,
-        attempt: attempt + 1,
-        retryInMs,
-        statusCode,
-      });
-      await sleep(retryInMs);
-      lastError = result.error;
-      continue;
-    }
+    return result.data;
+  } catch (error) {
+    const statusCode = error?.statusCode ?? null;
+    const errorType = normalizeMarketDataErrorType(error);
+    const requestId = error?.requestId || localRequestId;
 
     logMarketDataDiagnostics({
       type,
       url: parsedUrl.url,
       statusCode,
-      snippet: result.error.responseSnippet200 || '',
+      snippet: error?.responseText || error?.responseSnippet200 || '',
       errorType,
       requestId,
-      urlHost: result.error.urlHost || parsedUrl.urlHost,
-      urlPath: result.error.urlPath || parsedUrl.urlPath,
-      method: result.error.method || method,
-      errorMessage: result.error.errorMessage || result.error.message || null,
-      errorName: result.error.errorName || null,
+      urlHost: error?.urlHost || parsedUrl.urlHost,
+      urlPath: error?.urlPath || parsedUrl.urlPath,
+      method,
+      errorMessage: error?.message || null,
+      errorName: error?.name || null,
     });
 
     markMarketDataFailure(statusCode);
-    lastHttpError = result.error;
-    const err = new Error(result.error.errorMessage || 'Market data request failed');
+    lastHttpError = error;
+    const err = new Error(error?.message || 'Market data request failed');
     err.errorCode = errorType === 'parse_error' ? 'PARSE_ERROR' : errorType === 'timeout' ? 'TIMEOUT' : errorType === 'network_error' ? 'NETWORK' : 'HTTP_ERROR';
     err.errorType = errorType;
-    err.attempts = attempt + 1;
     err.statusCode = statusCode;
-    err.responseSnippet200 = result.error.responseSnippet200 || '';
+    err.responseSnippet200 = error?.responseText || error?.responseSnippet200 || '';
     err.requestId = requestId;
-    err.urlHost = result.error.urlHost || parsedUrl.urlHost;
-    err.urlPath = result.error.urlPath || parsedUrl.urlPath;
+    err.urlHost = error?.urlHost || parsedUrl.urlHost;
+    err.urlPath = error?.urlPath || parsedUrl.urlPath;
     if (errorType === 'network_error' || errorType === 'timeout') {
-      logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: err.attempts });
+      logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: 1 });
     }
     throw err;
   }
-
-  throw lastError || new Error('Market data request failed');
 }
 
 async function requestMarketDataJson({ type, url, symbol }) {
@@ -2620,7 +2542,7 @@ function getBarsFetchRange({ timeframe, limit }) {
   }
   const now = Date.now();
   const tfMinutes = timeframe === '15Min' ? 15 : timeframe === '5Min' ? 5 : 1;
-  const bufferFactor = 1.1;
+  const bufferFactor = 1.2;
   const lookbackMinutes = Math.ceil(Math.max(1, Number(limit) || 1) * tfMinutes * bufferFactor);
   const startMs = now - (lookbackMinutes * 60 * 1000);
   return {
@@ -8672,7 +8594,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   }
 
   lastBarsPrefetchMs = nowMs;
-  const chunkSize = Math.max(5, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 50));
+  const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
   const chunks = chunkArray(symbols, chunkSize);
   const bars1mBySymbol = new Map();
   const bars5mBySymbol = new Map();
@@ -8909,6 +8831,8 @@ async function runEntryScanOnce() {
     if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
       prefetchedBars = prefetchResult.prefetchedBars;
     }
+
+    const fallbackBudgetState = { remaining: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN };
 
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
@@ -9192,7 +9116,7 @@ function startEntryManager() {
       try {
         await loadSupportedCryptoPairs();
         const universe = Array.from(supportedCryptoPairsState.pairs || []);
-        await prefetchBarsForUniverse(universe);
+        await prefetchEntryScanMarketData(universe, { force: true });
       } catch (err) {
         console.warn('predictor_warmup_prefetch_failed', {
           error: normalizeBarsDebugError(err),
