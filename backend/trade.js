@@ -1816,6 +1816,66 @@ const positionsSnapshot = {
   loggedNoneSymbols: new Set(),
   pending: null,
 };
+let positionsSnapshotLogged = false;
+
+function updatePositionsSnapshot(positionsList) {
+  const nowMs = Date.now();
+  const list = Array.isArray(positionsList) ? positionsList : [];
+  const mapBySymbol = new Map();
+  const mapByRaw = new Map();
+  const mapByNormalized = new Map();
+
+  for (const pos of list) {
+    if (!pos || typeof pos !== 'object') {
+      continue;
+    }
+    const rawSymbol = String(pos.rawSymbol ?? pos.symbol ?? '');
+    const normalizedSymbol = normalizeSymbolInternal(rawSymbol || String(pos.symbol || ''));
+
+    if (rawSymbol) {
+      mapByRaw.set(rawSymbol, pos);
+    }
+    if (normalizedSymbol) {
+      mapBySymbol.set(normalizedSymbol, pos);
+      mapByNormalized.set(normalizedSymbol, pos);
+      positionsSnapshot.loggedNoneSymbols.delete(normalizedSymbol);
+    }
+  }
+
+  positionsSnapshot.tsMs = nowMs;
+  positionsSnapshot.mapBySymbol = mapBySymbol;
+  positionsSnapshot.mapByRaw = mapByRaw;
+  positionsSnapshot.mapByNormalized = mapByNormalized;
+
+  if (!positionsSnapshotLogged) {
+    positionsSnapshotLogged = true;
+    console.log('positions_snapshot_updated', { count: list.length, tsMs: nowMs });
+  }
+}
+
+async function fetchPositionsSnapshot() {
+  await fetchPositions();
+  return positionsSnapshot;
+}
+
+function logPositionNoneOnce(symbol, statusCode) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized || positionsSnapshot.loggedNoneSymbols.has(normalized)) {
+    return;
+  }
+  positionsSnapshot.loggedNoneSymbols.add(normalized);
+  console.warn('position_lookup_none', { symbol: normalized, statusCode });
+}
+
+function logPositionError({ symbol, statusCode, snippet, level = 'error', extra = null }) {
+  const logger = level === 'warn' ? console.warn : console.error;
+  logger('position_lookup_failed', {
+    symbol: normalizeSymbolInternal(symbol),
+    statusCode: Number.isFinite(statusCode) ? statusCode : null,
+    snippet: snippet || null,
+    ...(extra && typeof extra === 'object' ? extra : {}),
+  });
+}
 const openOrdersCache = {
   tsMs: 0,
   data: null,
