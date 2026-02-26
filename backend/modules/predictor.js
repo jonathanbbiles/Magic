@@ -25,12 +25,13 @@ function shouldEmitWarmupDebugLog(symbol, timeframe) {
   return true;
 }
 
-function logBarsDebug({ symbol, timeframe, start, end, limit, provider, responseCount, status, error }) {
-  const tf = String(timeframe || '').toLowerCase();
-  if (!shouldEmitWarmupDebugLog(symbol, tf)) return;
+function logBarsDebug({ symbol, timeframeInternal, timeframeRequested, start, end, limit, provider, responseCount, status, error, urlPath }) {
+  const keyTf = String(timeframeRequested || timeframeInternal || '').toLowerCase();
+  if (!shouldEmitWarmupDebugLog(symbol, keyTf)) return;
   console.warn('predictor_bars_debug', {
     symbol: symbol || null,
-    timeframe: tf || null,
+    timeframeInternal: timeframeInternal || null,
+    timeframeRequested: timeframeRequested || null,
     provider: provider || null,
     start: start || null,
     end: end || null,
@@ -38,6 +39,7 @@ function logBarsDebug({ symbol, timeframe, start, end, limit, provider, response
     responseCount: Number.isFinite(Number(responseCount)) ? Number(responseCount) : null,
     status: status || null,
     error: error || null,
+    urlPath: urlPath || null,
   });
 }
 

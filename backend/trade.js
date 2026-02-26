@@ -2675,18 +2675,28 @@ function getBarsWarmupThresholds() {
   };
 }
 
+function toAlpacaTimeframe(tf) {
+  const s = String(tf || '').trim();
+  const lower = s.toLowerCase();
+  if (lower === '1m' || lower === '1min') return '1Min';
+  if (lower === '5m' || lower === '5min') return '5Min';
+  if (lower === '15m' || lower === '15min') return '15Min';
+  if (/^\d{1,2}(Min|T)$/.test(s)) return s;
+  throw new Error(`Invalid timeframe for Alpaca bars: ${s}`);
+}
+
 function getBarsFetchRange({ timeframe, limit }) {
   if (!ALPACA_BARS_USE_TIME_RANGE) {
     return { start: null, end: null };
   }
-  const now = Date.now();
-  const tfMinutes = timeframe === '15Min' ? 15 : timeframe === '5Min' ? 5 : 1;
-  const bufferFactor = 1.2;
-  const lookbackMinutes = Math.ceil(Math.max(1, Number(limit) || 1) * tfMinutes * bufferFactor);
-  const startMs = now - (lookbackMinutes * 60 * 1000);
+  const tf = toAlpacaTimeframe(timeframe);
+  const tfMinutes = tf.endsWith('Min') ? parseInt(tf, 10) : (tf.endsWith('T') ? parseInt(tf, 10) : 1);
+  const now = new Date();
+  const backMinutes = Math.ceil(Math.max(1, Number(limit) || 200) * Math.max(1, tfMinutes) * 1.25);
+  const start = new Date(now.getTime() - backMinutes * 60_000);
   return {
-    start: new Date(startMs).toISOString(),
-    end: new Date(now).toISOString(),
+    start: start.toISOString(),
+    end: now.toISOString(),
   };
 }
 
@@ -2705,10 +2715,11 @@ function normalizeBarsDebugError(errorLike) {
   return errorLike?.errorMessage || errorLike?.message || String(errorLike);
 }
 
-function logPredictorBarsDebug({ symbol, timeframe, provider, start, end, limit, responseCount, status, error }) {
+function logPredictorBarsDebug({ symbol, timeframeInternal, timeframeRequested, provider, start, end, limit, responseCount, status, error, urlPath }) {
   logBarsDebug({
     symbol,
-    timeframe,
+    timeframeInternal,
+    timeframeRequested,
     provider,
     start,
     end,
@@ -2716,13 +2727,17 @@ function logPredictorBarsDebug({ symbol, timeframe, provider, start, end, limit,
     responseCount,
     status,
     error: normalizeBarsDebugError(error),
+    urlPath,
   });
 }
 
 async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca', start, end }) {
-  const timeRange = (!start && !end) ? getBarsFetchRange({ timeframe, limit }) : { start: start || null, end: end || null };
+  let timeframeRequested = null;
+  let timeRange = { start: start || null, end: end || null };
   try {
-    const resp = await fetchCryptoBars({ symbols: [symbol], limit, timeframe, start: timeRange.start, end: timeRange.end });
+    timeframeRequested = toAlpacaTimeframe(timeframe);
+    timeRange = (!start && !end) ? getBarsFetchRange({ timeframe: timeframeRequested, limit }) : timeRange;
+    const resp = await fetchCryptoBars({ symbols: [symbol], limit, timeframe: timeframeRequested, start: timeRange.start, end: timeRange.end });
     const normalizedSymbol = normalizeSymbol(symbol);
     const dataSymbol = toDataSymbol(normalizedSymbol);
     const series =
@@ -2735,7 +2750,8 @@ async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca
     const count = Array.isArray(series) ? series.length : 0;
     logPredictorBarsDebug({
       symbol,
-      timeframe,
+      timeframeInternal: timeframe,
+      timeframeRequested,
       provider,
       start: timeRange.start,
       end: timeRange.end,
@@ -2743,12 +2759,23 @@ async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca
       responseCount: count,
       status: 'ok',
       error: null,
+      urlPath: resp?.__requestMeta?.urlPath || null,
     });
+    if (count === 0 && (normalizedSymbol === 'BTC/USD' || normalizedSymbol === 'ETH/USD')) {
+      console.warn('bars_empty_warning', {
+        symbol: normalizedSymbol,
+        timeframeRequested,
+        start: timeRange.start,
+        end: timeRange.end,
+        limit: Number.isFinite(Number(limit)) ? Number(limit) : null,
+      });
+    }
     return { ok: true, response: resp, responseCount: count };
   } catch (error) {
     logPredictorBarsDebug({
       symbol,
-      timeframe,
+      timeframeInternal: timeframe,
+      timeframeRequested,
       provider,
       start: timeRange.start,
       end: timeRange.end,
@@ -5033,12 +5060,14 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
 
 async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min', start, end }) {
   const dataSymbols = symbols.map((s) => toDataSymbol(s));
-  const params = { symbols: dataSymbols.join(','), limit: String(limit), timeframe };
-  if (start) {
-    params.start = start;
+  const timeframeRequested = toAlpacaTimeframe(timeframe);
+  const resolvedRange = (!start && !end) ? getBarsFetchRange({ timeframe: timeframeRequested, limit }) : { start: start || null, end: end || null };
+  const params = { symbols: dataSymbols.join(','), limit: String(limit), timeframe: timeframeRequested };
+  if (resolvedRange.start) {
+    params.start = resolvedRange.start;
   }
-  if (end) {
-    params.end = end;
+  if (resolvedRange.end) {
+    params.end = resolvedRange.end;
   }
   const url = buildAlpacaUrl({
     baseUrl: CRYPTO_DATA_URL,
@@ -5046,7 +5075,16 @@ async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe 
     params,
     label: 'crypto_bars_batch',
   });
-  return requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') });
+  const data = await requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') });
+  if (data && typeof data === 'object') {
+    data.__requestMeta = {
+      timeframeRequested,
+      start: resolvedRange.start,
+      end: resolvedRange.end,
+      urlPath: parseUrlMetadata(url)?.urlPath || null,
+    };
+  }
+  return data;
 }
 
 async function fetchStockQuotes({ symbols }) {
