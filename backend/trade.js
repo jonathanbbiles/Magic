@@ -34,7 +34,7 @@ const { planTwap, computeNextLimitPrice } = require('./modules/twap');
 const quoteRouter = require('./modules/quotes');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
-const { alpacaLimiter, quoteLimiter, barsLimiter } = require('./limiters');
+const { quoteLimiter } = require('./limiters');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -277,6 +277,14 @@ const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS'
 const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', true);
 const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS', 60000);
 const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 4));
+const BARS_PREFETCH_INTERVAL_MS = readNumber('BARS_PREFETCH_INTERVAL_MS', 60000);
+const ALLOW_PER_SYMBOL_BARS_FALLBACK = readEnvFlag('ALLOW_PER_SYMBOL_BARS_FALLBACK', false);
+const PER_SCAN_BARS_FALLBACK_BUDGET = Math.max(0, readNumber('PER_SCAN_BARS_FALLBACK_BUDGET', 2));
+const ALPACA_BARS_USE_TIME_RANGE = readEnvFlag('ALPACA_BARS_USE_TIME_RANGE', true);
+const ALPACA_MD_MAX_CONCURRENCY = Math.max(1, readNumber('ALPACA_MD_MAX_CONCURRENCY', 2));
+const ALPACA_MD_MIN_DELAY_MS = Math.max(0, readNumber('ALPACA_MD_MIN_DELAY_MS', 200));
+const ALPACA_MD_MAX_RETRIES = Math.max(0, readNumber('ALPACA_MD_MAX_RETRIES', 6));
+const ALPACA_MD_BASE_BACKOFF_MS = Math.max(1, readNumber('ALPACA_MD_BASE_BACKOFF_MS', 500));
 
 // 1) Time-of-day conditioning
 const TIME_OF_DAY_ENABLED = readFlag('TIME_OF_DAY_ENABLED', false);
@@ -1055,48 +1063,17 @@ async function computeEntrySignal(symbol, opts = {}) {
     bars5mBySymbol instanceof Map &&
     bars15mBySymbol instanceof Map;
 
-  // Only use prefetched bars if they are actually present for THIS symbol.
-  // If not, fall back to per-symbol fetch (prevents mass predictor_error: insufficient_bars_*).
   const prefSeries1m = hasPrefetchedBarsMaps ? bars1mBySymbol.get(asset.symbol) : null;
   const prefSeries5m = hasPrefetchedBarsMaps ? bars5mBySymbol.get(asset.symbol) : null;
   const prefSeries15m = hasPrefetchedBarsMaps ? bars15mBySymbol.get(asset.symbol) : null;
 
-  const canUsePrefetchedBarsForSymbol =
-    Array.isArray(prefSeries1m) && prefSeries1m.length > 0 &&
-    Array.isArray(prefSeries5m) && prefSeries5m.length > 0 &&
-    Array.isArray(prefSeries15m) && prefSeries15m.length > 0;
+  const normalizedPrefSeries1m = Array.isArray(prefSeries1m) ? prefSeries1m : [];
+  const normalizedPrefSeries5m = Array.isArray(prefSeries5m) ? prefSeries5m : [];
+  const normalizedPrefSeries15m = Array.isArray(prefSeries15m) ? prefSeries15m : [];
 
-  if (canUsePrefetchedBarsForSymbol) {
-    bars1m = { bars: { [asset.symbol]: prefSeries1m } };
-    bars5m = { bars: { [asset.symbol]: prefSeries5m } };
-    bars15m = { bars: { [asset.symbol]: prefSeries15m } };
-  } else {
-    const warmupThresholds = getBarsWarmupThresholds();
-    const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: Math.max(60, warmupThresholds['1m']) }),
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: Math.max(60, warmupThresholds['5m']) }),
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: Math.max(60, warmupThresholds['15m']) }),
-    ]);
-    if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
-      const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
-      console.warn('predictor_error', {
-        symbol: asset.symbol,
-        reason: 'bars_fetch_failed',
-        errorName: err?.name || null,
-        errorMessage: err?.message || String(err),
-        stack: String(err?.stack || '').slice(0, 600),
-      });
-      return {
-        entryReady: false,
-        why: 'predictor_error',
-        meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
-        record: baseRecord,
-      };
-    }
-    bars1m = bars1mResult.response;
-    bars5m = bars5mResult.response;
-    bars15m = bars15mResult.response;
-  }
+  bars1m = { bars: { [asset.symbol]: normalizedPrefSeries1m } };
+  bars5m = { bars: { [asset.symbol]: normalizedPrefSeries5m } };
+  bars15m = { bars: { [asset.symbol]: normalizedPrefSeries15m } };
 
   const barKey = normalizeSymbol(asset.symbol);
   const barSeries1m =
@@ -1195,6 +1172,56 @@ async function computeEntrySignal(symbol, opts = {}) {
         record: baseRecord,
       };
     }
+  }
+
+  if (warmupGate.missing.length) {
+    const fallbackBudget = Number.isFinite(opts?.fallbackBudgetState?.remaining) ? opts.fallbackBudgetState.remaining : 0;
+    const canFallback = ALLOW_PER_SYMBOL_BARS_FALLBACK && fallbackBudget > 0;
+    if (!canFallback) {
+      return {
+        entryReady: false,
+        why: 'predictor_warmup',
+        meta: {
+          symbol: asset.symbol,
+          reason: 'predictor_warmup',
+          blockTrades: warmupGate.blockTrades,
+          lengths: warmupGate.lengths,
+          thresholds: warmupGate.thresholds,
+          missing: warmupGate.missing,
+          fallbackAllowed: ALLOW_PER_SYMBOL_BARS_FALLBACK,
+          fallbackBudget,
+        },
+        record: baseRecord,
+      };
+    }
+
+    const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: warmupGate.thresholds['1m'] }),
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: warmupGate.thresholds['5m'] }),
+      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: warmupGate.thresholds['15m'] }),
+    ]);
+    if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
+      const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
+      console.warn('predictor_error', {
+        symbol: asset.symbol,
+        reason: 'bars_fetch_failed',
+        errorName: err?.name || null,
+        errorMessage: err?.message || String(err),
+        stack: String(err?.stack || '').slice(0, 600),
+      });
+      return {
+        entryReady: false,
+        why: 'predictor_error',
+        meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
+        record: baseRecord,
+      };
+    }
+    if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
+      opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
+    }
+    bars1m = bars1mResult.response;
+    bars5m = bars5mResult.response;
+    bars15m = bars15mResult.response;
   }
 
   let predictorStretch;
@@ -1817,6 +1844,16 @@ const marketDataState = {
   cooldownUntil: 0,
   cooldownLoggedAt: 0,
 };
+let lastBarsPrefetchMs = 0;
+let lastPrefetchedBars = {
+  bars1mBySymbol: new Map(),
+  bars5mBySymbol: new Map(),
+  bars15mBySymbol: new Map(),
+};
+let predictorWarmupCompletedLogged = false;
+let alpacaMdActiveRequests = 0;
+let alpacaMdLastRequestAt = 0;
+const alpacaMdPendingQueue = [];
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
 let equityPeak = null;
@@ -2140,9 +2177,52 @@ function normalizeMarketDataErrorType(error) {
   return 'http_error';
 }
 
-async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', timeoutMs = MARKET_DATA_TIMEOUT_MS, retries = MARKET_DATA_RETRIES }) {
+function readRateLimitHeaders(rateLimit = {}, headers = {}) {
+  return {
+    limit: rateLimit?.limit || headers?.limit || headers?.['x-ratelimit-limit'] || headers?.['x-ratelimit-requests-limit'] || null,
+    remaining: rateLimit?.remaining || headers?.remaining || headers?.['x-ratelimit-remaining'] || headers?.['x-ratelimit-requests-remaining'] || null,
+    reset: rateLimit?.reset || headers?.reset || headers?.['x-ratelimit-reset'] || headers?.['x-ratelimit-requests-reset'] || null,
+  };
+}
+
+function scheduleAlpacaMarketDataRequest(task) {
+  return new Promise((resolve, reject) => {
+    alpacaMdPendingQueue.push({ task, resolve, reject });
+    drainAlpacaMarketDataQueue();
+  });
+}
+
+function drainAlpacaMarketDataQueue() {
+  if (alpacaMdActiveRequests >= ALPACA_MD_MAX_CONCURRENCY) return;
+  const next = alpacaMdPendingQueue.shift();
+  if (!next) return;
+  const sinceLastMs = Date.now() - alpacaMdLastRequestAt;
+  const waitMs = Math.max(0, ALPACA_MD_MIN_DELAY_MS - sinceLastMs);
+  alpacaMdActiveRequests += 1;
+  setTimeout(async () => {
+    try {
+      alpacaMdLastRequestAt = Date.now();
+      const result = await next.task();
+      next.resolve(result);
+    } catch (err) {
+      next.reject(err);
+    } finally {
+      alpacaMdActiveRequests = Math.max(0, alpacaMdActiveRequests - 1);
+      setTimeout(drainAlpacaMarketDataQueue, 0);
+    }
+  }, waitMs);
+}
+
+function getRetryDelayMs(attempt) {
+  const base = ALPACA_MD_BASE_BACKOFF_MS;
+  const jitter = Math.floor(Math.random() * base);
+  return base * (2 ** attempt) + jitter;
+}
+
+async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', timeoutMs = MARKET_DATA_TIMEOUT_MS }) {
   const label = getMarketDataLabel(type);
   const parsedUrl = parseUrlMetadata(url);
+  const endpoint = parsedUrl.urlPath || parsedUrl.url;
   const localRequestId = randomUUID();
 
   if (DEBUG_ALPACA_HTTP) {
@@ -2186,29 +2266,76 @@ async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', time
     throw err;
   }
 
-  const limiter = type === 'BARS' ? barsLimiter : alpacaLimiter;
-
-  const result = await limiter.schedule(async () => {
-    return await httpJson({
+  let lastError = null;
+  for (let attempt = 0; attempt <= ALPACA_MD_MAX_RETRIES; attempt += 1) {
+    const result = await scheduleAlpacaMarketDataRequest(() => httpJson({
       method,
       url: parsedUrl.url,
       headers: alpacaHeaders(),
       timeoutMs,
-      retries,
-    });
-  });
+      retries: 0,
+    }));
 
-  if (result.error) {
-    const errorType = normalizeMarketDataErrorType(result.error);
-    const normalizedRequestId = result.error.requestId || localRequestId;
+    if (!result.error) {
+      markMarketDataSuccess();
+      if (DEBUG_ALPACA_HTTP_OK) {
+        console.log('alpaca_marketdata', {
+          phase: 'ok',
+          label,
+          type,
+          method,
+          url: parsedUrl.url,
+          urlHost: parsedUrl.urlHost,
+          urlPath: parsedUrl.urlPath,
+          requestId: result.requestId || localRequestId,
+          statusCode: result.statusCode ?? 200,
+          errorType: 'ok',
+          errorMessage: null,
+          errorName: null,
+          snippet: result.responseSnippet200 || '',
+        });
+      }
+      return result.data;
+    }
+
     const statusCode = result.error.statusCode ?? null;
+    const errorType = normalizeMarketDataErrorType(result.error);
+    const requestId = result.error.requestId || localRequestId;
+    const rateLimitHeaders = readRateLimitHeaders(result.error.rateLimit, result.error.headers);
+    const retriable = statusCode === 429 || (Number.isFinite(statusCode) && statusCode >= 500) || errorType === 'timeout' || errorType === 'network_error';
+
+    if (statusCode === 429) {
+      const retryInMs = attempt < ALPACA_MD_MAX_RETRIES ? getRetryDelayMs(attempt) : null;
+      console.warn('marketdata_rate_limit', {
+        type,
+        limit: rateLimitHeaders.limit,
+        remaining: rateLimitHeaders.remaining,
+        reset: rateLimitHeaders.reset,
+        retryInMs,
+        endpoint,
+      });
+    }
+
+    if (attempt < ALPACA_MD_MAX_RETRIES && retriable) {
+      const retryInMs = getRetryDelayMs(attempt);
+      console.warn('marketdata_retry', {
+        endpoint,
+        attempt: attempt + 1,
+        retryInMs,
+        statusCode,
+      });
+      await sleep(retryInMs);
+      lastError = result.error;
+      continue;
+    }
+
     logMarketDataDiagnostics({
       type,
       url: parsedUrl.url,
       statusCode,
       snippet: result.error.responseSnippet200 || '',
       errorType,
-      requestId: normalizedRequestId,
+      requestId,
       urlHost: result.error.urlHost || parsedUrl.urlHost,
       urlPath: result.error.urlPath || parsedUrl.urlPath,
       method: result.error.method || method,
@@ -2221,423 +2348,19 @@ async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', time
     const err = new Error(result.error.errorMessage || 'Market data request failed');
     err.errorCode = errorType === 'parse_error' ? 'PARSE_ERROR' : errorType === 'timeout' ? 'TIMEOUT' : errorType === 'network_error' ? 'NETWORK' : 'HTTP_ERROR';
     err.errorType = errorType;
-    err.attempts = result.error.attempts ?? retries + 1;
+    err.attempts = attempt + 1;
     err.statusCode = statusCode;
     err.responseSnippet200 = result.error.responseSnippet200 || '';
-    err.requestId = normalizedRequestId;
+    err.requestId = requestId;
     err.urlHost = result.error.urlHost || parsedUrl.urlHost;
     err.urlPath = result.error.urlPath || parsedUrl.urlPath;
-    if (statusCode === 429 && result.error.rateLimit) {
-      console.warn('marketdata_rate_limit', {
-        type,
-        limit: result.error.rateLimit.limit,
-        remaining: result.error.rateLimit.remaining,
-        reset: result.error.rateLimit.reset,
-      });
-    }
     if (errorType === 'network_error' || errorType === 'timeout') {
       logNetworkError({ type: String(type || 'QUOTE').toLowerCase(), symbol, attempts: err.attempts });
     }
     throw err;
   }
 
-  const okRequestId = result.requestId || localRequestId;
-  logMarketDataDiagnostics({
-    type,
-    url: parsedUrl.url,
-    statusCode: result.statusCode ?? 200,
-    snippet: '',
-    errorType: 'ok',
-    requestId: okRequestId,
-    urlHost: result.urlHost || parsedUrl.urlHost,
-    urlPath: result.urlPath || parsedUrl.urlPath,
-    method,
-  });
-  markMarketDataSuccess();
-  return result.data;
-}
-
-function extractErrorCodeFromBody(body) {
-  if (!body) return null;
-  if (typeof body === 'object') {
-    const code = Number(body?.code ?? body?.error?.code);
-    return Number.isFinite(code) ? code : null;
-  }
-  if (typeof body !== 'string') return null;
-  try {
-    const parsed = JSON.parse(body);
-    const code = Number(parsed?.code ?? parsed?.error?.code);
-    return Number.isFinite(code) ? code : null;
-  } catch (err) {
-    return null;
-  }
-}
-
-function extractHttpErrorCode({ error, snippet }) {
-  const candidates = [
-    error?.response?.data,
-    error?.responseSnippet200,
-    error?.responseSnippet,
-    snippet,
-  ];
-  for (const candidate of candidates) {
-    const code = extractErrorCodeFromBody(candidate);
-    if (Number.isFinite(code)) return code;
-  }
-  return null;
-}
-
-function isInsufficientBalanceError({ statusCode, errorCode, message, snippet }) {
-  if (statusCode !== 403) return false;
-  if (errorCode === 40310000) return true;
-  const combined = `${message || ''} ${snippet || ''}`.toLowerCase();
-  return combined.includes('insufficient balance');
-}
-
-function clearExitTracking(symbol) {
-  const normalized = normalizePair(symbol);
-  exitState.delete(normalized);
-  desiredExitBpsBySymbol.delete(normalized);
-  lastActionAt.delete(normalized);
-  lastCancelReplaceAt.delete(normalized);
-  lastExitRefreshAt.delete(normalized);
-  lastOrderFetchAt.delete(normalized);
-  lastOrderSnapshotBySymbol.delete(normalized);
-  symbolLocks.delete(normalized);
-  insufficientBalanceExitCooldowns.delete(normalized);
-}
-
-function logMarketDataDiagnostics({
-  type,
-  url,
-  method,
-  statusCode,
-  snippet,
-  errorType,
-  requestId,
-  urlHost,
-  urlPath,
-  errorMessage,
-  errorName,
-}) {
-  const label = getMarketDataLabel(type);
-  const normalizedErrorType = String(errorType || '').trim().toLowerCase();
-  const isOk = normalizedErrorType === 'ok';
-  if (isOk && !(DEBUG_ALPACA_HTTP || DEBUG_ALPACA_HTTP_OK)) {
-    return;
-  }
-  console.log('alpaca_marketdata', {
-    label,
-    type,
-    method: method || null,
-    url,
-    urlHost: urlHost || null,
-    urlPath: urlPath || null,
-    requestId: requestId || null,
-    statusCode,
-    errorType,
-    errorMessage: errorMessage || null,
-    errorName: errorName || null,
-    snippet,
-  });
-}
-
-function logHttpError({ symbol, label, url, error }) {
-  const axiosStatus = error?.response?.status;
-  const statusCode = error?.statusCode ?? axiosStatus ?? null;
-  const axiosData = error?.response?.data;
-  const axiosSnippet =
-    typeof axiosData === 'string'
-      ? axiosData.slice(0, 200)
-      : axiosData
-        ? JSON.stringify(axiosData).slice(0, 200)
-        : '';
-  const errorMessage = error?.errorMessage || error?.message || `HTTP ${statusCode ?? 'NA'}`;
-  const snippet = error?.responseSnippet200 || error?.responseSnippet || axiosSnippet || '';
-  const method = error?.method || null;
-  const requestId = error?.requestId || null;
-  const urlHost = error?.urlHost || null;
-  const urlPath = error?.urlPath || null;
-  const errorType = error?.isNetworkError || error?.isTimeout ? 'network' : 'http';
-  const errorCode = extractHttpErrorCode({ error, snippet });
-  console.error('alpaca_http_error', {
-    symbol,
-    label,
-    method,
-    url: formatLogUrl(url),
-    urlHost,
-    urlPath,
-    requestId,
-    statusCode,
-    errorType,
-    errorMessage,
-    snippet,
-  });
-  const isInsufficientBalance = isInsufficientBalanceError({
-    statusCode,
-    errorCode,
-    message: errorMessage,
-    snippet,
-  });
-  if (statusCode === 401 || (statusCode === 403 && !isInsufficientBalance)) {
-    console.error('AUTH_ERROR: check Render env vars');
-  }
-}
-
-function logPositionNoneOnce(symbol, statusCode = 404) {
-  const normalized = normalizeSymbol(symbol);
-  if (positionsSnapshot.loggedNoneSymbols.has(normalized)) return;
-  positionsSnapshot.loggedNoneSymbols.add(normalized);
-  console.log('POS_NONE', { symbol: normalized, status: statusCode });
-}
-
-function logPositionError({ symbol, statusCode, snippet, level = 'error', extra = {} }) {
-  const normalized = normalizeSymbol(symbol);
-  const payload = {
-    symbol: normalized,
-    status: statusCode ?? null,
-    snippet: snippet || '',
-    ...extra,
-  };
-  if (level === 'warn') {
-    console.warn('POS_ERR', payload);
-  } else {
-    console.error('POS_ERR', payload);
-  }
-}
-
-function updatePositionsSnapshot(positions = []) {
-  const mapBySymbol = new Map();
-  const mapByRaw = new Map();
-  const mapByNormalized = new Map();
-  for (const pos of positions) {
-    const rawSymbol = pos.rawSymbol ?? pos.symbol;
-    const normalizedSymbol = normalizeSymbolInternal(rawSymbol);
-    const alpacaNormalized = normalizeSymbolForAlpaca(rawSymbol);
-    if (rawSymbol) {
-      mapByRaw.set(rawSymbol, pos);
-    }
-    if (normalizedSymbol) {
-      mapBySymbol.set(normalizedSymbol, pos);
-      mapByNormalized.set(normalizedSymbol, pos);
-    }
-    if (alpacaNormalized) {
-      mapByNormalized.set(alpacaNormalized, pos);
-    }
-  }
-  positionsSnapshot.mapBySymbol = mapBySymbol;
-  positionsSnapshot.mapByRaw = mapByRaw;
-  positionsSnapshot.mapByNormalized = mapByNormalized;
-  positionsSnapshot.tsMs = Date.now();
-  positionsSnapshot.loggedNoneSymbols.clear();
-}
-
-async function fetchPositionsSnapshot({ force = false } = {}) {
-  const nowMs = Date.now();
-  if (!force && positionsSnapshot.mapBySymbol.size > 0 && nowMs - positionsSnapshot.tsMs < POSITIONS_SNAPSHOT_TTL_MS) {
-    return positionsSnapshot;
-  }
-  if (positionsSnapshot.pending) {
-    return positionsSnapshot.pending;
-  }
-  positionsSnapshot.pending = (async () => {
-    const positions = await fetchPositions();
-    updatePositionsSnapshot(positions);
-    return positionsSnapshot;
-  })();
-  try {
-    return await positionsSnapshot.pending;
-  } finally {
-    positionsSnapshot.pending = null;
-  }
-}
-
-function logOrderPayload({ payload }) {
-  if (!payload) return;
-  const symbolRaw = payload.symbol ?? '';
-  const symbol = normalizePair(symbolRaw);
-  const qty = payload.qty ?? 'NA';
-  const limit = payload.limit_price ?? 'NA';
-  let notional = payload.notional ?? null;
-  if (!Number.isFinite(Number(notional)) && Number.isFinite(Number(qty)) && Number.isFinite(Number(limit))) {
-    notional = Number(qty) * Number(limit);
-  }
-  const notionalLogged = notional ?? 'NA';
-  console.log('order_submit', {
-    symbol_raw: symbolRaw,
-    symbol,
-    side: payload.side,
-    type: payload.type,
-    tif: payload.time_in_force,
-    qty,
-    notional: notionalLogged,
-    limit,
-  });
-}
-
-function logOrderIntent({ label, payload, reason }) {
-  if (!payload) return;
-  const symbolRaw = payload.symbol ?? '';
-  const symbol = normalizePair(symbolRaw);
-  console.log('order_intent', {
-    label: label || null,
-    symbol_raw: symbolRaw,
-    symbol,
-    side: payload.side,
-    type: payload.type,
-    tif: payload.time_in_force,
-    qty: payload.qty ?? payload.notional ?? 'NA',
-    limit: payload.limit_price ?? 'NA',
-    reason: reason || null,
-  });
-}
-
-function logOrderResponse({ payload, response, error }) {
-  const symbolRaw = payload?.symbol ?? '';
-  const symbol = normalizePair(symbolRaw);
-  if (response?.id) {
-    console.log('order_ok', {
-      id: response.id,
-      status: response.status || response.order_status || 'accepted',
-      symbol_raw: symbolRaw,
-      symbol,
-    });
-    return;
-  }
-  if (response) {
-    const body = JSON.stringify(response);
-    console.warn('order_fail', {
-      http: 'NA',
-      code: 'NA',
-      message: 'invalid_order_response',
-      body,
-      symbol_raw: symbolRaw,
-      symbol,
-    });
-    return;
-  }
-  if (error) {
-    const httpStatus = error?.statusCode ?? 'NA';
-    const code = error?.errorCode ?? 'NA';
-    const message = error?.errorMessage || error?.message || 'Unknown error';
-    const body = error?.responseSnippet200 || error?.responseSnippet || '';
-    console.warn('order_fail', {
-      http: httpStatus,
-      code,
-      message,
-      body,
-      symbol_raw: symbolRaw,
-      symbol,
-    });
-  }
-}
-
-async function placeOrderUnified({
-  symbol,
-  url,
-  payload,
-  label,
-  reason,
-  context,
-  intent,
-}) {
-  const resolvedIntent = String(
-    intent ||
-      (String(payload?.side || '').toLowerCase() === 'buy'
-        ? 'entry'
-        : (String(payload?.side || '').toLowerCase() === 'sell' ? 'exit' : ''))
-  ).toLowerCase();
-  const isEntry = resolvedIntent === 'entry';
-  const isExit = resolvedIntent === 'exit';
-  if (!TRADING_ENABLED) {
-    logTradingDisabledOnce();
-    return { skipped: true, reason: 'trading_disabled' };
-  }
-  if (isEntry && isTradingBlockedNow()) {
-    const remainingMs = Math.max(0, tradingBlockedUntilMs - Date.now());
-    logBrokerTradingDisabledOnce({ intent: 'entry', statusCode: null, errorCode: null });
-    return { skipped: true, reason: 'broker_trading_disabled', remainingMs, blockedUntilMs: tradingBlockedUntilMs };
-  }
-  logOrderIntent({ label, payload, reason });
-  logOrderPayload({ label, payload });
-  let response;
-  try {
-    response = await requestJson({
-      method: 'POST',
-      url,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-    logOrderResponse({ label, payload, response });
-  } catch (err) {
-    logHttpError({ symbol, label: 'orders', url, error: err });
-    logOrderResponse({ label, payload, error: err });
-    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
-    const errorCode = extractHttpErrorCode({ error: err, snippet: err?.responseSnippet200 || err?.responseSnippet });
-    const errorMessage = err?.errorMessage || err?.message || '';
-    const errorSnippet = err?.responseSnippet200 || err?.responseSnippet || '';
-    if (
-      String(payload?.side || '').toLowerCase() === 'sell' &&
-      isInsufficientBalanceError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })
-    ) {
-      const normalizedSymbol = normalizePair(symbol);
-      const untilMs = Date.now() + INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS;
-      insufficientBalanceExitCooldowns.set(normalizedSymbol, untilMs);
-      console.warn('insufficient_balance_exit_cooldown', {
-        symbol: normalizedSymbol,
-        statusCode,
-        errorCode,
-        cooldownMs: INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS,
-        cooldownUntilMs: untilMs,
-      });
-    }
-    if (isBrokerTradingDisabledError({ statusCode, errorCode, message: errorMessage, snippet: errorSnippet })) {
-      if (!isTradingBlockedNow()) {
-        startBrokerTradingDisabledCooldown();
-        console.error('TRADING_BLOCKED_SET_COOLDOWN', {
-          blockedUntilMs: tradingBlockedUntilMs,
-          blockedUntilIso: new Date(tradingBlockedUntilMs).toISOString(),
-          cooldownMs: BROKER_TRADING_DISABLED_BACKOFF_MS,
-        });
-      }
-      logBrokerTradingDisabledOnce({ intent: isExit ? 'exit' : 'entry', statusCode, errorCode });
-    }
-    if (isNetworkError(err)) {
-      logNetworkError({
-        type: 'order',
-        symbol,
-        attempts: err.attempts ?? 1,
-        context: context || label || null,
-      });
-    }
-    throw err;
-  }
-  return response;
-}
-
-async function requestJson({
-  method,
-  url,
-  headers,
-  body,
-  timeoutMs,
-  retries,
-}) {
-  const result = await httpJson({
-    method,
-    url,
-    headers,
-    body,
-    timeoutMs,
-    retries,
-  });
-
-  if (result.error) {
-    lastHttpError = result.error;
-    throw result.error;
-  }
-
-  return result.data;
+  throw lastError || new Error('Market data request failed');
 }
 
 async function requestMarketDataJson({ type, url, symbol }) {
@@ -2884,6 +2607,30 @@ function getBarsWarmupThresholds() {
   };
 }
 
+function getBarsFetchRange({ timeframe, limit }) {
+  if (!ALPACA_BARS_USE_TIME_RANGE) {
+    return { start: null, end: null };
+  }
+  const now = Date.now();
+  const tfMinutes = timeframe === '15Min' ? 15 : timeframe === '5Min' ? 5 : 1;
+  const bufferFactor = 1.1;
+  const lookbackMinutes = Math.ceil(Math.max(1, Number(limit) || 1) * tfMinutes * bufferFactor);
+  const startMs = now - (lookbackMinutes * 60 * 1000);
+  return {
+    start: new Date(startMs).toISOString(),
+    end: new Date(now).toISOString(),
+  };
+}
+
+function getWarmupBarLimits() {
+  const thresholds = getBarsWarmupThresholds();
+  return {
+    '1m': Math.max(60, thresholds['1m']),
+    '5m': Math.max(60, thresholds['5m']),
+    '15m': Math.max(60, thresholds['15m']),
+  };
+}
+
 function normalizeBarsDebugError(errorLike) {
   if (!errorLike) return null;
   if (typeof errorLike === 'string') return errorLike;
@@ -2905,8 +2652,9 @@ function logPredictorBarsDebug({ symbol, timeframe, provider, start, end, limit,
 }
 
 async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca', start, end }) {
+  const timeRange = (!start && !end) ? getBarsFetchRange({ timeframe, limit }) : { start: start || null, end: end || null };
   try {
-    const resp = await fetchCryptoBars({ symbols: [symbol], limit, timeframe, start, end });
+    const resp = await fetchCryptoBars({ symbols: [symbol], limit, timeframe, start: timeRange.start, end: timeRange.end });
     const normalizedSymbol = normalizeSymbol(symbol);
     const dataSymbol = toDataSymbol(normalizedSymbol);
     const series =
@@ -2917,14 +2665,25 @@ async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca
       resp?.bars?.[alpacaSymbol(normalizePair(dataSymbol))] ||
       [];
     const count = Array.isArray(series) ? series.length : 0;
+    logPredictorBarsDebug({
+      symbol,
+      timeframe,
+      provider,
+      start: timeRange.start,
+      end: timeRange.end,
+      limit,
+      responseCount: count,
+      status: 'ok',
+      error: null,
+    });
     return { ok: true, response: resp, responseCount: count };
   } catch (error) {
     logPredictorBarsDebug({
       symbol,
       timeframe,
       provider,
-      start,
-      end,
+      start: timeRange.start,
+      end: timeRange.end,
       limit,
       responseCount: 0,
       status: 'provider_error',
@@ -2937,42 +2696,7 @@ async function fetchBarsWithDebug({ symbol, timeframe, limit, provider = 'alpaca
 async function prefetchBarsForUniverse(universe) {
   const symbols = Array.isArray(universe) ? universe.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   if (!symbols.length) return;
-  const thresholds = getBarsWarmupThresholds();
-  const timeframes = [
-    { timeframe: '1Min', key: '1m', limit: Math.max(60, thresholds['1m']) },
-    { timeframe: '5Min', key: '5m', limit: Math.max(60, thresholds['5m']) },
-    { timeframe: '15Min', key: '15m', limit: Math.max(60, thresholds['15m']) },
-  ];
-  const queue = [...symbols];
-  const workers = new Array(Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, queue.length)).fill(null).map(async () => {
-    while (queue.length) {
-      const symbol = queue.shift();
-      if (!symbol) continue;
-      for (const tf of timeframes) {
-        const result = await fetchBarsWithDebug({ symbol, timeframe: tf.timeframe, limit: tf.limit });
-        if (!result.ok) {
-          console.warn('predictor_warmup_prefetch_failed', {
-            symbol,
-            timeframe: tf.key,
-            error: normalizeBarsDebugError(result.error),
-          });
-          continue;
-        }
-        if (result.responseCount < thresholds[tf.key]) {
-          logPredictorBarsDebug({
-            symbol,
-            timeframe: tf.key,
-            provider: 'alpaca',
-            limit: tf.limit,
-            responseCount: result.responseCount,
-            status: 'insufficient',
-            error: null,
-          });
-        }
-      }
-    }
-  });
-  await Promise.allSettled(workers);
+  await prefetchEntryScanMarketData(symbols, { force: true });
 }
 
 function computeNotionalForEntry({ portfolioValueUsd, baseNotionalUsd, volatilityBps, probability, minProbToEnter, consecutiveLosses: lossCount }) {
@@ -8923,33 +8647,44 @@ function buildBarsMapFromBatch(symbols, barsResp) {
   return barsBySymbol;
 }
 
-async function prefetchEntryScanMarketData(scanSymbols) {
+async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  const nowMs = Date.now();
+  if (!opts.force && nowMs - lastBarsPrefetchMs < BARS_PREFETCH_INTERVAL_MS) {
+    return {
+      ok: true,
+      skipped: 'interval_gate',
+      prefetchedBars: lastPrefetchedBars,
+    };
+  }
   if (symbols.length === 0) {
     return {
       ok: true,
-      prefetchedBars: {
-        bars1mBySymbol: new Map(),
-        bars5mBySymbol: new Map(),
-        bars15mBySymbol: new Map(),
-      },
+      prefetchedBars: lastPrefetchedBars,
     };
   }
 
-  const chunkSize = ENTRY_PREFETCH_CHUNK_SIZE;
+  lastBarsPrefetchMs = nowMs;
+  const chunkSize = Math.max(5, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 50));
   const chunks = chunkArray(symbols, chunkSize);
   const bars1mBySymbol = new Map();
   const bars5mBySymbol = new Map();
   const bars15mBySymbol = new Map();
+  const warmupLimits = getWarmupBarLimits();
+  const ranges = {
+    '1m': getBarsFetchRange({ timeframe: '1Min', limit: warmupLimits['1m'] }),
+    '5m': getBarsFetchRange({ timeframe: '5Min', limit: warmupLimits['5m'] }),
+    '15m': getBarsFetchRange({ timeframe: '15Min', limit: warmupLimits['15m'] }),
+  };
 
   for (const chunkSymbols of chunks) {
     try {
       const [quotesResp, orderbooksResp, bars1mResp, bars5mResp, bars15mResp] = await Promise.all([
         fetchCryptoQuotes({ symbols: chunkSymbols }),
         fetchCryptoOrderbooks({ symbols: chunkSymbols }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '1Min' }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '5Min' }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: 60, timeframe: '15Min' }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['1m'], timeframe: '1Min', start: ranges['1m'].start, end: ranges['1m'].end }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['5m'], timeframe: '5Min', start: ranges['5m'].start, end: ranges['5m'].end }),
+        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['15m'], timeframe: '15Min', start: ranges['15m'].start, end: ranges['15m'].end }),
       ]);
 
       warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
@@ -8973,13 +8708,15 @@ async function prefetchEntryScanMarketData(scanSymbols) {
     }
   }
 
+  lastPrefetchedBars = {
+    bars1mBySymbol,
+    bars5mBySymbol,
+    bars15mBySymbol,
+  };
+
   return {
     ok: true,
-    prefetchedBars: {
-      bars1mBySymbol,
-      bars5mBySymbol,
-      bars15mBySymbol,
-    },
+    prefetchedBars: lastPrefetchedBars,
   };
 }
 
@@ -9077,16 +8814,6 @@ async function runEntryScanOnce() {
       .filter((sym) => sym && !stableSymbols.has(sym));
     const universeSize = scanSymbols.length;
 
-    if (PREDICTOR_WARMUP_ENABLED && scanSymbols.length) {
-      setTimeout(() => {
-        prefetchBarsForUniverse(scanSymbols).catch((err) => {
-          console.warn('predictor_warmup_prefetch_failed', {
-            error: normalizeBarsDebugError(err),
-          });
-        });
-      }, 0);
-    }
-
     let positions = [];
     let openOrders = [];
     try {
@@ -9134,6 +8861,8 @@ async function runEntryScanOnce() {
         topSkipReasons: { max_concurrent_positions: 1 },
         universeSize,
         universeIsOverride,
+        warmupReadyCount,
+        warmupNotReadyCount,
         maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
         maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
         maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
@@ -9207,7 +8936,7 @@ async function runEntryScanOnce() {
         }
       }
 
-      const signal = await computeEntrySignal(symbol, { prefetchedBars });
+      const signal = await computeEntrySignal(symbol, { prefetchedBars, fallbackBudgetState });
       const recordBase = signal?.record ? { ...signal.record } : null;
       if (Number.isFinite(recordBase?.predictorProbability)) {
         candidateSignals.push({
@@ -9221,6 +8950,7 @@ async function runEntryScanOnce() {
       }
       if (!signal.entryReady) {
         skipped += 1;
+        if (signal.why === 'predictor_warmup') warmupNotReadyCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
         recordSkip(skipReason, symbol, signal.meta || null);
         if (recordBase) {
@@ -9234,6 +8964,7 @@ async function runEntryScanOnce() {
         continue;
       }
 
+      warmupReadyCount += 1;
       const riskGuard = await maybeUpdateRiskGuards();
       if (!riskGuard.ok || tradingHaltedReason || tradingHaltedByGuard) {
         skipped += 1;
@@ -9387,6 +9118,8 @@ async function runEntryScanOnce() {
       skipSamples: skipSamplesObj,
       universeSize,
       universeIsOverride,
+      warmupReadyCount,
+      warmupNotReadyCount,
       maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
       maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
       maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
@@ -9394,6 +9127,10 @@ async function runEntryScanOnce() {
       capEnabled,
       heldPositionsCount,
     });
+    if (PREDICTOR_WARMUP_ENABLED && !predictorWarmupCompletedLogged && warmupNotReadyCount === 0 && warmupReadyCount > 0) {
+      predictorWarmupCompletedLogged = true;
+      console.log('predictor_warmup_complete', { readySymbols: warmupReadyCount, universeSize });
+    }
   } finally {
     entryScanRunning = false;
   }
