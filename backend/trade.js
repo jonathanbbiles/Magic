@@ -486,6 +486,13 @@ function isBrokerTradingDisabledError({ statusCode, errorCode, message, snippet 
   return combined.includes('new orders are rejected') || combined.includes('trading is disabled');
 }
 
+function isInsufficientBalanceError({ statusCode, errorCode, message, snippet }) {
+  if (statusCode !== 403) return false;
+  if (errorCode === 40310000) return true;
+  const combined = `${message || ''} ${snippet || ''}`.toLowerCase();
+  return combined.includes('insufficient balance');
+}
+
 function startBrokerTradingDisabledCooldown() {
   tradingBlockedUntilMs = Date.now() + BROKER_TRADING_DISABLED_BACKOFF_MS;
   lastBrokerTradingDisabledLogMs = 0;
