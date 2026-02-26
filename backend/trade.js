@@ -488,6 +488,7 @@ const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
 const EXIT_REPAIR_INTERVAL_MS = readNumber('EXIT_REPAIR_INTERVAL_MS', 60000);
+const EXIT_RECONCILE_MISS_THRESHOLD = Math.max(1, Math.trunc(readNumber('EXIT_RECONCILE_MISS_THRESHOLD', 2)));
 const EXIT_REFRESH_ENABLED = readEnvFlag('EXIT_REFRESH_ENABLED', true);
 const EXIT_MAX_ORDER_AGE_MS = readNumber('EXIT_MAX_ORDER_AGE_MS', 120000);
 // Exit refresh behavior
@@ -1839,6 +1840,7 @@ const lastExitRefreshAt = new Map();
 const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
+const positionMissingCountBySymbol = new Map();
 const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
 const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
 const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
@@ -1868,6 +1870,38 @@ function getExitStateSnapshot() {
     snapshot[symbol] = entry;
   }
   return snapshot;
+}
+
+function clearExitTracking(symbol, meta = null) {
+  const s = String(symbol || '').trim();
+  if (!s) return;
+
+  const hadExit = exitState.has(s);
+  const before = {
+    hadExit,
+    hadDesiredExit: desiredExitBpsBySymbol.has(s),
+    hadEntrySpreadOverride: entrySpreadOverridesBySymbol.has(s),
+    hadLock: symbolLocks.has(s),
+    hadLastAction: lastActionAt.has(s),
+    hadLastExitRefresh: lastExitRefreshAt.has(s),
+    hadLastCancelReplace: lastCancelReplaceAt.has(s),
+    hadLastOrderFetch: lastOrderFetchAt.has(s),
+    hadLastOrderSnapshot: lastOrderSnapshotBySymbol.has(s),
+    hadPositionMissingCount: positionMissingCountBySymbol.has(s),
+  };
+
+  exitState.delete(s);
+  desiredExitBpsBySymbol.delete(s);
+  entrySpreadOverridesBySymbol.delete(s);
+  symbolLocks.delete(s);
+  lastActionAt.delete(s);
+  lastExitRefreshAt.delete(s);
+  lastCancelReplaceAt.delete(s);
+  lastOrderFetchAt.delete(s);
+  lastOrderSnapshotBySymbol.delete(s);
+  positionMissingCountBySymbol.delete(s);
+
+  console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
 }
 
 const cfeeCache = { ts: 0, items: [] };
@@ -6759,7 +6793,7 @@ async function manageExitStates() {
         stateQty: state?.qty ?? null,
         reason: 'not_in_broker_positions',
       });
-      clearExitTracking(normalizedSymbol);
+      clearExitTracking(normalizedSymbol, { reason: 'not_in_broker_positions' });
     }
     const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
 
@@ -7045,16 +7079,36 @@ async function manageExitStates() {
                 0,
             );
             if (!(Number.isFinite(refreshedQty) && refreshedQty > 0)) {
-              console.log('EXIT_STATE_RECONCILE_DROP', {
-                symbol,
-                stateQty: qtyNum,
-                reason: 'alpaca_position_missing_or_zero',
-              });
-              clearExitTracking(symbol);
+              const missingCount = (positionMissingCountBySymbol.get(symbol) || 0) + 1;
+              positionMissingCountBySymbol.set(symbol, missingCount);
+              if (missingCount >= EXIT_RECONCILE_MISS_THRESHOLD) {
+                console.log('EXIT_STATE_RECONCILE_DROP', {
+                  symbol,
+                  stateQty: qtyNum,
+                  reason: 'alpaca_position_missing_or_zero',
+                  missingCount,
+                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                });
+                clearExitTracking(symbol, {
+                  reason: 'alpaca_position_missing_or_zero',
+                  missingCount,
+                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                });
+              } else {
+                console.log('EXIT_STATE_RECONCILE_MISS', {
+                  symbol,
+                  stateQty: qtyNum,
+                  reason: 'alpaca_position_missing_or_zero',
+                  missingCount,
+                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                });
+              }
               continue;
             }
+            positionMissingCountBySymbol.delete(symbol);
             availableQtyOverride = refreshedQty;
           } else {
+            positionMissingCountBySymbol.delete(symbol);
             availableQtyOverride = availableQtyFromApi;
           }
         }
