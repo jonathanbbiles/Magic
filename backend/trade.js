@@ -2877,6 +2877,38 @@ function computeStopDistanceBps({ atr, price }) {
   return clamp(raw, STOPLOSS_MIN_DISTANCE_BPS, STOPLOSS_MAX_DISTANCE_BPS);
 }
 
+async function initializeAtrStopForState({ symbol, entryPrice, peakPrice }) {
+  const entryPriceNum = Number(entryPrice);
+  if (!Number.isFinite(entryPriceNum) || entryPriceNum <= 0) {
+    return null;
+  }
+  const barsResp = await fetchCryptoBars({ symbols: [symbol], limit: Math.max(30, STOPLOSS_ATR_PERIOD + 2), timeframe: '1Min' });
+  const key = Object.keys(barsResp?.bars || {})[0];
+  const candles = key ? barsResp.bars[key] : [];
+  const atr = computeATR(candles, STOPLOSS_ATR_PERIOD);
+  if (!Number.isFinite(atr) || atr <= 0) {
+    return null;
+  }
+  const stopDistanceBps = computeStopDistanceBps({ atr, price: entryPriceNum });
+  const stopPrice = Number.isFinite(stopDistanceBps)
+    ? entryPriceNum * (1 - stopDistanceBps / 10000)
+    : null;
+  const peakPriceNum = Number(peakPrice);
+  const peakPriceSinceEntry = Number.isFinite(peakPriceNum) && peakPriceNum > 0
+    ? peakPriceNum
+    : entryPriceNum;
+  return {
+    atr,
+    atrBpsAtEntry: atrToBps(atr, entryPriceNum),
+    stopDistanceBps,
+    stopPrice,
+    trailingStopPrice: TRAILING_STOP_ENABLED ? stopPrice : null,
+    peakPriceSinceEntry,
+    stopInitializedAt: Date.now(),
+    lastStopCheckAt: 0,
+  };
+}
+
 async function maybeUpdateRiskGuards() {
   const account = await getAccountInfo().catch(() => null);
   const portfolioValue = Number(account?.portfolioValue);
@@ -5958,38 +5990,35 @@ async function handleBuyFill({
 
   if (STOPS_ENABLED && STOPLOSS_ENABLED && STOPLOSS_MODE === 'atr') {
     try {
-      const barsResp = await fetchCryptoBars({ symbols: [symbol], limit: Math.max(30, STOPLOSS_ATR_PERIOD + 2), timeframe: '1Min' });
-      const key = Object.keys(barsResp?.bars || {})[0];
-      const candles = key ? barsResp.bars[key] : [];
-      const atr = computeATR(candles, STOPLOSS_ATR_PERIOD);
-      if (!Number.isFinite(atr) || atr <= 0) {
+      const stopState = await initializeAtrStopForState({
+        symbol,
+        entryPrice: entryPriceNum,
+        peakPrice: entryPriceNum,
+      });
+      if (!stopState) {
         console.warn('stoploss_unavailable', { symbol, reason: 'atr_unavailable' });
       } else {
-        const stopDistanceBps = computeStopDistanceBps({ atr, price: entryPriceNum });
-        const stopPrice = Number.isFinite(stopDistanceBps)
-          ? entryPriceNum * (1 - stopDistanceBps / 10000)
-          : null;
         const state = exitState.get(symbol) || {};
         exitState.set(symbol, {
           ...state,
-          atrAtEntry: atr,
-          atrBpsAtEntry: atrToBps(atr, entryPriceNum),
-          stopDistanceBps,
-          stopPrice,
-          trailingStopPrice: TRAILING_STOP_ENABLED ? stopPrice : null,
-          peakPriceSinceEntry: entryPriceNum,
-          stopInitializedAt: Date.now(),
-          lastStopCheckAt: 0,
+          atrAtEntry: stopState.atr,
+          atrBpsAtEntry: stopState.atrBpsAtEntry,
+          stopDistanceBps: stopState.stopDistanceBps,
+          stopPrice: stopState.stopPrice,
+          trailingStopPrice: stopState.trailingStopPrice,
+          peakPriceSinceEntry: stopState.peakPriceSinceEntry,
+          stopInitializedAt: stopState.stopInitializedAt,
+          lastStopCheckAt: stopState.lastStopCheckAt,
         });
         const tradeId = tradeForensics.getLatestTradeIdForSymbol(symbol);
         if (tradeId) {
           tradeForensics.update(tradeId, {
             stop: {
-              atr,
-              atrBps: atrToBps(atr, entryPriceNum),
-              stopPrice,
-              trailingStopPrice: TRAILING_STOP_ENABLED ? stopPrice : null,
-              stopDistanceBps,
+              atr: stopState.atr,
+              atrBps: stopState.atrBpsAtEntry,
+              stopPrice: stopState.stopPrice,
+              trailingStopPrice: stopState.trailingStopPrice,
+              stopDistanceBps: stopState.stopDistanceBps,
               triggeredAt: null,
               type: null,
             },
@@ -6368,43 +6397,14 @@ async function repairOrphanExits() {
     }
 
     if (hasOpenSell && !hasTrackedExit) {
-      let sellOrder = null;
-      try {
-        sellOrder = await submitLimitSell({
-          symbol,
-          qty,
-          limitPrice: targetPrice,
-          reason: 'exit_repair_orphan',
-          intentRef: getOrderIntentBucket(),
-          openOrders: expandedOrders,
-          postOnly: true,
-        });
-      } catch (err) {
-        failed += 1;
-        decision = 'FAILED:exit_repair_submit_sell';
-        console.warn('exit_repair_submit_sell_failed', { symbol, error: err?.message || err });
-        logExitRepairDecision({
-          symbol,
-          qty,
-          avgEntryPrice,
-          entryBasisType,
-          entryBasisValue,
-          costBasis,
-          bid,
-          ask,
-          targetPrice,
-          timeInForce,
-          orderType,
-          hasOpenSell,
-          gates: gateFlags,
-          decision,
-        });
-        continue;
-      }
-      if (sellOrder?.skipped) {
-        decision = `SKIP:${sellOrder.reason || 'exit_repair_sell_skipped'}`;
+      const openSellCandidates = openSellOrders.filter((order) => {
+        const orderQty = resolveOrderQty(order);
+        return Number.isFinite(orderQty) && orderQty > 0 && orderHasValidLimit(order);
+      });
+      if (!openSellCandidates.length) {
+        decision = 'SKIP:open_sell_unusable';
         skipped += 1;
-        exitsSkippedReasons.set('exit_repair_sell_skipped', (exitsSkippedReasons.get('exit_repair_sell_skipped') || 0) + 1);
+        exitsSkippedReasons.set('open_sell_unusable', (exitsSkippedReasons.get('open_sell_unusable') || 0) + 1);
         logExitRepairDecision({
           symbol,
           qty,
@@ -6423,83 +6423,133 @@ async function repairOrphanExits() {
         });
         continue;
       }
-      const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
-      if (sellOrderId) {
-        const now = Date.now();
-        const rawSubmittedAt =
-          sellOrder?.submittedAt ||
-          sellOrder?.submitted_at ||
-          sellOrder?.created_at ||
-          sellOrder?.createdAt ||
-          null;
-        const parsedSubmittedAt =
-          typeof rawSubmittedAt === 'number' ? rawSubmittedAt : rawSubmittedAt ? Date.parse(rawSubmittedAt) : null;
-        const sellOrderSubmittedAt = Number.isFinite(parsedSubmittedAt) ? parsedSubmittedAt : now;
-        const returnedLimit =
-          Number.isFinite(Number(sellOrder?.limitPrice))
-            ? Number(sellOrder.limitPrice)
-            : normalizeOrderLimitPrice(sellOrder);
-        const sellOrderLimit = Number.isFinite(returnedLimit) ? returnedLimit : targetPrice;
-        exitState.set(symbol, {
-          symbol,
-          qty,
-          entryPrice: entryBasisValue,
-          effectiveEntryPrice: entryBasisValue,
-          entryTime: now,
-          notionalUsd,
-          minNetProfitBps,
-          targetPrice,
-          feeBpsRoundTrip,
-          profitBufferBps,
-          desiredNetExitBps,
-          slippageBpsUsed: slippageBps,
-          spreadBufferBps,
-          entryFeeBps,
-          exitFeeBps,
-          requiredExitBps,
-          netAfterFeesBps,
-          sellOrderId,
-          sellOrderSubmittedAt,
-          sellOrderLimit,
-          takerAttempted: false,
-          entryOrderId: null,
-        });
-        desiredExitBpsBySymbol.delete(symbol);
-        if (sellOrder?.adopted) {
-          adopted += 1;
-          decision = 'ADOPT_EXIT';
-          console.warn('exit_repair_adopted_sell', {
-            symbol,
-            orderId: sellOrderId,
-            adoptedLimit: sellOrderLimit,
-            adoptedSubmittedAt: sellOrderSubmittedAt,
-          });
-        } else {
-          placed += 1;
-          decision = 'PLACED:exit_repair_submit_sell';
+
+      const bestOrder = openSellCandidates.reduce((best, candidate) => {
+        const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
+        const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
+        const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
+        const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
+        const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
+        const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
+        return safeCandidateTs > safeBestTs ? candidate : best;
+      }, openSellCandidates[0]);
+
+      const adoptedOrderId = bestOrder?.id || bestOrder?.order_id || null;
+      const adoptedLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
+      const adoptedQty = resolveOrderQty(bestOrder);
+      const adoptedSubmittedAtRaw =
+        bestOrder?.submitted_at ||
+        bestOrder?.submittedAt ||
+        bestOrder?.created_at ||
+        bestOrder?.createdAt ||
+        null;
+      const adoptedSubmittedAtParsed =
+        typeof adoptedSubmittedAtRaw === 'number'
+          ? adoptedSubmittedAtRaw
+          : adoptedSubmittedAtRaw
+            ? Date.parse(adoptedSubmittedAtRaw)
+            : null;
+      const adoptedSubmittedAt = Number.isFinite(adoptedSubmittedAtParsed) ? adoptedSubmittedAtParsed : Date.now();
+      const now = Date.now();
+      const trackedState = exitState.get(symbol) || {};
+      const entrySpreadBpsUsed = Number.isFinite(Number(trackedState.entrySpreadBpsUsed))
+        ? Number(trackedState.entrySpreadBpsUsed)
+        : 0;
+
+      exitState.set(symbol, {
+        ...trackedState,
+        symbol,
+        qty,
+        entryPrice: entryBasisValue,
+        effectiveEntryPrice: entryBasisValue,
+        entryBasisType,
+        entryTime: Number.isFinite(Number(trackedState.entryTime)) ? Number(trackedState.entryTime) : now,
+        notionalUsd,
+        minNetProfitBps,
+        targetPrice,
+        feeBpsRoundTrip,
+        profitBufferBps,
+        desiredNetExitBps,
+        entrySpreadBpsUsed,
+        slippageBpsUsed: slippageBps,
+        spreadBufferBps,
+        entryFeeBps,
+        exitFeeBps,
+        requiredExitBps,
+        netAfterFeesBps,
+        sellOrderId: adoptedOrderId,
+        sellOrderSubmittedAt: adoptedSubmittedAt,
+        sellOrderLimit: Number.isFinite(adoptedLimit) ? adoptedLimit : targetPrice,
+        takerAttempted: false,
+        entryOrderId: trackedState.entryOrderId || null,
+      });
+      desiredExitBpsBySymbol.delete(symbol);
+      adopted += 1;
+      skipped += 1;
+      decision = 'ADOPT:open_sell_tracked';
+      exitsSkippedReasons.set('adopt_open_sell_tracked', (exitsSkippedReasons.get('adopt_open_sell_tracked') || 0) + 1);
+      console.log('exit_repair_adopt_open_sell', {
+        symbol,
+        adoptedOrderId,
+        adoptedLimit,
+        positionQty: qty,
+        orderQty: adoptedQty,
+      });
+
+      if (STOPS_ENABLED && STOPLOSS_ENABLED) {
+        const stateAfterAdoption = exitState.get(symbol) || {};
+        const currentStopPrice = Number(stateAfterAdoption.stopPrice);
+        if (!(Number.isFinite(currentStopPrice) && currentStopPrice > 0)) {
+          try {
+            const stopState = await initializeAtrStopForState({
+              symbol,
+              entryPrice: entryBasisValue,
+              peakPrice: Number.isFinite(bid) && bid > 0 ? bid : entryBasisValue,
+            });
+            if (stopState) {
+              exitState.set(symbol, {
+                ...stateAfterAdoption,
+                atrAtEntry: stopState.atr,
+                atrBpsAtEntry: stopState.atrBpsAtEntry,
+                stopDistanceBps: stopState.stopDistanceBps,
+                stopPrice: stopState.stopPrice,
+                trailingStopPrice: stopState.trailingStopPrice,
+                peakPriceSinceEntry: stopState.peakPriceSinceEntry,
+                stopInitializedAt: stopState.stopInitializedAt,
+                lastStopCheckAt: stopState.lastStopCheckAt,
+              });
+              console.log('exit_repair_stop_initialized', {
+                symbol,
+                stopPrice: stopState.stopPrice,
+                atr: stopState.atr,
+                stopDistanceBps: stopState.stopDistanceBps,
+              });
+            } else {
+              console.warn('exit_repair_stop_unavailable', { symbol, reason: 'atr_unavailable' });
+            }
+          } catch (err) {
+            console.warn('exit_repair_stop_unavailable', { symbol, error: err?.message || err });
+          }
         }
-        exitsSkippedReasons.set(
-          sellOrder?.adopted ? 'adopt_exit_repair' : 'placed_exit_repair',
-          (exitsSkippedReasons.get(sellOrder?.adopted ? 'adopt_exit_repair' : 'placed_exit_repair') || 0) + 1
-        );
-        logExitRepairDecision({
-          symbol,
-          qty,
-          avgEntryPrice,
-          entryBasisType,
-          entryBasisValue,
-          costBasis,
-          bid,
-          ask,
-          targetPrice,
-          timeInForce,
-          orderType,
-          hasOpenSell,
-          gates: gateFlags,
-          decision,
-        });
-        continue;
       }
+
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        entryBasisType,
+        entryBasisValue,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
     }
 
     if (!autoSellEnabled) {
@@ -11204,6 +11254,7 @@ module.exports = {
   getSupportedCryptoPairsSnapshot,
   filterSupportedCryptoSymbols,
   scanOrphanPositions,
+  repairOrphanExits,
 
   startEntryManager,
   startExitManager,
