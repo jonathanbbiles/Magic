@@ -352,6 +352,7 @@ const ENTRY_PREFETCH_CHUNK_SIZE =
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
+const PREDICTOR_DEBUG_VERBOSE = readEnvFlag('PREDICTOR_DEBUG_VERBOSE', false);
 const PREDICTOR_WARMUP_MIN_1M_BARS = readNumber('PREDICTOR_WARMUP_MIN_1M_BARS', 200);
 const PREDICTOR_WARMUP_MIN_5M_BARS = readNumber('PREDICTOR_WARMUP_MIN_5M_BARS', 200);
 const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS', 100);
@@ -539,6 +540,15 @@ const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QU
 const quoteTsDebugLogged = new Set();
 const quoteKeyMissingLogged = new Set();
 const cryptoQuoteTtlOverrideLogged = new Set();
+const EXPENSIVE_MD_CONCURRENCY = Math.max(1, Math.min(2, Math.trunc(readNumber('EXPENSIVE_MD_CONCURRENCY', 2))));
+let expensiveMdActive = 0;
+const expensiveMdQueue = [];
+const expensiveMdByKey = new Map();
+const marketDataRetryBackoffByKey = new Map();
+let marketDataPassId = 0;
+const quotePassCache = new Map();
+const orderbookPassCache = new Map();
+
 const HALT_ON_ORPHANS = readEnvFlag('HALT_ON_ORPHANS', false);
 const ORPHAN_AUTO_ATTACH_TP = readEnvFlag('ORPHAN_AUTO_ATTACH_TP', true);
 const ORPHAN_REPAIR_BEFORE_HALT = readEnvFlag('ORPHAN_REPAIR_BEFORE_HALT', true);
@@ -1862,6 +1872,7 @@ const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
 const positionMissingCountBySymbol = new Map();
 const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
+const exitStateFirstSeenAtBySymbol = new Map(); // symbol -> ms (bookkeeping fallback, not broker confirmation)
 const pendingExitAttachBySymbol = new Map(); // symbol -> { qty, entryOrderId, filledAtMs }
 const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
 const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
@@ -1911,6 +1922,7 @@ function clearExitTracking(symbol, meta = null) {
     hadLastOrderSnapshot: lastOrderSnapshotBySymbol.has(s),
     hadPositionMissingCount: positionMissingCountBySymbol.has(s),
     hadLastConfirmedPositionSeen: lastConfirmedPositionSeenAtBySymbol.has(s),
+    hadExitStateFirstSeen: exitStateFirstSeenAtBySymbol.has(s),
     hadPendingExitAttach: pendingExitAttachBySymbol.has(s),
   };
 
@@ -1925,6 +1937,7 @@ function clearExitTracking(symbol, meta = null) {
   lastOrderSnapshotBySymbol.delete(s);
   positionMissingCountBySymbol.delete(s);
   lastConfirmedPositionSeenAtBySymbol.delete(s);
+  exitStateFirstSeenAtBySymbol.delete(s);
   pendingExitAttachBySymbol.delete(s);
 
   console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
@@ -1942,6 +1955,25 @@ function getLastPositionConfirmedAt(symbol) {
   const normalized = normalizeSymbolInternal(symbol);
   if (!normalized) return 0;
   return Number(lastConfirmedPositionSeenAtBySymbol.get(normalized) || 0);
+}
+
+function ensureExitStateFirstSeen(symbol, tsMs = Date.now()) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return 0;
+  if (!exitStateFirstSeenAtBySymbol.has(normalized)) {
+    exitStateFirstSeenAtBySymbol.set(normalized, tsMs);
+  }
+  return Number(exitStateFirstSeenAtBySymbol.get(normalized) || 0);
+}
+
+function getExitStateReferenceMs(symbol, nowMs = Date.now()) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return null;
+  const confirmedAt = getLastPositionConfirmedAt(normalized);
+  if (confirmedAt > 0) return Math.max(0, nowMs - confirmedAt);
+  const firstSeenAt = ensureExitStateFirstSeen(normalized, nowMs);
+  if (firstSeenAt > 0) return Math.max(0, nowMs - firstSeenAt);
+  return null;
 }
 
 function markPendingExitAttach(symbol, payload = {}) {
@@ -2688,6 +2720,46 @@ function formatLoggedAgeSeconds(ageMs) {
   return Math.min(Math.round(ageMs / 1000), MAX_LOGGED_QUOTE_AGE_SECONDS);
 }
 
+async function withExpensiveMarketDataLimit(fn, dedupeKey = null) {
+  if (dedupeKey && expensiveMdByKey.has(dedupeKey)) return expensiveMdByKey.get(dedupeKey);
+
+  const run = async () => {
+    while (expensiveMdActive >= EXPENSIVE_MD_CONCURRENCY) {
+      await new Promise((resolve) => expensiveMdQueue.push(resolve));
+    }
+    expensiveMdActive += 1;
+    try {
+      return await fn();
+    } finally {
+      expensiveMdActive = Math.max(0, expensiveMdActive - 1);
+      const next = expensiveMdQueue.shift();
+      if (typeof next === 'function') next();
+    }
+  };
+
+  const promise = run().finally(() => {
+    if (dedupeKey) expensiveMdByKey.delete(dedupeKey);
+  });
+
+  if (dedupeKey) expensiveMdByKey.set(dedupeKey, promise);
+  return promise;
+}
+
+async function waitForRetryBackoff(backoffKey) {
+  if (!backoffKey) return;
+  const nextAllowedAt = Number(marketDataRetryBackoffByKey.get(backoffKey) || 0);
+  const waitMs = nextAllowedAt - Date.now();
+  if (waitMs > 0) {
+    await sleep(waitMs);
+  }
+}
+
+function beginMarketDataPass() {
+  marketDataPassId += 1;
+  quotePassCache.clear();
+  orderbookPassCache.clear();
+}
+
 function buildUrlWithParams(baseUrl, params = {}) {
   const searchParams = new URLSearchParams();
   Object.entries(params).forEach(([key, value]) => {
@@ -2914,6 +2986,7 @@ function normalizeBarsDebugError(errorLike) {
 }
 
 function logPredictorBarsDebug({ symbol, timeframeInternal, timeframeRequested, provider, start, end, limit, responseCount, status, error, urlPath }) {
+  if (!PREDICTOR_DEBUG_VERBOSE) return;
   logBarsDebug({
     symbol,
     timeframeInternal,
@@ -4644,6 +4717,10 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
 
   const nowMs = Date.now();
+  const passCached = quotePassCache.get(symbol);
+  if (passCached?.passId === marketDataPassId && passCached?.quote) {
+    return passCached.quote;
+  }
   const cached = quoteCache.get(symbol);
   const cachedTsMs = cached && Number.isFinite(cached.tsMs) ? cached.tsMs : null;
   const cachedAgeMsRaw = Number.isFinite(cachedTsMs)
@@ -4655,11 +4732,13 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
   if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMsFinal) {
     recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'cache' });
-    return {
+    const fromCache = {
       bid: cached.bid,
       ask: cached.ask,
       tsMs: cachedTsMs,
     };
+    quotePassCache.set(symbol, { passId: marketDataPassId, quote: fromCache });
+    return fromCache;
   }
 
   if (cached) {
@@ -4703,11 +4782,13 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     quoteCache.set(symbol, fallback);
     recordLastQuoteAt(symbol, { tsMs: fallback.tsMs, source: fallback.source });
     recordQuoteSuccess(symbol);
-    return {
+    const fallbackQuote = {
       bid: fallback.bid,
       ask: fallback.ask,
       tsMs: fallback.tsMs,
     };
+    quotePassCache.set(symbol, { passId: marketDataPassId, quote: fallbackQuote });
+    return fallbackQuote;
   };
 
   if (primaryError) {
@@ -4829,6 +4910,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   quoteCache.set(symbol, normalizedQuote);
   recordLastQuoteAt(symbol, { tsMs, source: 'fresh' });
   recordQuoteSuccess(symbol);
+  quotePassCache.set(symbol, { passId: marketDataPassId, quote: normalizedQuote });
   return normalizedQuote;
 
 }
@@ -4986,17 +5068,22 @@ async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
     params: { symbols: dataSymbols.join(',') },
     label: 'crypto_latest_orderbooks_batch',
   });
-  return requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') });
+  return withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') }), `ORDERBOOK:${location}:${dataSymbols.join(',')}`);
 }
 
 async function getLatestOrderbook(symbol, { maxAgeMs }) {
   const now = Date.now();
+  const passCached = orderbookPassCache.get(symbol);
+  if (passCached?.passId === marketDataPassId && passCached?.orderbook) {
+    return { ok: true, orderbook: passCached.orderbook, source: 'pass_cache' };
+  }
   const cached = orderbookCache.get(symbol);
   if (
     cached &&
     Number.isFinite(cached.receivedAtMs) &&
     (now - cached.receivedAtMs) <= Math.max(250, maxAgeMs)
   ) {
+    orderbookPassCache.set(symbol, { passId: marketDataPassId, orderbook: cached });
     return { ok: true, orderbook: cached, source: 'cache' };
   }
 
@@ -5125,6 +5212,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
                   receivedAtMs: now,
                 };
                 orderbookCache.set(symbol, normalized);
+                orderbookPassCache.set(symbol, { passId: marketDataPassId, orderbook: normalized });
                 return { ok: true, orderbook: normalized, source: 'fresh' };
               }
             }
@@ -5165,6 +5253,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
       source: 'quote_fallback',
     };
     orderbookCache.set(symbol, syntheticOrderbook);
+    orderbookPassCache.set(symbol, { passId: marketDataPassId, orderbook: syntheticOrderbook });
     return { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' };
   }
 
@@ -5274,7 +5363,7 @@ async function fetchCryptoQuotes({ symbols, location = 'us' }) {
     params: { symbols: dataSymbols.join(',') },
     label: 'crypto_latest_quotes_batch',
   });
-  return requestMarketDataJson({ type: 'QUOTE', url, symbol: dataSymbols.join(',') });
+  return withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'QUOTE', url, symbol: dataSymbols.join(',') }), `QUOTE:${location}:${dataSymbols.join(',')}`);
 }
 
 async function fetchCryptoTrades({ symbols, location = 'us' }) {
@@ -5305,7 +5394,7 @@ async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe 
     params,
     label: 'crypto_bars_batch',
   });
-  const data = await requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') });
+  const data = await withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') }), `BARS:${location}:${timeframeRequested}:${dataSymbols.join(',')}:${resolvedRange.start || ''}:${resolvedRange.end || ''}:${limit}`);
   if (data && typeof data === 'object') {
     data.__requestMeta = {
       timeframeRequested,
@@ -5347,6 +5436,7 @@ async function fetchCryptoBarsWarmupPaged({
   let lastUrlPath = null;
   let rateLimited = false;
   let retries = 0;
+  const retryBackoffKey = `BARS_WARMUP:${location}:${timeframeRequested}:${dataSymbols.join(',')}`;
 
   const allSatisfied = () =>
     normalizedSymbols.every((symbol) => (barsBySymbol[symbol]?.length || 0) >= perSymbolLimit);
@@ -5368,13 +5458,14 @@ async function fetchCryptoBarsWarmupPaged({
       label: 'crypto_bars_batch_warmup_paged',
     });
 
+    await waitForRetryBackoff(retryBackoffKey);
     let data;
     try {
-      data = await requestMarketDataJson({
+      data = await withExpensiveMarketDataLimit(() => requestMarketDataJson({
         type: 'BARS',
         url,
         symbol: dataSymbols.join(','),
-      });
+      }), retryBackoffKey);
     } catch (err) {
       const statusCode = Number(err?.statusCode);
       if (statusCode === 429) {
@@ -5382,8 +5473,10 @@ async function fetchCryptoBarsWarmupPaged({
         retries += 1;
         const retryInMsRaw = Number(err?.rateLimit?.retryInMs);
         const retryBaseMs = Number.isFinite(retryInMsRaw) && retryInMsRaw > 0 ? retryInMsRaw : 1200;
-        const jitterMs = Math.floor(Math.random() * 200);
-        await sleep(retryBaseMs + jitterMs);
+        const jitterMs = Math.floor(Math.random() * 250);
+        const waitMs = retryBaseMs + jitterMs;
+        marketDataRetryBackoffByKey.set(retryBackoffKey, Date.now() + waitMs);
+        await sleep(waitMs);
         continue;
       }
       throw err;
@@ -5422,11 +5515,11 @@ async function fetchCryptoBarsWarmupPaged({
     return acc;
   }, 0);
   console.log('predictor_warmup_fetch_summary', {
-    symbolsCount: normalizedSymbols.length,
-    timeframe: timeframeRequested,
-    pagesFetched: pages,
-    barsFoundBySymbolCount,
-    rateLimited,
+    symbols: normalizedSymbols.length,
+    tf: timeframeRequested,
+    pages,
+    found: barsFoundBySymbolCount,
+    rl: rateLimited,
     retries,
   });
 
@@ -7142,9 +7235,8 @@ async function manageExitStates() {
     }, new Map());
     for (const [symbol, state] of exitState.entries()) {
       const normalizedSymbol = normalizePair(symbol);
+      ensureExitStateFirstSeen(normalizedSymbol, now);
       const qtyNum = Number(state?.qty ?? 0);
-      const lastConfirmedAt = getLastPositionConfirmedAt(normalizedSymbol);
-      const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
       const liveOrdersForSymbol = openOrdersBySymbol.get(normalizedSymbol) || [];
       const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, normalizedSymbol, qtyNum);
       const pendingExitAttach = hasPendingExitAttach(normalizedSymbol);
@@ -7159,17 +7251,13 @@ async function manageExitStates() {
         markPositionConfirmed(normalizedSymbol);
         console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
           symbol: normalizedSymbol,
-          stateQty: qtyNum,
-          reason: 'matching_open_sell',
+          missingCount: 0,
         });
         continue;
       }
 
-      if (pendingExitAttach) {
-        continue;
-      }
-
       const missingCount = positionMissingCountBySymbol.get(normalizedSymbol) || 0;
+      const millisSinceConfirmed = getExitStateReferenceMs(normalizedSymbol, now);
 
       const canDrop =
         missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
@@ -7181,26 +7269,20 @@ async function manageExitStates() {
       if (!canDrop) {
         console.log('EXIT_STATE_RECONCILE_MISS', {
           symbol: normalizedSymbol,
-          stateQty: qtyNum,
-          reason: 'not_in_broker_positions',
           missingCount,
-          missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
-          millisSinceConfirmed,
-          hasMatchingOpenSell,
-          pendingExitAttach,
+          msSinceRef: millisSinceConfirmed,
+          openSell: hasMatchingOpenSell,
+          pending: pendingExitAttach,
         });
         continue;
       }
 
       console.log('EXIT_STATE_RECONCILE_DROP', {
         symbol: normalizedSymbol,
-        stateQty: qtyNum,
-        reason: 'not_in_broker_positions',
         missingCount,
-        missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
-        millisSinceConfirmed,
-        hasMatchingOpenSell,
-        pendingExitAttach,
+        msSinceRef: millisSinceConfirmed,
+        openSell: hasMatchingOpenSell,
+        pending: pendingExitAttach,
       });
 
       clearExitTracking(normalizedSymbol, {
@@ -7479,6 +7561,7 @@ async function manageExitStates() {
 
         let availableQtyOverride = null;
         if (openSellCount === 0 && openBuyCount === 0) {
+          ensureExitStateFirstSeen(symbol, now);
           const availableQtyFromApi = await getAvailablePositionQty(symbol);
           const liveOrdersForSymbol = openOrdersBySymbol.get(normalizePair(symbol)) || [];
           const pendingExitAttach = hasPendingExitAttach(symbol);
@@ -7515,21 +7598,14 @@ async function manageExitStates() {
                 markPositionConfirmed(symbol);
                 console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
                   symbol,
-                  stateQty: qtyNum,
-                  reason: 'matching_open_sell',
+                  missingCount: 0,
                 });
-                continue;
-              }
-
-              if (pendingExitAttach) {
                 continue;
               }
 
               const missingCount = (positionMissingCountBySymbol.get(symbol) || 0) + 1;
               positionMissingCountBySymbol.set(symbol, missingCount);
-
-              const lastConfirmedAt = getLastPositionConfirmedAt(symbol);
-              const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
+              const millisSinceConfirmed = getExitStateReferenceMs(symbol, now);
 
               const canDrop =
                 missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
@@ -7541,13 +7617,10 @@ async function manageExitStates() {
               if (canDrop) {
                 console.log('EXIT_STATE_RECONCILE_DROP', {
                   symbol,
-                  stateQty: qtyNum,
-                  reason: 'alpaca_position_missing_or_zero',
                   missingCount,
-                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
-                  millisSinceConfirmed,
-                  hasMatchingOpenSell,
-                  pendingExitAttach,
+                  msSinceRef: millisSinceConfirmed,
+                  openSell: hasMatchingOpenSell,
+                  pending: pendingExitAttach,
                 });
 
                 clearExitTracking(symbol, {
@@ -7561,13 +7634,10 @@ async function manageExitStates() {
               } else {
                 console.log('EXIT_STATE_RECONCILE_MISS', {
                   symbol,
-                  stateQty: qtyNum,
-                  reason: 'alpaca_position_missing_or_zero',
                   missingCount,
-                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
-                  millisSinceConfirmed,
-                  hasMatchingOpenSell,
-                  pendingExitAttach,
+                  msSinceRef: millisSinceConfirmed,
+                  openSell: hasMatchingOpenSell,
+                  pending: pendingExitAttach,
                 });
               }
 
@@ -9302,10 +9372,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
   for (const chunkSymbols of chunks) {
     try {
-      const [quotesResp, orderbooksResp] = await Promise.all([
-        fetchCryptoQuotes({ symbols: chunkSymbols }),
-        fetchCryptoOrderbooks({ symbols: chunkSymbols }),
-      ]);
+      const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
+      const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
       const bars1mResp = await fetchCryptoBarsWarmupPaged({
         symbols: chunkSymbols,
         perSymbolLimit: warmupLimits['1m'],
@@ -9362,6 +9430,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 }
 
 async function runEntryScanOnce() {
+  beginMarketDataPass();
   printConfigOnce();
   if (entryScanRunning) return;
   entryScanRunning = true;
