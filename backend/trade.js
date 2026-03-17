@@ -1234,7 +1234,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     for (const missing of warmupGate.missing) {
       logPredictorBarsDebug({
         symbol: asset.symbol,
-        timeframe: missing.timeframe,
+        timeframeInternal: missing.timeframe,
+        timeframeRequested: toAlpacaTimeframe(missing.timeframe),
         provider: 'alpaca',
         limit: warmupGate.thresholds[missing.timeframe],
         responseCount: warmupGate.lengths[missing.timeframe],
@@ -5153,6 +5154,103 @@ async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe 
   return data;
 }
 
+async function fetchCryptoBarsWarmupPaged({
+  symbols,
+  location = 'us',
+  perSymbolLimit = 200,
+  timeframe = '1Min',
+  start,
+  end,
+  maxPages = 50,
+}) {
+  const normalizedSymbols = (Array.isArray(symbols) ? symbols : [])
+    .map((s) => normalizeSymbol(s))
+    .filter(Boolean);
+
+  const dataSymbols = normalizedSymbols.map((s) => toDataSymbol(s));
+  const timeframeRequested = toAlpacaTimeframe(timeframe);
+  const resolvedRange =
+    (!start && !end)
+      ? getBarsFetchRange({ timeframe: timeframeRequested, limit: perSymbolLimit })
+      : { start: start || null, end: end || null };
+
+  const barsBySymbol = {};
+  for (const symbol of normalizedSymbols) {
+    barsBySymbol[symbol] = [];
+  }
+
+  let nextPageToken = null;
+  let pages = 0;
+  let lastUrlPath = null;
+
+  const allSatisfied = () =>
+    normalizedSymbols.every((symbol) => (barsBySymbol[symbol]?.length || 0) >= perSymbolLimit);
+
+  while (pages < maxPages && !allSatisfied()) {
+    const params = {
+      symbols: dataSymbols.join(','),
+      limit: String(perSymbolLimit),
+      timeframe: timeframeRequested,
+    };
+    if (resolvedRange.start) params.start = resolvedRange.start;
+    if (resolvedRange.end) params.end = resolvedRange.end;
+    if (nextPageToken) params.page_token = nextPageToken;
+
+    const url = buildAlpacaUrl({
+      baseUrl: CRYPTO_DATA_URL,
+      path: `${location}/bars`,
+      params,
+      label: 'crypto_bars_batch_warmup_paged',
+    });
+
+    const data = await requestMarketDataJson({
+      type: 'BARS',
+      url,
+      symbol: dataSymbols.join(','),
+    });
+
+    lastUrlPath = parseUrlMetadata(url)?.urlPath || lastUrlPath;
+
+    const rawBars = data?.bars || {};
+    for (const symbol of normalizedSymbols) {
+      const dataSymbol = toDataSymbol(symbol);
+      const series =
+        rawBars?.[dataSymbol] ||
+        rawBars?.[symbol] ||
+        rawBars?.[alpacaSymbol(dataSymbol)] ||
+        rawBars?.[alpacaSymbol(symbol)] ||
+        rawBars?.[normalizePair(dataSymbol)] ||
+        rawBars?.[normalizePair(alpacaSymbol(dataSymbol))] ||
+        [];
+
+      if (Array.isArray(series) && series.length) {
+        barsBySymbol[symbol].push(...series);
+        if (barsBySymbol[symbol].length > perSymbolLimit) {
+          barsBySymbol[symbol] = barsBySymbol[symbol].slice(-perSymbolLimit);
+        }
+      }
+    }
+
+    nextPageToken = data?.next_page_token || null;
+    pages += 1;
+
+    if (!nextPageToken) break;
+  }
+
+  return {
+    bars: barsBySymbol,
+    next_page_token: nextPageToken || null,
+    __requestMeta: {
+      timeframeRequested,
+      start: resolvedRange.start,
+      end: resolvedRange.end,
+      urlPath: lastUrlPath,
+      pages,
+      perSymbolLimit,
+    },
+  };
+}
+
 async function fetchStockQuotes({ symbols }) {
   const url = buildAlpacaUrl({
     baseUrl: STOCKS_DATA_URL,
@@ -8852,7 +8950,7 @@ function buildBarsMapFromBatch(symbols, barsResp) {
       bars?.[normalizePair(dataSymbol)] ||
       bars?.[normalizePair(alpacaSymbol(dataSymbol))] ||
       [];
-    barsBySymbol.set(normalizedSymbol, Array.isArray(series) ? series : []);
+    barsBySymbol.set(normalizedSymbol, Array.isArray(series) ? series.slice() : []);
   }
   return barsBySymbol;
 }
@@ -8892,9 +8990,27 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       const [quotesResp, orderbooksResp, bars1mResp, bars5mResp, bars15mResp] = await Promise.all([
         fetchCryptoQuotes({ symbols: chunkSymbols }),
         fetchCryptoOrderbooks({ symbols: chunkSymbols }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['1m'], timeframe: '1Min', start: ranges['1m'].start, end: ranges['1m'].end }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['5m'], timeframe: '5Min', start: ranges['5m'].start, end: ranges['5m'].end }),
-        fetchCryptoBars({ symbols: chunkSymbols, limit: warmupLimits['15m'], timeframe: '15Min', start: ranges['15m'].start, end: ranges['15m'].end }),
+        fetchCryptoBarsWarmupPaged({
+          symbols: chunkSymbols,
+          perSymbolLimit: warmupLimits['1m'],
+          timeframe: '1Min',
+          start: ranges['1m'].start,
+          end: ranges['1m'].end,
+        }),
+        fetchCryptoBarsWarmupPaged({
+          symbols: chunkSymbols,
+          perSymbolLimit: warmupLimits['5m'],
+          timeframe: '5Min',
+          start: ranges['5m'].start,
+          end: ranges['5m'].end,
+        }),
+        fetchCryptoBarsWarmupPaged({
+          symbols: chunkSymbols,
+          perSymbolLimit: warmupLimits['15m'],
+          timeframe: '15Min',
+          start: ranges['15m'].start,
+          end: ranges['15m'].end,
+        }),
       ]);
 
       warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
