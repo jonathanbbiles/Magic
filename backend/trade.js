@@ -348,7 +348,7 @@ const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
 const chunkSizeEnv = Number(process.env.ENTRY_PREFETCH_CHUNK_SIZE);
 const ENTRY_PREFETCH_CHUNK_SIZE =
-  Number.isFinite(chunkSizeEnv) ? Math.max(1, chunkSizeEnv) : 8;
+  Number.isFinite(chunkSizeEnv) ? Math.max(1, chunkSizeEnv) : 3;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
@@ -1930,6 +1930,7 @@ function clearExitTracking(symbol, meta = null) {
   console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
 }
 
+// Only call this on hard broker evidence, not cache/snapshot membership.
 function markPositionConfirmed(symbol, tsMs = Date.now()) {
   const normalized = normalizeSymbolInternal(symbol);
   if (!normalized) return;
@@ -2041,7 +2042,6 @@ async function waitForPositionQtyVisibility(symbol, minQty = 0) {
       );
       lastAvailableQty = snapshotQty;
       if (Number.isFinite(snapshotQty) && snapshotQty > 0 && snapshotQty >= requiredQty) {
-        markPositionConfirmed(normalized);
         return {
           ok: true,
           availableQty: snapshotQty,
@@ -2116,7 +2116,6 @@ function updatePositionsSnapshot(positionsList) {
       mapBySymbol.set(normalizedSymbol, pos);
       mapByNormalized.set(normalizedSymbol, pos);
       positionsSnapshot.loggedNoneSymbols.delete(normalizedSymbol);
-      markPositionConfirmed(normalizedSymbol, nowMs);
     }
   }
 
@@ -5346,6 +5345,8 @@ async function fetchCryptoBarsWarmupPaged({
   let nextPageToken = null;
   let pages = 0;
   let lastUrlPath = null;
+  let rateLimited = false;
+  let retries = 0;
 
   const allSatisfied = () =>
     normalizedSymbols.every((symbol) => (barsBySymbol[symbol]?.length || 0) >= perSymbolLimit);
@@ -5367,11 +5368,26 @@ async function fetchCryptoBarsWarmupPaged({
       label: 'crypto_bars_batch_warmup_paged',
     });
 
-    const data = await requestMarketDataJson({
-      type: 'BARS',
-      url,
-      symbol: dataSymbols.join(','),
-    });
+    let data;
+    try {
+      data = await requestMarketDataJson({
+        type: 'BARS',
+        url,
+        symbol: dataSymbols.join(','),
+      });
+    } catch (err) {
+      const statusCode = Number(err?.statusCode);
+      if (statusCode === 429) {
+        rateLimited = true;
+        retries += 1;
+        const retryInMsRaw = Number(err?.rateLimit?.retryInMs);
+        const retryBaseMs = Number.isFinite(retryInMsRaw) && retryInMsRaw > 0 ? retryInMsRaw : 1200;
+        const jitterMs = Math.floor(Math.random() * 200);
+        await sleep(retryBaseMs + jitterMs);
+        continue;
+      }
+      throw err;
+    }
 
     lastUrlPath = parseUrlMetadata(url)?.urlPath || lastUrlPath;
 
@@ -5400,6 +5416,19 @@ async function fetchCryptoBarsWarmupPaged({
 
     if (!nextPageToken) break;
   }
+
+  const barsFoundBySymbolCount = normalizedSymbols.reduce((acc, symbol) => {
+    if ((barsBySymbol[symbol]?.length || 0) > 0) return acc + 1;
+    return acc;
+  }, 0);
+  console.log('predictor_warmup_fetch_summary', {
+    symbolsCount: normalizedSymbols.length,
+    timeframe: timeframeRequested,
+    pagesFetched: pages,
+    barsFoundBySymbolCount,
+    rateLimited,
+    retries,
+  });
 
   return {
     bars: barsBySymbol,
@@ -7111,52 +7140,53 @@ async function manageExitStates() {
       acc.get(symbol).push(order);
       return acc;
     }, new Map());
-    const openSellSymbols = new Set();
-    openOrdersList.forEach((order) => {
-      const side = String(order.side || '').toLowerCase();
-      if (side !== 'sell') return;
-      const status = String(order.status || '').toLowerCase();
-      if (!isOpenLikeOrderStatus(status)) return;
-      const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-      if (orderSymbol) {
-        openSellSymbols.add(orderSymbol);
-      }
-    });
-    let brokerHeldSymbols = new Set();
-    try {
-      const positions = await fetchPositions();
-      brokerHeldSymbols = new Set(
-        (Array.isArray(positions) ? positions : [])
-          .map((pos) => {
-            const qty = Number(pos.qty ?? pos.quantity ?? pos.position_qty ?? pos.available);
-            if (!Number.isFinite(qty) || qty <= 0 || isDustQty(qty)) return null;
-            return normalizeSymbol(pos.symbol || pos.rawSymbol || pos.asset_id || pos.id || '');
-          })
-          .filter((sym) => sym),
-      );
-    } catch (err) {
-      console.warn('exit_manager_positions_failed', { error: err?.message || err });
-    }
     for (const [symbol, state] of exitState.entries()) {
       const normalizedSymbol = normalizePair(symbol);
       const qtyNum = Number(state?.qty ?? 0);
       const lastConfirmedAt = getLastPositionConfirmedAt(normalizedSymbol);
       const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
-      const hasOpenSell = openSellSymbols.has(normalizedSymbol);
+      const liveOrdersForSymbol = openOrdersBySymbol.get(normalizedSymbol) || [];
+      const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, normalizedSymbol, qtyNum);
       const pendingExitAttach = hasPendingExitAttach(normalizedSymbol);
+      const availableQtyFromApi = await getAvailablePositionQty(normalizedSymbol);
 
-      if (brokerHeldSymbols.has(normalizedSymbol) || hasOpenSell || pendingExitAttach) {
+      if (Number.isFinite(availableQtyFromApi) && availableQtyFromApi > 0) {
         markPositionConfirmed(normalizedSymbol);
         continue;
       }
 
-      if (!(Number.isFinite(millisSinceConfirmed) && millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS)) {
+      if (hasMatchingOpenSell) {
+        markPositionConfirmed(normalizedSymbol);
+        console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
+          symbol: normalizedSymbol,
+          stateQty: qtyNum,
+          reason: 'matching_open_sell',
+        });
+        continue;
+      }
+
+      if (pendingExitAttach) {
+        continue;
+      }
+
+      const missingCount = positionMissingCountBySymbol.get(normalizedSymbol) || 0;
+
+      const canDrop =
+        missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
+        !hasMatchingOpenSell &&
+        !pendingExitAttach &&
+        Number.isFinite(millisSinceConfirmed) &&
+        millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS;
+
+      if (!canDrop) {
         console.log('EXIT_STATE_RECONCILE_MISS', {
           symbol: normalizedSymbol,
           stateQty: qtyNum,
           reason: 'not_in_broker_positions',
+          missingCount,
+          missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
           millisSinceConfirmed,
-          hasOpenSell,
+          hasMatchingOpenSell,
           pendingExitAttach,
         });
         continue;
@@ -7166,15 +7196,19 @@ async function manageExitStates() {
         symbol: normalizedSymbol,
         stateQty: qtyNum,
         reason: 'not_in_broker_positions',
+        missingCount,
+        missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
         millisSinceConfirmed,
-        hasOpenSell,
+        hasMatchingOpenSell,
         pendingExitAttach,
       });
 
       clearExitTracking(normalizedSymbol, {
         reason: 'not_in_broker_positions',
+        missingCount,
+        missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
         millisSinceConfirmed,
-        hasOpenSell,
+        hasMatchingOpenSell,
         pendingExitAttach,
       });
     }
@@ -7446,8 +7480,13 @@ async function manageExitStates() {
         let availableQtyOverride = null;
         if (openSellCount === 0 && openBuyCount === 0) {
           const availableQtyFromApi = await getAvailablePositionQty(symbol);
+          const liveOrdersForSymbol = openOrdersBySymbol.get(normalizePair(symbol)) || [];
+          const pendingExitAttach = hasPendingExitAttach(symbol);
 
-          if (availableQtyFromApi === 0 && qtyNum > 0) {
+          if (Number.isFinite(availableQtyFromApi) && availableQtyFromApi > 0) {
+            markPositionConfirmed(symbol);
+            availableQtyOverride = availableQtyFromApi;
+          } else if (qtyNum > 0) {
             let refreshedPosition = null;
             try {
               refreshedPosition = await fetchPosition(symbol);
@@ -7469,18 +7508,28 @@ async function manageExitStates() {
 
             if (Number.isFinite(refreshedQty) && refreshedQty > 0) {
               markPositionConfirmed(symbol);
-              positionMissingCountBySymbol.delete(symbol);
               availableQtyOverride = refreshedQty;
             } else {
+              const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, symbol, qtyNum);
+              if (hasMatchingOpenSell) {
+                markPositionConfirmed(symbol);
+                console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
+                  symbol,
+                  stateQty: qtyNum,
+                  reason: 'matching_open_sell',
+                });
+                continue;
+              }
+
+              if (pendingExitAttach) {
+                continue;
+              }
+
               const missingCount = (positionMissingCountBySymbol.get(symbol) || 0) + 1;
               positionMissingCountBySymbol.set(symbol, missingCount);
 
               const lastConfirmedAt = getLastPositionConfirmedAt(symbol);
               const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
-
-              const liveOrdersForSymbol = openOrdersBySymbol.get(normalizePair(symbol)) || [];
-              const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, symbol, qtyNum);
-              const pendingExitAttach = hasPendingExitAttach(symbol);
 
               const canDrop =
                 missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
@@ -7524,14 +7573,7 @@ async function manageExitStates() {
 
               continue;
             }
-          } else {
-            markPositionConfirmed(symbol);
-            positionMissingCountBySymbol.delete(symbol);
-            availableQtyOverride = availableQtyFromApi;
           }
-        } else {
-          markPositionConfirmed(symbol);
-          positionMissingCountBySymbol.delete(symbol);
         }
 
         const maxHoldMsForced =
@@ -9260,31 +9302,31 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
   for (const chunkSymbols of chunks) {
     try {
-      const [quotesResp, orderbooksResp, bars1mResp, bars5mResp, bars15mResp] = await Promise.all([
+      const [quotesResp, orderbooksResp] = await Promise.all([
         fetchCryptoQuotes({ symbols: chunkSymbols }),
         fetchCryptoOrderbooks({ symbols: chunkSymbols }),
-        fetchCryptoBarsWarmupPaged({
-          symbols: chunkSymbols,
-          perSymbolLimit: warmupLimits['1m'],
-          timeframe: '1Min',
-          start: ranges['1m'].start,
-          end: ranges['1m'].end,
-        }),
-        fetchCryptoBarsWarmupPaged({
-          symbols: chunkSymbols,
-          perSymbolLimit: warmupLimits['5m'],
-          timeframe: '5Min',
-          start: ranges['5m'].start,
-          end: ranges['5m'].end,
-        }),
-        fetchCryptoBarsWarmupPaged({
-          symbols: chunkSymbols,
-          perSymbolLimit: warmupLimits['15m'],
-          timeframe: '15Min',
-          start: ranges['15m'].start,
-          end: ranges['15m'].end,
-        }),
       ]);
+      const bars1mResp = await fetchCryptoBarsWarmupPaged({
+        symbols: chunkSymbols,
+        perSymbolLimit: warmupLimits['1m'],
+        timeframe: '1Min',
+        start: ranges['1m'].start,
+        end: ranges['1m'].end,
+      });
+      const bars5mResp = await fetchCryptoBarsWarmupPaged({
+        symbols: chunkSymbols,
+        perSymbolLimit: warmupLimits['5m'],
+        timeframe: '5Min',
+        start: ranges['5m'].start,
+        end: ranges['5m'].end,
+      });
+      const bars15mResp = await fetchCryptoBarsWarmupPaged({
+        symbols: chunkSymbols,
+        perSymbolLimit: warmupLimits['15m'],
+        timeframe: '15Min',
+        start: ranges['15m'].start,
+        end: ranges['15m'].end,
+      });
 
       warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
       warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
