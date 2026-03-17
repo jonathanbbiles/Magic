@@ -488,7 +488,26 @@ const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
 const EXIT_REPAIR_INTERVAL_MS = readNumber('EXIT_REPAIR_INTERVAL_MS', 60000);
-const EXIT_RECONCILE_MISS_THRESHOLD = Math.max(1, Math.trunc(readNumber('EXIT_RECONCILE_MISS_THRESHOLD', 2)));
+const EXIT_RECONCILE_MISS_THRESHOLD = Math.max(
+  2,
+  Math.trunc(readNumber('EXIT_RECONCILE_MISS_THRESHOLD', 5)),
+);
+const EXIT_RECONCILE_MIN_CONFIRM_MS = Math.max(
+  0,
+  readNumber('EXIT_RECONCILE_MIN_CONFIRM_MS', 60000),
+);
+const POST_FILL_POSITION_SETTLE_MS = Math.max(
+  0,
+  readNumber('POST_FILL_POSITION_SETTLE_MS', 15000),
+);
+const POST_FILL_POSITION_POLL_MS = Math.max(
+  100,
+  readNumber('POST_FILL_POSITION_POLL_MS', 750),
+);
+const POST_FILL_EXIT_ATTACH_ATTEMPTS = Math.max(
+  1,
+  Math.trunc(readNumber('POST_FILL_EXIT_ATTACH_ATTEMPTS', 20)),
+);
 const EXIT_REFRESH_ENABLED = readEnvFlag('EXIT_REFRESH_ENABLED', true);
 const EXIT_MAX_ORDER_AGE_MS = readNumber('EXIT_MAX_ORDER_AGE_MS', 120000);
 // Exit refresh behavior
@@ -1842,6 +1861,8 @@ const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
 const positionMissingCountBySymbol = new Map();
+const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
+const pendingExitAttachBySymbol = new Map(); // symbol -> { qty, entryOrderId, filledAtMs }
 const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
 const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
 const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
@@ -1889,6 +1910,8 @@ function clearExitTracking(symbol, meta = null) {
     hadLastOrderFetch: lastOrderFetchAt.has(s),
     hadLastOrderSnapshot: lastOrderSnapshotBySymbol.has(s),
     hadPositionMissingCount: positionMissingCountBySymbol.has(s),
+    hadLastConfirmedPositionSeen: lastConfirmedPositionSeenAtBySymbol.has(s),
+    hadPendingExitAttach: pendingExitAttachBySymbol.has(s),
   };
 
   exitState.delete(s);
@@ -1901,8 +1924,148 @@ function clearExitTracking(symbol, meta = null) {
   lastOrderFetchAt.delete(s);
   lastOrderSnapshotBySymbol.delete(s);
   positionMissingCountBySymbol.delete(s);
+  lastConfirmedPositionSeenAtBySymbol.delete(s);
+  pendingExitAttachBySymbol.delete(s);
 
   console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
+}
+
+function markPositionConfirmed(symbol, tsMs = Date.now()) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return;
+  lastConfirmedPositionSeenAtBySymbol.set(normalized, tsMs);
+  positionMissingCountBySymbol.delete(normalized);
+}
+
+function getLastPositionConfirmedAt(symbol) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return 0;
+  return Number(lastConfirmedPositionSeenAtBySymbol.get(normalized) || 0);
+}
+
+function markPendingExitAttach(symbol, payload = {}) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return;
+  pendingExitAttachBySymbol.set(normalized, {
+    symbol: normalized,
+    qty: Number(payload.qty) || 0,
+    entryOrderId: payload.entryOrderId || null,
+    filledAtMs: Number(payload.filledAtMs) || Date.now(),
+  });
+}
+
+function clearPendingExitAttach(symbol) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return;
+  pendingExitAttachBySymbol.delete(normalized);
+}
+
+function hasPendingExitAttach(symbol) {
+  const normalized = normalizeSymbolInternal(symbol);
+  if (!normalized) return false;
+  const pending = pendingExitAttachBySymbol.get(normalized);
+  if (!pending) return false;
+  const ageMs = Date.now() - Number(pending.filledAtMs || 0);
+  return ageMs >= 0 && ageMs <= POST_FILL_POSITION_SETTLE_MS;
+}
+
+function hasOpenSellForSymbol(openOrders, symbol, requiredQty = null) {
+  const normalizedSymbol = normalizePair(symbol);
+  const orders = Array.isArray(openOrders) ? openOrders : [];
+  return orders.some((order) => {
+    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+    const side = String(order.side || '').toLowerCase();
+    const status = String(order.status || '').toLowerCase();
+    if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
+    if (!isOpenLikeOrderStatus(status)) return false;
+    if (requiredQty == null) return true;
+    const orderQty = normalizeOrderQty(order);
+    return orderQtyMeetsRequired(orderQty, Number(requiredQty));
+  });
+}
+
+async function waitForPositionQtyVisibility(symbol, minQty = 0) {
+  const normalized = normalizeSymbolInternal(symbol);
+  const requiredQty = Number(minQty) || 0;
+  const startedAt = Date.now();
+  let attempts = 0;
+  let lastAvailableQty = 0;
+
+  while (
+    attempts < POST_FILL_EXIT_ATTACH_ATTEMPTS &&
+    Date.now() - startedAt <= POST_FILL_POSITION_SETTLE_MS
+  ) {
+    attempts += 1;
+
+    try {
+      positionsListCache.tsMs = 0;
+      positionsListCache.data = null;
+      positionsSnapshot.tsMs = 0;
+
+      const directPos = await fetchPosition(normalized);
+      const directQty = Number(
+        directPos?.qty_available ??
+          directPos?.available ??
+          directPos?.qty ??
+          directPos?.quantity ??
+          0,
+      );
+      if (Number.isFinite(directQty) && directQty > 0 && directQty >= requiredQty) {
+        markPositionConfirmed(normalized);
+        return {
+          ok: true,
+          availableQty: directQty,
+          attempts,
+          source: 'positions_single',
+        };
+      }
+    } catch (err) {
+      console.warn('post_fill_position_poll_failed', {
+        symbol: normalized,
+        attempts,
+        error: err?.message || err,
+      });
+    }
+
+    try {
+      positionsListCache.tsMs = 0;
+      positionsListCache.data = null;
+      const snapshot = await fetchPositionsSnapshot();
+      const pos = snapshot.mapBySymbol.get(normalized);
+      const snapshotQty = Number(
+        pos?.qty_available ??
+          pos?.available ??
+          pos?.qty ??
+          pos?.quantity ??
+          0,
+      );
+      lastAvailableQty = snapshotQty;
+      if (Number.isFinite(snapshotQty) && snapshotQty > 0 && snapshotQty >= requiredQty) {
+        markPositionConfirmed(normalized);
+        return {
+          ok: true,
+          availableQty: snapshotQty,
+          attempts,
+          source: 'positions_snapshot',
+        };
+      }
+    } catch (err) {
+      console.warn('post_fill_snapshot_poll_failed', {
+        symbol: normalized,
+        attempts,
+        error: err?.message || err,
+      });
+    }
+
+    await sleep(POST_FILL_POSITION_POLL_MS);
+  }
+
+  return {
+    ok: false,
+    availableQty: Number.isFinite(lastAvailableQty) ? lastAvailableQty : 0,
+    attempts,
+    source: null,
+  };
 }
 
 const cfeeCache = { ts: 0, items: [] };
@@ -1953,6 +2116,7 @@ function updatePositionsSnapshot(positionsList) {
       mapBySymbol.set(normalizedSymbol, pos);
       mapByNormalized.set(normalizedSymbol, pos);
       positionsSnapshot.loggedNoneSymbols.delete(normalizedSymbol);
+      markPositionConfirmed(normalizedSymbol, nowMs);
     }
   }
 
@@ -5788,7 +5952,14 @@ async function submitIocLimitSell({
   return { order: response, requestedQty: finalQty };
 }
 
-async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entryOrderId = null, maxFill = null }) {
+async function attachInitialExitLimit({
+  symbol: rawSymbol,
+  qty,
+  entryPrice,
+  entryOrderId = null,
+  maxFill = null,
+  availableQtyOverride = null,
+}) {
   const symbol = normalizeSymbol(rawSymbol);
   const entryPriceNum = Number(entryPrice);
   const qtyNum = Number(qty);
@@ -5971,6 +6142,10 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     limitPrice: initialLimit,
     reason: 'initial_target',
     intentRef: entryOrderId || getOrderIntentBucket(),
+    availableQtyOverride:
+      Number.isFinite(availableQtyOverride) && availableQtyOverride > 0
+        ? availableQtyOverride
+        : undefined,
     postOnly,
   });
 
@@ -6010,6 +6185,11 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     takerAttempted: false,
   });
 
+  const initialActionTaken =
+    sellOrder?.id || sellOrder?.order_id
+      ? 'placed_initial_limit_sell'
+      : (sellOrder?.skipped ? `initial_limit_sell_skipped:${sellOrder.reason || 'unknown'}` : 'initial_limit_sell_not_confirmed');
+
   logExitDecision({
     symbol,
     heldSeconds: 0,
@@ -6018,7 +6198,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
     bid: null,
     ask: null,
     minNetProfitBps,
-    actionTaken: 'placed_initial_limit_sell',
+    actionTaken: initialActionTaken,
   });
 
   return sellOrder;
@@ -6078,13 +6258,39 @@ async function handleBuyFill({
   entrySpreadOverridesBySymbol.set(symbol, entrySpreadBpsUsed);
 
   const maxFill = await fetchMaxFillPriceForOrder({ symbol, orderId: entryOrderId });
+
+  markPendingExitAttach(symbol, {
+    qty: qtyNum,
+    entryOrderId,
+    filledAtMs: Date.now(),
+  });
+
+  const settle = await waitForPositionQtyVisibility(symbol, qtyNum);
+
+  console.log('post_fill_position_settle', {
+    symbol,
+    qty: qtyNum,
+    ok: settle.ok,
+    availableQty: settle.availableQty,
+    attempts: settle.attempts,
+    source: settle.source,
+  });
+
   const sellOrder = await attachInitialExitLimit({
     symbol,
     qty: qtyNum,
     entryPrice: entryPriceNum,
     entryOrderId,
     maxFill,
+    availableQtyOverride:
+      settle.ok && Number.isFinite(settle.availableQty) && settle.availableQty > 0
+        ? settle.availableQty
+        : null,
   });
+
+  if (sellOrder?.id || sellOrder?.order_id) {
+    clearPendingExitAttach(symbol);
+  }
 
   if (STOPS_ENABLED && STOPLOSS_ENABLED && STOPLOSS_MODE === 'atr') {
     try {
@@ -6933,15 +7139,44 @@ async function manageExitStates() {
     }
     for (const [symbol, state] of exitState.entries()) {
       const normalizedSymbol = normalizePair(symbol);
-      if (brokerHeldSymbols.has(normalizedSymbol) || openSellSymbols.has(normalizedSymbol)) {
+      const qtyNum = Number(state?.qty ?? 0);
+      const lastConfirmedAt = getLastPositionConfirmedAt(normalizedSymbol);
+      const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
+      const hasOpenSell = openSellSymbols.has(normalizedSymbol);
+      const pendingExitAttach = hasPendingExitAttach(normalizedSymbol);
+
+      if (brokerHeldSymbols.has(normalizedSymbol) || hasOpenSell || pendingExitAttach) {
+        markPositionConfirmed(normalizedSymbol);
         continue;
       }
+
+      if (!(Number.isFinite(millisSinceConfirmed) && millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS)) {
+        console.log('EXIT_STATE_RECONCILE_MISS', {
+          symbol: normalizedSymbol,
+          stateQty: qtyNum,
+          reason: 'not_in_broker_positions',
+          millisSinceConfirmed,
+          hasOpenSell,
+          pendingExitAttach,
+        });
+        continue;
+      }
+
       console.log('EXIT_STATE_RECONCILE_DROP', {
         symbol: normalizedSymbol,
-        stateQty: state?.qty ?? null,
+        stateQty: qtyNum,
         reason: 'not_in_broker_positions',
+        millisSinceConfirmed,
+        hasOpenSell,
+        pendingExitAttach,
       });
-      clearExitTracking(normalizedSymbol, { reason: 'not_in_broker_positions' });
+
+      clearExitTracking(normalizedSymbol, {
+        reason: 'not_in_broker_positions',
+        millisSinceConfirmed,
+        hasOpenSell,
+        pendingExitAttach,
+      });
     }
     const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
 
@@ -7211,36 +7446,68 @@ async function manageExitStates() {
         let availableQtyOverride = null;
         if (openSellCount === 0 && openBuyCount === 0) {
           const availableQtyFromApi = await getAvailablePositionQty(symbol);
+
           if (availableQtyFromApi === 0 && qtyNum > 0) {
             let refreshedPosition = null;
             try {
               refreshedPosition = await fetchPosition(symbol);
             } catch (err) {
-              console.warn('exit_state_reconcile_fetch_failed', { symbol, error: err?.message || err });
+              console.warn('exit_state_reconcile_fetch_failed', {
+                symbol,
+                error: err?.message || err,
+              });
               continue;
             }
+
             const refreshedQty = Number(
               refreshedPosition?.qty_available ??
-                refreshedPosition?.available ??
-                refreshedPosition?.qty ??
-                refreshedPosition?.quantity ??
-                0,
+              refreshedPosition?.available ??
+              refreshedPosition?.qty ??
+              refreshedPosition?.quantity ??
+              0,
             );
-            if (!(Number.isFinite(refreshedQty) && refreshedQty > 0)) {
+
+            if (Number.isFinite(refreshedQty) && refreshedQty > 0) {
+              markPositionConfirmed(symbol);
+              positionMissingCountBySymbol.delete(symbol);
+              availableQtyOverride = refreshedQty;
+            } else {
               const missingCount = (positionMissingCountBySymbol.get(symbol) || 0) + 1;
               positionMissingCountBySymbol.set(symbol, missingCount);
-              if (missingCount >= EXIT_RECONCILE_MISS_THRESHOLD) {
+
+              const lastConfirmedAt = getLastPositionConfirmedAt(symbol);
+              const millisSinceConfirmed = lastConfirmedAt > 0 ? Math.max(0, now - lastConfirmedAt) : null;
+
+              const liveOrdersForSymbol = openOrdersBySymbol.get(normalizePair(symbol)) || [];
+              const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, symbol, qtyNum);
+              const pendingExitAttach = hasPendingExitAttach(symbol);
+
+              const canDrop =
+                missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
+                !hasMatchingOpenSell &&
+                !pendingExitAttach &&
+                Number.isFinite(millisSinceConfirmed) &&
+                millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS;
+
+              if (canDrop) {
                 console.log('EXIT_STATE_RECONCILE_DROP', {
                   symbol,
                   stateQty: qtyNum,
                   reason: 'alpaca_position_missing_or_zero',
                   missingCount,
                   missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                  millisSinceConfirmed,
+                  hasMatchingOpenSell,
+                  pendingExitAttach,
                 });
+
                 clearExitTracking(symbol, {
                   reason: 'alpaca_position_missing_or_zero',
                   missingCount,
                   missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                  millisSinceConfirmed,
+                  hasMatchingOpenSell,
+                  pendingExitAttach,
                 });
               } else {
                 console.log('EXIT_STATE_RECONCILE_MISS', {
@@ -7249,16 +7516,22 @@ async function manageExitStates() {
                   reason: 'alpaca_position_missing_or_zero',
                   missingCount,
                   missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                  millisSinceConfirmed,
+                  hasMatchingOpenSell,
+                  pendingExitAttach,
                 });
               }
+
               continue;
             }
-            positionMissingCountBySymbol.delete(symbol);
-            availableQtyOverride = refreshedQty;
           } else {
+            markPositionConfirmed(symbol);
             positionMissingCountBySymbol.delete(symbol);
             availableQtyOverride = availableQtyFromApi;
           }
+        } else {
+          markPositionConfirmed(symbol);
+          positionMissingCountBySymbol.delete(symbol);
         }
 
         const maxHoldMsForced =
