@@ -2060,6 +2060,7 @@ const positionMissingCountBySymbol = new Map();
 const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
 const exitStateFirstSeenAtBySymbol = new Map(); // symbol -> ms (bookkeeping fallback, not broker confirmation)
 const pendingExitAttachBySymbol = new Map(); // symbol -> { qty, entryOrderId, filledAtMs }
+const loggedSymbolNormalizations = new Set();
 const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
 const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
 const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
@@ -2313,6 +2314,60 @@ const positionsSnapshot = {
 };
 let positionsSnapshotLogged = false;
 
+function getBrokerPositionLookupKeys(rawSymbol) {
+  const raw = String(rawSymbol || '').trim().toUpperCase();
+  const canonical = normalizeSymbolInternal(rawSymbol);
+  const alpaca = normalizeSymbolForAlpaca(rawSymbol);
+  if (raw && canonical && raw !== canonical) {
+    const key = `${raw}->${canonical}`;
+    if (!loggedSymbolNormalizations.has(key)) {
+      loggedSymbolNormalizations.add(key);
+      console.log('symbol_normalized', { raw, canonical, source: 'broker_position' });
+    }
+  }
+  const keys = [canonical, alpaca, raw].filter(Boolean);
+  return Array.from(new Set(keys));
+}
+
+function extractBrokerPositionQty(position) {
+  const totalQty = Number(
+    position?.qty ??
+      position?.quantity ??
+      position?.position_qty ??
+      0,
+  );
+  const availableQty = Number(
+    position?.qty_available ??
+      position?.available ??
+      position?.available_qty ??
+      position?.remaining_qty ??
+      position?.remainingQty ??
+      0,
+  );
+  const qtyForPresence = Number.isFinite(totalQty) && totalQty > 0
+    ? totalQty
+    : (Number.isFinite(availableQty) ? availableQty : 0);
+  return {
+    totalQty: Number.isFinite(totalQty) ? totalQty : 0,
+    availableQty: Number.isFinite(availableQty) ? availableQty : 0,
+    qtyForPresence,
+  };
+}
+
+function findPositionInSnapshot(snapshot, symbol) {
+  const lookup = snapshot?.mapByNormalized;
+  if (!lookup || typeof lookup.get !== 'function') {
+    return null;
+  }
+  for (const key of getBrokerPositionLookupKeys(symbol)) {
+    const position = lookup.get(key);
+    if (position) {
+      return { position, key };
+    }
+  }
+  return null;
+}
+
 function updatePositionsSnapshot(positionsList) {
   const nowMs = Date.now();
   const list = Array.isArray(positionsList) ? positionsList : [];
@@ -2330,10 +2385,15 @@ function updatePositionsSnapshot(positionsList) {
     if (rawSymbol) {
       mapByRaw.set(rawSymbol, pos);
     }
-    if (normalizedSymbol) {
-      mapBySymbol.set(normalizedSymbol, pos);
-      mapByNormalized.set(normalizedSymbol, pos);
-      positionsSnapshot.loggedNoneSymbols.delete(normalizedSymbol);
+    const symbolKeys = getBrokerPositionLookupKeys(rawSymbol || normalizedSymbol);
+    if (symbolKeys.length > 0) {
+      if (normalizedSymbol) {
+        mapBySymbol.set(normalizedSymbol, pos);
+      }
+      symbolKeys.forEach((key) => {
+        mapByNormalized.set(key, pos);
+        positionsSnapshot.loggedNoneSymbols.delete(key);
+      });
     }
   }
 
@@ -4197,9 +4257,8 @@ async function getAvgEntryPriceInfoFromAlpaca(symbol) {
   let positionsKeysSample = null;
   try {
     const snapshot = await fetchPositionsSnapshot();
-    const keySet = snapshot.mapByNormalized;
-    positionsKeysSample = Array.from(keySet.keys()).slice(0, 8);
-    position = keySet.get(normalized) || keySet.get(alpacaSymbolTried) || null;
+    positionsKeysSample = Array.from(snapshot.mapByNormalized.keys()).slice(0, 8);
+    position = findPositionInSnapshot(snapshot, normalized)?.position || null;
   } catch (err) {
     console.warn('alpaca_avg_entry_list_failed', { symbol: normalized, error: err?.message || err });
   }
@@ -4263,19 +4322,90 @@ async function getAvailablePositionQty(symbol) {
   const normalized = normalizeSymbol(symbol);
   try {
     const snapshot = await fetchPositionsSnapshot();
-    const pos = snapshot.mapBySymbol.get(normalized);
+    const pos = findPositionInSnapshot(snapshot, normalized)?.position || null;
     if (!pos) {
       logPositionNoneOnce(normalized, 404);
       return 0;
     }
-    const qty = Number(pos?.qty_available ?? pos?.available ?? pos?.qty ?? pos?.quantity ?? 0);
-    return Number.isFinite(qty) ? qty : 0;
+    const { availableQty, totalQty } = extractBrokerPositionQty(pos);
+    return availableQty > 0 ? availableQty : totalQty;
   } catch (err) {
     if (err?.statusCode === 404) {
       logPositionNoneOnce(normalized, 404);
       return 0;
     }
     throw err;
+  }
+}
+
+async function getBrokerPositionPresence(symbol, snapshot = null) {
+  const normalized = normalizeSymbolInternal(symbol);
+  let localSnapshot = snapshot;
+  if (!localSnapshot) {
+    try {
+      localSnapshot = await fetchPositionsSnapshot();
+    } catch (err) {
+      return {
+        status: 'unknown',
+        reason: 'broker_positions_unavailable',
+        symbol: normalized,
+        error: err?.message || err,
+      };
+    }
+  }
+
+  const fromSnapshot = findPositionInSnapshot(localSnapshot, normalized);
+  const snapshotKeysSample = Array.from(localSnapshot?.mapByNormalized?.keys?.() || []).slice(0, 8);
+  if (fromSnapshot?.position) {
+    const qty = extractBrokerPositionQty(fromSnapshot.position);
+    if (qty.qtyForPresence > 0) {
+      return {
+        status: 'present',
+        reason: 'snapshot_match',
+        symbol: normalized,
+        lookupKey: fromSnapshot.key,
+        snapshotKeysSample,
+        ...qty,
+      };
+    }
+  }
+
+  try {
+    const fetched = await fetchPosition(normalized);
+    if (!fetched) {
+      return {
+        status: 'absent',
+        reason: 'position_not_found',
+        symbol: normalized,
+        snapshotKeysSample,
+      };
+    }
+    const qty = extractBrokerPositionQty(fetched);
+    if (qty.qtyForPresence > 0) {
+      return {
+        status: 'present',
+        reason: 'single_position_match',
+        symbol: normalized,
+        lookupKey: normalizeSymbolInternal(fetched?.symbol || fetched?.rawSymbol || normalized),
+        snapshotKeysSample,
+        ...qty,
+      };
+    }
+    return {
+      status: 'absent',
+      reason: 'position_qty_zero',
+      symbol: normalized,
+      snapshotKeysSample,
+      ...qty,
+    };
+  } catch (err) {
+    return {
+      status: 'unknown',
+      reason: 'broker_positions_unavailable',
+      symbol: normalized,
+      snapshotKeysSample,
+      error: err?.message || err,
+    };
   }
 }
 
@@ -7512,6 +7642,13 @@ async function manageExitStates() {
       acc.get(symbol).push(order);
       return acc;
     }, new Map());
+    let brokerSnapshot = null;
+    try {
+      brokerSnapshot = await fetchPositionsSnapshot();
+    } catch (err) {
+      brokerSnapshot = null;
+      console.warn('exit_state_reconcile_snapshot_failed', { error: err?.message || err });
+    }
     for (const [symbol, state] of exitState.entries()) {
       const normalizedSymbol = normalizePair(symbol);
       ensureExitStateFirstSeen(normalizedSymbol, now);
@@ -7519,10 +7656,26 @@ async function manageExitStates() {
       const liveOrdersForSymbol = openOrdersBySymbol.get(normalizedSymbol) || [];
       const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, normalizedSymbol, qtyNum);
       const pendingExitAttach = hasPendingExitAttach(normalizedSymbol);
-      const availableQtyFromApi = await getAvailablePositionQty(normalizedSymbol);
+      const presence = await getBrokerPositionPresence(normalizedSymbol, brokerSnapshot);
+      const avgEntryProbe = avgEntryPriceCache.get(normalizedSymbol);
+      const avgEntryFound = Number.isFinite(avgEntryProbe?.value) && avgEntryProbe.value > 0;
+      const missingCountBefore = positionMissingCountBySymbol.get(normalizedSymbol) || 0;
 
-      if (Number.isFinite(availableQtyFromApi) && availableQtyFromApi > 0) {
+      if (presence.status === 'present') {
         markPositionConfirmed(normalizedSymbol);
+        console.log('exit_reconcile_presence_check', {
+          symbol,
+          canonicalSymbol: normalizedSymbol,
+          brokerPositionFound: true,
+          brokerPresenceReason: presence.reason,
+          brokerLookupKey: presence.lookupKey || null,
+          brokerPositionKeysSample: presence.snapshotKeysSample || null,
+          avgEntryFound,
+          openSellFound: hasMatchingOpenSell,
+          pendingExitAttach,
+          missingCountBefore,
+          action: 'confirmed_present',
+        });
         continue;
       }
 
@@ -7535,7 +7688,19 @@ async function manageExitStates() {
         continue;
       }
 
-      const missingCount = positionMissingCountBySymbol.get(normalizedSymbol) || 0;
+      if (presence.status === 'unknown') {
+        console.log('EXIT_STATE_RECONCILE_DEFER', {
+          symbol: normalizedSymbol,
+          reason: presence.reason,
+          pending: pendingExitAttach,
+          openSell: hasMatchingOpenSell,
+          missingCount: missingCountBefore,
+          error: presence.error || null,
+        });
+        continue;
+      }
+
+      const missingCount = missingCountBefore;
       const millisSinceConfirmed = getExitStateReferenceMs(normalizedSymbol, now);
 
       const canDrop =
@@ -7546,6 +7711,19 @@ async function manageExitStates() {
         millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS;
 
       if (!canDrop) {
+        console.log('exit_reconcile_presence_check', {
+          symbol,
+          canonicalSymbol: normalizedSymbol,
+          brokerPositionFound: false,
+          brokerPresenceReason: presence.reason,
+          brokerLookupKey: presence.lookupKey || null,
+          brokerPositionKeysSample: presence.snapshotKeysSample || null,
+          avgEntryFound,
+          openSellFound: hasMatchingOpenSell,
+          pendingExitAttach,
+          missingCountBefore,
+          action: 'retain_waiting',
+        });
         console.log('EXIT_STATE_RECONCILE_MISS', {
           symbol: normalizedSymbol,
           missingCount,
@@ -7558,11 +7736,11 @@ async function manageExitStates() {
 
       console.log('EXIT_STATE_RECONCILE_DROP', {
         symbol: normalizedSymbol,
-        missingCount,
-        msSinceRef: millisSinceConfirmed,
-        openSell: hasMatchingOpenSell,
-        pending: pendingExitAttach,
-      });
+          missingCount,
+          msSinceRef: millisSinceConfirmed,
+          openSell: hasMatchingOpenSell,
+          pending: pendingExitAttach,
+        });
 
       clearExitTracking(normalizedSymbol, {
         reason: 'not_in_broker_positions',
@@ -7840,88 +8018,108 @@ async function manageExitStates() {
 
         let availableQtyOverride = null;
         if (openSellCount === 0 && openBuyCount === 0) {
-          ensureExitStateFirstSeen(symbol, now);
-          const availableQtyFromApi = await getAvailablePositionQty(symbol);
-          const liveOrdersForSymbol = openOrdersBySymbol.get(normalizePair(symbol)) || [];
-          const pendingExitAttach = hasPendingExitAttach(symbol);
+          const canonicalSymbol = normalizeSymbolInternal(symbol);
+          ensureExitStateFirstSeen(canonicalSymbol, now);
+          const availableQtyFromApi = await getAvailablePositionQty(canonicalSymbol);
+          const liveOrdersForSymbol = openOrdersBySymbol.get(canonicalSymbol) || [];
+          const pendingExitAttach = hasPendingExitAttach(canonicalSymbol);
+          const presence = await getBrokerPositionPresence(canonicalSymbol, brokerSnapshot);
+          const missingCountBefore = positionMissingCountBySymbol.get(canonicalSymbol) || 0;
 
           if (Number.isFinite(availableQtyFromApi) && availableQtyFromApi > 0) {
-            markPositionConfirmed(symbol);
             availableQtyOverride = availableQtyFromApi;
+          }
+
+          if (presence.status === 'present') {
+            markPositionConfirmed(canonicalSymbol);
+            console.log('exit_reconcile_presence_check', {
+              symbol,
+              canonicalSymbol,
+              brokerPositionFound: true,
+              brokerPresenceReason: presence.reason,
+              brokerLookupKey: presence.lookupKey || null,
+              brokerPositionKeysSample: presence.snapshotKeysSample || null,
+              avgEntryFound: Number.isFinite(avgEntryPrice) && avgEntryPrice > 0,
+              openSellFound: false,
+              pendingExitAttach,
+              missingCountBefore,
+              action: 'confirmed_present',
+            });
           } else if (qtyNum > 0) {
-            let refreshedPosition = null;
-            try {
-              refreshedPosition = await fetchPosition(symbol);
-            } catch (err) {
-              console.warn('exit_state_reconcile_fetch_failed', {
-                symbol,
-                error: err?.message || err,
+            const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, canonicalSymbol, qtyNum);
+            if (hasMatchingOpenSell) {
+              markPositionConfirmed(canonicalSymbol);
+              console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
+                symbol: canonicalSymbol,
+                missingCount: 0,
               });
               continue;
             }
 
-            const refreshedQty = Number(
-              refreshedPosition?.qty_available ??
-              refreshedPosition?.available ??
-              refreshedPosition?.qty ??
-              refreshedPosition?.quantity ??
-              0,
-            );
-
-            if (Number.isFinite(refreshedQty) && refreshedQty > 0) {
-              markPositionConfirmed(symbol);
-              availableQtyOverride = refreshedQty;
-            } else {
-              const hasMatchingOpenSell = hasOpenSellForSymbol(liveOrdersForSymbol, symbol, qtyNum);
-              if (hasMatchingOpenSell) {
-                markPositionConfirmed(symbol);
-                console.log('EXIT_STATE_RECONCILE_HOLD_BY_OPEN_SELL', {
-                  symbol,
-                  missingCount: 0,
-                });
-                continue;
-              }
-
-              const missingCount = (positionMissingCountBySymbol.get(symbol) || 0) + 1;
-              positionMissingCountBySymbol.set(symbol, missingCount);
-              const millisSinceConfirmed = getExitStateReferenceMs(symbol, now);
-
-              const canDrop =
-                missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
-                !hasMatchingOpenSell &&
-                !pendingExitAttach &&
-                Number.isFinite(millisSinceConfirmed) &&
-                millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS;
-
-              if (canDrop) {
-                console.log('EXIT_STATE_RECONCILE_DROP', {
-                  symbol,
-                  missingCount,
-                  msSinceRef: millisSinceConfirmed,
-                  openSell: hasMatchingOpenSell,
-                  pending: pendingExitAttach,
-                });
-
-                clearExitTracking(symbol, {
-                  reason: 'alpaca_position_missing_or_zero',
-                  missingCount,
-                  missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
-                  millisSinceConfirmed,
-                  hasMatchingOpenSell,
-                  pendingExitAttach,
-                });
-              } else {
-                console.log('EXIT_STATE_RECONCILE_MISS', {
-                  symbol,
-                  missingCount,
-                  msSinceRef: millisSinceConfirmed,
-                  openSell: hasMatchingOpenSell,
-                  pending: pendingExitAttach,
-                });
-              }
-
+            if (presence.status === 'unknown') {
+              console.log('EXIT_STATE_RECONCILE_DEFER', {
+                symbol: canonicalSymbol,
+                reason: presence.reason,
+                pending: pendingExitAttach,
+                openSell: hasMatchingOpenSell,
+                missingCount: missingCountBefore,
+                error: presence.error || null,
+              });
               continue;
             }
+
+            const missingCount = missingCountBefore + 1;
+            positionMissingCountBySymbol.set(canonicalSymbol, missingCount);
+            const millisSinceConfirmed = getExitStateReferenceMs(canonicalSymbol, now);
+
+            const canDrop =
+              missingCount >= EXIT_RECONCILE_MISS_THRESHOLD &&
+              !hasMatchingOpenSell &&
+              !pendingExitAttach &&
+              Number.isFinite(millisSinceConfirmed) &&
+              millisSinceConfirmed >= EXIT_RECONCILE_MIN_CONFIRM_MS;
+
+            if (canDrop) {
+              console.log('EXIT_STATE_RECONCILE_DROP', {
+                symbol: canonicalSymbol,
+                missingCount,
+                msSinceRef: millisSinceConfirmed,
+                openSell: hasMatchingOpenSell,
+                pending: pendingExitAttach,
+              });
+
+              clearExitTracking(canonicalSymbol, {
+                reason: 'alpaca_position_missing_or_zero',
+                missingCount,
+                missThreshold: EXIT_RECONCILE_MISS_THRESHOLD,
+                millisSinceConfirmed,
+                hasMatchingOpenSell,
+                pendingExitAttach,
+              });
+            } else {
+              console.log('exit_reconcile_presence_check', {
+                symbol,
+                canonicalSymbol,
+                brokerPositionFound: false,
+                brokerPresenceReason: presence.reason,
+                brokerLookupKey: presence.lookupKey || null,
+                brokerPositionKeysSample: presence.snapshotKeysSample || null,
+                avgEntryFound: Number.isFinite(avgEntryPrice) && avgEntryPrice > 0,
+                openSellFound: hasMatchingOpenSell,
+                pendingExitAttach,
+                missingCountBefore,
+                action: 'increment_missing',
+              });
+              console.log('EXIT_STATE_RECONCILE_MISS', {
+                symbol: canonicalSymbol,
+                missingCount,
+                msSinceRef: millisSinceConfirmed,
+                openSell: hasMatchingOpenSell,
+                pending: pendingExitAttach,
+              });
+            }
+
+            continue;
           }
         }
 
@@ -12164,6 +12362,9 @@ module.exports = {
   computeTargetSellPrice,
   resolveEntryBasis,
   computeAwayBps,
+  getBrokerPositionLookupKeys,
+  extractBrokerPositionQty,
+  findPositionInSnapshot,
   expandNestedOrders,
   isOpenLikeOrderStatus,
   getExitStateSnapshot,

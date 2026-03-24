@@ -115,7 +115,14 @@ assert.equal(
 );
 
 const tradeEntryBasis = loadTrade();
-const { resolveEntryBasis, computeTargetSellPrice, computeAwayBps } = tradeEntryBasis;
+const {
+  resolveEntryBasis,
+  computeTargetSellPrice,
+  computeAwayBps,
+  getBrokerPositionLookupKeys,
+  extractBrokerPositionQty,
+  findPositionInSnapshot,
+} = tradeEntryBasis;
 
 const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
 assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
@@ -133,6 +140,26 @@ assert.equal(fallbackEntry.entryBasis, 101);
 
 assert.equal(computeAwayBps(110, 100), 1000);
 assert.equal(computeAwayBps(90, 100), 1000);
+
+assert.deepEqual(getBrokerPositionLookupKeys('dotusd'), ['DOT/USD', 'DOTUSD']);
+assert.deepEqual(getBrokerPositionLookupKeys('DOT/USD'), ['DOT/USD', 'DOTUSD']);
+
+const qtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty: '12.5', qty_available: '0' });
+assert.equal(qtyEvidence.totalQty, 12.5);
+assert.equal(qtyEvidence.availableQty, 0);
+assert.equal(qtyEvidence.qtyForPresence, 12.5);
+
+const missingQtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty_available: '0', qty: '0' });
+assert.equal(missingQtyEvidence.qtyForPresence, 0);
+
+const snapshot = {
+  mapByNormalized: new Map([
+    ['DOT/USD', { symbol: 'DOT/USD', qty: '3' }],
+    ['DOTUSD', { symbol: 'DOTUSD', qty: '3' }],
+  ]),
+};
+assert.equal(findPositionInSnapshot(snapshot, 'DOT/USD')?.position?.symbol, 'DOT/USD');
+assert.equal(findPositionInSnapshot(snapshot, 'dotusd')?.position?.symbol, 'DOT/USD');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
