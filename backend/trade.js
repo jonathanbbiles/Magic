@@ -343,6 +343,7 @@ const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 20);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
+const REGIME_ALLOW_UNKNOWN_VOL = readEnvFlag('REGIME_ALLOW_UNKNOWN_VOL', false);
 const MOMENTUM_MIN_STRENGTH = readNumber('MOMENTUM_MIN_STRENGTH', 0.15);
 const REVERSION_MIN_RECOVERY_STRENGTH = readNumber('REVERSION_MIN_RECOVERY_STRENGTH', 0.10);
 const FAILED_TRADE_MAX_AGE_SEC = readNumber('FAILED_TRADE_MAX_AGE_SEC', 90);
@@ -942,6 +943,36 @@ function microMetrics({ mid, prevMid, spreadBps }) {
   return {
     deltaBps,
     microBias,
+  };
+}
+
+function deriveAtrVolatilityBpsFromBars(barSeries1m, refPrice) {
+  const atr = computeATR(Array.isArray(barSeries1m) ? barSeries1m : [], STOPLOSS_ATR_PERIOD);
+  const atrBps = atrToBps(atr, refPrice);
+  return Number.isFinite(atrBps) ? atrBps : null;
+}
+
+function resolveRegimeVolatilityContext({ predictorSignals, barSeries1m, refPrice } = {}) {
+  const primaryVol = Number(predictorSignals?.volatilityBps);
+  if (Number.isFinite(primaryVol)) {
+    return {
+      volatilityBps: primaryVol,
+      volatilitySource: 'predictor_signals',
+      volatilityState: 'known',
+    };
+  }
+  const fallbackVol = deriveAtrVolatilityBpsFromBars(barSeries1m, refPrice);
+  if (Number.isFinite(fallbackVol)) {
+    return {
+      volatilityBps: fallbackVol,
+      volatilitySource: 'atr_fallback',
+      volatilityState: 'known',
+    };
+  }
+  return {
+    volatilityBps: null,
+    volatilitySource: 'missing',
+    volatilityState: 'unknown',
   };
 }
 
@@ -1561,30 +1592,21 @@ async function computeEntrySignal(symbol, opts = {}) {
     predictorSignals: predictorTp?.signals,
     momentumMinStrength: MOMENTUM_MIN_STRENGTH,
     reversionMinRecoveryStrength: REVERSION_MIN_RECOVERY_STRENGTH,
-    requireMomentum: REGIME_REQUIRE_MOMENTUM,
+    requireMomentum: true,
   });
-
-  if (!momentumState.confirmed) {
-    logEntrySkip({
-      symbol: asset.symbol,
-      spreadBps,
-      requiredEdgeBps,
-      reason: 'momentum_gate',
-      momentumState,
-    });
-    return {
-      entryReady: false,
-      why: 'momentum_gate',
-      meta: { symbol: asset.symbol, spreadBps, requiredEdgeBps, momentumState },
-      record: baseRecord,
-    };
-  }
+  const volatilityContext = resolveRegimeVolatilityContext({
+    predictorSignals: predictorTp?.signals,
+    barSeries1m,
+    refPrice: mid,
+  });
 
   const marketDataHealthy = Number.isFinite(bid) && Number.isFinite(ask) && Number.isFinite(spreadBps) && obResult?.ok;
   const regimeDecision = evaluateTradeableRegime({
     spreadBps,
     weakLiquidity,
-    volatilityBps: predictorTp?.signals?.volatilityBps,
+    volatilityBps: volatilityContext.volatilityBps,
+    volatilitySource: volatilityContext.volatilitySource,
+    volatilityState: volatilityContext.volatilityState,
     momentumState,
     marketDataHealthy,
     maxSpreadBps: REGIME_MAX_SPREAD_BPS,
@@ -1592,6 +1614,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     maxVolBps: REGIME_MAX_VOL_BPS,
     requireMomentum: REGIME_REQUIRE_MOMENTUM,
     blockWeakLiquidity: REGIME_BLOCK_WEAK_LIQUIDITY,
+    allowUnknownVol: REGIME_ALLOW_UNKNOWN_VOL,
   });
 
   if (!regimeDecision.entryAllowed) {
@@ -1599,6 +1622,9 @@ async function computeEntrySignal(symbol, opts = {}) {
       symbol: asset.symbol,
       spreadBps,
       weakLiquidity,
+      volatilityBps: regimeDecision.volatilityBps,
+      volatilitySource: regimeDecision.volatilitySource,
+      volatilityState: regimeDecision.volatilityState,
       volState: regimeDecision.volState,
       momentumState: regimeDecision.momentumState,
       reason: regimeDecision.reason,
@@ -1627,6 +1653,23 @@ async function computeEntrySignal(symbol, opts = {}) {
       entryReady: false,
       why: 'profit_gate',
       meta: { symbol: asset.symbol, spreadBps, requiredEdgeBps, targetProfitBps: TARGET_PROFIT_BPS },
+      record: baseRecord,
+    };
+  }
+
+  // Trigger-strength gate: this is intentionally separate from the broader regime gate.
+  if (!momentumState.confirmed) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'momentum_trigger_gate',
+      momentumState,
+    });
+    return {
+      entryReady: false,
+      why: 'momentum_trigger_gate',
+      meta: { symbol: asset.symbol, spreadBps, requiredEdgeBps, momentumState },
       record: baseRecord,
     };
   }
@@ -7338,6 +7381,61 @@ async function repairOrphanExitsSafe() {
   }
 }
 
+async function recomputeLiveMomentumState({ symbol, bid, ask }) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const refPrice =
+    Number.isFinite(bid) && Number.isFinite(ask)
+      ? (bid + ask) / 2
+      : (Number.isFinite(bid) ? bid : ask);
+  if (!Number.isFinite(refPrice) || refPrice <= 0) {
+    return null;
+  }
+  try {
+    const [bars1mResult, bars5mResult, bars15mResult, obResult] = await Promise.all([
+      fetchBarsWithDebug({ symbol: normalizedSymbol, timeframe: '1Min', limit: Math.max(60, PREDICTOR_WARMUP_MIN_1M_BARS) }),
+      fetchBarsWithDebug({ symbol: normalizedSymbol, timeframe: '5Min', limit: Math.max(60, PREDICTOR_WARMUP_MIN_5M_BARS) }),
+      fetchBarsWithDebug({ symbol: normalizedSymbol, timeframe: '15Min', limit: Math.max(40, PREDICTOR_WARMUP_MIN_15M_BARS) }),
+      getLatestOrderbook(normalizedSymbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS }),
+    ]);
+    if (!bars1mResult?.ok || !bars5mResult?.ok || !bars15mResult?.ok || !obResult?.ok) {
+      return null;
+    }
+    const bars1m = bars1mResult?.response?.bars?.[normalizedSymbol] || [];
+    const bars5m = bars5mResult?.response?.bars?.[normalizedSymbol] || [];
+    const bars15m = bars15mResult?.response?.bars?.[normalizedSymbol] || [];
+    const predictor = predictOne({
+      symbol: normalizedSymbol,
+      bars: bars1m,
+      bars1m,
+      bars5m,
+      bars15m,
+      orderbook: obResult.orderbook,
+      spreadBps: Number.isFinite(bid) && Number.isFinite(ask) ? ((ask - bid) / refPrice) * BPS : 0,
+      refPrice,
+      marketContext: {
+        targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+        horizonMinutes: TARGET_HORIZON_MINUTES,
+        orderbookBandBps: ORDERBOOK_BAND_BPS,
+        orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        orderbookImpactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        volumeTrendMin: VOLUME_TREND_MIN,
+        timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
+        regimeZscoreThreshold: REGIME_ZSCORE_THRESHOLD,
+      },
+    });
+    return evaluateMomentumState({
+      predictorSignals: predictor?.signals,
+      momentumMinStrength: MOMENTUM_MIN_STRENGTH,
+      reversionMinRecoveryStrength: REVERSION_MIN_RECOVERY_STRENGTH,
+      requireMomentum: true,
+    });
+  } catch (err) {
+    console.warn('exit_failed_trade_momentum_recompute_failed', { symbol: normalizedSymbol, error: err?.message || err });
+    return null;
+  }
+}
+
 async function manageExitStates() {
 
   if (exitManagerRunning) {
@@ -8632,16 +8730,21 @@ async function manageExitStates() {
         const unrealizedPct = Number.isFinite(bid) && Number.isFinite(state.entryPrice) && state.entryPrice > 0
           ? ((bid - state.entryPrice) / state.entryPrice) * 100
           : null;
-        const liveMomentumState = state.entryMomentumState && typeof state.entryMomentumState === 'object'
+        const entryMomentumState = state.entryMomentumState && typeof state.entryMomentumState === 'object'
           ? { ...state.entryMomentumState }
           : null;
-        if (liveMomentumState && Number.isFinite(unrealizedPct) && unrealizedPct < FAILED_TRADE_MIN_PROGRESS_PCT) {
-          liveMomentumState.confirmed = false;
-          liveMomentumState.reason = 'price_followthrough_lost';
-        }
+        const shouldEvaluateFailedTradeMomentum =
+          FAILED_TRADE_EXIT_ON_MOMENTUM_LOSS &&
+          Number.isFinite(heldSeconds) &&
+          heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
+        const liveMomentumState = shouldEvaluateFailedTradeMomentum
+          ? await recomputeLiveMomentumState({ symbol, bid, ask })
+          : null;
         const failedTradeDecision = shouldExitFailedTrade({
           ageSec: heldSeconds,
           unrealizedPct,
+          progressPct: unrealizedPct,
+          entryMomentumState,
           momentumState: liveMomentumState,
           maxAgeSec: FAILED_TRADE_MAX_AGE_SEC,
           minProgressPct: FAILED_TRADE_MIN_PROGRESS_PCT,
@@ -8678,7 +8781,9 @@ async function manageExitStates() {
             symbol,
             ageSec: heldSeconds,
             unrealizedPct,
-            momentumState: liveMomentumState || null,
+            progressPct: failedTradeDecision.progressPct,
+            entryMomentumState: failedTradeDecision.entryMomentumState,
+            currentMomentumState: failedTradeDecision.currentMomentumState,
             reason: failedTradeDecision.reason,
           });
           exitState.delete(symbol);

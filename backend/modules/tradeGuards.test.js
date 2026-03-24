@@ -37,6 +37,31 @@ const badRegime = evaluateTradeableRegime({
 assert.equal(badRegime.entryAllowed, false);
 assert.ok(badRegime.reasons.includes('spread_too_wide'));
 
+const unknownVolBlocked = evaluateTradeableRegime({
+  spreadBps: 12,
+  weakLiquidity: false,
+  volatilityBps: null,
+  volatilityState: 'unknown',
+  volatilitySource: 'missing',
+  momentumState,
+  marketDataHealthy: true,
+  allowUnknownVol: false,
+});
+assert.equal(unknownVolBlocked.entryAllowed, false);
+assert.ok(unknownVolBlocked.reasons.includes('vol_missing'));
+
+const unknownVolAllowed = evaluateTradeableRegime({
+  spreadBps: 12,
+  weakLiquidity: false,
+  volatilityBps: null,
+  volatilityState: 'unknown',
+  volatilitySource: 'missing',
+  momentumState,
+  marketDataHealthy: true,
+  allowUnknownVol: true,
+});
+assert.equal(unknownVolAllowed.entryAllowed, true);
+
 const edge = computeNetEdgeBps({
   expectedMoveBps: 260,
   feeBpsRoundTrip: 20,
@@ -57,6 +82,7 @@ const confidence = computeConfidenceScore({
   weights: { prob: 0.35, spread: 0.2, liquidity: 0.2, momentum: 0.15, regime: 0.1 },
 });
 assert.ok(confidence.confidenceScore > 0.5);
+assert.ok(confidence.confidenceScore <= 1);
 
 const failedTradeExit = shouldExitFailedTrade({
   ageSec: 100,
@@ -67,5 +93,17 @@ const failedTradeExit = shouldExitFailedTrade({
   exitOnMomentumLoss: true,
 });
 assert.equal(failedTradeExit.shouldExit, true);
+assert.equal(failedTradeExit.reason, 'momentum_loss');
+
+const failedTradeNoFollowthrough = shouldExitFailedTrade({
+  ageSec: 100,
+  unrealizedPct: 0.05,
+  momentumState: null,
+  maxAgeSec: 90,
+  minProgressPct: 0.10,
+  exitOnMomentumLoss: true,
+});
+assert.equal(failedTradeNoFollowthrough.shouldExit, true);
+assert.equal(failedTradeNoFollowthrough.reason, 'no_followthrough');
 
 console.log('trade guards tests passed');
