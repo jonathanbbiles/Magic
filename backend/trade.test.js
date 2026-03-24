@@ -142,3 +142,24 @@ const attachBlock = tradeSource.slice(attachStart, attachEnd);
 assert.equal(/computeBookAnchoredSellLimit/.test(attachBlock), false);
 
 console.log('trade tests passed');
+
+const guards = require('./modules/tradeGuards');
+const weakRegime = guards.evaluateTradeableRegime({
+  spreadBps: 12,
+  weakLiquidity: true,
+  volatilityBps: 100,
+  momentumState: { confirmed: true },
+  marketDataHealthy: true,
+});
+assert.equal(weakRegime.entryAllowed, false);
+assert.ok(weakRegime.reasons.includes('weak_liquidity'));
+
+const failedDecision = guards.shouldExitFailedTrade({
+  ageSec: 95,
+  unrealizedPct: 0.02,
+  momentumState: { confirmed: false },
+  maxAgeSec: 90,
+  minProgressPct: 0.10,
+  exitOnMomentumLoss: true,
+});
+assert.equal(failedDecision.shouldExit, true);
