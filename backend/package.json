@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node startup.test.js && node quoteUtils.test.js && node symbolUtils.test.js && node trade.test.js && node predictorWarmup.test.js && node modules/tradeGuards.test.js",
+    "test": "node startup.test.js && node quoteUtils.test.js && node symbolUtils.test.js && node trade.test.js && node predictorWarmup.test.js && node modules/tradeGuards.test.js && node config/validateEnv.test.js",
     "smoke": "node smoke.test.js"
   },
   "dependencies": {

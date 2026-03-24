@@ -43,6 +43,8 @@ function evaluateTradeableRegime({
   spreadBps,
   weakLiquidity,
   volatilityBps,
+  volatilityState = 'known',
+  volatilitySource = 'signals',
   momentumState,
   marketDataHealthy,
   maxSpreadBps = 40,
@@ -50,12 +52,14 @@ function evaluateTradeableRegime({
   maxVolBps = 250,
   requireMomentum = true,
   blockWeakLiquidity = true,
+  allowUnknownVol = false,
 } = {}) {
   const spreadOk = Number.isFinite(spreadBps) && spreadBps <= maxSpreadBps;
   const liquidityOk = blockWeakLiquidity ? !weakLiquidity : true;
+  const volUnknown = volatilityState === 'unknown' || !Number.isFinite(volatilityBps);
   const volLow = Number.isFinite(volatilityBps) && volatilityBps < minVolBps;
   const volHigh = Number.isFinite(volatilityBps) && volatilityBps > maxVolBps;
-  const volOk = Number.isFinite(volatilityBps) && !volLow && !volHigh;
+  const volOk = volUnknown ? allowUnknownVol : (!volLow && !volHigh);
   const momentumOk = requireMomentum ? Boolean(momentumState?.confirmed) : true;
   const dataOk = Boolean(marketDataHealthy);
 
@@ -63,7 +67,10 @@ function evaluateTradeableRegime({
   if (!dataOk) reasons.push('market_data_unhealthy');
   if (!spreadOk) reasons.push('spread_too_wide');
   if (!liquidityOk) reasons.push('weak_liquidity');
-  if (!volOk) reasons.push(volLow ? 'vol_too_low' : 'vol_too_high');
+  if (!volOk) {
+    if (volUnknown) reasons.push('vol_missing');
+    else reasons.push(volLow ? 'vol_too_low' : 'vol_too_high');
+  }
   if (!momentumOk) reasons.push(`momentum_${momentumState?.reason || 'unconfirmed'}`);
 
   return {
@@ -72,7 +79,10 @@ function evaluateTradeableRegime({
     reasons,
     spreadOk,
     liquidityOk,
-    volState: volOk ? 'ok' : (volLow ? 'too_low' : 'too_high'),
+    volatilityBps: Number.isFinite(volatilityBps) ? volatilityBps : null,
+    volatilitySource,
+    volatilityState: volUnknown ? 'unknown' : 'known',
+    volState: volOk ? 'ok' : (volUnknown ? 'unknown' : (volLow ? 'too_low' : 'too_high')),
     momentumState: momentumState?.confirmed ? 'confirmed' : (momentumState?.reason || 'unconfirmed'),
     marketDataHealthy: dataOk,
   };
@@ -140,22 +150,52 @@ function computeConfidenceScore({
 function shouldExitFailedTrade({
   ageSec,
   unrealizedPct,
+  progressPct,
+  entryMomentumState,
   momentumState,
   maxAgeSec = 90,
   minProgressPct = 0.10,
   exitOnMomentumLoss = true,
 } = {}) {
   const agedOut = Number.isFinite(ageSec) && ageSec >= maxAgeSec;
-  const insufficientProgress = Number.isFinite(unrealizedPct) && unrealizedPct < minProgressPct;
+  const progressValue = Number.isFinite(progressPct) ? progressPct : unrealizedPct;
+  const insufficientProgress = Number.isFinite(progressValue) && progressValue < minProgressPct;
   const momentumLost = exitOnMomentumLoss && momentumState && !momentumState.confirmed;
 
-  if (agedOut && insufficientProgress) {
-    return { shouldExit: true, reason: 'age_without_progress', agedOut, insufficientProgress, momentumLost: Boolean(momentumLost) };
-  }
   if (momentumLost && agedOut) {
-    return { shouldExit: true, reason: 'momentum_loss', agedOut, insufficientProgress, momentumLost: true };
+    return {
+      shouldExit: true,
+      reason: 'momentum_loss',
+      agedOut,
+      insufficientProgress,
+      momentumLost: true,
+      progressPct: Number.isFinite(progressValue) ? progressValue : null,
+      entryMomentumState: entryMomentumState || null,
+      currentMomentumState: momentumState || null,
+    };
   }
-  return { shouldExit: false, reason: 'hold', agedOut, insufficientProgress, momentumLost: Boolean(momentumLost) };
+  if (agedOut && insufficientProgress) {
+    return {
+      shouldExit: true,
+      reason: 'no_followthrough',
+      agedOut,
+      insufficientProgress,
+      momentumLost: Boolean(momentumLost),
+      progressPct: Number.isFinite(progressValue) ? progressValue : null,
+      entryMomentumState: entryMomentumState || null,
+      currentMomentumState: momentumState || null,
+    };
+  }
+  return {
+    shouldExit: false,
+    reason: 'hold',
+    agedOut,
+    insufficientProgress,
+    momentumLost: Boolean(momentumLost),
+    progressPct: Number.isFinite(progressValue) ? progressValue : null,
+    entryMomentumState: entryMomentumState || null,
+    currentMomentumState: momentumState || null,
+  };
 }
 
 module.exports = {
