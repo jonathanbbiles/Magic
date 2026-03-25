@@ -461,7 +461,7 @@ const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
 const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
 const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 10000);
 const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 60);
-const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 75);
+const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 175);
 const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN', 0.25);
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
 const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
@@ -1115,6 +1115,16 @@ async function computeEntrySignal(symbol, opts = {}) {
   baseRecord.orderbookLiquidityScore = orderbookMeta.liquidityScore;
 
   if (!orderbookMeta.ok) {
+    if (orderbookMeta.reason === 'ob_depth_insufficient') {
+      logEntrySkip({
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps,
+        reason: orderbookMeta.reason,
+        actualDepthUsd: Math.min(orderbookMeta.askDepthUsd, orderbookMeta.bidDepthUsd),
+        minDepthThreshold: ORDERBOOK_MIN_DEPTH_USD,
+      });
+    }
     return {
       entryReady: false,
       why: 'orderbook_liquidity_gate',
