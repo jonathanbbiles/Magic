@@ -414,7 +414,7 @@ const SPREAD_ELASTICITY_MIN_BASELINE_BPS = readNumber('SPREAD_ELASTICITY_MIN_BAS
 const VOL_COMPRESSION_ENABLED = readFlag('VOL_COMPRESSION_ENABLED', true);
 const VOL_COMPRESSION_LOOKBACK_SHORT = readNumber('VOL_COMPRESSION_LOOKBACK_SHORT', 20);
 const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG', 60);
-const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.55);
+const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.45);
 const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
 
 // 4) Orderbook absorption
@@ -1268,8 +1268,11 @@ async function computeEntrySignal(symbol, opts = {}) {
         spreadBps,
         requiredEdgeBps,
         reason: 'vol_compression_gate',
-        actual: Number.isFinite(longVolBps) ? longVolBps : null,
-        threshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+        compressionRatio: Number.isFinite(compressionRatio) ? compressionRatio : null,
+        minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
+        shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
+        longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
+        minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
         volCompression: volCompressionMeta,
       });
       return {
