@@ -196,6 +196,8 @@ assert.equal(inferredSellability.availableQty, 5);
 assert.equal(inferredSellability.reservedQty, 5);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
+assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
+assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10\);/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
 assert.ok(attachStart !== -1 && attachEnd !== -1);

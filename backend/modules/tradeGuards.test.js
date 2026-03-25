@@ -37,6 +37,27 @@ const badRegime = evaluateTradeableRegime({
 assert.equal(badRegime.entryAllowed, false);
 assert.ok(badRegime.reasons.includes('spread_too_wide'));
 
+const lowVolNowAllowedRegime = evaluateTradeableRegime({
+  spreadBps: 12,
+  weakLiquidity: false,
+  volatilityBps: 16,
+  momentumState,
+  marketDataHealthy: true,
+  minVolBps: 15,
+});
+assert.equal(lowVolNowAllowedRegime.entryAllowed, true);
+
+const stillTooLowVolRegime = evaluateTradeableRegime({
+  spreadBps: 12,
+  weakLiquidity: false,
+  volatilityBps: 14.9,
+  momentumState,
+  marketDataHealthy: true,
+  minVolBps: 15,
+});
+assert.equal(stillTooLowVolRegime.entryAllowed, false);
+assert.ok(stillTooLowVolRegime.reasons.includes('vol_too_low'));
+
 const unknownVolBlocked = evaluateTradeableRegime({
   spreadBps: 12,
   weakLiquidity: false,
