@@ -21,12 +21,35 @@ withEnv({}, () => {
   assert.doesNotThrow(() => validateEnv());
 });
 
+withEnv({}, () => {
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...args) => logs.push(args);
+  try {
+    validateEnv();
+  } finally {
+    console.log = originalLog;
+  }
+  const guardrails = logs.find((entry) => entry[0] === 'config_guardrails')?.[1];
+  assert.ok(guardrails);
+  assert.equal(guardrails.regime.minVolBps, 15);
+  assert.equal(guardrails.volCompression.minLongVolBps, 10);
+});
+
 withEnv({ REGIME_ALLOW_UNKNOWN_VOL: 'maybe' }, () => {
   assert.throws(() => validateEnv(), /REGIME_ALLOW_UNKNOWN_VOL must be a boolean-like value/);
 });
 
 withEnv({ REGIME_MIN_VOL_BPS: '300', REGIME_MAX_VOL_BPS: '100' }, () => {
   assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS cannot exceed REGIME_MAX_VOL_BPS/);
+});
+
+withEnv({ REGIME_MIN_VOL_BPS: '0' }, () => {
+  assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS must be > 0/);
+});
+
+withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS: '0' }, () => {
+  assert.throws(() => validateEnv(), /VOL_COMPRESSION_MIN_LONG_VOL_BPS must be > 0/);
 });
 
 withEnv({ CONFIDENCE_MIN_MULTIPLIER: '1.2', CONFIDENCE_MAX_MULTIPLIER: '0.9' }, () => {

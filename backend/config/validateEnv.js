@@ -183,8 +183,9 @@ const validateEnv = () => {
 
   try {
     const regimeMaxSpreadBps = parseFiniteNumberEnv('REGIME_MAX_SPREAD_BPS', 40);
-    const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 20);
+    const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 15);
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
+    const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
     const regimeRequireMomentum = parseBooleanEnv('REGIME_REQUIRE_MOMENTUM', true);
     const regimeBlockWeakLiquidity = parseBooleanEnv('REGIME_BLOCK_WEAK_LIQUIDITY', true);
     const regimeAllowUnknownVol = parseBooleanEnv('REGIME_ALLOW_UNKNOWN_VOL', false);
@@ -209,6 +210,13 @@ const validateEnv = () => {
     assertInRange('REGIME_MAX_SPREAD_BPS', regimeMaxSpreadBps, 0, 10000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
+    assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS', volCompressionMinLongVolBps, 0, 10000);
+    if (regimeMinVolBps <= 0) {
+      throw new Error(`REGIME_MIN_VOL_BPS must be > 0. Received: "${regimeMinVolBps}"`);
+    }
+    if (volCompressionMinLongVolBps <= 0) {
+      throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS must be > 0. Received: "${volCompressionMinLongVolBps}"`);
+    }
     if (regimeMinVolBps > regimeMaxVolBps) {
       throw new Error(`REGIME_MIN_VOL_BPS cannot exceed REGIME_MAX_VOL_BPS. Received min=${regimeMinVolBps}, max=${regimeMaxVolBps}`);
     }
@@ -251,6 +259,9 @@ const validateEnv = () => {
         requireMomentum: regimeRequireMomentum,
         blockWeakLiquidity: regimeBlockWeakLiquidity,
         allowUnknownVol: regimeAllowUnknownVol,
+      },
+      volCompression: {
+        minLongVolBps: volCompressionMinLongVolBps,
       },
       failedTrade: {
         maxAgeSec: failedTradeMaxAgeSec,

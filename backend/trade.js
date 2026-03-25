@@ -339,7 +339,7 @@ const LIQUIDITY_WINDOW_UTC_END = readNumber('LIQUIDITY_WINDOW_UTC_END', 16);
 const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
 const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
-const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 20);
+const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -415,7 +415,7 @@ const VOL_COMPRESSION_ENABLED = readFlag('VOL_COMPRESSION_ENABLED', true);
 const VOL_COMPRESSION_LOOKBACK_SHORT = readNumber('VOL_COMPRESSION_LOOKBACK_SHORT', 20);
 const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG', 60);
 const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.55);
-const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 12);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
 
 // 4) Orderbook absorption
 const ORDERBOOK_ABSORPTION_ENABLED = readFlag('ORDERBOOK_ABSORPTION_ENABLED', true);
@@ -1253,6 +1253,8 @@ async function computeEntrySignal(symbol, opts = {}) {
   const volCompressionMeta = {
     shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
     longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
+    minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+    minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
     compressionRatio,
     lookbackShort: VOL_COMPRESSION_LOOKBACK_SHORT,
     lookbackLong: VOL_COMPRESSION_LOOKBACK_LONG,
@@ -1266,6 +1268,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         spreadBps,
         requiredEdgeBps,
         reason: 'vol_compression_gate',
+        actual: Number.isFinite(longVolBps) ? longVolBps : null,
+        threshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
         volCompression: volCompressionMeta,
       });
       return {
@@ -1628,6 +1632,10 @@ async function computeEntrySignal(symbol, opts = {}) {
       volState: regimeDecision.volState,
       momentumState: regimeDecision.momentumState,
       reason: regimeDecision.reason,
+      thresholds: {
+        regimeMinVolBps: REGIME_MIN_VOL_BPS,
+        compressionMinLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+      },
     });
     return {
       entryReady: false,
