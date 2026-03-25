@@ -44,6 +44,7 @@ const {
   computeConfidenceScore,
   shouldExitFailedTrade,
 } = require('./modules/tradeGuards');
+const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -1104,10 +1105,20 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const orderbookMeta = computeOrderbookMetrics(obResult.orderbook, {
-    bid: obResult.orderbook.bestBid,
-    ask: obResult.orderbook.bestAsk,
-  });
+  const orderbookMeta = computeOrderbookMetrics(
+    obResult.orderbook,
+    {
+      bid: obResult.orderbook.bestBid,
+      ask: obResult.orderbook.bestAsk,
+    },
+    {
+      bandBps: ORDERBOOK_BAND_BPS,
+      minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+      maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+      impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      imbalanceBiasScale: ORDERBOOK_IMBALANCE_BIAS_SCALE,
+    },
+  );
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
   baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
   baseRecord.orderbookImpactBpsBuy = orderbookMeta.impactBpsBuy;
@@ -1116,13 +1127,27 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   if (!orderbookMeta.ok) {
     if (orderbookMeta.reason === 'ob_depth_insufficient') {
+      const obMidPrice = Number.isFinite(obResult.orderbook.bestAsk) && Number.isFinite(obResult.orderbook.bestBid)
+        ? (obResult.orderbook.bestAsk + obResult.orderbook.bestBid) / 2
+        : null;
       logEntrySkip({
         symbol: asset.symbol,
         spreadBps,
         requiredEdgeBps,
         reason: orderbookMeta.reason,
-        actualDepthUsd: Math.min(orderbookMeta.askDepthUsd, orderbookMeta.bidDepthUsd),
+        depthState: orderbookMeta.depthState,
+        depthComputationMode: orderbookMeta.depthComputationMode,
+        levelsConsideredPerSide: orderbookMeta.levelsConsideredPerSide,
+        maxDepthDistanceBps: orderbookMeta.maxDepthDistanceBps,
+        bestBid: obResult.orderbook.bestBid,
+        bestAsk: obResult.orderbook.bestAsk,
+        midPrice: obMidPrice,
+        bidDepthUsd: orderbookMeta.bidDepthUsd,
+        askDepthUsd: orderbookMeta.askDepthUsd,
+        totalDepthUsd: orderbookMeta.totalDepthUsd,
+        actualDepthUsd: orderbookMeta.actualDepthUsd,
         minDepthThreshold: ORDERBOOK_MIN_DEPTH_USD,
+        orderbookLevelCounts: orderbookMeta.orderbookLevelCounts,
       });
     }
     return {
@@ -5683,91 +5708,6 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
       fallback: 'quotes',
       fallbackStatus: 'missing',
     },
-  };
-}
-
-function sumDepthUsdWithinBand(levels, bestPrice, bandBps, side) {
-  const band = Math.max(1, bandBps) / 10000;
-  const limit = side === 'ask' ? bestPrice * (1 + band) : bestPrice * (1 - band);
-  let total = 0;
-  for (const lvl of levels) {
-    const p = Number(lvl?.p ?? lvl?.price);
-    const s = Number(lvl?.s ?? lvl?.size ?? lvl?.q ?? lvl?.qty);
-    if (!Number.isFinite(p) || !Number.isFinite(s) || p <= 0 || s <= 0) continue;
-    if (side === 'ask') {
-      if (p > limit) continue;
-    } else if (p < limit) {
-      continue;
-    }
-    total += p * s;
-  }
-  return total;
-}
-
-function estimateBuyImpactBps(asks, bestAsk, notionalUsd) {
-  const target = Math.max(1, Number(notionalUsd) || 0);
-  let remaining = target;
-  let cost = 0;
-  let qty = 0;
-  for (const lvl of asks) {
-    const p = Number(lvl?.p ?? lvl?.price);
-    const s = Number(lvl?.s ?? lvl?.size ?? lvl?.q ?? lvl?.qty);
-    if (!Number.isFinite(p) || !Number.isFinite(s) || p <= 0 || s <= 0) continue;
-    const lvlNotional = p * s;
-    const takeNotional = Math.min(remaining, lvlNotional);
-    const takeQty = takeNotional / p;
-    cost += takeNotional;
-    qty += takeQty;
-    remaining -= takeNotional;
-    if (remaining <= 0) break;
-  }
-  if (remaining > 0 || qty <= 0) return Infinity;
-  const vwap = cost / qty;
-  return ((vwap - bestAsk) / bestAsk) * 10000;
-}
-
-function computeOrderbookMetrics({ asks, bids }, { bid, ask }) {
-  const askDepthUsd = sumDepthUsdWithinBand(asks, ask, ORDERBOOK_BAND_BPS, 'ask');
-  const bidDepthUsd = sumDepthUsdWithinBand(bids, bid, ORDERBOOK_BAND_BPS, 'bid');
-  const impactBpsBuy = estimateBuyImpactBps(asks, ask, ORDERBOOK_IMPACT_NOTIONAL_USD);
-
-  const denom = Math.max(1, bidDepthUsd + askDepthUsd);
-  const imbalance = (bidDepthUsd - askDepthUsd) / denom;
-  const obBias = clamp(imbalance * ORDERBOOK_IMBALANCE_BIAS_SCALE, -0.05, 0.05);
-
-  const depthScore = clamp(Math.min(askDepthUsd, bidDepthUsd) / Math.max(1, ORDERBOOK_MIN_DEPTH_USD), 0, 1);
-  const impactScore = clamp(
-    1 - (Number.isFinite(impactBpsBuy) ? impactBpsBuy : ORDERBOOK_MAX_IMPACT_BPS) / Math.max(1, ORDERBOOK_MAX_IMPACT_BPS),
-    0,
-    1,
-  );
-  const liquidityScore = clamp(0.7 * depthScore + 0.3 * impactScore, 0, 1);
-
-  const extremeAskDepthUsd = ORDERBOOK_MIN_DEPTH_USD * 0.2;
-  const extremeBidDepthUsd = ORDERBOOK_MIN_DEPTH_USD * 0.1;
-  const extremeImpactBps = ORDERBOOK_MAX_IMPACT_BPS * 3;
-  const hardFailDepth = askDepthUsd < extremeAskDepthUsd || bidDepthUsd < extremeBidDepthUsd;
-  const hardFailImpact = !Number.isFinite(impactBpsBuy) || impactBpsBuy > extremeImpactBps;
-  const hardFail = hardFailDepth || hardFailImpact;
-
-  let reason = null;
-  if (hardFailDepth) {
-    reason = 'ob_depth_insufficient';
-  } else if (hardFailImpact) {
-    reason = 'ob_impact_too_high';
-  }
-
-  return {
-    askDepthUsd,
-    bidDepthUsd,
-    impactBpsBuy,
-    imbalance,
-    obBias,
-    depthScore,
-    impactScore,
-    liquidityScore,
-    ok: !hardFail,
-    reason,
   };
 }
 
