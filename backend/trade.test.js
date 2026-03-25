@@ -197,9 +197,11 @@ assert.equal(inferredSellability.reservedQty, 5);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
+assert.match(tradeSource, /const ORDERBOOK_MIN_DEPTH_USD = readNumber\('ORDERBOOK_MIN_DEPTH_USD', 175\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_RATIO = readNumber\('VOL_COMPRESSION_MIN_RATIO', 0\.45\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10\);/);
 assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,[\s\S]*shortVolBps:[\s\S]*longVolBps:[\s\S]*minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,/);
+assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*actualDepthUsd: Math\.min\(orderbookMeta\.askDepthUsd, orderbookMeta\.bidDepthUsd\),[\s\S]*minDepthThreshold: ORDERBOOK_MIN_DEPTH_USD,/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
 assert.ok(attachStart !== -1 && attachEnd !== -1);

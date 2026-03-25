@@ -32,6 +32,7 @@ withEnv({}, () => {
   }
   const guardrails = logs.find((entry) => entry[0] === 'config_guardrails')?.[1];
   assert.ok(guardrails);
+  assert.equal(guardrails.regime.orderbookMinDepthUsd, 175);
   assert.equal(guardrails.volCompression.minRatio, 0.45);
   assert.equal(guardrails.regime.minVolBps, 15);
   assert.equal(guardrails.volCompression.minLongVolBps, 10);
@@ -47,6 +48,10 @@ withEnv({ REGIME_MIN_VOL_BPS: '300', REGIME_MAX_VOL_BPS: '100' }, () => {
 
 withEnv({ REGIME_MIN_VOL_BPS: '0' }, () => {
   assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS must be > 0/);
+});
+
+withEnv({ ORDERBOOK_MIN_DEPTH_USD: '0' }, () => {
+  assert.throws(() => validateEnv(), /ORDERBOOK_MIN_DEPTH_USD must be > 0/);
 });
 
 withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS: '0' }, () => {

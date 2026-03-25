@@ -183,6 +183,7 @@ const validateEnv = () => {
 
   try {
     const regimeMaxSpreadBps = parseFiniteNumberEnv('REGIME_MAX_SPREAD_BPS', 40);
+    const orderbookMinDepthUsd = parseFiniteNumberEnv('ORDERBOOK_MIN_DEPTH_USD', 175);
     const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 15);
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
     const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.45);
@@ -209,6 +210,7 @@ const validateEnv = () => {
     const standdownDurationMin = parseFiniteNumberEnv('STANDDOWN_DURATION_MIN', 20);
 
     assertInRange('REGIME_MAX_SPREAD_BPS', regimeMaxSpreadBps, 0, 10000);
+    assertInRange('ORDERBOOK_MIN_DEPTH_USD', orderbookMinDepthUsd, 0, 1000000000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
     assertInRange('VOL_COMPRESSION_MIN_RATIO', volCompressionMinRatio, 0, 10);
@@ -218,6 +220,9 @@ const validateEnv = () => {
     }
     if (regimeMinVolBps <= 0) {
       throw new Error(`REGIME_MIN_VOL_BPS must be > 0. Received: "${regimeMinVolBps}"`);
+    }
+    if (orderbookMinDepthUsd <= 0) {
+      throw new Error(`ORDERBOOK_MIN_DEPTH_USD must be > 0. Received: "${orderbookMinDepthUsd}"`);
     }
     if (volCompressionMinLongVolBps <= 0) {
       throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS must be > 0. Received: "${volCompressionMinLongVolBps}"`);
@@ -259,6 +264,7 @@ const validateEnv = () => {
     console.log('config_guardrails', {
       regime: {
         maxSpreadBps: regimeMaxSpreadBps,
+        orderbookMinDepthUsd,
         minVolBps: regimeMinVolBps,
         maxVolBps: regimeMaxVolBps,
         requireMomentum: regimeRequireMomentum,
