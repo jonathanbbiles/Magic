@@ -121,6 +121,8 @@ const {
   computeAwayBps,
   getBrokerPositionLookupKeys,
   extractBrokerPositionQty,
+  getOpenSellOrdersForSymbol,
+  computeExitSellability,
   findPositionInSnapshot,
 } = tradeEntryBasis;
 
@@ -147,10 +149,15 @@ assert.deepEqual(getBrokerPositionLookupKeys('DOT/USD'), ['DOT/USD', 'DOTUSD']);
 const qtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty: '12.5', qty_available: '0' });
 assert.equal(qtyEvidence.totalQty, 12.5);
 assert.equal(qtyEvidence.availableQty, 0);
+assert.equal(qtyEvidence.hasAvailableQtyField, true);
 assert.equal(qtyEvidence.qtyForPresence, 12.5);
 
 const missingQtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty_available: '0', qty: '0' });
 assert.equal(missingQtyEvidence.qtyForPresence, 0);
+assert.equal(missingQtyEvidence.hasAvailableQtyField, true);
+
+const inferredQtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty: '2.5' });
+assert.equal(inferredQtyEvidence.hasAvailableQtyField, false);
 
 const snapshot = {
   mapByNormalized: new Map([
@@ -160,6 +167,33 @@ const snapshot = {
 };
 assert.equal(findPositionInSnapshot(snapshot, 'DOT/USD')?.position?.symbol, 'DOT/USD');
 assert.equal(findPositionInSnapshot(snapshot, 'dotusd')?.position?.symbol, 'DOT/USD');
+
+const openOrders = [
+  { symbol: 'DOTUSD', side: 'sell', status: 'new', qty: '4.0', type: 'limit', limit_price: '8.15' },
+  { symbol: 'DOT/USD', side: 'sell', status: 'held', qty: '1.0', type: 'limit', limit_price: '8.25' },
+  { symbol: 'DOTUSD', side: 'sell', status: 'filled', qty: '2.0', type: 'limit', limit_price: '8.30' },
+  { symbol: 'DOTUSD', side: 'buy', status: 'new', qty: '3.0' },
+];
+const normalizedOpenSells = getOpenSellOrdersForSymbol(openOrders, 'DOT/USD');
+assert.equal(normalizedOpenSells.length, 2);
+
+const reservedSellability = computeExitSellability({
+  symbol: 'DOT/USD',
+  position: { symbol: 'DOTUSD', qty: '6.116995699', qty_available: '0' },
+  openOrders,
+});
+assert.equal(reservedSellability.totalPositionQty, 6.116995699);
+assert.equal(reservedSellability.availableQty, 0);
+assert.equal(reservedSellability.openSellCount, 2);
+assert.equal(reservedSellability.reservedQty, 5);
+
+const inferredSellability = computeExitSellability({
+  symbol: 'DOT/USD',
+  position: { symbol: 'DOTUSD', qty: '10' },
+  openOrders,
+});
+assert.equal(inferredSellability.availableQty, 5);
+assert.equal(inferredSellability.reservedQty, 5);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
