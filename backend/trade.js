@@ -2190,17 +2190,15 @@ function hasPendingExitAttach(symbol) {
 }
 
 function hasOpenSellForSymbol(openOrders, symbol, requiredQty = null) {
-  const normalizedSymbol = normalizePair(symbol);
-  const orders = Array.isArray(openOrders) ? openOrders : [];
-  return orders.some((order) => {
-    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-    const side = String(order.side || '').toLowerCase();
-    const status = String(order.status || '').toLowerCase();
-    if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
-    if (!isOpenLikeOrderStatus(status)) return false;
-    if (requiredQty == null) return true;
+  const matches = getOpenSellOrdersForSymbol(openOrders, symbol);
+  if (!matches.length) return false;
+  if (requiredQty == null) return true;
+  const requiredQtyNum = Number(requiredQty);
+  if (!(Number.isFinite(requiredQtyNum) && requiredQtyNum > 0)) return true;
+  return matches.some((order) => {
     const orderQty = normalizeOrderQty(order);
-    return orderQtyMeetsRequired(orderQty, Number(requiredQty));
+    if (orderQtyMeetsRequired(orderQty, requiredQtyNum)) return true;
+    return Number.isFinite(orderQty) && orderQty > 0 && !isDustQty(orderQty);
   });
 }
 
@@ -2330,26 +2328,27 @@ function getBrokerPositionLookupKeys(rawSymbol) {
 }
 
 function extractBrokerPositionQty(position) {
+  const availableRaw =
+    position?.qty_available ??
+    position?.available ??
+    position?.available_qty ??
+    position?.remaining_qty ??
+    position?.remainingQty;
   const totalQty = Number(
     position?.qty ??
       position?.quantity ??
       position?.position_qty ??
       0,
   );
-  const availableQty = Number(
-    position?.qty_available ??
-      position?.available ??
-      position?.available_qty ??
-      position?.remaining_qty ??
-      position?.remainingQty ??
-      0,
-  );
+  const availableQty = Number(availableRaw ?? 0);
+  const hasAvailableQtyField = availableRaw != null && Number.isFinite(availableQty);
   const qtyForPresence = Number.isFinite(totalQty) && totalQty > 0
     ? totalQty
     : (Number.isFinite(availableQty) ? availableQty : 0);
   return {
     totalQty: Number.isFinite(totalQty) ? totalQty : 0,
     availableQty: Number.isFinite(availableQty) ? availableQty : 0,
+    hasAvailableQtyField,
     qtyForPresence,
   };
 }
@@ -4327,8 +4326,11 @@ async function getAvailablePositionQty(symbol) {
       logPositionNoneOnce(normalized, 404);
       return 0;
     }
-    const { availableQty, totalQty } = extractBrokerPositionQty(pos);
-    return availableQty > 0 ? availableQty : totalQty;
+    const { availableQty, totalQty, hasAvailableQtyField } = extractBrokerPositionQty(pos);
+    if (hasAvailableQtyField) {
+      return Math.max(0, availableQty);
+    }
+    return Math.max(0, totalQty);
   } catch (err) {
     if (err?.statusCode === 404) {
       logPositionNoneOnce(normalized, 404);
@@ -4795,6 +4797,49 @@ function resolveOrderQty(order) {
   if (Number.isFinite(normalizedQty)) return normalizedQty;
   const fallback = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
   return Number.isFinite(fallback) ? fallback : null;
+}
+
+function getOpenSellOrdersForSymbol(orders, symbol) {
+  const normalizedSymbol = normalizePair(symbol);
+  const list = Array.isArray(orders) ? orders : [];
+  return list.filter((order) => {
+    const orderSymbol = normalizePair(order?.symbol || order?.rawSymbol);
+    const side = String(order?.side || '').toLowerCase();
+    const status = String(order?.status || '').toLowerCase();
+    return orderSymbol === normalizedSymbol && side === 'sell' && isOpenLikeOrderStatus(status);
+  });
+}
+
+function computeExitSellability({
+  symbol,
+  position = null,
+  openOrders = [],
+}) {
+  const canonicalSymbol = normalizePair(symbol);
+  const openSellOrders = getOpenSellOrdersForSymbol(openOrders, canonicalSymbol);
+  const reservedQty = openSellOrders.reduce((sum, order) => {
+    const qty = normalizeOrderQty(order);
+    return sum + (Number.isFinite(qty) && qty > 0 ? qty : 0);
+  }, 0);
+  const openSellQty = reservedQty;
+  const openSellCount = openSellOrders.length;
+  const qty = extractBrokerPositionQty(position || {});
+  const totalPositionQty = Number.isFinite(qty.totalQty) && qty.totalQty > 0 ? qty.totalQty : 0;
+  const brokerAvailableQty = Number.isFinite(qty.availableQty) && qty.availableQty > 0 ? qty.availableQty : 0;
+  const inferredAvailableQty = Math.max(0, totalPositionQty - reservedQty);
+  const availableQty = qty.hasAvailableQtyField ? brokerAvailableQty : inferredAvailableQty;
+  const sellableQty = Math.max(0, availableQty);
+  return {
+    symbol,
+    canonicalSymbol,
+    totalPositionQty,
+    availableQty: sellableQty,
+    reservedQty,
+    openSellQty,
+    openSellCount,
+    openSellOrders,
+    hasAvailableQtyField: qty.hasAvailableQtyField,
+  };
 }
 
 function orderHasValidLimit(order) {
@@ -6128,31 +6173,27 @@ async function submitLimitSell({
     return { skipped: true, reason: tradeGate.reasonCode };
   }
 
-  const open = openOrders || (await fetchLiveOrders());
-  const availableQty =
-    Number.isFinite(availableQtyOverride) && availableQtyOverride >= 0
-      ? availableQtyOverride
-      : await getAvailablePositionQty(symbol);
-  if (!(availableQty > 0)) {
-    logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
-    return { skipped: true, reason: 'no_position_qty' };
-  }
-  const qtyNum = Number(qty);
-  const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
-
-  const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
+  const open = openOrders || (await fetchLiveOrders({ force: true }));
   const openList = Array.isArray(open) ? open : [];
   const normalizedSymbol = normalizePair(symbol);
-  const requiredQty = Number.isFinite(adjustedQty) && adjustedQty > 0 ? adjustedQty : availableQty;
-  const openSellCandidates = openList.filter((order) => {
-    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-    const side = String(order.side || '').toLowerCase();
-    const status = String(order.status || '').toLowerCase();
-    if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
+  let position = null;
+  try {
+    const snapshot = await fetchPositionsSnapshot();
+    position = findPositionInSnapshot(snapshot, normalizedSymbol)?.position || null;
+  } catch (err) {
+    position = null;
+  }
 
-    // IMPORTANT: only adopt sells that are actually OPEN-like
-    if (!isOpenLikeOrderStatus(status)) return false;
-
+  const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
+  const openSellOrders = getOpenSellOrdersForSymbol(openList, normalizedSymbol);
+  if (openSellOrders.length) {
+    console.log('open_sell_detected', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      openSellCount: openSellOrders.length,
+    });
+  }
+  const openSellCandidates = openSellOrders.filter((order) => {
     // Must be a real limit TP (avoid adopting market sells / weird records)
     const type = String(order.type || order.order_type || '').toLowerCase();
     if (type && type !== 'limit') return false;
@@ -6162,11 +6203,38 @@ async function submitLimitSell({
 
     return true;
   });
-  const anySellHistory = openList.some((order) => {
-    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-    const side = String(order.side || '').toLowerCase();
-    return orderSymbol === normalizedSymbol && side === 'sell';
+  const sellability = computeExitSellability({
+    symbol: normalizedSymbol,
+    position,
+    openOrders: openList,
   });
+  console.log('exit_sellability_check', {
+    symbol,
+    canonicalSymbol: normalizedSymbol,
+    totalPositionQty: sellability.totalPositionQty,
+    availableQty: sellability.availableQty,
+    reservedQty: sellability.reservedQty,
+    openSellFound: sellability.openSellCount > 0,
+    openSellCount: sellability.openSellCount,
+    openSellQty: sellability.openSellQty,
+    pendingExitAttach: hasPendingExitAttach(normalizedSymbol),
+  });
+  if (sellability.openSellCount > 0) {
+    console.log('open_sell_qty_reserved', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      reservedQty: sellability.reservedQty,
+      openSellCount: sellability.openSellCount,
+    });
+  }
+  const qtyNum = Number(qty);
+  const baseAvailableQty = Number.isFinite(availableQtyOverride) && availableQtyOverride >= 0
+    ? Math.min(availableQtyOverride, sellability.availableQty)
+    : sellability.availableQty;
+  const availableQty = Number.isFinite(baseAvailableQty) && baseAvailableQty >= 0 ? baseAvailableQty : 0;
+  const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
+  const requiredQty = Number.isFinite(adjustedQty) && adjustedQty > 0 ? adjustedQty : availableQty;
+  const anySellHistory = openSellOrders.length > 0;
   if (anySellHistory && openSellCandidates.length === 0) {
     console.log('sell_history_present_but_no_open_sell', { symbol });
   }
@@ -6185,8 +6253,9 @@ async function submitLimitSell({
     }, pool[0]);
     const adoptedId = bestOrder?.id || bestOrder?.order_id || null;
     const adoptedLimit = normalizeOrderLimitPrice(bestOrder);
-    console.log('adopt_existing_sell', {
+    console.log('tp_attach_adopt_existing_sell', {
       symbol,
+      canonicalSymbol: normalizedSymbol,
       orderId: adoptedId,
       status: String(bestOrder?.status || '').toLowerCase(),
       type: String(bestOrder?.type || bestOrder?.order_type || '').toLowerCase(),
@@ -6200,6 +6269,21 @@ async function submitLimitSell({
       submittedAt: bestOrder?.submitted_at || bestOrder?.submittedAt || bestOrder?.created_at || bestOrder?.createdAt,
       adopted: true,
     };
+  }
+  if (!(availableQty > 0)) {
+    console.log('tp_attach_deferred', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      reason: 'qty_reserved_or_unavailable',
+      totalPositionQty: sellability.totalPositionQty,
+      availableQty,
+      reservedQty: sellability.reservedQty,
+      openSellFound: sellability.openSellCount > 0,
+      openSellCount: sellability.openSellCount,
+      openSellQty: sellability.openSellQty,
+    });
+    logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
+    return { skipped: true, reason: 'qty_reserved_or_unavailable' };
   }
 
   const sizeGuard = guardTradeSize({
@@ -7763,8 +7847,12 @@ async function manageExitStates() {
         const heldMs = Math.max(0, now - state.entryTime);
         const heldSeconds = heldMs / 1000;
         const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
-        const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
-        const openSellCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell').length;
+        const openBuyCount = symbolOrders.filter((order) => {
+          const side = String(order.side || '').toLowerCase();
+          return side === 'buy' && isOpenLikeOrderStatus(order?.status);
+        }).length;
+        const openSellOrders = getOpenSellOrdersForSymbol(symbolOrders, symbol);
+        const openSellCount = openSellOrders.length;
         const cooldownUntil = insufficientBalanceExitCooldowns.get(normalizePair(symbol));
         if (Number.isFinite(cooldownUntil) && cooldownUntil > now) {
           console.log('exit_manager_skip_orders', {
@@ -7916,7 +8004,6 @@ async function manageExitStates() {
             : null;
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
-        const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
         const hasOpenSell = openSellOrders.length > 0 || Boolean(state.sellOrderId);
         let existingOrderAgeMs = null;
         let refreshOrder = null;
@@ -11703,11 +11790,7 @@ async function submitOrder(order = {}) {
       return { skipped: true, reason: 'no_position_qty' };
     }
     const openOrders = await fetchLiveOrders();
-    const hasOpenSell = (Array.isArray(openOrders) ? openOrders : []).some((order) => {
-      const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-      const side = String(order.side || '').toLowerCase();
-      return orderSymbol === normalizePair(normalizedSymbol) && side === 'sell';
-    });
+    const hasOpenSell = getOpenSellOrdersForSymbol(openOrders, normalizedSymbol).length > 0;
     if (hasOpenSell) {
       console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'sell', reason: 'existing_sell_open' });
       return { skipped: true, reason: 'existing_sell_open' };
@@ -11965,12 +12048,12 @@ async function fetchOrders(params = {}) {
 
 }
 
-async function fetchLiveOrders() {
+async function fetchLiveOrders({ force = false } = {}) {
   const nowMs = Date.now();
-  if (liveOrdersCache.data && nowMs - liveOrdersCache.tsMs < LIVE_ORDERS_CACHE_TTL_MS) {
+  if (!force && liveOrdersCache.data && nowMs - liveOrdersCache.tsMs < LIVE_ORDERS_CACHE_TTL_MS) {
     return liveOrdersCache.data;
   }
-  if (liveOrdersCache.pending) {
+  if (!force && liveOrdersCache.pending) {
     return liveOrdersCache.pending;
   }
   const afterIso = new Date(nowMs - 15 * 60 * 1000).toISOString();
@@ -11982,7 +12065,24 @@ async function fetchLiveOrders() {
         direction: 'desc',
         limit: 500,
       });
-      const normalized = filterLiveOrders(Array.isArray(response) ? response : []).map((order) => {
+      const normalized = (Array.isArray(response) ? response : [])
+        .filter((order) => isOpenLikeOrderStatus(order?.status))
+        .map((order) => {
+          const rawSymbol = order.rawSymbol ?? order.symbol;
+          const normalizedSymbol = normalizeSymbol(rawSymbol);
+          return {
+            ...order,
+            rawSymbol,
+            pairSymbol: normalizedSymbol,
+            symbol: normalizedSymbol,
+          };
+        });
+      liveOrdersCache.data = normalized;
+      liveOrdersCache.tsMs = Date.now();
+      return normalized;
+    } catch (err) {
+      const fallback = await fetchOrders({ status: 'open' });
+      const normalized = (Array.isArray(fallback) ? fallback : []).map((order) => {
         const rawSymbol = order.rawSymbol ?? order.symbol;
         const normalizedSymbol = normalizeSymbol(rawSymbol);
         return {
@@ -11995,12 +12095,6 @@ async function fetchLiveOrders() {
       liveOrdersCache.data = normalized;
       liveOrdersCache.tsMs = Date.now();
       return normalized;
-    } catch (err) {
-      const fallback = await fetchOrders({ status: 'open' });
-      const list = Array.isArray(fallback) ? fallback : [];
-      liveOrdersCache.data = list;
-      liveOrdersCache.tsMs = Date.now();
-      return list;
     }
   };
   liveOrdersCache.pending = fetcher();
@@ -12364,6 +12458,8 @@ module.exports = {
   computeAwayBps,
   getBrokerPositionLookupKeys,
   extractBrokerPositionQty,
+  getOpenSellOrdersForSymbol,
+  computeExitSellability,
   findPositionInSnapshot,
   expandNestedOrders,
   isOpenLikeOrderStatus,
