@@ -345,6 +345,7 @@ const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
 const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
 const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
+const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 6);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -1812,7 +1813,9 @@ async function computeEntrySignal(symbol, opts = {}) {
     momentumState,
     marketDataHealthy,
     maxSpreadBps: REGIME_MAX_SPREAD_BPS,
-    minVolBps: REGIME_MIN_VOL_BPS,
+    minVolBps: symbolTier === 'tier1'
+      ? REGIME_MIN_VOL_BPS_TIER1
+      : REGIME_MIN_VOL_BPS,
     maxVolBps: REGIME_MAX_VOL_BPS,
     requireMomentum: REGIME_REQUIRE_MOMENTUM,
     blockWeakLiquidity: REGIME_BLOCK_WEAK_LIQUIDITY,
@@ -1830,9 +1833,14 @@ async function computeEntrySignal(symbol, opts = {}) {
       volState: regimeDecision.volState,
       momentumState: regimeDecision.momentumState,
       reason: regimeDecision.reason,
+      minVolThresholdApplied: symbolTier === 'tier1'
+        ? REGIME_MIN_VOL_BPS_TIER1
+        : REGIME_MIN_VOL_BPS,
       thresholds: {
         regimeMinVolBps: REGIME_MIN_VOL_BPS,
+        regimeMinVolBpsTier1: REGIME_MIN_VOL_BPS_TIER1,
         compressionMinLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+        compressionMinLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,
       },
     });
     return {

@@ -93,7 +93,7 @@ function evaluateVolCompression({
   shortVolBps,
   longVolBps,
   minLongVolBps = 10,
-  minLongVolBpsTier1 = 6,
+  minLongVolBpsTier1 = 3,
   minCompressionRatio = 0.45,
   lookbackShort = null,
   lookbackLong = null,
