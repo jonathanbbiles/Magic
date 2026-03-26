@@ -37,8 +37,9 @@ withEnv({}, () => {
   assert.equal(guardrails.sparseFallback.maxSpreadBps, 12);
   assert.equal(guardrails.volCompression.minRatio, 0.45);
   assert.equal(guardrails.regime.minVolBps, 15);
+  assert.equal(guardrails.regime.minVolBpsTier1, 6);
   assert.equal(guardrails.volCompression.minLongVolBps, 10);
-  assert.equal(guardrails.volCompression.minLongVolBpsTier1, 6);
+  assert.equal(guardrails.volCompression.minLongVolBpsTier1, 3);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
 });
@@ -53,6 +54,10 @@ withEnv({ REGIME_MIN_VOL_BPS: '300', REGIME_MAX_VOL_BPS: '100' }, () => {
 
 withEnv({ REGIME_MIN_VOL_BPS: '0' }, () => {
   assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS must be > 0/);
+});
+
+withEnv({ REGIME_MIN_VOL_BPS_TIER1: '0' }, () => {
+  assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS_TIER1 must be > 0/);
 });
 
 withEnv({ ORDERBOOK_MIN_DEPTH_USD: '0' }, () => {

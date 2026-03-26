@@ -194,6 +194,7 @@ const validateEnv = () => {
     const regimeMaxSpreadBps = parseFiniteNumberEnv('REGIME_MAX_SPREAD_BPS', 40);
     const orderbookMinDepthUsd = parseFiniteNumberEnv('ORDERBOOK_MIN_DEPTH_USD', 175);
     const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 15);
+    const regimeMinVolBpsTier1 = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS_TIER1', 6);
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
     const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.45);
     const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
@@ -253,6 +254,7 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', orderbookSparseConfirmMaxPerScan, 1, 100);
     assertInRange('ORDERBOOK_MIN_DEPTH_USD', orderbookMinDepthUsd, 0, 1000000000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
+    assertInRange('REGIME_MIN_VOL_BPS_TIER1', regimeMinVolBpsTier1, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
     assertInRange('VOL_COMPRESSION_MIN_RATIO', volCompressionMinRatio, 0, 10);
     assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS', volCompressionMinLongVolBps, 0, 10000);
@@ -262,6 +264,9 @@ const validateEnv = () => {
     }
     if (regimeMinVolBps <= 0) {
       throw new Error(`REGIME_MIN_VOL_BPS must be > 0. Received: "${regimeMinVolBps}"`);
+    }
+    if (regimeMinVolBpsTier1 <= 0) {
+      throw new Error(`REGIME_MIN_VOL_BPS_TIER1 must be > 0. Received: "${regimeMinVolBpsTier1}"`);
     }
     if (orderbookMinDepthUsd <= 0) {
       throw new Error(`ORDERBOOK_MIN_DEPTH_USD must be > 0. Received: "${orderbookMinDepthUsd}"`);
@@ -321,6 +326,7 @@ const validateEnv = () => {
         orderbookMinDepthUsd,
         orderbookMinLevelsPerSide,
         minVolBps: regimeMinVolBps,
+        minVolBpsTier1: regimeMinVolBpsTier1,
         maxVolBps: regimeMaxVolBps,
         requireMomentum: regimeRequireMomentum,
         blockWeakLiquidity: regimeBlockWeakLiquidity,
