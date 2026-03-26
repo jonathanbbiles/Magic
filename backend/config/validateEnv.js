@@ -199,7 +199,7 @@ const validateEnv = () => {
     const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.60);
     const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8);
     const volCompressionMinLongVolBpsTier1 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2);
-    const volCompressionMinLongVolBpsTier2 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 7);
+    const volCompressionMinLongVolBpsTier2 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4);
     const regimeRequireMomentum = parseBooleanEnv('REGIME_REQUIRE_MOMENTUM', true);
     const regimeBlockWeakLiquidity = parseBooleanEnv('REGIME_BLOCK_WEAK_LIQUIDITY', true);
     const regimeAllowUnknownVol = parseBooleanEnv('REGIME_ALLOW_UNKNOWN_VOL', false);

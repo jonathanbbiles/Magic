@@ -9,6 +9,8 @@ const {
   ORDERBOOK_RETRY_ATTEMPTS,
   ORDERBOOK_RETRY_BACKOFF_MS,
   MIN_PROB_TO_ENTER,
+  MIN_PROB_TO_ENTER_TIER1,
+  MIN_PROB_TO_ENTER_TIER2,
   MIN_PROB_TO_ENTER_TP,
   MIN_PROB_TO_ENTER_STRETCH,
 } = require('./config/marketData');
@@ -398,6 +400,9 @@ const PREDICTOR_DEBUG_VERBOSE = readEnvFlag('PREDICTOR_DEBUG_VERBOSE', false);
 const PREDICTOR_WARMUP_MIN_1M_BARS = readNumber('PREDICTOR_WARMUP_MIN_1M_BARS', 200);
 const PREDICTOR_WARMUP_MIN_5M_BARS = readNumber('PREDICTOR_WARMUP_MIN_5M_BARS', 200);
 const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS', 100);
+const PREDICTOR_MIN_BARS_1M = readNumber('PREDICTOR_MIN_BARS_1M', 30);
+const PREDICTOR_MIN_BARS_5M = readNumber('PREDICTOR_MIN_BARS_5M', 30);
+const PREDICTOR_MIN_BARS_15M = readNumber('PREDICTOR_MIN_BARS_15M', 20);
 const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', false);
 const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS', 60000);
 const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 4));
@@ -425,7 +430,7 @@ const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG'
 const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.60);
 const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8);
 const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2);
-const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 7);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4);
 
 // 4) Orderbook absorption
 const ORDERBOOK_ABSORPTION_ENABLED = readFlag('ORDERBOOK_ABSORPTION_ENABLED', false);
@@ -527,8 +532,13 @@ function printConfigOnce() {
     maxConcurrentPositionsEnabled: Number.isFinite(getEffectiveMaxConcurrentPositions()) && getEffectiveMaxConcurrentPositions() !== Number.POSITIVE_INFINITY,
     PREDICTOR_WARMUP_ENABLED,
     PREDICTOR_WARMUP_BLOCK_TRADES,
+    predictorWarmupThresholds: getBarsWarmupThresholds(),
+    predictorMinBarsThresholds: getPredictorMinBarsThresholds(),
     REGIME_MIN_VOL_BPS_TIER1,
     VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
+    MIN_PROB_TO_ENTER,
+    MIN_PROB_TO_ENTER_TIER1,
+    MIN_PROB_TO_ENTER_TIER2,
     ORDERBOOK_ABSORPTION_ENABLED,
     tradePortfolioPctRequested: TRADE_PORTFOLIO_PCT_RAW,
     tradePortfolioPctEffective: TRADE_PORTFOLIO_PCT,
@@ -1583,7 +1593,19 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   }
 
-  if (warmupGate.missing.length) {
+  const predictorMinBarsThresholds = getPredictorMinBarsThresholds();
+  const predictorInputGateBeforeFallback = evaluatePredictorWarmupGate({
+    enabled: true,
+    blockTrades: false,
+    lengths: {
+      '1m': Array.isArray(barSeries1m) ? barSeries1m.length : 0,
+      '5m': Array.isArray(barSeries5m) ? barSeries5m.length : 0,
+      '15m': Array.isArray(barSeries15m) ? barSeries15m.length : 0,
+    },
+    thresholds: predictorMinBarsThresholds,
+  });
+
+  if (warmupGate.missing.length || predictorInputGateBeforeFallback.missing.length) {
     const fallbackBudget = Number.isFinite(opts?.fallbackBudgetState?.remaining) ? opts.fallbackBudgetState.remaining : 0;
     const canFallback = ALLOW_PER_SYMBOL_BARS_FALLBACK && fallbackBudget > 0;
     if (warmupGate.skip && !canFallback) {
@@ -1613,38 +1635,46 @@ async function computeEntrySignal(symbol, opts = {}) {
       });
     } else {
 
+      const fetchThresholds = {
+        '1m': Math.max(warmupGate.thresholds['1m'], predictorMinBarsThresholds['1m']),
+        '5m': Math.max(warmupGate.thresholds['5m'], predictorMinBarsThresholds['5m']),
+        '15m': Math.max(warmupGate.thresholds['15m'], predictorMinBarsThresholds['15m']),
+      };
       const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
-        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: warmupGate.thresholds['1m'] }),
-        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: warmupGate.thresholds['5m'] }),
-        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: warmupGate.thresholds['15m'] }),
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: fetchThresholds['1m'] }),
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: fetchThresholds['5m'] }),
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: fetchThresholds['15m'] }),
       ]);
       if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
-        return {
-          entryReady: false,
-          why: 'predictor_unavailable',
-          meta: {
-            symbol: asset.symbol,
-            reason: 'bars_fetch_failed',
-            blockTrades: warmupGate.blockTrades,
-            lengths: warmupGate.lengths,
-            thresholds: warmupGate.thresholds,
-            missing: warmupGate.missing,
-          },
-          record: baseRecord,
-        };
+        if (predictorInputGateBeforeFallback.missing.length) {
+          return {
+            entryReady: false,
+            why: 'predictor_unavailable',
+            meta: {
+              symbol: asset.symbol,
+              reason: 'bars_fetch_failed',
+              blockTrades: warmupGate.blockTrades,
+              lengths: warmupGate.lengths,
+              thresholds: predictorMinBarsThresholds,
+              missing: predictorInputGateBeforeFallback.missing,
+            },
+            record: baseRecord,
+          };
+        }
+      } else {
+        if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
+          opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
+        }
+        bars1m = bars1mResult.response;
+        bars5m = bars5mResult.response;
+        bars15m = bars15mResult.response;
+        barSeries1m = extractBarSeriesForSymbol(bars1m, asset.symbol);
+        barSeries5m = extractBarSeriesForSymbol(bars5m, asset.symbol);
+        barSeries15m = extractBarSeriesForSymbol(bars15m, asset.symbol);
+        closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
+          Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
+        ).filter((value) => Number.isFinite(value) && value > 0);
       }
-      if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
-        opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
-      }
-      bars1m = bars1mResult.response;
-      bars5m = bars5mResult.response;
-      bars15m = bars15mResult.response;
-      barSeries1m = extractBarSeriesForSymbol(bars1m, asset.symbol);
-      barSeries5m = extractBarSeriesForSymbol(bars5m, asset.symbol);
-      barSeries15m = extractBarSeriesForSymbol(bars15m, asset.symbol);
-      closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
-        Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
-      ).filter((value) => Number.isFinite(value) && value > 0);
     }
   }
 
@@ -1656,7 +1686,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       '5m': Array.isArray(barSeries5m) ? barSeries5m.length : 0,
       '15m': Array.isArray(barSeries15m) ? barSeries15m.length : 0,
     },
-    thresholds: getBarsWarmupThresholds(),
+    thresholds: predictorMinBarsThresholds,
   });
   if (predictorInputGate.missing.length) {
     if (PREDICTOR_WARMUP_ENABLED && PREDICTOR_WARMUP_BLOCK_TRADES) {
@@ -1811,7 +1841,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     lastTs: quote.tsMs,
   };
 
-  const baseMinProbToEnter = MIN_PROB_TO_ENTER_TP;
+  const baseMinProbToEnter = symbolTier === 'tier2'
+    ? MIN_PROB_TO_ENTER_TIER2
+    : MIN_PROB_TO_ENTER_TIER1;
+  const tierMinProbThresholdApplied = symbolTier === 'tier1' || symbolTier === 'tier2';
   const baseMinExpectedValueBps = EV_MIN_BPS + EV_BUFFER_BPS;
   const timeOfDayContext = getTimeOfDayContext(nowMs);
   const timeOfDayMultiplier =
@@ -1846,6 +1879,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       probability: predictorTp?.probability ?? null,
       minProbToEnter: effectiveMinProbToEnter,
       baseMinProbToEnter,
+      effectiveMinProbToEnter,
+      tierMinProbThresholdApplied,
       stretchProbability: predictorStretch?.probability ?? null,
       stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
       tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
@@ -1859,6 +1894,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         probability: predictorTp?.probability ?? null,
         minProbToEnter: effectiveMinProbToEnter,
         baseMinProbToEnter,
+        effectiveMinProbToEnter,
+        tierMinProbThresholdApplied,
         stretchProbability: predictorStretch?.probability ?? null,
         timeOfDay: timeOfDayMeta,
       },
@@ -3619,6 +3656,14 @@ function getBarsWarmupThresholds() {
     '1m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_1M_BARS) || 200),
     '5m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_5M_BARS) || 200),
     '15m': Math.max(1, Number(PREDICTOR_WARMUP_MIN_15M_BARS) || 100),
+  };
+}
+
+function getPredictorMinBarsThresholds() {
+  return {
+    '1m': Math.max(1, Number(PREDICTOR_MIN_BARS_1M) || 30),
+    '5m': Math.max(1, Number(PREDICTOR_MIN_BARS_5M) || 30),
+    '15m': Math.max(1, Number(PREDICTOR_MIN_BARS_15M) || 20),
   };
 }
 

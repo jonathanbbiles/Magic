@@ -199,6 +199,10 @@ const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
 assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', false\);/);
+assert.match(tradeSource, /const PREDICTOR_MIN_BARS_1M = readNumber\('PREDICTOR_MIN_BARS_1M', 30\);/);
+assert.match(tradeSource, /const PREDICTOR_MIN_BARS_5M = readNumber\('PREDICTOR_MIN_BARS_5M', 30\);/);
+assert.match(tradeSource, /const PREDICTOR_MIN_BARS_15M = readNumber\('PREDICTOR_MIN_BARS_15M', 20\);/);
+assert.match(tradeSource, /thresholds: predictorMinBarsThresholds/);
 assert.match(tradeSource, /if \(warmupGate\.skip && !canFallback\) \{/);
 assert.match(tradeSource, /console\.log\('runtime_config_effective', \{[\s\S]*MAX_CONCURRENT_POSITIONS,[\s\S]*PREDICTOR_WARMUP_ENABLED,[\s\S]*PREDICTOR_WARMUP_BLOCK_TRADES,[\s\S]*ORDERBOOK_ABSORPTION_ENABLED,[\s\S]*\}\);/);
 assert.match(tradeSource, /const ORDERBOOK_MIN_DEPTH_USD = readNumber\('ORDERBOOK_MIN_DEPTH_USD', 175\);/);
@@ -207,7 +211,7 @@ assert.match(tradeSource, /const \{ computeOrderbookMetrics \} = require\('\.\/m
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_RATIO = readNumber\('VOL_COMPRESSION_MIN_RATIO', 0\.60\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2\);/);
-assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 7\);/);
+assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4\);/);
 assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 0\);/);
 assert.match(tradeSource, /const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0\.10;/);
 assert.match(tradeSource, /const TRADE_PORTFOLIO_PCT = Math\.max\(0, Math\.min\(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW\)\);/);
@@ -228,6 +232,41 @@ assert.ok(attachStart !== -1 && attachEnd !== -1);
 const attachBlock = tradeSource.slice(attachStart, attachEnd);
 assert.equal(/computeBookAnchoredSellLimit/.test(attachBlock), false);
 
+
+const marketDataConfigPath = require.resolve('./config/marketData');
+
+withEnv({
+  MIN_PROB_TO_ENTER: null,
+  MIN_PROB_TO_ENTER_TIER1: null,
+  MIN_PROB_TO_ENTER_TIER2: null,
+}, () => {
+  delete require.cache[marketDataConfigPath];
+  const cfg = require('./config/marketData');
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.35);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.40);
+});
+
+withEnv({
+  MIN_PROB_TO_ENTER: '0.53',
+  MIN_PROB_TO_ENTER_TIER1: null,
+  MIN_PROB_TO_ENTER_TIER2: null,
+}, () => {
+  delete require.cache[marketDataConfigPath];
+  const cfg = require('./config/marketData');
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.53);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.53);
+});
+
+withEnv({
+  MIN_PROB_TO_ENTER: '0.53',
+  MIN_PROB_TO_ENTER_TIER1: '0.35',
+  MIN_PROB_TO_ENTER_TIER2: '0.40',
+}, () => {
+  delete require.cache[marketDataConfigPath];
+  const cfg = require('./config/marketData');
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.35);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.40);
+});
 console.log('trade tests passed');
 
 const guards = require('./modules/tradeGuards');
