@@ -31,8 +31,12 @@ function evaluateEntryMarketData({
   quoteAgeMs,
   requiredEdgeBps,
   netEdgeBps,
+  minNetEdgeBps,
   predictorProbability,
   weakLiquidity,
+  cappedOrderNotionalUsd,
+  requiredDepthUsd,
+  availableDepthUsd,
   orderbookMeta,
   policy,
 }) {
@@ -50,9 +54,11 @@ function evaluateEntryMarketData({
     enabled: Boolean(policy?.sparseFallback?.enabled),
     symbolAllowed: false,
     quoteFresh: false,
+    quoteWithinFallbackTolerance: false,
     spreadOk: false,
     edgeOk: false,
     probabilityOk: false,
+    depthOk: false,
     accepted: false,
   };
 
@@ -61,7 +67,11 @@ function evaluateEntryMarketData({
     dataQualityState = 'data_quality_bad';
     executionMode = 'reject';
     reasons.push('orderbook_malformed');
-  } else if (Number.isFinite(quoteAgeMs) && quoteAgeMs > policy.quoteMaxAgeMs) {
+  } else if (
+    Number.isFinite(quoteAgeMs) &&
+    quoteAgeMs > policy.quoteMaxAgeMs &&
+    !isSparseDepthState(depthState)
+  ) {
     dataQualityState = 'data_quality_bad';
     executionMode = 'reject';
     reasons.push('quote_stale');
@@ -69,21 +79,40 @@ function evaluateEntryMarketData({
     dataQualityState = 'orderbook_sparse';
     const sparseFallback = policy?.sparseFallback || {};
     const allowedSymbol = sparseFallback.symbols?.has(normalizePair(symbol)) || false;
+    const staleQuoteToleranceMs = Number.isFinite(sparseFallback.staleQuoteToleranceMs)
+      ? sparseFallback.staleQuoteToleranceMs
+      : sparseFallback.requireQuoteFreshMs;
+    const edgeFloorBps = Number.isFinite(minNetEdgeBps) ? minNetEdgeBps : requiredEdgeBps;
+    const requiredDepthUsdUsed = Number.isFinite(requiredDepthUsd)
+      ? Math.max(0, requiredDepthUsd)
+      : Number.isFinite(cappedOrderNotionalUsd)
+        ? Math.max(0, cappedOrderNotionalUsd)
+        : null;
+    const availableDepthUsdUsed = Number.isFinite(availableDepthUsd)
+      ? Math.max(0, availableDepthUsd)
+      : Number.isFinite(orderbookMeta?.actualDepthUsd)
+        ? Math.max(0, orderbookMeta.actualDepthUsd)
+        : null;
     sparseFallbackState.symbolAllowed = allowedSymbol;
     sparseFallbackState.quoteFresh = Number.isFinite(quoteAgeMs) && quoteAgeMs <= sparseFallback.requireQuoteFreshMs;
+    sparseFallbackState.quoteWithinFallbackTolerance = Number.isFinite(quoteAgeMs) && quoteAgeMs <= staleQuoteToleranceMs;
     sparseFallbackState.spreadOk = Number.isFinite(spreadBps) && spreadBps <= sparseFallback.maxSpreadBps;
-    sparseFallbackState.edgeOk = Number.isFinite(netEdgeBps) && netEdgeBps >= (requiredEdgeBps + sparseFallback.requireStrongerEdgeBps);
+    sparseFallbackState.edgeOk = Number.isFinite(netEdgeBps) && netEdgeBps >= (edgeFloorBps + sparseFallback.requireStrongerEdgeBps);
     sparseFallbackState.probabilityOk = Number.isFinite(predictorProbability) && predictorProbability >= sparseFallback.minProbability;
+    sparseFallbackState.depthOk = Number.isFinite(requiredDepthUsdUsed) &&
+      Number.isFinite(availableDepthUsdUsed) &&
+      availableDepthUsdUsed >= requiredDepthUsdUsed;
 
     const tierAllowsSparseFallback = symbolTier === 'tier1';
     if (
       sparseFallback.enabled &&
       tierAllowsSparseFallback &&
       allowedSymbol &&
-      sparseFallbackState.quoteFresh &&
+      sparseFallbackState.quoteWithinFallbackTolerance &&
       sparseFallbackState.spreadOk &&
       sparseFallbackState.edgeOk &&
-      sparseFallbackState.probabilityOk
+      sparseFallbackState.probabilityOk &&
+      sparseFallbackState.depthOk
     ) {
       executionMode = 'sparse_fallback';
       sparseFallbackState.accepted = true;
@@ -99,7 +128,7 @@ function evaluateEntryMarketData({
           ? 'sparse_fallback_tier_restricted'
           : !allowedSymbol
             ? 'sparse_fallback_symbol_restricted'
-            : !sparseFallbackState.quoteFresh
+            : !sparseFallbackState.quoteWithinFallbackTolerance
               ? 'quote_stale'
               : !sparseFallbackState.spreadOk
                 ? 'sparse_fallback_spread_wide'
@@ -107,7 +136,9 @@ function evaluateEntryMarketData({
                   ? 'sparse_fallback_edge_weak'
                   : !sparseFallbackState.probabilityOk
                     ? 'sparse_fallback_probability_weak'
-                    : 'ob_depth_insufficient';
+                    : !sparseFallbackState.depthOk
+                      ? 'ob_depth_insufficient'
+                      : 'ob_depth_insufficient';
       reasons.push(rejectReason);
     }
   } else if (!orderbookMeta.ok) {
