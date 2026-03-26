@@ -44,6 +44,7 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
+  assert.equal(guardrails.entryUniverse.mode, 'dynamic');
 });
 
 withEnv({ REGIME_ALLOW_UNKNOWN_VOL: 'maybe' }, () => {
@@ -82,8 +83,8 @@ withEnv({ EXECUTION_TIER1_SYMBOLS: '' }, () => {
   assert.throws(() => validateEnv(), /EXECUTION_TIER1_SYMBOLS must include at least one symbol/);
 });
 
-withEnv({ ENTRY_SYMBOLS_PRIMARY: '' }, () => {
-  assert.throws(() => validateEnv(), /ENTRY_SYMBOLS_PRIMARY must include at least one symbol/);
+withEnv({ ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: '' }, () => {
+  assert.throws(() => validateEnv(), /ENTRY_SYMBOLS_PRIMARY must include at least one symbol when ENTRY_UNIVERSE_MODE=configured/);
 });
 
 withEnv({ MARKETDATA_ORDERBOOK_TTL_MS: '0' }, () => {

@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { buildEntryUniverse } = require('./entryUniversePolicy');
+const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets } = require('./entryUniversePolicy');
 
 const uniPrimaryOnly = buildEntryUniverse({
   primaryRaw: 'BTC/USD,ETH/USD, btc/usd ',
@@ -19,5 +19,23 @@ assert.deepEqual(uniWithSecondary.scanSymbols, ['BTC/USD', 'ETH/USD', 'LINK/USD'
 assert.equal(uniWithSecondary.primaryCount, 3);
 assert.equal(uniWithSecondary.secondaryCount, 2);
 assert.equal(uniWithSecondary.classes.get('ARB/USD'), 'secondary');
+
+const dynamicUniverse = buildDynamicCryptoUniverseFromAssets([
+  { symbol: 'BTCUSD', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'ETH/USD', asset_class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'btc/usd', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'DOGE/USD', class: 'crypto', tradable: true, status: 'inactive' },
+  { symbol: 'AAPL', class: 'us_equity', tradable: true, status: 'active' },
+  { symbol: 'BAD-PAIR', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'SOL/USDT', class: 'crypto', tradable: true, status: 'active' },
+], {
+  allowedSymbols: new Set(['BTC/USD', 'ETH/USD']),
+});
+assert.deepEqual(dynamicUniverse.symbols, ['BTC/USD', 'ETH/USD']);
+assert.equal(dynamicUniverse.stats.tradableCryptoCount, 5);
+assert.equal(dynamicUniverse.stats.acceptedCount, 2);
+assert.equal(dynamicUniverse.stats.malformedCount, 2);
+assert.equal(dynamicUniverse.stats.unsupportedCount, 0);
+assert.equal(dynamicUniverse.stats.duplicateCount, 1);
 
 console.log('entry universe policy tests passed');
