@@ -87,23 +87,24 @@ assert.equal(unknownVolAllowed.entryAllowed, true);
 const tier1Compression = evaluateVolCompression({
   symbolTier: 'tier1',
   shortVolBps: 8,
-  longVolBps: 6.5,
+  longVolBps: 3.1,
   minLongVolBps: 10,
-  minLongVolBpsTier1: 6,
+  minLongVolBpsTier1: 3,
   minCompressionRatio: 0.45,
   lookbackShort: 6,
   lookbackLong: 30,
   enabled: true,
 });
 assert.equal(tier1Compression.ok, true);
-assert.equal(tier1Compression.minLongVolThresholdApplied, 6);
+assert.equal(tier1Compression.minLongVolThresholdApplied, 3);
+assert.notEqual(tier1Compression.minLongVolThresholdApplied, 10);
 
 const tier2Compression = evaluateVolCompression({
   symbolTier: 'tier2',
   shortVolBps: 8,
   longVolBps: 9.5,
   minLongVolBps: 10,
-  minLongVolBpsTier1: 6,
+  minLongVolBpsTier1: 3,
   minCompressionRatio: 0.45,
   enabled: true,
 });
@@ -116,7 +117,7 @@ const missingTierCompression = evaluateVolCompression({
   shortVolBps: 8,
   longVolBps: 12,
   minLongVolBps: 10,
-  minLongVolBpsTier1: 6,
+  minLongVolBpsTier1: 3,
   minCompressionRatio: 0.45,
   enabled: true,
 });
