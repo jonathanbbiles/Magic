@@ -195,6 +195,7 @@ const validateEnv = () => {
     const orderbookMinDepthUsd = parseFiniteNumberEnv('ORDERBOOK_MIN_DEPTH_USD', 175);
     const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 15);
     const regimeMinVolBpsTier1 = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS_TIER1', 4);
+    const regimeMinVolBpsTier2 = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS_TIER2', 8);
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
     const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.60);
     const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8);
@@ -208,6 +209,7 @@ const validateEnv = () => {
     const orderbookSparseMaxSpreadBps = parseFiniteNumberEnv('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
     const orderbookSparseRequireStrongerEdgeBps = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
     const orderbookSparseRequireQuoteFreshMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
+    const orderbookSparseStaleQuoteToleranceMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);
     const orderbookSparseConfirmRetry = parseBooleanEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
     const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
     const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
@@ -247,6 +249,7 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', orderbookSparseMaxSpreadBps, 0, 10000);
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', orderbookSparseRequireStrongerEdgeBps, 0, 10000);
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', orderbookSparseRequireQuoteFreshMs, 0, 3600000);
+    assertInRange('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', orderbookSparseStaleQuoteToleranceMs, 0, 3600000);
     assertInRange('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', orderbookSparseConfirmRetryMs, 0, 10000);
     assertInRange('MARKETDATA_QUOTE_TTL_MS', marketdataQuoteTtlMs, 1, 600000);
     assertInRange('MARKETDATA_ORDERBOOK_TTL_MS', marketdataOrderbookTtlMs, 1, 600000);
@@ -256,6 +259,7 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_MIN_DEPTH_USD', orderbookMinDepthUsd, 0, 1000000000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
     assertInRange('REGIME_MIN_VOL_BPS_TIER1', regimeMinVolBpsTier1, 0, 10000);
+    assertInRange('REGIME_MIN_VOL_BPS_TIER2', regimeMinVolBpsTier2, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
     assertInRange('VOL_COMPRESSION_MIN_RATIO', volCompressionMinRatio, 0, 10);
     assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS', volCompressionMinLongVolBps, 0, 10000);
@@ -269,6 +273,9 @@ const validateEnv = () => {
     }
     if (regimeMinVolBpsTier1 <= 0) {
       throw new Error(`REGIME_MIN_VOL_BPS_TIER1 must be > 0. Received: "${regimeMinVolBpsTier1}"`);
+    }
+    if (regimeMinVolBpsTier2 <= 0) {
+      throw new Error(`REGIME_MIN_VOL_BPS_TIER2 must be > 0. Received: "${regimeMinVolBpsTier2}"`);
     }
     if (orderbookMinDepthUsd <= 0) {
       throw new Error(`ORDERBOOK_MIN_DEPTH_USD must be > 0. Received: "${orderbookMinDepthUsd}"`);
@@ -332,6 +339,7 @@ const validateEnv = () => {
         orderbookMinLevelsPerSide,
         minVolBps: regimeMinVolBps,
         minVolBpsTier1: regimeMinVolBpsTier1,
+        minVolBpsTier2: regimeMinVolBpsTier2,
         maxVolBps: regimeMaxVolBps,
         requireMomentum: regimeRequireMomentum,
         blockWeakLiquidity: regimeBlockWeakLiquidity,
@@ -342,6 +350,7 @@ const validateEnv = () => {
         maxSpreadBps: orderbookSparseMaxSpreadBps,
         requireStrongerEdgeBps: orderbookSparseRequireStrongerEdgeBps,
         requireQuoteFreshMs: orderbookSparseRequireQuoteFreshMs,
+        staleQuoteToleranceMs: orderbookSparseStaleQuoteToleranceMs,
         confirmRetry: orderbookSparseConfirmRetry,
         confirmRetryMs: orderbookSparseConfirmRetryMs,
         symbols: sparseFallbackSymbols,
