@@ -2,6 +2,7 @@ const assert = require('assert/strict');
 const {
   evaluateTradeableRegime,
   evaluateMomentumState,
+  evaluateVolCompression,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,
@@ -82,6 +83,46 @@ const unknownVolAllowed = evaluateTradeableRegime({
   allowUnknownVol: true,
 });
 assert.equal(unknownVolAllowed.entryAllowed, true);
+
+const tier1Compression = evaluateVolCompression({
+  symbolTier: 'tier1',
+  shortVolBps: 8,
+  longVolBps: 6.5,
+  minLongVolBps: 10,
+  minLongVolBpsTier1: 6,
+  minCompressionRatio: 0.45,
+  lookbackShort: 6,
+  lookbackLong: 30,
+  enabled: true,
+});
+assert.equal(tier1Compression.ok, true);
+assert.equal(tier1Compression.minLongVolThresholdApplied, 6);
+
+const tier2Compression = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 8,
+  longVolBps: 9.5,
+  minLongVolBps: 10,
+  minLongVolBpsTier1: 6,
+  minCompressionRatio: 0.45,
+  enabled: true,
+});
+assert.equal(tier2Compression.ok, false);
+assert.equal(tier2Compression.reason, 'long_vol_below_threshold');
+assert.equal(tier2Compression.minLongVolThresholdApplied, 10);
+
+const missingTierCompression = evaluateVolCompression({
+  symbolTier: null,
+  shortVolBps: 8,
+  longVolBps: 12,
+  minLongVolBps: 10,
+  minLongVolBpsTier1: 6,
+  minCompressionRatio: 0.45,
+  enabled: true,
+});
+assert.equal(missingTierCompression.ok, false);
+assert.equal(missingTierCompression.reason, 'symbol_tier_missing');
+assert.equal(missingTierCompression.status, 'symbol_tier_missing');
 
 const edge = computeNetEdgeBps({
   expectedMoveBps: 260,

@@ -88,6 +88,123 @@ function evaluateTradeableRegime({
   };
 }
 
+function evaluateVolCompression({
+  symbolTier,
+  shortVolBps,
+  longVolBps,
+  minLongVolBps = 10,
+  minLongVolBpsTier1 = 6,
+  minCompressionRatio = 0.45,
+  lookbackShort = null,
+  lookbackLong = null,
+  enabled = true,
+} = {}) {
+  const normalizedSymbolTier = typeof symbolTier === 'string' ? symbolTier.toLowerCase() : null;
+  const hasKnownTier = normalizedSymbolTier === 'tier1' || normalizedSymbolTier === 'tier2' || normalizedSymbolTier === 'tier3';
+  const minLongVolThresholdApplied = hasKnownTier
+    ? (normalizedSymbolTier === 'tier1' ? minLongVolBpsTier1 : minLongVolBps)
+    : null;
+  const shortVol = Number.isFinite(shortVolBps) ? shortVolBps : null;
+  const longVol = Number.isFinite(longVolBps) ? longVolBps : null;
+  const compressionRatio = (Number.isFinite(shortVolBps) && Number.isFinite(longVolBps))
+    ? shortVolBps / Math.max(longVolBps, 1e-6)
+    : null;
+
+  if (!enabled) {
+    return {
+      ok: true,
+      reason: 'disabled',
+      symbolTier: normalizedSymbolTier,
+      shortVolBps: shortVol,
+      longVolBps: longVol,
+      minLongVolThresholdApplied,
+      minCompressionRatioThreshold: minCompressionRatio,
+      compressionRatio,
+      lookbackShort,
+      lookbackLong,
+      status: 'disabled',
+    };
+  }
+
+  if (!Number.isFinite(shortVolBps) || !Number.isFinite(longVolBps)) {
+    return {
+      ok: true,
+      reason: 'insufficient_samples',
+      symbolTier: normalizedSymbolTier,
+      shortVolBps: shortVol,
+      longVolBps: longVol,
+      minLongVolThresholdApplied,
+      minCompressionRatioThreshold: minCompressionRatio,
+      compressionRatio,
+      lookbackShort,
+      lookbackLong,
+      status: 'insufficient_samples',
+    };
+  }
+
+  if (!hasKnownTier) {
+    return {
+      ok: false,
+      reason: 'symbol_tier_missing',
+      symbolTier: normalizedSymbolTier,
+      shortVolBps: shortVol,
+      longVolBps: longVol,
+      minLongVolThresholdApplied,
+      minCompressionRatioThreshold: minCompressionRatio,
+      compressionRatio,
+      lookbackShort,
+      lookbackLong,
+      status: 'symbol_tier_missing',
+    };
+  }
+
+  if (longVolBps < minLongVolThresholdApplied) {
+    return {
+      ok: false,
+      reason: 'long_vol_below_threshold',
+      symbolTier: normalizedSymbolTier,
+      shortVolBps: shortVol,
+      longVolBps: longVol,
+      minLongVolThresholdApplied,
+      minCompressionRatioThreshold: minCompressionRatio,
+      compressionRatio,
+      lookbackShort,
+      lookbackLong,
+      status: 'blocked',
+    };
+  }
+
+  if (compressionRatio < minCompressionRatio) {
+    return {
+      ok: false,
+      reason: 'compression_ratio_below_threshold',
+      symbolTier: normalizedSymbolTier,
+      shortVolBps: shortVol,
+      longVolBps: longVol,
+      minLongVolThresholdApplied,
+      minCompressionRatioThreshold: minCompressionRatio,
+      compressionRatio,
+      lookbackShort,
+      lookbackLong,
+      status: 'blocked',
+    };
+  }
+
+  return {
+    ok: true,
+    reason: 'ok',
+    symbolTier: normalizedSymbolTier,
+    shortVolBps: shortVol,
+    longVolBps: longVol,
+    minLongVolThresholdApplied,
+    minCompressionRatioThreshold: minCompressionRatio,
+    compressionRatio,
+    lookbackShort,
+    lookbackLong,
+    status: 'ok',
+  };
+}
+
 function computeNetEdgeBps({ expectedMoveBps, feeBpsRoundTrip, entrySlippageBufferBps, exitSlippageBufferBps, adverseSpreadCostBps } = {}) {
   const gross = Number(expectedMoveBps) || 0;
   const net = gross
@@ -201,6 +318,7 @@ function shouldExitFailedTrade({
 module.exports = {
   evaluateMomentumState,
   evaluateTradeableRegime,
+  evaluateVolCompression,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,
