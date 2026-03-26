@@ -26,4 +26,30 @@ const { evaluatePredictorWarmupGate } = require('./modules/predictorWarmup');
   assert.strictEqual(result.missing.length, 0);
 })();
 
+(function testDoesNotBlockWhenBlockTradesDisabled() {
+  const result = evaluatePredictorWarmupGate({
+    enabled: true,
+    blockTrades: false,
+    lengths: { '1m': 10, '5m': 80, '15m': 90 },
+    thresholds: { '1m': 200, '5m': 200, '15m': 100 },
+  });
+  assert.strictEqual(result.skip, false);
+  assert.strictEqual(result.reason, 'predictor_warmup');
+  assert.ok(Array.isArray(result.missing));
+  assert.ok(result.missing.length >= 1);
+})();
+
+(function testDisabledWarmupNeverBlocks() {
+  const result = evaluatePredictorWarmupGate({
+    enabled: false,
+    blockTrades: true,
+    lengths: { '1m': 0, '5m': 0, '15m': 0 },
+    thresholds: { '1m': 200, '5m': 200, '15m': 100 },
+  });
+  assert.strictEqual(result.skip, false);
+  assert.strictEqual(result.reason, null);
+  assert.ok(Array.isArray(result.missing));
+  assert.ok(result.missing.length >= 1);
+})();
+
 console.log('predictorWarmup.test.js passed');

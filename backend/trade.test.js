@@ -199,6 +199,8 @@ const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
 assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', false\);/);
+assert.match(tradeSource, /if \(warmupGate\.skip && !canFallback\) \{/);
+assert.match(tradeSource, /console\.log\('runtime_config_effective', \{[\s\S]*MAX_CONCURRENT_POSITIONS,[\s\S]*PREDICTOR_WARMUP_ENABLED,[\s\S]*PREDICTOR_WARMUP_BLOCK_TRADES,[\s\S]*ORDERBOOK_ABSORPTION_ENABLED,[\s\S]*\}\);/);
 assert.match(tradeSource, /const ORDERBOOK_MIN_DEPTH_USD = readNumber\('ORDERBOOK_MIN_DEPTH_USD', 175\);/);
 assert.match(tradeSource, /const ORDERBOOK_ABSORPTION_ENABLED = readFlag\('ORDERBOOK_ABSORPTION_ENABLED', false\);/);
 assert.match(tradeSource, /const \{ computeOrderbookMetrics \} = require\('\.\/modules\/orderbookMetrics'\);/);

@@ -520,6 +520,12 @@ let printedConfigOnce = false;
 function printConfigOnce() {
   if (printedConfigOnce) return;
   printedConfigOnce = true;
+  console.log('runtime_config_effective', {
+    MAX_CONCURRENT_POSITIONS,
+    PREDICTOR_WARMUP_ENABLED,
+    PREDICTOR_WARMUP_BLOCK_TRADES,
+    ORDERBOOK_ABSORPTION_ENABLED,
+  });
   console.log('runtime_config', {
     MIN_PROB_TO_ENTER,
     EV_GUARD_ENABLED,
@@ -1544,7 +1550,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   if (warmupGate.missing.length) {
     const fallbackBudget = Number.isFinite(opts?.fallbackBudgetState?.remaining) ? opts.fallbackBudgetState.remaining : 0;
     const canFallback = ALLOW_PER_SYMBOL_BARS_FALLBACK && fallbackBudget > 0;
-    if (!canFallback) {
+    if (warmupGate.skip && !canFallback) {
       return {
         entryReady: false,
         why: 'predictor_warmup',
@@ -1561,34 +1567,44 @@ async function computeEntrySignal(symbol, opts = {}) {
         record: baseRecord,
       };
     }
-
-    const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: warmupGate.thresholds['1m'] }),
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: warmupGate.thresholds['5m'] }),
-      fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: warmupGate.thresholds['15m'] }),
-    ]);
-    if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
-      const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
-      console.warn('predictor_error', {
+    if (!canFallback) {
+      console.log('predictor_warmup_fallback_skipped', {
         symbol: asset.symbol,
-        reason: 'bars_fetch_failed',
-        errorName: err?.name || null,
-        errorMessage: err?.message || String(err),
-        stack: String(err?.stack || '').slice(0, 600),
+        blockTrades: warmupGate.blockTrades,
+        missing: warmupGate.missing,
+        fallbackAllowed: ALLOW_PER_SYMBOL_BARS_FALLBACK,
+        fallbackBudget,
       });
-      return {
-        entryReady: false,
-        why: 'predictor_error',
-        meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
-        record: baseRecord,
-      };
+    } else {
+
+      const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: warmupGate.thresholds['1m'] }),
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '5Min', limit: warmupGate.thresholds['5m'] }),
+        fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: warmupGate.thresholds['15m'] }),
+      ]);
+      if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
+        const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
+        console.warn('predictor_error', {
+          symbol: asset.symbol,
+          reason: 'bars_fetch_failed',
+          errorName: err?.name || null,
+          errorMessage: err?.message || String(err),
+          stack: String(err?.stack || '').slice(0, 600),
+        });
+        return {
+          entryReady: false,
+          why: 'predictor_error',
+          meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
+          record: baseRecord,
+        };
+      }
+      if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
+        opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
+      }
+      bars1m = bars1mResult.response;
+      bars5m = bars5mResult.response;
+      bars15m = bars15mResult.response;
     }
-    if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
-      opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
-    }
-    bars1m = bars1mResult.response;
-    bars5m = bars5mResult.response;
-    bars15m = bars15mResult.response;
   }
 
   let predictorStretch;
