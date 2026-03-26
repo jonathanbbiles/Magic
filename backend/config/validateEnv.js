@@ -194,11 +194,12 @@ const validateEnv = () => {
     const regimeMaxSpreadBps = parseFiniteNumberEnv('REGIME_MAX_SPREAD_BPS', 40);
     const orderbookMinDepthUsd = parseFiniteNumberEnv('ORDERBOOK_MIN_DEPTH_USD', 175);
     const regimeMinVolBps = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS', 15);
-    const regimeMinVolBpsTier1 = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS_TIER1', 6);
+    const regimeMinVolBpsTier1 = parseFiniteNumberEnv('REGIME_MIN_VOL_BPS_TIER1', 4);
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
-    const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.45);
-    const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
-    const volCompressionMinLongVolBpsTier1 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 3);
+    const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.60);
+    const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8);
+    const volCompressionMinLongVolBpsTier1 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2);
+    const volCompressionMinLongVolBpsTier2 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 7);
     const regimeRequireMomentum = parseBooleanEnv('REGIME_REQUIRE_MOMENTUM', true);
     const regimeBlockWeakLiquidity = parseBooleanEnv('REGIME_BLOCK_WEAK_LIQUIDITY', true);
     const regimeAllowUnknownVol = parseBooleanEnv('REGIME_ALLOW_UNKNOWN_VOL', false);
@@ -259,6 +260,7 @@ const validateEnv = () => {
     assertInRange('VOL_COMPRESSION_MIN_RATIO', volCompressionMinRatio, 0, 10);
     assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS', volCompressionMinLongVolBps, 0, 10000);
     assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', volCompressionMinLongVolBpsTier1, 0, 10000);
+    assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', volCompressionMinLongVolBpsTier2, 0, 10000);
     if (volCompressionMinRatio <= 0) {
       throw new Error(`VOL_COMPRESSION_MIN_RATIO must be > 0. Received: "${volCompressionMinRatio}"`);
     }
@@ -276,6 +278,9 @@ const validateEnv = () => {
     }
     if (volCompressionMinLongVolBpsTier1 <= 0) {
       throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 must be > 0. Received: "${volCompressionMinLongVolBpsTier1}"`);
+    }
+    if (volCompressionMinLongVolBpsTier2 <= 0) {
+      throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 must be > 0. Received: "${volCompressionMinLongVolBpsTier2}"`);
     }
     if (regimeMinVolBps > regimeMaxVolBps) {
       throw new Error(`REGIME_MIN_VOL_BPS cannot exceed REGIME_MAX_VOL_BPS. Received min=${regimeMinVolBps}, max=${regimeMaxVolBps}`);
@@ -363,6 +368,7 @@ const validateEnv = () => {
         minRatio: volCompressionMinRatio,
         minLongVolBps: volCompressionMinLongVolBps,
         minLongVolBpsTier1: volCompressionMinLongVolBpsTier1,
+        minLongVolBpsTier2: volCompressionMinLongVolBpsTier2,
       },
       failedTrade: {
         maxAgeSec: failedTradeMaxAgeSec,

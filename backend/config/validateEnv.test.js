@@ -35,11 +35,12 @@ withEnv({}, () => {
   assert.equal(guardrails.regime.orderbookMinDepthUsd, 175);
   assert.equal(guardrails.regime.orderbookMinLevelsPerSide, 2);
   assert.equal(guardrails.sparseFallback.maxSpreadBps, 12);
-  assert.equal(guardrails.volCompression.minRatio, 0.45);
+  assert.equal(guardrails.volCompression.minRatio, 0.60);
   assert.equal(guardrails.regime.minVolBps, 15);
-  assert.equal(guardrails.regime.minVolBpsTier1, 6);
-  assert.equal(guardrails.volCompression.minLongVolBps, 10);
-  assert.equal(guardrails.volCompression.minLongVolBpsTier1, 3);
+  assert.equal(guardrails.regime.minVolBpsTier1, 4);
+  assert.equal(guardrails.volCompression.minLongVolBps, 8);
+  assert.equal(guardrails.volCompression.minLongVolBpsTier1, 2);
+  assert.equal(guardrails.volCompression.minLongVolBpsTier2, 7);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
 });
@@ -90,6 +91,10 @@ withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS: '0' }, () => {
 
 withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1: '0' }, () => {
   assert.throws(() => validateEnv(), /VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 must be > 0/);
+});
+
+withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2: '0' }, () => {
+  assert.throws(() => validateEnv(), /VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 must be > 0/);
 });
 
 withEnv({ VOL_COMPRESSION_MIN_RATIO: '0' }, () => {

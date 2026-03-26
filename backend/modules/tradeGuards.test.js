@@ -62,10 +62,10 @@ assert.ok(stillTooLowVolRegime.reasons.includes('vol_too_low'));
 const tier1RegimeAllowed = evaluateTradeableRegime({
   spreadBps: 12,
   weakLiquidity: false,
-  volatilityBps: 6.1,
+  volatilityBps: 4.1,
   momentumState,
   marketDataHealthy: true,
-  minVolBps: 6,
+  minVolBps: 4,
 });
 assert.equal(tier1RegimeAllowed.entryAllowed, true);
 
@@ -109,37 +109,54 @@ const tier1Compression = evaluateVolCompression({
   symbolTier: 'tier1',
   shortVolBps: 8,
   longVolBps: 3.1,
-  minLongVolBps: 10,
-  minLongVolBpsTier1: 3,
-  minCompressionRatio: 0.45,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 7,
+  minCompressionRatio: 0.60,
   lookbackShort: 6,
   lookbackLong: 30,
   enabled: true,
 });
 assert.equal(tier1Compression.ok, true);
-assert.equal(tier1Compression.minLongVolThresholdApplied, 3);
-assert.notEqual(tier1Compression.minLongVolThresholdApplied, 10);
+assert.equal(tier1Compression.minLongVolThresholdApplied, 2);
+assert.notEqual(tier1Compression.minLongVolThresholdApplied, 8);
 
 const tier2Compression = evaluateVolCompression({
   symbolTier: 'tier2',
   shortVolBps: 8,
-  longVolBps: 9.5,
-  minLongVolBps: 10,
-  minLongVolBpsTier1: 3,
-  minCompressionRatio: 0.45,
+  longVolBps: 6.5,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 7,
+  minCompressionRatio: 0.60,
   enabled: true,
 });
 assert.equal(tier2Compression.ok, false);
 assert.equal(tier2Compression.reason, 'long_vol_below_threshold');
-assert.equal(tier2Compression.minLongVolThresholdApplied, 10);
+assert.equal(tier2Compression.minLongVolThresholdApplied, 7);
+
+const tier3Compression = evaluateVolCompression({
+  symbolTier: 'tier3',
+  shortVolBps: 5.5,
+  longVolBps: 8.1,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 7,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier3Compression.ok, true);
+assert.equal(tier3Compression.minLongVolThresholdApplied, 8);
+assert.equal(tier3Compression.minCompressionRatioThreshold, 0.60);
 
 const missingTierCompression = evaluateVolCompression({
   symbolTier: null,
   shortVolBps: 8,
   longVolBps: 12,
-  minLongVolBps: 10,
-  minLongVolBpsTier1: 3,
-  minCompressionRatio: 0.45,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 7,
+  minCompressionRatio: 0.60,
   enabled: true,
 });
 assert.equal(missingTierCompression.ok, false);

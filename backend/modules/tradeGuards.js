@@ -92,9 +92,10 @@ function evaluateVolCompression({
   symbolTier,
   shortVolBps,
   longVolBps,
-  minLongVolBps = 10,
-  minLongVolBpsTier1 = 3,
-  minCompressionRatio = 0.45,
+  minLongVolBps = 8,
+  minLongVolBpsTier1 = 2,
+  minLongVolBpsTier2 = 7,
+  minCompressionRatio = 0.60,
   lookbackShort = null,
   lookbackLong = null,
   enabled = true,
@@ -102,7 +103,9 @@ function evaluateVolCompression({
   const normalizedSymbolTier = typeof symbolTier === 'string' ? symbolTier.toLowerCase() : null;
   const hasKnownTier = normalizedSymbolTier === 'tier1' || normalizedSymbolTier === 'tier2' || normalizedSymbolTier === 'tier3';
   const minLongVolThresholdApplied = hasKnownTier
-    ? (normalizedSymbolTier === 'tier1' ? minLongVolBpsTier1 : minLongVolBps)
+    ? (normalizedSymbolTier === 'tier1'
+      ? minLongVolBpsTier1
+      : (normalizedSymbolTier === 'tier2' ? minLongVolBpsTier2 : minLongVolBps))
     : null;
   const shortVol = Number.isFinite(shortVolBps) ? shortVolBps : null;
   const longVol = Number.isFinite(longVolBps) ? longVolBps : null;
