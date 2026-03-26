@@ -354,6 +354,7 @@ const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
 const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
 const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 4);
+const REGIME_MIN_VOL_BPS_TIER2 = readNumber('REGIME_MIN_VOL_BPS_TIER2', 8);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -493,6 +494,7 @@ const ORDERBOOK_SPARSE_FALLBACK_SYMBOLS = parseSymbolSet(process.env.ORDERBOOK_S
 const ORDERBOOK_SPARSE_MAX_SPREAD_BPS = readNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
 const ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS = readNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
 const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = readNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
+const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);
 const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBABILITY', 0.60);
 const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
 const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
@@ -539,6 +541,7 @@ function printConfigOnce() {
     predictorWarmupThresholds: getBarsWarmupThresholds(),
     predictorMinBarsThresholds: getPredictorMinBarsThresholds(),
     REGIME_MIN_VOL_BPS_TIER1,
+    REGIME_MIN_VOL_BPS_TIER2,
     VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
     volCompressionMinLongVolBpsTier2Effective: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
     MIN_PROB_TO_ENTER,
@@ -953,6 +956,7 @@ function getEntryMarketDataPolicy() {
       maxSpreadBps: ORDERBOOK_SPARSE_MAX_SPREAD_BPS,
       requireStrongerEdgeBps: ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS,
       requireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+      staleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
       minProbability: ORDERBOOK_SPARSE_MIN_PROBABILITY,
       confidenceCapMultiplier: ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT,
     },
@@ -1980,7 +1984,9 @@ async function computeEntrySignal(symbol, opts = {}) {
     maxSpreadBps: REGIME_MAX_SPREAD_BPS,
     minVolBps: symbolTier === 'tier1'
       ? REGIME_MIN_VOL_BPS_TIER1
-      : REGIME_MIN_VOL_BPS,
+      : symbolTier === 'tier2'
+        ? REGIME_MIN_VOL_BPS_TIER2
+        : REGIME_MIN_VOL_BPS,
     maxVolBps: REGIME_MAX_VOL_BPS,
     requireMomentum: REGIME_REQUIRE_MOMENTUM,
     blockWeakLiquidity: REGIME_BLOCK_WEAK_LIQUIDITY,
@@ -2001,10 +2007,13 @@ async function computeEntrySignal(symbol, opts = {}) {
       reason: regimeDecision.reason,
       minVolThresholdApplied: symbolTier === 'tier1'
         ? REGIME_MIN_VOL_BPS_TIER1
-        : REGIME_MIN_VOL_BPS,
+        : symbolTier === 'tier2'
+          ? REGIME_MIN_VOL_BPS_TIER2
+          : REGIME_MIN_VOL_BPS,
       thresholds: {
         regimeMinVolBps: REGIME_MIN_VOL_BPS,
         regimeMinVolBpsTier1: REGIME_MIN_VOL_BPS_TIER1,
+        regimeMinVolBpsTier2: REGIME_MIN_VOL_BPS_TIER2,
         compressionMinLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
         compressionMinLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,
         compressionMinLongVolBpsTier2: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
@@ -2096,8 +2105,12 @@ async function computeEntrySignal(symbol, opts = {}) {
     quoteAgeMs,
     requiredEdgeBps,
     netEdgeBps: edge.netEdgeBps,
+    minNetEdgeBps: edgeRequirements.minNetEdgeBps,
     predictorProbability: predictorTp?.probability ?? null,
     weakLiquidity,
+    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    availableDepthUsd: orderbookMeta.actualDepthUsd,
     orderbookMeta,
     policy: getEntryMarketDataPolicy(),
   });
@@ -2116,6 +2129,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     spreadBps,
     probability: predictorTp?.probability ?? null,
     confidenceCap: marketDataEval.confidenceMultiplierCap,
+    quoteAgeMs,
+    sparseFallback: marketDataEval.sparseFallbackState,
+    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
     reason: marketDataEval.reason,
   });
   if (marketDataEval.dataQualityState !== 'ok') {
@@ -2126,6 +2143,11 @@ async function computeEntrySignal(symbol, opts = {}) {
         spreadBps,
         probability: predictorTp?.probability ?? null,
         netEdgeBps: edge.netEdgeBps,
+        quoteAgeMs,
+        requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        availableDepthUsd: orderbookMeta.actualDepthUsd,
+        cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        sparseFallback: marketDataEval.sparseFallbackState,
         reason: marketDataEval.reason,
       });
     }
@@ -2168,7 +2190,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       spreadBps,
       probability: predictorTp?.probability ?? null,
       netEdgeBps: edge.netEdgeBps,
+      quoteAgeMs,
+      requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      availableDepthUsd: orderbookMeta.actualDepthUsd,
+      cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
       confidenceCap: marketDataEval.confidenceMultiplierCap,
+      sparseFallback: marketDataEval.sparseFallbackState,
     });
   }
 
@@ -3015,7 +3042,7 @@ function computeEntryEdgeRequirements({
   const transactionCostBpsNoSpread = feeBpsRoundTripUsed + entrySlippageBpsUsed + exitSlippageBpsUsed + profitBufferBpsUsed;
   const derivedRequiredEdgeBps = transactionCostBpsNoSpread + spreadBpsUsed + minNetEdgeBpsUsed;
   const requiredEdgeBps = Number.isFinite(REQUIRED_EDGE_BPS)
-    ? Math.max(REQUIRED_EDGE_BPS, derivedRequiredEdgeBps)
+    ? Math.max(0, REQUIRED_EDGE_BPS)
     : derivedRequiredEdgeBps;
   const maxAffordableSpreadBps = Number.isFinite(targetMoveBpsUsed)
     ? Math.max(0, targetMoveBpsUsed - transactionCostBpsNoSpread - minNetEdgeBpsUsed)
