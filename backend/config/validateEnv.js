@@ -54,6 +54,12 @@ const parseFiniteNumberEnv = (name, defaultValue) => {
   return n;
 };
 
+const parseSymbolListEnv = (name, fallback = '') =>
+  String(process.env[name] ?? fallback)
+    .split(',')
+    .map((symbol) => symbol.trim())
+    .filter(Boolean);
+
 const assertInRange = (name, value, min, max) => {
   if (!Number.isFinite(value) || value < min || value > max) {
     throw new Error(`${name} must be between ${min} and ${max}. Received: "${value}"`);
@@ -191,6 +197,17 @@ const validateEnv = () => {
     const regimeRequireMomentum = parseBooleanEnv('REGIME_REQUIRE_MOMENTUM', true);
     const regimeBlockWeakLiquidity = parseBooleanEnv('REGIME_BLOCK_WEAK_LIQUIDITY', true);
     const regimeAllowUnknownVol = parseBooleanEnv('REGIME_ALLOW_UNKNOWN_VOL', false);
+    const orderbookMinLevelsPerSide = parseFiniteNumberEnv('ORDERBOOK_MIN_LEVELS_PER_SIDE', 2);
+    const orderbookSparseFallbackEnabled = parseBooleanEnv('ORDERBOOK_SPARSE_FALLBACK_ENABLED', true);
+    const orderbookSparseMaxSpreadBps = parseFiniteNumberEnv('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
+    const orderbookSparseRequireStrongerEdgeBps = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
+    const orderbookSparseRequireQuoteFreshMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
+    const orderbookSparseConfirmRetry = parseBooleanEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
+    const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
+    const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
+    const executionTier1Symbols = parseSymbolListEnv('EXECUTION_TIER1_SYMBOLS', 'BTC/USD,ETH/USD');
+    const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'SOL/USD,LINK/USD,AVAX/USD');
+    const executionTier3Default = parseBooleanEnv('EXECUTION_TIER3_DEFAULT', true);
 
     const failedTradeMaxAgeSec = parseFiniteNumberEnv('FAILED_TRADE_MAX_AGE_SEC', 90);
     const failedTradeMinProgressPct = parseFiniteNumberEnv('FAILED_TRADE_MIN_PROGRESS_PCT', 0.10);
@@ -210,6 +227,11 @@ const validateEnv = () => {
     const standdownDurationMin = parseFiniteNumberEnv('STANDDOWN_DURATION_MIN', 20);
 
     assertInRange('REGIME_MAX_SPREAD_BPS', regimeMaxSpreadBps, 0, 10000);
+    assertInRange('ORDERBOOK_MIN_LEVELS_PER_SIDE', orderbookMinLevelsPerSide, 1, 100);
+    assertInRange('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', orderbookSparseMaxSpreadBps, 0, 10000);
+    assertInRange('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', orderbookSparseRequireStrongerEdgeBps, 0, 10000);
+    assertInRange('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', orderbookSparseRequireQuoteFreshMs, 0, 3600000);
+    assertInRange('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', orderbookSparseConfirmRetryMs, 0, 10000);
     assertInRange('ORDERBOOK_MIN_DEPTH_USD', orderbookMinDepthUsd, 0, 1000000000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
@@ -260,16 +282,37 @@ const validateEnv = () => {
     assertPositiveInteger('STANDDOWN_AFTER_LOSSES', standdownAfterLosses);
     assertPositiveInteger('STANDDOWN_WINDOW_MIN', standdownWindowMin);
     assertPositiveInteger('STANDDOWN_DURATION_MIN', standdownDurationMin);
+    if (!sparseFallbackSymbols.length) {
+      throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
+    }
+    if (!executionTier1Symbols.length) {
+      throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
+    }
 
     console.log('config_guardrails', {
       regime: {
         maxSpreadBps: regimeMaxSpreadBps,
         orderbookMinDepthUsd,
+        orderbookMinLevelsPerSide,
         minVolBps: regimeMinVolBps,
         maxVolBps: regimeMaxVolBps,
         requireMomentum: regimeRequireMomentum,
         blockWeakLiquidity: regimeBlockWeakLiquidity,
         allowUnknownVol: regimeAllowUnknownVol,
+      },
+      sparseFallback: {
+        enabled: orderbookSparseFallbackEnabled,
+        maxSpreadBps: orderbookSparseMaxSpreadBps,
+        requireStrongerEdgeBps: orderbookSparseRequireStrongerEdgeBps,
+        requireQuoteFreshMs: orderbookSparseRequireQuoteFreshMs,
+        confirmRetry: orderbookSparseConfirmRetry,
+        confirmRetryMs: orderbookSparseConfirmRetryMs,
+        symbols: sparseFallbackSymbols,
+      },
+      executionTiering: {
+        tier1Symbols: executionTier1Symbols,
+        tier2Symbols: executionTier2Symbols,
+        tier3Default: executionTier3Default,
       },
       volCompression: {
         minRatio: volCompressionMinRatio,

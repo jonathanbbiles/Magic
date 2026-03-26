@@ -54,6 +54,11 @@ assert.equal(sparseMetrics.reason, 'ob_depth_insufficient');
 assert.equal(sparseMetrics.depthState, 'orderbook_sparse');
 assert.equal(sparseMetrics.actualDepthUsd, null);
 
+const relaxedLevelsMetrics = computeOrderbookMetrics(sparseBook, { ask: 10, bid: 9.99 }, { ...baseConfig, minLevelsPerSide: 1 });
+assert.equal(relaxedLevelsMetrics.depthState, 'ok');
+assert.ok(relaxedLevelsMetrics.askDepthUsd > 0);
+assert.ok(relaxedLevelsMetrics.bidDepthUsd > 0);
+
 const malformedBook = {
   asks: [{ p: 'bad', s: 'oops' }],
   bids: [{ price: null, qty: undefined }],

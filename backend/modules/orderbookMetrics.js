@@ -81,11 +81,12 @@ function estimateBuyImpactBps(asks, bestAsk, notionalUsd) {
 }
 
 function resolveDepthState({ asks, bids, askSide, bidSide }) {
+  const minLevelsPerSide = Math.max(1, Math.floor(Number(askSide?.minLevelsPerSide ?? bidSide?.minLevelsPerSide ?? 2) || 2));
   if (!Array.isArray(asks) || !Array.isArray(bids)) return 'orderbook_malformed';
   if (!asks.length || !bids.length) return 'orderbook_sparse';
   if (askSide.levelCounts.valid === 0 || bidSide.levelCounts.valid === 0) return 'orderbook_malformed';
   if (askSide.levelCounts.inBand === 0 || bidSide.levelCounts.inBand === 0) return 'depth_calc_unreliable';
-  if (askSide.levelCounts.valid < 2 || bidSide.levelCounts.valid < 2) return 'orderbook_sparse';
+  if (askSide.levelCounts.valid < minLevelsPerSide || bidSide.levelCounts.valid < minLevelsPerSide) return 'orderbook_sparse';
   return 'ok';
 }
 
@@ -121,8 +122,9 @@ function computeOrderbookMetrics(orderbook, quote, config) {
     };
   }
 
-  const askSide = computeDepthForSide({ levels: asks, bestPrice: ask, bandBps: config.bandBps, side: 'ask' });
-  const bidSide = computeDepthForSide({ levels: bids, bestPrice: bid, bandBps: config.bandBps, side: 'bid' });
+  const minLevelsPerSide = Math.max(1, Math.floor(Number(config.minLevelsPerSide) || 2));
+  const askSide = { ...computeDepthForSide({ levels: asks, bestPrice: ask, bandBps: config.bandBps, side: 'ask' }), minLevelsPerSide };
+  const bidSide = { ...computeDepthForSide({ levels: bids, bestPrice: bid, bandBps: config.bandBps, side: 'bid' }), minLevelsPerSide };
   const askDepthUsd = askSide.depthUsd;
   const bidDepthUsd = bidSide.depthUsd;
   const totalDepthUsd = askDepthUsd + bidDepthUsd;
