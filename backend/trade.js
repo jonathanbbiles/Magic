@@ -40,6 +40,7 @@ const { quoteLimiter } = require('./limiters');
 const {
   evaluateMomentumState,
   evaluateTradeableRegime,
+  evaluateVolCompression,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,
@@ -1441,51 +1442,46 @@ async function computeEntrySignal(symbol, opts = {}) {
   ).filter((value) => Number.isFinite(value) && value > 0);
   const shortVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_SHORT);
   const longVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_LONG);
-  const minLongVolThresholdApplied = symbolTier === 'tier1'
-    ? VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1
-    : VOL_COMPRESSION_MIN_LONG_VOL_BPS;
-  const compressionRatio = Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)
-    ? shortVolBps / Math.max(longVolBps, 1e-6)
-    : null;
-  const volCompressionMeta = {
+  const volCompressionMeta = evaluateVolCompression({
     symbolTier,
-    shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
-    longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
-    minLongVolThresholdApplied,
-    minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
-    compressionRatio,
+    shortVolBps,
+    longVolBps,
+    minLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+    minLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,
+    minCompressionRatio: VOL_COMPRESSION_MIN_RATIO,
     lookbackShort: VOL_COMPRESSION_LOOKBACK_SHORT,
     lookbackLong: VOL_COMPRESSION_LOOKBACK_LONG,
-    status: (Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)) ? 'ok' : 'insufficient_samples',
-  };
+    enabled: VOL_COMPRESSION_ENABLED,
+  });
 
-  if (VOL_COMPRESSION_ENABLED && Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)) {
-    if (longVolBps < minLongVolThresholdApplied || compressionRatio < VOL_COMPRESSION_MIN_RATIO) {
-      logEntrySkip({
+  if (VOL_COMPRESSION_ENABLED && !volCompressionMeta.ok) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      symbolTier,
+      spreadBps,
+      requiredEdgeBps,
+      reason: 'vol_compression_gate',
+      shortVolBps: volCompressionMeta.shortVolBps,
+      longVolBps: volCompressionMeta.longVolBps,
+      compressionRatio: volCompressionMeta.compressionRatio,
+      minCompressionRatioThreshold: volCompressionMeta.minCompressionRatioThreshold,
+      minLongVolThresholdApplied: volCompressionMeta.minLongVolThresholdApplied,
+      lookbackShort: volCompressionMeta.lookbackShort,
+      lookbackLong: volCompressionMeta.lookbackLong,
+      status: volCompressionMeta.status,
+      volCompression: volCompressionMeta,
+    });
+    return {
+      entryReady: false,
+      why: 'vol_compression_gate',
+      meta: {
         symbol: asset.symbol,
-        symbolTier,
         spreadBps,
         requiredEdgeBps,
-        reason: 'vol_compression_gate',
-        compressionRatio: Number.isFinite(compressionRatio) ? compressionRatio : null,
-        minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
-        shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
-        longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
-        minLongVolThresholdApplied,
         volCompression: volCompressionMeta,
-      });
-      return {
-        entryReady: false,
-        why: 'vol_compression_gate',
-        meta: {
-          symbol: asset.symbol,
-          spreadBps,
-          requiredEdgeBps,
-          volCompression: volCompressionMeta,
-        },
-        record: baseRecord,
-      };
-    }
+      },
+      record: baseRecord,
+    };
   }
 
   const barSeries5m =

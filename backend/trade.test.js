@@ -202,8 +202,9 @@ assert.match(tradeSource, /const \{ computeOrderbookMetrics \} = require\('\.\/m
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_RATIO = readNumber\('VOL_COMPRESSION_MIN_RATIO', 0\.45\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 6\);/);
-assert.match(tradeSource, /const minLongVolThresholdApplied = symbolTier === 'tier1'[\s\S]*\? VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1[\s\S]*: VOL_COMPRESSION_MIN_LONG_VOL_BPS;/);
-assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,[\s\S]*shortVolBps:[\s\S]*longVolBps:[\s\S]*minLongVolThresholdApplied,/);
+assert.match(tradeSource, /const \{\s*evaluateMomentumState,\s*evaluateTradeableRegime,\s*evaluateVolCompression,/);
+assert.match(tradeSource, /const volCompressionMeta = evaluateVolCompression\(\{[\s\S]*symbolTier,[\s\S]*minLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,[\s\S]*minLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,[\s\S]*enabled: VOL_COMPRESSION_ENABLED,/);
+assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*shortVolBps: volCompressionMeta\.shortVolBps,[\s\S]*longVolBps: volCompressionMeta\.longVolBps,[\s\S]*compressionRatio: volCompressionMeta\.compressionRatio,[\s\S]*minCompressionRatioThreshold: volCompressionMeta\.minCompressionRatioThreshold,[\s\S]*minLongVolThresholdApplied: volCompressionMeta\.minLongVolThresholdApplied,/);
 assert.match(tradeSource, /logEntrySkip\(\{[\s\S]*symbolTier,[\s\S]*reason: 'vol_compression_gate',/);
 assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orderbookMeta\.depthState,[\s\S]*bidDepthUsd: orderbookMeta\.bidDepthUsd,[\s\S]*askDepthUsd: orderbookMeta\.askDepthUsd,[\s\S]*actualDepthUsd: orderbookMeta\.actualDepthUsd,[\s\S]*orderbookLevelCounts: orderbookMeta\.orderbookLevelCounts,/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
