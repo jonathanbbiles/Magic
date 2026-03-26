@@ -212,12 +212,17 @@ assert.match(tradeSource, /const VOL_COMPRESSION_MIN_RATIO = readNumber\('VOL_CO
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4\);/);
+assert.match(tradeSource, /const MIN_NET_EDGE_BPS = readNumber\('MIN_NET_EDGE_BPS', 5\);/);
+assert.match(tradeSource, /const ENTRY_PROFIT_BUFFER_BPS = readNumber\('ENTRY_PROFIT_BUFFER_BPS', 5\);/);
 assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 0\);/);
 assert.match(tradeSource, /const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0\.10;/);
 assert.match(tradeSource, /const TRADE_PORTFOLIO_PCT = Math\.max\(0, Math\.min\(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW\)\);/);
 assert.match(tradeSource, /why: 'predictor_unavailable'/);
 assert.match(tradeSource, /reason: 'predictor_missing_bars'/);
+assert.match(tradeSource, /console\.log\('predictor_warmup_info',/);
 assert.match(tradeSource, /function computeCappedEntryNotional\(/);
+assert.match(tradeSource, /function computeEntryEdgeRequirements\(/);
+assert.match(tradeSource, /if \(edge\.netEdgeBps < edgeRequirements\.minNetEdgeBps\) \{/);
 assert.match(tradeSource, /const \{\s*evaluateMomentumState,\s*evaluateTradeableRegime,\s*evaluateVolCompression,/);
 assert.match(tradeSource, /const volCompressionMeta = evaluateVolCompression\(\{[\s\S]*symbolTier,[\s\S]*minLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,[\s\S]*minLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,[\s\S]*minLongVolBpsTier2: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,[\s\S]*enabled: VOL_COMPRESSION_ENABLED,/);
 assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*shortVolBps: volCompressionMeta\.shortVolBps,[\s\S]*longVolBps: volCompressionMeta\.longVolBps,[\s\S]*compressionRatio: volCompressionMeta\.compressionRatio,[\s\S]*minCompressionRatioThreshold: volCompressionMeta\.minCompressionRatioThreshold,[\s\S]*minLongVolThresholdApplied: volCompressionMeta\.minLongVolThresholdApplied,/);
