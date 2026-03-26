@@ -276,7 +276,11 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 0);
 
 const BUFFER_BPS = Number(process.env.BUFFER_BPS || 0);
 const ENTRY_BUFFER_BPS = readNumber('ENTRY_BUFFER_BPS', 10);
-const REQUIRED_EDGE_BPS = readNumber('REQUIRED_EDGE_BPS', 200);
+const REQUIRED_EDGE_BPS = Number.isFinite(Number(process.env.REQUIRED_EDGE_BPS))
+  ? Number(process.env.REQUIRED_EDGE_BPS)
+  : null;
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 5);
+const ENTRY_PROFIT_BUFFER_BPS = readNumber('ENTRY_PROFIT_BUFFER_BPS', 5);
 const FEE_BPS_ROUND_TRIP = readNumber('FEE_BPS_ROUND_TRIP', 20);
 const ENTRY_SLIPPAGE_BUFFER_BPS = readNumber('ENTRY_SLIPPAGE_BUFFER_BPS', 10);
 const EXIT_SLIPPAGE_BUFFER_BPS = readNumber('EXIT_SLIPPAGE_BUFFER_BPS', 10);
@@ -536,6 +540,7 @@ function printConfigOnce() {
     predictorMinBarsThresholds: getPredictorMinBarsThresholds(),
     REGIME_MIN_VOL_BPS_TIER1,
     VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
+    volCompressionMinLongVolBpsTier2Effective: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
     MIN_PROB_TO_ENTER,
     MIN_PROB_TO_ENTER_TIER1,
     MIN_PROB_TO_ENTER_TIER2,
@@ -552,6 +557,9 @@ function printConfigOnce() {
     TARGET_PROFIT_BPS,
     STOP_LOSS_BPS,
     ENTRY_BUFFER_BPS,
+    MIN_NET_EDGE_BPS,
+    ENTRY_PROFIT_BUFFER_BPS,
+    REQUIRED_EDGE_BPS,
     FEE_BPS_MAKER,
     FEE_BPS_TAKER,
     feeBpsRoundTrip: feeBpsRoundTrip(),
@@ -1552,6 +1560,7 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   let barSeries5m = extractBarSeriesForSymbol(bars5m, asset.symbol);
   let barSeries15m = extractBarSeriesForSymbol(bars15m, asset.symbol);
+  const predictorMinBarsThresholds = getPredictorMinBarsThresholds();
 
   const warmupGate = evaluatePredictorWarmupGate({
     enabled: PREDICTOR_WARMUP_ENABLED,
@@ -1564,6 +1573,17 @@ async function computeEntrySignal(symbol, opts = {}) {
     thresholds: getBarsWarmupThresholds(),
   });
   if (PREDICTOR_WARMUP_ENABLED && warmupGate.missing.length) {
+    if (!warmupGate.blockTrades) {
+      console.log('predictor_warmup_info', {
+        symbol: asset.symbol,
+        blockTrades: false,
+        note: 'warmup thresholds are informational; predictor readiness uses predictor min bars',
+        lengths: warmupGate.lengths,
+        warmupThresholds: warmupGate.thresholds,
+        predictorMinBarsThresholds,
+        missing: warmupGate.missing,
+      });
+    }
     for (const missing of warmupGate.missing) {
       logPredictorBarsDebug({
         symbol: asset.symbol,
@@ -1572,7 +1592,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         provider: 'alpaca',
         limit: warmupGate.thresholds[missing.timeframe],
         responseCount: warmupGate.lengths[missing.timeframe],
-        status: 'insufficient',
+        status: warmupGate.blockTrades ? 'insufficient' : 'informational',
         error: null,
       });
     }
@@ -1593,7 +1613,6 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   }
 
-  const predictorMinBarsThresholds = getPredictorMinBarsThresholds();
   const predictorInputGateBeforeFallback = evaluatePredictorWarmupGate({
     enabled: true,
     blockTrades: false,
@@ -1636,9 +1655,15 @@ async function computeEntrySignal(symbol, opts = {}) {
     } else {
 
       const fetchThresholds = {
-        '1m': Math.max(warmupGate.thresholds['1m'], predictorMinBarsThresholds['1m']),
-        '5m': Math.max(warmupGate.thresholds['5m'], predictorMinBarsThresholds['5m']),
-        '15m': Math.max(warmupGate.thresholds['15m'], predictorMinBarsThresholds['15m']),
+        '1m': warmupGate.blockTrades
+          ? Math.max(warmupGate.thresholds['1m'], predictorMinBarsThresholds['1m'])
+          : predictorMinBarsThresholds['1m'],
+        '5m': warmupGate.blockTrades
+          ? Math.max(warmupGate.thresholds['5m'], predictorMinBarsThresholds['5m'])
+          : predictorMinBarsThresholds['5m'],
+        '15m': warmupGate.blockTrades
+          ? Math.max(warmupGate.thresholds['15m'], predictorMinBarsThresholds['15m'])
+          : predictorMinBarsThresholds['15m'],
       };
       const [bars1mResult, bars5mResult, bars15mResult] = await Promise.all([
         fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '1Min', limit: fetchThresholds['1m'] }),
@@ -1993,12 +2018,34 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
-    logEntrySkip({ symbol: asset.symbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
+  const edgeRequirements = computeEntryEdgeRequirements({
+    spreadBps,
+    targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+  });
+  if (Number.isFinite(spreadBps) && spreadBps > edgeRequirements.maxAffordableSpreadBps) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      symbolTier,
+      spreadBps,
+      requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+      reason: 'profit_gate',
+      feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
+      slippageBps: edgeRequirements.slippageBps,
+      targetMoveBps: edgeRequirements.targetMoveBps,
+      minNetEdgeBps: edgeRequirements.minNetEdgeBps,
+      profitBufferBps: edgeRequirements.profitBufferBps,
+      maxAffordableSpreadBps: edgeRequirements.maxAffordableSpreadBps,
+    });
     return {
       entryReady: false,
       why: 'profit_gate',
-      meta: { symbol: asset.symbol, spreadBps, requiredEdgeBps, targetProfitBps: TARGET_PROFIT_BPS },
+      meta: {
+        symbol: asset.symbol,
+        spreadBps,
+        requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+        maxAffordableSpreadBps: edgeRequirements.maxAffordableSpreadBps,
+        targetProfitBps: TARGET_PROFIT_BPS,
+      },
       record: baseRecord,
     };
   }
@@ -2032,7 +2079,12 @@ async function computeEntrySignal(symbol, opts = {}) {
     symbol: asset.symbol,
     symbolTier,
     spreadBps,
-    requiredEdgeBps,
+    feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
+    slippageBps: edgeRequirements.slippageBps,
+    targetMoveBps: edgeRequirements.targetMoveBps,
+    minNetEdgeBps: edgeRequirements.minNetEdgeBps,
+    profitBufferBps: edgeRequirements.profitBufferBps,
+    requiredEdgeBps: edgeRequirements.requiredEdgeBps,
     grossEdgeBps: edge.grossEdgeBps,
     netEdgeBps: edge.netEdgeBps,
   });
@@ -2120,11 +2172,23 @@ async function computeEntrySignal(symbol, opts = {}) {
     });
   }
 
-  if (edge.netEdgeBps < requiredEdgeBps) {
+  if (edge.netEdgeBps < edgeRequirements.minNetEdgeBps) {
     return {
       entryReady: false,
       why: 'net_edge_gate',
-      meta: { symbol: asset.symbol, spreadBps, requiredEdgeBps, grossEdgeBps: edge.grossEdgeBps, netEdgeBps: edge.netEdgeBps },
+      meta: {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        targetMoveBps: edgeRequirements.targetMoveBps,
+        feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
+        slippageBps: edgeRequirements.slippageBps,
+        minNetEdgeBps: edgeRequirements.minNetEdgeBps,
+        profitBufferBps: edgeRequirements.profitBufferBps,
+        requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+        grossEdgeBps: edge.grossEdgeBps,
+        netEdgeBps: edge.netEdgeBps,
+      },
       record: baseRecord,
     };
   }
@@ -2932,11 +2996,45 @@ function logSkip(reason, details = {}) {
 }
 
 function computeRequiredEntryEdgeBps() {
-  const configuredRequiredEdge = Number.isFinite(REQUIRED_EDGE_BPS) ? REQUIRED_EDGE_BPS : 0;
-  const feesRoundTripBps = Number.isFinite(FEE_BPS_ROUND_TRIP) ? FEE_BPS_ROUND_TRIP : (Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : 0);
-  const entryBufferBps = Number.isFinite(ENTRY_BUFFER_BPS) ? ENTRY_BUFFER_BPS : 0;
-  const dynamicFloor = TARGET_PROFIT_BPS + feesRoundTripBps + entryBufferBps;
-  return Math.max(configuredRequiredEdge, dynamicFloor);
+  return computeEntryEdgeRequirements().requiredEdgeBps;
+}
+
+function computeEntryEdgeRequirements({
+  spreadBps,
+  targetMoveBps,
+  minNetEdgeBps,
+  profitBufferBps,
+} = {}) {
+  const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : ENTRY_TAKE_PROFIT_BPS;
+  const feeBpsRoundTripUsed = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : (Number(FEE_BPS_ROUND_TRIP) || 0);
+  const entrySlippageBpsUsed = Number(ENTRY_SLIPPAGE_BUFFER_BPS) || 0;
+  const exitSlippageBpsUsed = Number(EXIT_SLIPPAGE_BUFFER_BPS) || 0;
+  const spreadBpsUsed = Number.isFinite(spreadBps) ? Math.max(0, spreadBps) : 0;
+  const minNetEdgeBpsUsed = Number.isFinite(minNetEdgeBps) ? Math.max(0, minNetEdgeBps) : Math.max(0, MIN_NET_EDGE_BPS);
+  const profitBufferBpsUsed = Number.isFinite(profitBufferBps) ? Math.max(0, profitBufferBps) : Math.max(0, ENTRY_PROFIT_BUFFER_BPS);
+  const transactionCostBpsNoSpread = feeBpsRoundTripUsed + entrySlippageBpsUsed + exitSlippageBpsUsed + profitBufferBpsUsed;
+  const derivedRequiredEdgeBps = transactionCostBpsNoSpread + spreadBpsUsed + minNetEdgeBpsUsed;
+  const requiredEdgeBps = Number.isFinite(REQUIRED_EDGE_BPS)
+    ? Math.max(REQUIRED_EDGE_BPS, derivedRequiredEdgeBps)
+    : derivedRequiredEdgeBps;
+  const maxAffordableSpreadBps = Number.isFinite(targetMoveBpsUsed)
+    ? Math.max(0, targetMoveBpsUsed - transactionCostBpsNoSpread - minNetEdgeBpsUsed)
+    : Number.POSITIVE_INFINITY;
+  return {
+    targetMoveBps: targetMoveBpsUsed,
+    feeBpsRoundTrip: feeBpsRoundTripUsed,
+    entrySlippageBps: entrySlippageBpsUsed,
+    exitSlippageBps: exitSlippageBpsUsed,
+    slippageBps: entrySlippageBpsUsed + exitSlippageBpsUsed,
+    spreadBps: spreadBpsUsed,
+    minNetEdgeBps: minNetEdgeBpsUsed,
+    profitBufferBps: profitBufferBpsUsed,
+    transactionCostBpsNoSpread,
+    derivedRequiredEdgeBps,
+    requiredEdgeBps,
+    requiredEdgeOverrideBps: REQUIRED_EDGE_BPS,
+    maxAffordableSpreadBps,
+  };
 }
 
 function recordAdverseExit(reasonCode) {

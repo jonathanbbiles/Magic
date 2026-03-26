@@ -157,6 +157,29 @@ const tier2CompressionAvax = evaluateVolCompression({
 });
 assert.equal(tier2CompressionAvax.ok, true);
 
+const tier2CompressionAtFloor = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 2.6,
+  longVolBps: 4.0,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 4,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier2CompressionAtFloor.ok, true);
+assert.equal(tier2CompressionAtFloor.minLongVolThresholdApplied, 4);
+
+const tier2CompressionDefaultThreshold = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 2.7,
+  longVolBps: 4.1,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier2CompressionDefaultThreshold.ok, true);
+assert.equal(tier2CompressionDefaultThreshold.minLongVolThresholdApplied, 4);
+
 const tier2CompressionBelowFloor = evaluateVolCompression({
   symbolTier: 'tier2',
   shortVolBps: 2.2,
@@ -208,6 +231,16 @@ const edge = computeNetEdgeBps({
 });
 assert.equal(edge.grossEdgeBps, 260);
 assert.equal(edge.netEdgeBps, 205);
+assert.equal(edge.netEdgeBps > 5, true);
+
+const negativeEdge = computeNetEdgeBps({
+  expectedMoveBps: 24.31,
+  feeBpsRoundTrip: 20,
+  entrySlippageBufferBps: 10,
+  exitSlippageBufferBps: 10,
+  adverseSpreadCostBps: 13.88,
+});
+assert.equal(negativeEdge.netEdgeBps < 0, true);
 
 const confidence = computeConfidenceScore({
   predictorProbability: 0.8,
