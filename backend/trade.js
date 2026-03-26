@@ -345,7 +345,7 @@ const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
 const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
 const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
-const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 6);
+const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 4);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -420,9 +420,10 @@ const SPREAD_ELASTICITY_MIN_BASELINE_BPS = readNumber('SPREAD_ELASTICITY_MIN_BAS
 const VOL_COMPRESSION_ENABLED = readFlag('VOL_COMPRESSION_ENABLED', true);
 const VOL_COMPRESSION_LOOKBACK_SHORT = readNumber('VOL_COMPRESSION_LOOKBACK_SHORT', 20);
 const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG', 60);
-const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.45);
-const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
-const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 3);
+const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.60);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 8);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 2);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 7);
 
 // 4) Orderbook absorption
 const ORDERBOOK_ABSORPTION_ENABLED = readFlag('ORDERBOOK_ABSORPTION_ENABLED', true);
@@ -1147,6 +1148,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   ) {
     logEntrySkip({
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       requiredEdgeBps,
       reason: 'spread_elasticity_gate',
@@ -1449,6 +1451,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     longVolBps,
     minLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
     minLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,
+    minLongVolBpsTier2: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
     minCompressionRatio: VOL_COMPRESSION_MIN_RATIO,
     lookbackShort: VOL_COMPRESSION_LOOKBACK_SHORT,
     lookbackLong: VOL_COMPRESSION_LOOKBACK_LONG,
@@ -1738,6 +1741,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     const isTimeOfDayGate = timeOfDayMakesStricter && (predictorTp?.probability ?? -1) >= baseMinProbToEnter;
     logEntrySkip({
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       requiredEdgeBps,
       reason: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
@@ -1767,6 +1771,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   if (!SIMPLIFY_GATES && MIN_PROB_TO_ENTER_STRETCH > 0 && (predictorStretch?.probability ?? -1) < MIN_PROB_TO_ENTER_STRETCH) {
     logEntrySkip({
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       requiredEdgeBps,
       reason: 'predictor_stretch_gate',
@@ -1825,6 +1830,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   if (!regimeDecision.entryAllowed) {
     console.log('entry_regime_gate', {
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       weakLiquidity,
       volatilityBps: regimeDecision.volatilityBps,
@@ -1841,6 +1847,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         regimeMinVolBpsTier1: REGIME_MIN_VOL_BPS_TIER1,
         compressionMinLongVolBps: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
         compressionMinLongVolBpsTier1: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1,
+        compressionMinLongVolBpsTier2: VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
       },
     });
     return {
@@ -1865,6 +1872,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   if (!momentumState.confirmed) {
     logEntrySkip({
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       requiredEdgeBps,
       reason: 'momentum_trigger_gate',
@@ -2067,6 +2075,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     const breakevenP = netLossBps / (netWinBps + netLossBps);
     console.log('entry_ev_gate', {
       symbol: asset.symbol,
+      symbolTier,
       spreadBps,
       requiredEdgeBps,
       p,
