@@ -38,6 +38,7 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minRatio, 0.45);
   assert.equal(guardrails.regime.minVolBps, 15);
   assert.equal(guardrails.volCompression.minLongVolBps, 10);
+  assert.equal(guardrails.volCompression.minLongVolBpsTier1, 6);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
 });
@@ -80,6 +81,10 @@ withEnv({ MARKETDATA_ORDERBOOK_TTL_MS: '0' }, () => {
 
 withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS: '0' }, () => {
   assert.throws(() => validateEnv(), /VOL_COMPRESSION_MIN_LONG_VOL_BPS must be > 0/);
+});
+
+withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1: '0' }, () => {
+  assert.throws(() => validateEnv(), /VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 must be > 0/);
 });
 
 withEnv({ VOL_COMPRESSION_MIN_RATIO: '0' }, () => {
