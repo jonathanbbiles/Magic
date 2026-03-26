@@ -46,6 +46,8 @@ const {
 } = require('./modules/tradeGuards');
 const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
+const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
+const { buildEntryUniverse } = require('./modules/entryUniversePolicy');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -479,6 +481,15 @@ const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = readNumber('ORDERBOOK_SPARSE_REQ
 const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBABILITY', 0.60);
 const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
 const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
+const ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN = Math.max(1, Math.floor(readNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1)));
+const MARKETDATA_DEDUPE_ENABLED = readEnvFlag('MARKETDATA_DEDUPE_ENABLED', true);
+const MARKETDATA_QUOTE_TTL_MS = Math.max(250, readNumber('MARKETDATA_QUOTE_TTL_MS', 3000));
+const MARKETDATA_ORDERBOOK_TTL_MS = Math.max(250, readNumber('MARKETDATA_ORDERBOOK_TTL_MS', 2000));
+const MARKETDATA_BARS_TTL_MS = Math.max(1000, readNumber('MARKETDATA_BARS_TTL_MS', 10000));
+const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, readNumber('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000));
+const ENTRY_SYMBOLS_PRIMARY = String(process.env.ENTRY_SYMBOLS_PRIMARY || 'BTC/USD,ETH/USD,LINK/USD,AVAX/USD,SOL/USD');
+const ENTRY_SYMBOLS_SECONDARY = String(process.env.ENTRY_SYMBOLS_SECONDARY || 'ARB/USD,UNI/USD,RENDER/USD');
+const ENTRY_SYMBOLS_INCLUDE_SECONDARY = readEnvFlag('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
 const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
 const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
 const EXECUTION_TIER3_DEFAULT = readEnvFlag('EXECUTION_TIER3_DEFAULT', true);
@@ -598,6 +609,13 @@ const marketDataRetryBackoffByKey = new Map();
 let marketDataPassId = 0;
 const quotePassCache = new Map();
 const orderbookPassCache = new Map();
+const entryMarketDataCoordinator = createRequestCoordinator({
+  dedupeEnabled: MARKETDATA_DEDUPE_ENABLED,
+  quoteTtlMs: MARKETDATA_QUOTE_TTL_MS,
+  orderbookTtlMs: MARKETDATA_ORDERBOOK_TTL_MS,
+  barsTtlMs: MARKETDATA_BARS_TTL_MS,
+  rateLimitCooldownMs: MARKETDATA_RATE_LIMIT_COOLDOWN_MS,
+});
 
 const HALT_ON_ORPHANS = readEnvFlag('HALT_ON_ORPHANS', false);
 const ORPHAN_AUTO_ATTACH_TP = readEnvFlag('ORPHAN_AUTO_ATTACH_TP', true);
@@ -1018,6 +1036,7 @@ function resolveRegimeVolatilityContext({ predictorSignals, barSeries1m, refPric
 
 async function computeEntrySignal(symbol, opts = {}) {
   const asset = { symbol: normalizeSymbol(symbol) };
+  const entryMdContext = opts?.entryMarketDataContext || null;
   const requiredEdgeBps = computeRequiredEntryEdgeBps();
   const configSnapshot = {
     targetMoveBps: TARGET_MOVE_BPS,
@@ -1061,13 +1080,39 @@ async function computeEntrySignal(symbol, opts = {}) {
     config: configSnapshot,
   };
   let quote;
-  try {
-    quote = await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
-  } catch (err) {
+  let obResult = null;
+  let barsSnapshot = null;
+  if (entryMdContext) {
+    const mdSnapshot = await getOrFetchSymbolMarketData({
+      context: entryMdContext,
+      coordinator: entryMarketDataCoordinator,
+      symbol: asset.symbol,
+      fetchQuote: getQuoteForTrading,
+      fetchOrderbook: getLatestOrderbook,
+      quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+    });
+    quote = mdSnapshot?.quote || null;
+    obResult = mdSnapshot?.orderbook || null;
+    barsSnapshot = mdSnapshot?.bars || null;
+  } else {
+    try {
+      quote = await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+    } catch (err) {
+      return {
+        entryReady: false,
+        why: 'stale_quote',
+        meta: { symbol: asset.symbol, error: err?.message || err },
+        record: baseRecord,
+      };
+    }
+  }
+
+  if (!quote) {
     return {
       entryReady: false,
-      why: 'stale_quote',
-      meta: { symbol: asset.symbol, error: err?.message || err },
+      why: 'marketdata_unavailable',
+      meta: { symbol: asset.symbol, reason: 'quote_unavailable' },
       record: baseRecord,
     };
   }
@@ -1122,9 +1167,16 @@ async function computeEntrySignal(symbol, opts = {}) {
     : false;
   const executionTierPolicy = getExecutionTierPolicy();
   const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
+  console.log('entry_execution_policy_gate', {
+    symbol: asset.symbol,
+    symbolTier,
+    sparseFallbackEnabled: ORDERBOOK_SPARSE_FALLBACK_ENABLED,
+  });
   const quoteAgeMs = Number.isFinite(quote.tsMs) ? Math.max(0, nowMs - quote.tsMs) : null;
 
-  let obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+  if (!obResult) {
+    obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+  }
   if (!obResult.ok) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
     return {
@@ -1176,15 +1228,34 @@ async function computeEntrySignal(symbol, opts = {}) {
   const shouldConfirmSparse =
     ORDERBOOK_SPARSE_CONFIRM_RETRY &&
     (orderbookMeta?.depthState === 'orderbook_sparse' || sparseByLevelCount);
-  if (shouldConfirmSparse && ORDERBOOK_SPARSE_RETRY_ONCE) {
+  const sparseConfirmAlreadyAttempted = entryMdContext?.sparseConfirmAttempts?.has(asset.symbol);
+  const sparseConfirmAttemptAllowed = !sparseConfirmAlreadyAttempted &&
+    (!entryMdContext?.sparseConfirmAttempts || entryMdContext.sparseConfirmAttempts.size < ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN);
+  if (shouldConfirmSparse && ORDERBOOK_SPARSE_RETRY_ONCE && sparseConfirmAttemptAllowed) {
+    if (entryMdContext?.sparseConfirmAttempts) {
+      entryMdContext.sparseConfirmAttempts.add(asset.symbol);
+      entryMdContext.stats.sparseFallbackAttempts += 1;
+    }
     if (ORDERBOOK_SPARSE_CONFIRM_RETRY_MS > 0) {
       await sleep(ORDERBOOK_SPARSE_CONFIRM_RETRY_MS);
     }
-    const obRetry = await getLatestOrderbook(asset.symbol, {
+    const obRetrySnapshot = entryMdContext
+      ? await getOrFetchSymbolMarketData({
+        context: entryMdContext,
+        coordinator: entryMarketDataCoordinator,
+        symbol: asset.symbol,
+        fetchQuote: getQuoteForTrading,
+        fetchOrderbook: getLatestOrderbook,
+        quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        forceOrderbookRefresh: true,
+      })
+      : null;
+    const obRetry = entryMdContext ? obRetrySnapshot?.orderbook : await getLatestOrderbook(asset.symbol, {
       maxAgeMs: ORDERBOOK_MAX_AGE_MS,
       bypassCache: true,
     });
-    if (obRetry.ok) {
+    if (obRetry?.ok) {
       obResult = obRetry;
       orderbookMeta = buildOrderbookMeta(obResult);
       console.log('entry_sparse_fallback_eval', {
@@ -1195,7 +1266,17 @@ async function computeEntrySignal(symbol, opts = {}) {
         depthState: orderbookMeta.depthState,
         levelsConsideredPerSide: orderbookMeta.levelsConsideredPerSide,
       });
+    } else if (entryMdContext) {
+      entryMdContext.stats.sparseFallbackRejects += 1;
     }
+  } else if (shouldConfirmSparse && entryMdContext) {
+    entryMdContext.stats.sparseFallbackRejects += 1;
+    console.log('entry_sparse_fallback_eval', {
+      symbol: asset.symbol,
+      symbolTier,
+      action: 'retry_blocked',
+      reason: sparseConfirmAlreadyAttempted ? 'already_attempted' : 'cooldown_active',
+    });
   }
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
   baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
@@ -1335,9 +1416,9 @@ async function computeEntrySignal(symbol, opts = {}) {
     bars5mBySymbol instanceof Map &&
     bars15mBySymbol instanceof Map;
 
-  const prefSeries1m = hasPrefetchedBarsMaps ? bars1mBySymbol.get(asset.symbol) : null;
-  const prefSeries5m = hasPrefetchedBarsMaps ? bars5mBySymbol.get(asset.symbol) : null;
-  const prefSeries15m = hasPrefetchedBarsMaps ? bars15mBySymbol.get(asset.symbol) : null;
+  const prefSeries1m = hasPrefetchedBarsMaps ? bars1mBySymbol.get(asset.symbol) : (Array.isArray(barsSnapshot?.oneMin) ? barsSnapshot.oneMin : null);
+  const prefSeries5m = hasPrefetchedBarsMaps ? bars5mBySymbol.get(asset.symbol) : (Array.isArray(barsSnapshot?.fiveMin) ? barsSnapshot.fiveMin : null);
+  const prefSeries15m = hasPrefetchedBarsMaps ? bars15mBySymbol.get(asset.symbol) : (Array.isArray(barsSnapshot?.fifteenMin) ? barsSnapshot.fifteenMin : null);
 
   const normalizedPrefSeries1m = Array.isArray(prefSeries1m) ? prefSeries1m : [];
   const normalizedPrefSeries5m = Array.isArray(prefSeries5m) ? prefSeries5m : [];
@@ -1875,6 +1956,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   }
 
   if (marketDataEval.executionMode === 'sparse_fallback') {
+    if (entryMdContext) entryMdContext.stats.sparseFallbackAccepts += 1;
     console.log('entry_sparse_fallback_accept', {
       symbol: asset.symbol,
       symbolTier,
@@ -10281,17 +10363,28 @@ async function runEntryScanOnce() {
     }
 
     const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
+    const configuredUniverse = buildEntryUniverse({
+      primaryRaw: ENTRY_SYMBOLS_PRIMARY,
+      secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
+      includeSecondary: ENTRY_SYMBOLS_INCLUDE_SECONDARY,
+    });
     let universe = [];
+    let universeMode = 'configured_primary_secondary';
     if (autoScanSymbols.length) {
       universe = autoScanSymbols;
+      universeMode = 'auto_scan_override';
     } else if (SIMPLE_SCALPER_ENABLED) {
-      await loadSupportedCryptoPairs();
-      universe = Array.from(supportedCryptoPairsState.pairs);
+      universe = configuredUniverse.scanSymbols;
     } else {
-      await loadSupportedCryptoPairs();
-      universe = Array.from(supportedCryptoPairsState.pairs);
+      universe = configuredUniverse.scanSymbols;
+      if (!universe.length) {
+        await loadSupportedCryptoPairs();
+        universe = Array.from(supportedCryptoPairsState.pairs);
+        universeMode = 'supported_pairs_fallback';
+      }
       if (!universe.length) {
         universe = CRYPTO_CORE_TRACKED;
+        universeMode = 'core_tracked_fallback';
       }
     }
     const scanSymbols = universe
@@ -10389,6 +10482,10 @@ async function runEntryScanOnce() {
     if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
       prefetchedBars = prefetchResult.prefetchedBars;
     }
+    const entryMarketDataContext = buildEntryMarketDataContext({
+      scanId: `${startMs}`,
+      prefetchedBars,
+    });
 
     const fallbackBudgetState = { remaining: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN };
 
@@ -10397,6 +10494,10 @@ async function runEntryScanOnce() {
         break;
       }
       scanned += 1;
+      const universeClass = configuredUniverse.classes.get(symbol) || (autoScanSymbols.length ? 'override' : 'unclassified');
+      if (DEBUG_ENTRY) {
+        console.log('entry_universe_gate', { symbol, universeClass, universeMode });
+      }
       if (heldSymbols.has(symbol)) {
         skipped += 1;
         recordSkip('held_position', symbol, null);
@@ -10425,7 +10526,7 @@ async function runEntryScanOnce() {
         }
       }
 
-      const signal = await computeEntrySignal(symbol, { prefetchedBars, fallbackBudgetState });
+      const signal = await computeEntrySignal(symbol, { prefetchedBars, fallbackBudgetState, entryMarketDataContext });
       const recordBase = signal?.record ? { ...signal.record } : null;
       if (Number.isFinite(recordBase?.predictorProbability)) {
         candidateSignals.push({
@@ -10617,6 +10718,19 @@ async function runEntryScanOnce() {
       maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
       capEnabled,
       heldPositionsCount,
+      universeMode,
+      primarySymbols: configuredUniverse.primaryCount,
+      secondarySymbols: configuredUniverse.secondaryCount,
+      marketDataBudget: {
+        cacheHits: entryMarketDataContext.stats.cacheHits,
+        freshFetches: entryMarketDataContext.stats.freshFetches,
+        rateLimited: entryMarketDataContext.stats.rateLimited,
+        cooldownBlocked: entryMarketDataContext.stats.cooldownBlocked,
+        sparseFallbackAttempts: entryMarketDataContext.stats.sparseFallbackAttempts,
+        sparseFallbackAccepts: entryMarketDataContext.stats.sparseFallbackAccepts,
+        sparseFallbackRejects: entryMarketDataContext.stats.sparseFallbackRejects,
+        endpointCooldowns: entryMarketDataCoordinator.getCooldownSnapshot(),
+      },
     });
     if (PREDICTOR_WARMUP_ENABLED && !predictorWarmupCompletedLogged && warmupNotReadyCount === 0 && warmupReadyCount > 0) {
       predictorWarmupCompletedLogged = true;

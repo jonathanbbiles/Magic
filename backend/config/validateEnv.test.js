@@ -38,6 +38,8 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minRatio, 0.45);
   assert.equal(guardrails.regime.minVolBps, 15);
   assert.equal(guardrails.volCompression.minLongVolBps, 10);
+  assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
+  assert.equal(guardrails.entryUniverse.includeSecondary, false);
 });
 
 withEnv({ REGIME_ALLOW_UNKNOWN_VOL: 'maybe' }, () => {
@@ -66,6 +68,14 @@ withEnv({ ORDERBOOK_SPARSE_CONFIRM_RETRY: 'invalid' }, () => {
 
 withEnv({ EXECUTION_TIER1_SYMBOLS: '' }, () => {
   assert.throws(() => validateEnv(), /EXECUTION_TIER1_SYMBOLS must include at least one symbol/);
+});
+
+withEnv({ ENTRY_SYMBOLS_PRIMARY: '' }, () => {
+  assert.throws(() => validateEnv(), /ENTRY_SYMBOLS_PRIMARY must include at least one symbol/);
+});
+
+withEnv({ MARKETDATA_ORDERBOOK_TTL_MS: '0' }, () => {
+  assert.throws(() => validateEnv(), /MARKETDATA_ORDERBOOK_TTL_MS must be between 1 and 600000/);
 });
 
 withEnv({ VOL_COMPRESSION_MIN_LONG_VOL_BPS: '0' }, () => {

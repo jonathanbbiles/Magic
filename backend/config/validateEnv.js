@@ -1,5 +1,6 @@
 const path = require('path');
 const recorder = require('../modules/recorder');
+const { normalizePair } = require('../symbolUtils');
 
 const maskSecret = (value) => {
   const raw = String(value || '');
@@ -57,8 +58,10 @@ const parseFiniteNumberEnv = (name, defaultValue) => {
 const parseSymbolListEnv = (name, fallback = '') =>
   String(process.env[name] ?? fallback)
     .split(',')
-    .map((symbol) => symbol.trim())
+    .map((symbol) => normalizePair(symbol))
     .filter(Boolean);
+
+const dedupeSymbols = (symbols = []) => Array.from(new Set(symbols));
 
 const assertInRange = (name, value, min, max) => {
   if (!Number.isFinite(value) || value < min || value > max) {
@@ -206,8 +209,18 @@ const validateEnv = () => {
     const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
     const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
     const executionTier1Symbols = parseSymbolListEnv('EXECUTION_TIER1_SYMBOLS', 'BTC/USD,ETH/USD');
-    const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'SOL/USD,LINK/USD,AVAX/USD');
+    const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
     const executionTier3Default = parseBooleanEnv('EXECUTION_TIER3_DEFAULT', true);
+    const marketdataDedupeEnabled = parseBooleanEnv('MARKETDATA_DEDUPE_ENABLED', true);
+    const marketdataQuoteTtlMs = parseFiniteNumberEnv('MARKETDATA_QUOTE_TTL_MS', 3000);
+    const marketdataOrderbookTtlMs = parseFiniteNumberEnv('MARKETDATA_ORDERBOOK_TTL_MS', 2000);
+    const marketdataBarsTtlMs = parseFiniteNumberEnv('MARKETDATA_BARS_TTL_MS', 10000);
+    const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000);
+    const entrySymbolsPrimary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_PRIMARY', 'BTC/USD,ETH/USD,LINK/USD,AVAX/USD,SOL/USD'));
+    const entrySymbolsSecondary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_SECONDARY', 'ARB/USD,UNI/USD,RENDER/USD'))
+      .filter((symbol) => !entrySymbolsPrimary.includes(symbol));
+    const entrySymbolsIncludeSecondary = parseBooleanEnv('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
+    const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1);
 
     const failedTradeMaxAgeSec = parseFiniteNumberEnv('FAILED_TRADE_MAX_AGE_SEC', 90);
     const failedTradeMinProgressPct = parseFiniteNumberEnv('FAILED_TRADE_MIN_PROGRESS_PCT', 0.10);
@@ -232,6 +245,11 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', orderbookSparseRequireStrongerEdgeBps, 0, 10000);
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', orderbookSparseRequireQuoteFreshMs, 0, 3600000);
     assertInRange('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', orderbookSparseConfirmRetryMs, 0, 10000);
+    assertInRange('MARKETDATA_QUOTE_TTL_MS', marketdataQuoteTtlMs, 1, 600000);
+    assertInRange('MARKETDATA_ORDERBOOK_TTL_MS', marketdataOrderbookTtlMs, 1, 600000);
+    assertInRange('MARKETDATA_BARS_TTL_MS', marketdataBarsTtlMs, 1, 600000);
+    assertInRange('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', marketdataRateLimitCooldownMs, 1, 600000);
+    assertInRange('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', orderbookSparseConfirmMaxPerScan, 1, 100);
     assertInRange('ORDERBOOK_MIN_DEPTH_USD', orderbookMinDepthUsd, 0, 1000000000);
     assertInRange('REGIME_MIN_VOL_BPS', regimeMinVolBps, 0, 10000);
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
@@ -285,6 +303,9 @@ const validateEnv = () => {
     if (!sparseFallbackSymbols.length) {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
+    if (!entrySymbolsPrimary.length) {
+      throw new Error('ENTRY_SYMBOLS_PRIMARY must include at least one symbol.');
+    }
     if (!executionTier1Symbols.length) {
       throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
     }
@@ -310,9 +331,22 @@ const validateEnv = () => {
         symbols: sparseFallbackSymbols,
       },
       executionTiering: {
-        tier1Symbols: executionTier1Symbols,
-        tier2Symbols: executionTier2Symbols,
+        tier1Symbols: dedupeSymbols(executionTier1Symbols),
+        tier2Symbols: dedupeSymbols(executionTier2Symbols),
         tier3Default: executionTier3Default,
+      },
+      entryUniverse: {
+        primarySymbols: entrySymbolsPrimary,
+        secondarySymbols: entrySymbolsSecondary,
+        includeSecondary: entrySymbolsIncludeSecondary,
+      },
+      marketDataCoordinator: {
+        dedupeEnabled: marketdataDedupeEnabled,
+        quoteTtlMs: marketdataQuoteTtlMs,
+        orderbookTtlMs: marketdataOrderbookTtlMs,
+        barsTtlMs: marketdataBarsTtlMs,
+        rateLimitCooldownMs: marketdataRateLimitCooldownMs,
+        sparseConfirmMaxPerScan: orderbookSparseConfirmMaxPerScan,
       },
       volCompression: {
         minRatio: volCompressionMinRatio,
