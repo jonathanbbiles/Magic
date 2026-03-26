@@ -34,7 +34,7 @@ function loadTrade(overrides = {}) {
   });
 }
 
-const { isInsufficientBalanceError } = loadTrade();
+const { isInsufficientBalanceError, isInsufficientSellableQtyError } = loadTrade();
 
 assert.equal(
   isInsufficientBalanceError({
@@ -61,6 +61,28 @@ assert.equal(
     statusCode: 401,
     errorCode: 40310000,
     message: 'insufficient balance',
+    snippet: '',
+  }),
+  false,
+);
+
+assert.equal(
+  isInsufficientSellableQtyError({
+    statusCode: 403,
+    errorCode: null,
+    side: 'sell',
+    message: 'insufficient balance for AVAX (requested: 1.1, available: 0)',
+    snippet: '',
+  }),
+  true,
+);
+
+assert.equal(
+  isInsufficientSellableQtyError({
+    statusCode: 403,
+    errorCode: null,
+    side: 'sell',
+    message: 'insufficient balance for AVAX (requested: 1.1, available: 0.4)',
     snippet: '',
   }),
   false,
@@ -186,7 +208,7 @@ assert.equal(reservedSellability.totalPositionQty, 6.116995699);
 assert.equal(reservedSellability.availableQty, 0);
 assert.equal(reservedSellability.openSellCount, 2);
 assert.equal(reservedSellability.reservedQty, 5);
-assert.equal(reservedSellability.sellabilitySource, 'blocked');
+assert.equal(reservedSellability.sellabilitySource, 'blocked_open_sell_exists');
 assert.equal(reservedSellability.blockedReason, 'open_sell_exists');
 
 const inferredSellability = computeExitSellability({
@@ -194,9 +216,10 @@ const inferredSellability = computeExitSellability({
   position: { symbol: 'DOTUSD', qty: '10' },
   openOrders: [],
 });
-assert.equal(inferredSellability.availableQty, 10);
+assert.equal(inferredSellability.availableQty, 0);
 assert.equal(inferredSellability.reservedQty, 0);
-assert.equal(inferredSellability.sellabilitySource, 'inferred_from_position');
+assert.equal(inferredSellability.sellabilitySource, 'blocked_broker_unavailable');
+assert.equal(inferredSellability.blockedReason, 'awaiting_broker_sellable_qty');
 
 const fallbackSellability = computeExitSellability({
   symbol: 'AVAX/USD',
@@ -207,8 +230,9 @@ assert.equal(fallbackSellability.openSellCount, 0);
 assert.equal(fallbackSellability.reservedQty, 0);
 assert.equal(fallbackSellability.brokerAvailableQty, 0);
 assert.equal(fallbackSellability.inferredAvailableQty, 4.25);
-assert.equal(fallbackSellability.availableQty, 4.25);
-assert.equal(fallbackSellability.sellabilitySource, 'inferred_from_position');
+assert.equal(fallbackSellability.availableQty, 0);
+assert.equal(fallbackSellability.sellabilitySource, 'blocked_broker_unavailable');
+assert.equal(fallbackSellability.blockedReason, 'awaiting_broker_sellable_qty');
 
 const zeroQtySellability = computeExitSellability({
   symbol: 'ETH/USD',
@@ -216,7 +240,7 @@ const zeroQtySellability = computeExitSellability({
   openOrders: [],
 });
 assert.equal(zeroQtySellability.availableQty, 0);
-assert.equal(zeroQtySellability.sellabilitySource, 'blocked');
+assert.equal(zeroQtySellability.sellabilitySource, 'blocked_no_position_qty');
 assert.equal(zeroQtySellability.blockedReason, 'no_position_qty');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
@@ -259,6 +283,9 @@ assert.match(tradeSource, /logEntrySkip\(\{[\s\S]*symbolTier,[\s\S]*reason: 'vol
 assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orderbookMeta\.depthState,[\s\S]*bidDepthUsd: orderbookMeta\.bidDepthUsd,[\s\S]*askDepthUsd: orderbookMeta\.askDepthUsd,[\s\S]*actualDepthUsd: orderbookMeta\.actualDepthUsd,[\s\S]*orderbookLevelCounts: orderbookMeta\.orderbookLevelCounts,/);
 assert.match(tradeSource, /actionTaken = 'defer_no_sellable_qty';/);
 assert.match(tradeSource, /sellabilitySource: sellability\.sellabilitySource,/);
+assert.match(tradeSource, /reason: 'awaiting_broker_sellable_qty'/);
+assert.match(tradeSource, /sellabilitySource: 'inferred_for_diagnostics_only'/);
+assert.match(tradeSource, /console\.log\('entry_universe_selection', \{/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
 assert.ok(attachStart !== -1 && attachEnd !== -1);

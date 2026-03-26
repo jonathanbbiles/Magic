@@ -758,6 +758,14 @@ function isInsufficientBalanceError({ statusCode, errorCode, message, snippet })
   return combined.includes('insufficient balance');
 }
 
+function isInsufficientSellableQtyError({ statusCode, errorCode, message, snippet, side }) {
+  const orderSide = String(side || '').toLowerCase();
+  if (orderSide && orderSide !== 'sell') return false;
+  if (!isInsufficientBalanceError({ statusCode, errorCode, message, snippet })) return false;
+  const combined = `${message || ''} ${snippet || ''}`.toLowerCase();
+  return /available["']?\s*:\s*0(?:[^.\d]|$)/.test(combined);
+}
+
 function startBrokerTradingDisabledCooldown() {
   tradingBlockedUntilMs = Date.now() + BROKER_TRADING_DISABLED_BACKOFF_MS;
   lastBrokerTradingDisabledLogMs = 0;
@@ -3320,7 +3328,11 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       loadedAt: supportedCryptoPairsState.lastUpdated,
     });
   } catch (err) {
-    console.warn('supported_pairs_fetch_failed', err?.errorMessage || err?.message || err);
+    console.warn('supported_pairs_fetch_failed', {
+      mode: 'dynamic_full_universe',
+      error: err?.errorMessage || err?.message || String(err),
+      fallback: 'configured_or_core',
+    });
   }
   return supportedCryptoPairsState.pairs;
 }
@@ -5427,25 +5439,22 @@ function computeExitSellability({
   const inferredAvailableQty = Math.max(0, totalPositionQty - reservedQty);
   const hasOpenSell = openSellCount > 0 || openSellQty > 0;
   const hasReservedQty = reservedQty > 0;
-  const canUseInferredFallback =
-    totalPositionQty > 0 &&
-    !hasOpenSell &&
-    !hasReservedQty &&
-    brokerAvailableQty <= 0;
   let availableQty = 0;
-  let sellabilitySource = 'blocked';
+  let sellabilitySource = 'blocked_no_position_qty';
   let blockedReason = null;
 
   if (hasOpenSell) {
+    sellabilitySource = 'blocked_open_sell_exists';
     blockedReason = 'open_sell_exists';
   } else if (hasReservedQty) {
+    sellabilitySource = 'blocked_qty_reserved';
     blockedReason = 'qty_reserved';
   } else if (qty.hasAvailableQtyField && brokerAvailableQty > 0) {
     availableQty = brokerAvailableQty;
     sellabilitySource = 'broker_available';
-  } else if ((!qty.hasAvailableQtyField || canUseInferredFallback) && inferredAvailableQty > 0) {
-    availableQty = inferredAvailableQty;
-    sellabilitySource = 'inferred_from_position';
+  } else if (inferredAvailableQty > 0) {
+    sellabilitySource = 'blocked_broker_unavailable';
+    blockedReason = 'awaiting_broker_sellable_qty';
   } else {
     blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
   }
@@ -6771,17 +6780,16 @@ async function submitLimitSell({
     blockedReason: sellability.blockedReason,
     pendingExitAttach: hasPendingExitAttach(normalizedSymbol),
   });
-  if (sellability.sellabilitySource === 'inferred_from_position') {
-    console.log('exit_sellability_inferred_fallback', {
-      symbol,
-      canonicalSymbol: normalizedSymbol,
-      totalPositionQty: sellability.totalPositionQty,
-      brokerAvailableQty: sellability.brokerAvailableQty,
-      reservedQty: sellability.reservedQty,
-      openSellCount: sellability.openSellCount,
-      inferredAvailableQty: sellability.inferredAvailableQty,
-    });
-  }
+  console.log('exit_sellability_inferred_fallback', {
+    symbol,
+    canonicalSymbol: normalizedSymbol,
+    totalPositionQty: sellability.totalPositionQty,
+    brokerAvailableQty: sellability.brokerAvailableQty,
+    reservedQty: sellability.reservedQty,
+    openSellCount: sellability.openSellCount,
+    inferredAvailableQty: sellability.inferredAvailableQty,
+    sellabilitySource: 'inferred_for_diagnostics_only',
+  });
   if (sellability.openSellCount > 0) {
     console.log('open_sell_qty_reserved', {
       symbol,
@@ -6791,9 +6799,48 @@ async function submitLimitSell({
     });
   }
   const qtyNum = Number(qty);
+  let brokerRecheckSellability = sellability;
+  try {
+    const refreshedPosition = await fetchPosition(normalizedSymbol);
+    brokerRecheckSellability = computeExitSellability({
+      symbol: normalizedSymbol,
+      position: refreshedPosition || null,
+      openOrders: openList,
+    });
+    console.log('exit_sellability_recheck', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      totalPositionQty: brokerRecheckSellability.totalPositionQty,
+      brokerAvailableQty: brokerRecheckSellability.brokerAvailableQty,
+      reservedQty: brokerRecheckSellability.reservedQty,
+      openSellCount: brokerRecheckSellability.openSellCount,
+      inferredAvailableQty: brokerRecheckSellability.inferredAvailableQty,
+      availableQty: brokerRecheckSellability.availableQty,
+      sellabilitySource: brokerRecheckSellability.sellabilitySource,
+      blockedReason: brokerRecheckSellability.blockedReason,
+      recheckSource: 'positions_single',
+    });
+  } catch (err) {
+    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    if (statusCode === 404) {
+      brokerRecheckSellability = computeExitSellability({
+        symbol: normalizedSymbol,
+        position: null,
+        openOrders: openList,
+      });
+    } else {
+      console.warn('exit_sellability_recheck_failed', {
+        symbol,
+        canonicalSymbol: normalizedSymbol,
+        statusCode,
+        error: err?.errorMessage || err?.message || String(err),
+      });
+      return { skipped: true, reason: 'awaiting_broker_sellable_qty' };
+    }
+  }
   const baseAvailableQty = Number.isFinite(availableQtyOverride) && availableQtyOverride >= 0
-    ? Math.min(availableQtyOverride, sellability.availableQty)
-    : sellability.availableQty;
+    ? Math.min(availableQtyOverride, brokerRecheckSellability.availableQty)
+    : brokerRecheckSellability.availableQty;
   const availableQty = Number.isFinite(baseAvailableQty) && baseAvailableQty >= 0 ? baseAvailableQty : 0;
   const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
   const requiredQty = Number.isFinite(adjustedQty) && adjustedQty > 0 ? adjustedQty : availableQty;
@@ -6834,21 +6881,29 @@ async function submitLimitSell({
     };
   }
   if (!(availableQty > 0)) {
+    const deferReason = brokerRecheckSellability.blockedReason === 'awaiting_broker_sellable_qty'
+      ? 'awaiting_broker_sellable_qty'
+      : 'qty_reserved_or_unavailable';
     console.log('tp_attach_deferred', {
       symbol,
       canonicalSymbol: normalizedSymbol,
-      reason: 'qty_reserved_or_unavailable',
-      totalPositionQty: sellability.totalPositionQty,
+      reason: deferReason,
+      totalPositionQty: brokerRecheckSellability.totalPositionQty,
+      brokerAvailableQty: brokerRecheckSellability.brokerAvailableQty,
       availableQty,
-      reservedQty: sellability.reservedQty,
-      openSellFound: sellability.openSellCount > 0,
-      openSellCount: sellability.openSellCount,
-      openSellQty: sellability.openSellQty,
-      sellabilitySource: sellability.sellabilitySource,
-      blockedReason: sellability.blockedReason,
+      reservedQty: brokerRecheckSellability.reservedQty,
+      openSellFound: brokerRecheckSellability.openSellCount > 0,
+      openSellCount: brokerRecheckSellability.openSellCount,
+      openSellQty: brokerRecheckSellability.openSellQty,
+      inferredAvailableQty: brokerRecheckSellability.inferredAvailableQty,
+      sellabilitySource: brokerRecheckSellability.sellabilitySource,
+      blockedReason: brokerRecheckSellability.blockedReason,
     });
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
-    return { skipped: true, reason: 'qty_reserved_or_unavailable' };
+    return {
+      skipped: true,
+      reason: deferReason,
+    };
   }
 
   const sizeGuard = guardTradeSize({
@@ -6903,6 +6958,41 @@ async function submitLimitSell({
     const status = err?.statusCode ?? err?.response?.status ?? null;
     const body = err?.response?.data ?? err?.responseSnippet200 ?? err?.responseSnippet ?? err?.message ?? null;
     const bodyText = typeof body === 'string' ? body : JSON.stringify(body);
+    if (isInsufficientSellableQtyError({
+      statusCode: status,
+      errorCode: err?.errorCode ?? null,
+      message: err?.errorMessage || err?.message || '',
+      snippet: bodyText || '',
+      side: payload?.side,
+    })) {
+      const now = Date.now();
+      const retryAt = now + INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS;
+      insufficientBalanceExitCooldowns.set(normalizedSymbol, retryAt);
+      positionsListCache.tsMs = 0;
+      try {
+        await fetchPositionsSnapshot();
+      } catch (refreshErr) {
+        console.warn('broker_availability_refresh_failed', {
+          symbol,
+          error: refreshErr?.errorMessage || refreshErr?.message || String(refreshErr),
+        });
+      }
+      console.warn('tp_attach_deferred_broker_availability', {
+        symbol,
+        canonicalSymbol: normalizedSymbol,
+        reason: 'broker_qty_unavailable',
+        brokerStatus: status,
+        brokerMessage: bodyText,
+        cooldownMs: INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS,
+        retryAtMs: retryAt,
+        retryAtIso: new Date(retryAt).toISOString(),
+      });
+      return {
+        skipped: true,
+        reason: 'awaiting_broker_sellable_qty',
+        cooldownUntilMs: retryAt,
+      };
+    }
     console.error('tp_sell_error', { symbol, status, body: bodyText });
     throw err;
   }
@@ -9150,7 +9240,10 @@ async function manageExitStates() {
             reasonCode = 'place_gtc_tp';
             lastActionAt.set(symbol, now);
           } else {
-            if (replacement?.reason === 'qty_reserved_or_unavailable' && openSellCount === 0) {
+            if (
+              (replacement?.reason === 'qty_reserved_or_unavailable' || replacement?.reason === 'awaiting_broker_sellable_qty')
+              && openSellCount === 0
+            ) {
               actionTaken = 'defer_no_sellable_qty';
               reasonCode = 'defer_no_sellable_qty';
             } else {
@@ -10774,6 +10867,16 @@ async function runEntryScanOnce() {
     const scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
+    console.log('entry_universe_selection', {
+      universeMode,
+      overrideActive: universeIsOverride,
+      configuredOverrideActive: ENTRY_UNIVERSE_MODE === 'configured',
+      tradableCryptoSymbolsFetched: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      acceptedSymbols: scanSymbols.length,
+      configuredPrimaryCount: configuredUniverse.primaryCount,
+      configuredSecondaryCount: configuredUniverse.secondaryCount,
+      sampleSymbols: scanSymbols.slice(0, 10),
+    });
     const universeSize = scanSymbols.length;
     const isDynamicMode = universeMode.startsWith('dynamic');
     const primarySymbolsCount = isDynamicMode ? universeSize : configuredUniverse.primaryCount;
@@ -13117,6 +13220,7 @@ module.exports = {
   logMarketDataUrlSelfCheck,
   runDustCleanup,
   isInsufficientBalanceError,
+  isInsufficientSellableQtyError,
   shouldCancelExitSell,
   computeBookAnchoredSellLimit,
   computeTargetSellPrice,
