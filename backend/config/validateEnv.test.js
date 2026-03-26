@@ -38,6 +38,7 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minRatio, 0.60);
   assert.equal(guardrails.regime.minVolBps, 15);
   assert.equal(guardrails.regime.minVolBpsTier1, 4);
+  assert.equal(guardrails.regime.minVolBpsTier2, 8);
   assert.equal(guardrails.volCompression.minLongVolBps, 8);
   assert.equal(guardrails.volCompression.minLongVolBpsTier1, 2);
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
@@ -59,6 +60,10 @@ withEnv({ REGIME_MIN_VOL_BPS: '0' }, () => {
 
 withEnv({ REGIME_MIN_VOL_BPS_TIER1: '0' }, () => {
   assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS_TIER1 must be > 0/);
+});
+
+withEnv({ REGIME_MIN_VOL_BPS_TIER2: '0' }, () => {
+  assert.throws(() => validateEnv(), /REGIME_MIN_VOL_BPS_TIER2 must be > 0/);
 });
 
 withEnv({ ORDERBOOK_MIN_DEPTH_USD: '0' }, () => {

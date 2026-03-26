@@ -155,6 +155,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=4`
 - `ORDERBOOK_ABSORPTION_ENABLED=false`
 - `REGIME_MIN_VOL_BPS_TIER1=4`
+- `REGIME_MIN_VOL_BPS_TIER2=8`
 - `VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2=4`
 - Warmup targets (`PREDICTOR_WARMUP_MIN_*`) are telemetry/full-history targets; predictor readiness uses `PREDICTOR_MIN_BARS_*` when warmup blocking is disabled.
 - `MIN_PROB_TO_ENTER_TIER1=0.35`
@@ -163,6 +164,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `MIN_NET_EDGE_BPS=5`
 - `ENTRY_PROFIT_BUFFER_BPS=5`
 - `REQUIRED_EDGE_BPS` (optional legacy hard override; leave unset to keep derived edge economics)
+- `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS=15000` (bounded sparse-fallback tolerance for tier1 quote staleness)
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
 - `PER_SCAN_BARS_FALLBACK_BUDGET=2`
