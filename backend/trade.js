@@ -247,7 +247,9 @@ async function placeOrderUnified({
   }
 }
 
-const TRADE_PORTFOLIO_PCT = Number(process.env.TRADE_PORTFOLIO_PCT || 0.10);
+const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0.10;
+const TRADE_PORTFOLIO_PCT_RAW = readNumber('TRADE_PORTFOLIO_PCT', MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT);
+const TRADE_PORTFOLIO_PCT = Math.max(0, Math.min(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW));
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 1);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
 const TRADING_BLOCK_COOLDOWN_MS = readNumber('TRADING_BLOCK_COOLDOWN_MS', 60000);
@@ -514,7 +516,7 @@ const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
-const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
+const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
 
 let printedConfigOnce = false;
 function printConfigOnce() {
@@ -522,9 +524,15 @@ function printConfigOnce() {
   printedConfigOnce = true;
   console.log('runtime_config_effective', {
     MAX_CONCURRENT_POSITIONS,
+    maxConcurrentPositionsEnabled: Number.isFinite(getEffectiveMaxConcurrentPositions()) && getEffectiveMaxConcurrentPositions() !== Number.POSITIVE_INFINITY,
     PREDICTOR_WARMUP_ENABLED,
     PREDICTOR_WARMUP_BLOCK_TRADES,
+    REGIME_MIN_VOL_BPS_TIER1,
+    VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2,
     ORDERBOOK_ABSORPTION_ENABLED,
+    tradePortfolioPctRequested: TRADE_PORTFOLIO_PCT_RAW,
+    tradePortfolioPctEffective: TRADE_PORTFOLIO_PCT,
+    maxPortfolioAllocationPerTradePct: MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT,
   });
   console.log('runtime_config', {
     MIN_PROB_TO_ENTER,
@@ -550,6 +558,50 @@ function getEffectiveMaxConcurrentPositions() {
   const n = Number(MAX_CONCURRENT_POSITIONS);
   if (!Number.isFinite(n) || n <= 0) return Number.POSITIVE_INFINITY;
   return Math.floor(n);
+}
+
+function extractBarSeriesForSymbol(barsPayload, symbol) {
+  const barKey = normalizeSymbol(symbol);
+  return (
+    barsPayload?.bars?.[barKey] ||
+    barsPayload?.bars?.[normalizePair(barKey)] ||
+    barsPayload?.bars?.[alpacaSymbol(barKey)] ||
+    barsPayload?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
+    []
+  );
+}
+
+function computeCappedEntryNotional({
+  symbol,
+  portfolioValue,
+  buyingPower,
+  baseNotionalUsd,
+  context,
+}) {
+  const portfolioCapUsd = Math.max(0, Number(portfolioValue) * MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT);
+  const requestedNotionalUsd = Number(baseNotionalUsd);
+  const cappedNotionalUsd = Math.min(
+    Number.isFinite(requestedNotionalUsd) ? requestedNotionalUsd : 0,
+    Number.isFinite(buyingPower) ? buyingPower : 0,
+    Number.isFinite(portfolioCapUsd) ? portfolioCapUsd : 0,
+  );
+  console.log('entry_notional_cap', {
+    symbol,
+    context,
+    portfolioValue,
+    buyingPower,
+    targetAllocationPct: TRADE_PORTFOLIO_PCT,
+    maxAllocationPct: MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT,
+    requestedNotionalUsd,
+    portfolioCapUsd,
+    cappedNotionalUsd,
+    finalNotionalUsd: cappedNotionalUsd,
+  });
+  return {
+    portfolioCapUsd,
+    requestedNotionalUsd,
+    cappedNotionalUsd,
+  };
 }
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
@@ -1439,14 +1491,8 @@ async function computeEntrySignal(symbol, opts = {}) {
   bars5m = { bars: { [asset.symbol]: normalizedPrefSeries5m } };
   bars15m = { bars: { [asset.symbol]: normalizedPrefSeries15m } };
 
-  const barKey = normalizeSymbol(asset.symbol);
-  const barSeries1m =
-    bars1m?.bars?.[barKey] ||
-    bars1m?.bars?.[normalizePair(barKey)] ||
-    bars1m?.bars?.[alpacaSymbol(barKey)] ||
-    bars1m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
-    [];
-  const closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
+  let barSeries1m = extractBarSeriesForSymbol(bars1m, asset.symbol);
+  let closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
     Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
   ).filter((value) => Number.isFinite(value) && value > 0);
   const shortVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_SHORT);
@@ -1494,18 +1540,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const barSeries5m =
-    bars5m?.bars?.[barKey] ||
-    bars5m?.bars?.[normalizePair(barKey)] ||
-    bars5m?.bars?.[alpacaSymbol(barKey)] ||
-    bars5m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
-    [];
-  const barSeries15m =
-    bars15m?.bars?.[barKey] ||
-    bars15m?.bars?.[normalizePair(barKey)] ||
-    bars15m?.bars?.[alpacaSymbol(barKey)] ||
-    bars15m?.bars?.[alpacaSymbol(normalizePair(barKey))] ||
-    [];
+  let barSeries5m = extractBarSeriesForSymbol(bars5m, asset.symbol);
+  let barSeries15m = extractBarSeriesForSymbol(bars15m, asset.symbol);
 
   const warmupGate = evaluatePredictorWarmupGate({
     enabled: PREDICTOR_WARMUP_ENABLED,
@@ -1583,18 +1619,17 @@ async function computeEntrySignal(symbol, opts = {}) {
         fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: warmupGate.thresholds['15m'] }),
       ]);
       if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
-        const err = bars1mResult.error || bars5mResult.error || bars15mResult.error;
-        console.warn('predictor_error', {
-          symbol: asset.symbol,
-          reason: 'bars_fetch_failed',
-          errorName: err?.name || null,
-          errorMessage: err?.message || String(err),
-          stack: String(err?.stack || '').slice(0, 600),
-        });
         return {
           entryReady: false,
-          why: 'predictor_error',
-          meta: { symbol: asset.symbol, reason: 'bars_fetch_failed', error: err?.message || String(err) },
+          why: 'predictor_unavailable',
+          meta: {
+            symbol: asset.symbol,
+            reason: 'bars_fetch_failed',
+            blockTrades: warmupGate.blockTrades,
+            lengths: warmupGate.lengths,
+            thresholds: warmupGate.thresholds,
+            missing: warmupGate.missing,
+          },
           record: baseRecord,
         };
       }
@@ -1604,7 +1639,54 @@ async function computeEntrySignal(symbol, opts = {}) {
       bars1m = bars1mResult.response;
       bars5m = bars5mResult.response;
       bars15m = bars15mResult.response;
+      barSeries1m = extractBarSeriesForSymbol(bars1m, asset.symbol);
+      barSeries5m = extractBarSeriesForSymbol(bars5m, asset.symbol);
+      barSeries15m = extractBarSeriesForSymbol(bars15m, asset.symbol);
+      closes1m = (Array.isArray(barSeries1m) ? barSeries1m : []).map((bar) =>
+        Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
+      ).filter((value) => Number.isFinite(value) && value > 0);
     }
+  }
+
+  const predictorInputGate = evaluatePredictorWarmupGate({
+    enabled: true,
+    blockTrades: false,
+    lengths: {
+      '1m': Array.isArray(barSeries1m) ? barSeries1m.length : 0,
+      '5m': Array.isArray(barSeries5m) ? barSeries5m.length : 0,
+      '15m': Array.isArray(barSeries15m) ? barSeries15m.length : 0,
+    },
+    thresholds: getBarsWarmupThresholds(),
+  });
+  if (predictorInputGate.missing.length) {
+    if (PREDICTOR_WARMUP_ENABLED && PREDICTOR_WARMUP_BLOCK_TRADES) {
+      return {
+        entryReady: false,
+        why: 'predictor_warmup',
+        meta: {
+          symbol: asset.symbol,
+          reason: 'predictor_warmup',
+          blockTrades: true,
+          lengths: predictorInputGate.lengths,
+          thresholds: predictorInputGate.thresholds,
+          missing: predictorInputGate.missing,
+        },
+        record: baseRecord,
+      };
+    }
+    return {
+      entryReady: false,
+      why: 'predictor_unavailable',
+      meta: {
+        symbol: asset.symbol,
+        reason: 'predictor_missing_bars',
+        blockTrades: Boolean(PREDICTOR_WARMUP_BLOCK_TRADES),
+        lengths: predictorInputGate.lengths,
+        thresholds: predictorInputGate.thresholds,
+        missing: predictorInputGate.missing,
+      },
+      record: baseRecord,
+    };
   }
 
   let predictorStretch;
@@ -11028,8 +11110,15 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
     return { skipped: true, reason: 'no_buying_power' };
   }
   const reserveUsd = Math.max(0, BUYING_POWER_RESERVE_USD);
-  const buyingPowerAvailable = buyingPower - reserveUsd;
-  const notionalUsd = Math.min(portfolioValue * 0.10, buyingPowerAvailable);
+  const buyingPowerAvailable = Math.max(0, buyingPower - reserveUsd);
+  const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
+  const { cappedNotionalUsd: notionalUsd } = computeCappedEntryNotional({
+    symbol: normalizedSymbol,
+    portfolioValue,
+    buyingPower: buyingPowerAvailable,
+    baseNotionalUsd: targetTradeAmount,
+    context: 'simple_scalper_entry',
+  });
   if (!Number.isFinite(notionalUsd) || notionalUsd < MIN_ORDER_NOTIONAL_USD) {
     logSimpleScalperSkip(normalizedSymbol, 'notional_too_small', {
       notionalUsd,
@@ -11358,7 +11447,13 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     return { skipped: true, reason: 'invalid_account_values' };
   }
   const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
-  const baseNotionalUsd = Math.min(targetTradeAmount, buyingPower);
+  const { cappedNotionalUsd: baseNotionalUsd } = computeCappedEntryNotional({
+    symbol: normalizedSymbol,
+    portfolioValue,
+    buyingPower,
+    baseNotionalUsd: targetTradeAmount,
+    context: 'entry_base_sizing',
+  });
   const sizing = computeNotionalForEntry({
     portfolioValueUsd: portfolioValue,
     baseNotionalUsd,
@@ -11374,10 +11469,17 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     ? clamp(confidenceMultiplierRaw, CONFIDENCE_MIN_MULTIPLIER, CONFIDENCE_MAX_MULTIPLIER)
     : 1;
   const preConfidenceNotional = (sizing.finalNotionalUsd || baseNotionalUsd) * sizeMult;
-  const amountToSpend = Math.min(preConfidenceNotional * confidenceMultiplier, buyingPower);
+  const { cappedNotionalUsd: amountToSpend, portfolioCapUsd } = computeCappedEntryNotional({
+    symbol: normalizedSymbol,
+    portfolioValue,
+    buyingPower,
+    baseNotionalUsd: preConfidenceNotional * confidenceMultiplier,
+    context: 'entry_final_sizing',
+  });
   console.log('entry_confidence_sizing', {
     symbol: normalizedSymbol,
     baseUsd: preConfidenceNotional,
+    portfolioCapUsd,
     finalUsd: amountToSpend,
     confidenceScore: options?.confidenceMeta?.confidenceScore ?? null,
     confidenceMultiplier,
@@ -11663,8 +11765,13 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
   }
 
   const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
-
-  const amountToSpend = Math.min(targetTradeAmount, buyingPower);
+  const { cappedNotionalUsd: amountToSpend } = computeCappedEntryNotional({
+    symbol: normalizedSymbol,
+    portfolioValue,
+    buyingPower,
+    baseNotionalUsd: targetTradeAmount,
+    context: 'market_entry_sizing',
+  });
 
   const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
