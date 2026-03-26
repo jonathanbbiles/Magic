@@ -10,27 +10,19 @@ import {
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
-
-const theme = {
-  colors: {
-    bg: '#070A12',
-    text: 'rgba(255,255,255,0.92)',
-    muted: 'rgba(255,255,255,0.65)',
-    faint: 'rgba(255,255,255,0.45)',
-    card: '#0B1220',
-    cardAlt: '#0F1730',
-    positive: '#72FFB6',
-    negative: '#FF5C8A',
-    warning: '#FFD36E',
-    border: 'rgba(255,255,255,0.10)',
-    glowPos: 'rgba(114,255,182,0.55)',
-    glowNeg: 'rgba(255,92,138,0.55)',
-    errorBg: 'rgba(255,60,90,0.18)',
-    errorText: 'rgba(255,220,230,0.95)',
-  },
-  spacing: { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 },
-  radius: { md: 14, lg: 18, xl: 24 },
-};
+import HeldPositionsLiveChart from './src/components/HeldPositionsLiveChart';
+import Sparkline from './src/components/Sparkline';
+import { theme } from './src/theme';
+import {
+  appendSnapshotToHistory,
+  DEFAULT_HISTORY_LIMIT,
+  DEFAULT_RANGE_MS,
+  extractCurrentPrice,
+  extractSymbol,
+  extractUnrealizedPl,
+  RANGE_OPTIONS,
+  toFiniteNumber,
+} from './src/utils/chartUtils';
 
 const POLL_MS = 20000;
 
@@ -63,66 +55,31 @@ async function fetchDashboard() {
   return json;
 }
 
-function toNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
 function usd(v) {
-  const n = toNum(v);
+  const n = toFiniteNumber(v);
   if (!Number.isFinite(n)) return '—';
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function signedUsd(v) {
-  const n = toNum(v);
+  const n = toFiniteNumber(v);
   if (!Number.isFinite(n)) return '—';
   const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return `${n >= 0 ? '+' : '-'}$${abs}`;
 }
 
 function pct(v) {
-  const n = toNum(v);
+  const n = toFiniteNumber(v);
   if (!Number.isFinite(n)) return '—';
   return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
 }
 
-function minsSince(isoTs) {
-  const ms = Date.parse(String(isoTs || ''));
-  if (!Number.isFinite(ms)) return '—';
-  const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000));
-  return `${mins}m`;
-}
-
-function ageLabelFromPosition(position) {
-  const heldDirect = toNum(position?.heldSeconds);
-  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
-    const mins = Math.floor(heldDirect / 60);
-    const rem = Math.floor(heldDirect % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const heldSnake = toNum(position?.held_seconds);
-  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
-    const mins = Math.floor(heldSnake / 60);
-    const rem = Math.floor(heldSnake % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const createdMs = Date.parse(String(position?.created_at || ''));
-  if (Number.isFinite(createdMs)) {
-    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
-    const mins = Math.floor(seconds / 60);
-    const rem = Math.floor(seconds % 60);
-    return `${mins}m ${rem}s`;
-  }
-  return '—';
-}
-
 function ageLabelShort(position) {
-  const heldDirect = toNum(position?.heldSeconds);
+  const heldDirect = toFiniteNumber(position?.heldSeconds);
   if (Number.isFinite(heldDirect) && heldDirect >= 0) {
     return `${Math.floor(heldDirect / 60)}m`;
   }
-  const heldSnake = toNum(position?.held_seconds);
+  const heldSnake = toFiniteNumber(position?.held_seconds);
   if (Number.isFinite(heldSnake) && heldSnake >= 0) {
     return `${Math.floor(heldSnake / 60)}m`;
   }
@@ -134,12 +91,11 @@ function ageLabelShort(position) {
   return '—';
 }
 
-
 function distToTargetPct(position) {
-  const current = toNum(position?.current_price);
+  const current = extractCurrentPrice(position);
   const sellLimit =
-    toNum(position?.sell?.activeLimit) ??
-    toNum(position?.bot?.sellOrderLimit);
+    toFiniteNumber(position?.sell?.activeLimit) ??
+    toFiniteNumber(position?.bot?.sellOrderLimit);
 
   if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) return null;
   return ((sellLimit - current) / current) * 100;
@@ -153,11 +109,11 @@ function Chip({ value }) {
   );
 }
 
-function CompactPositionRow({ position }) {
-  const symbol = position?.symbol || '—';
+function CompactPositionRow({ position, historyPoints, rangeMs, nowMs }) {
+  const symbol = extractSymbol(position) || '—';
 
-  const upnl = toNum(position?.unrealized_pl);
-  const upnlPctRaw = toNum(position?.unrealized_plpc);
+  const upnl = extractUnrealizedPl(position);
+  const upnlPctRaw = toFiniteNumber(position?.unrealized_plpc);
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
   const pnlPositive = (upnl || 0) >= 0;
 
@@ -168,10 +124,11 @@ function CompactPositionRow({ position }) {
   const pnlPercent = pct(upnlPct);
   const timeShort = ageLabelShort(position);
 
+
   const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
 
   return (
-    <View style={[compactStyles.tile, { borderColor: glow }]}>
+    <View style={[compactStyles.tile, { borderColor: glow }]}> 
       <View style={compactStyles.line1}>
         <Text style={compactStyles.sym} numberOfLines={1} ellipsizeMode="tail">
           {symbol}
@@ -194,6 +151,13 @@ function CompactPositionRow({ position }) {
           ⏱️ {timeShort}
         </Text>
       </View>
+
+      <Sparkline
+        points={historyPoints}
+        rangeMs={rangeMs}
+        nowMs={nowMs}
+        currentPrice={extractCurrentPrice(position)}
+      />
     </View>
   );
 }
@@ -203,12 +167,26 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const [historyBySymbol, setHistoryBySymbol] = useState({});
+  const [selectedRangeMs, setSelectedRangeMs] = useState(DEFAULT_RANGE_MS);
+  const [chartMode, setChartMode] = useState('normalized');
+  const [tickNowMs, setTickNowMs] = useState(Date.now());
+
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
     if (!isRefresh) setLoading(true);
     try {
       const payload = await fetchDashboard();
       setDashboard(payload);
+
+      const positionsList = Array.isArray(payload?.positions) ? payload.positions : [];
+      const nowMs = Date.now();
+      setHistoryBySymbol((prev) =>
+        appendSnapshotToHistory(prev, positionsList, nowMs, {
+          limit: DEFAULT_HISTORY_LIMIT,
+        })
+      );
+      setTickNowMs(nowMs);
       setError(null);
     } catch (err) {
       const message = err?.message || 'Request failed';
@@ -234,7 +212,7 @@ export default function App() {
       const bDist = distToTargetPct(b);
       if (!Number.isFinite(aDist)) return 1;
       if (!Number.isFinite(bDist)) return -1;
-      return aDist - bDist; // closest to fill first
+      return aDist - bDist;
     });
 
     return list;
@@ -243,13 +221,23 @@ export default function App() {
   const account = dashboard?.account || {};
   const portfolioValue = account?.portfolio_value ?? account?.equity;
 
-  const weeklyChangePct = toNum(dashboard?.meta?.weeklyChangePct);
+  const weeklyChangePct = toFiniteNumber(dashboard?.meta?.weeklyChangePct);
 
-  const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
+  const openPL = useMemo(
+    () => positions.reduce((sum, p) => sum + (extractUnrealizedPl(p) || 0), 0),
+    [positions]
+  );
 
   const openPLPct = useMemo(() => {
-    const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
-    if (!Number.isFinite(mv) || mv <= 0) return null;
+    const mv = positions.reduce((sum, p) => {
+      const currentPrice = extractCurrentPrice(p);
+      const qty = toFiniteNumber(p?.qty);
+      const marketValue = toFiniteNumber(p?.market_value);
+      if (Number.isFinite(marketValue)) return sum + marketValue;
+      if (Number.isFinite(currentPrice) && Number.isFinite(qty)) return sum + currentPrice * qty;
+      return sum;
+    }, 0);
+    if (!Number.isFinite(mv) || mv <= 0) return 0;
     return (openPL / mv) * 100;
   }, [positions, openPL]);
 
@@ -261,7 +249,7 @@ export default function App() {
           data={positions}
           numColumns={2}
           columnWrapperStyle={styles.gridRow}
-          keyExtractor={(item) => String(item?.symbol || 'unknown')}
+          keyExtractor={(item) => String(extractSymbol(item) || 'unknown')}
           contentContainerStyle={styles.content}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
@@ -281,6 +269,17 @@ export default function App() {
                 <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
               </View>
 
+              <HeldPositionsLiveChart
+                positions={positions}
+                historyBySymbol={historyBySymbol}
+                rangeOptions={RANGE_OPTIONS}
+                selectedRange={selectedRangeMs}
+                onSelectRange={setSelectedRangeMs}
+                mode={chartMode}
+                onModeChange={setChartMode}
+                nowMs={tickNowMs}
+              />
+
               {error ? (
                 <View style={styles.errorBanner}>
                   <Text style={styles.errorText}>{error}</Text>
@@ -294,7 +293,18 @@ export default function App() {
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
             </View>
           }
-          renderItem={({ item }) => <CompactPositionRow position={item} />}
+          renderItem={({ item }) => {
+            const symbol = extractSymbol(item);
+            const historyPoints = historyBySymbol?.[symbol]?.points || [];
+            return (
+              <CompactPositionRow
+                position={item}
+                historyPoints={historyPoints}
+                rangeMs={selectedRangeMs}
+                nowMs={tickNowMs}
+              />
+            );
+          }}
         />
       </LinearGradient>
     </SafeAreaView>
@@ -353,61 +363,6 @@ const headerStyles = StyleSheet.create({
   openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
   openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
 });
-
-const cardStyles = StyleSheet.create({
-  card: {
-    borderRadius: theme.radius.lg,
-    padding: theme.spacing.md,
-    marginBottom: theme.spacing.md,
-    borderWidth: 1.25,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
-  },
-  symWrap: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  symbol: { color: theme.colors.text, fontSize: 19, fontWeight: '900', letterSpacing: 0.8 },
-  qty: { color: theme.colors.muted, fontSize: 14, fontWeight: '800' },
-  pill: {
-    flexDirection: 'row',
-    gap: 6,
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 999,
-    borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.06)',
-  },
-  pillText: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
-  grid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    gap: theme.spacing.sm,
-    marginBottom: theme.spacing.sm,
-  },
-  stat: {
-    minWidth: '48%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 6,
-  },
-  statIcon: { color: theme.colors.muted, fontSize: 14, fontWeight: '900' },
-  statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
-  bigRow: { marginBottom: theme.spacing.sm },
-  forensicsWrap: {
-    marginTop: theme.spacing.xs,
-    paddingTop: theme.spacing.xs,
-    borderTopWidth: 1,
-    borderTopColor: theme.colors.border,
-  },
-  forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
-  forensicsDebug: { color: theme.colors.faint, fontSize: 11, marginTop: 2 },
-});
-
 
 const compactStyles = StyleSheet.create({
   tile: {
