@@ -186,14 +186,38 @@ assert.equal(reservedSellability.totalPositionQty, 6.116995699);
 assert.equal(reservedSellability.availableQty, 0);
 assert.equal(reservedSellability.openSellCount, 2);
 assert.equal(reservedSellability.reservedQty, 5);
+assert.equal(reservedSellability.sellabilitySource, 'blocked');
+assert.equal(reservedSellability.blockedReason, 'open_sell_exists');
 
 const inferredSellability = computeExitSellability({
   symbol: 'DOT/USD',
   position: { symbol: 'DOTUSD', qty: '10' },
-  openOrders,
+  openOrders: [],
 });
-assert.equal(inferredSellability.availableQty, 5);
-assert.equal(inferredSellability.reservedQty, 5);
+assert.equal(inferredSellability.availableQty, 10);
+assert.equal(inferredSellability.reservedQty, 0);
+assert.equal(inferredSellability.sellabilitySource, 'inferred_from_position');
+
+const fallbackSellability = computeExitSellability({
+  symbol: 'AVAX/USD',
+  position: { symbol: 'AVAXUSD', qty: '4.25', qty_available: '0' },
+  openOrders: [],
+});
+assert.equal(fallbackSellability.openSellCount, 0);
+assert.equal(fallbackSellability.reservedQty, 0);
+assert.equal(fallbackSellability.brokerAvailableQty, 0);
+assert.equal(fallbackSellability.inferredAvailableQty, 4.25);
+assert.equal(fallbackSellability.availableQty, 4.25);
+assert.equal(fallbackSellability.sellabilitySource, 'inferred_from_position');
+
+const zeroQtySellability = computeExitSellability({
+  symbol: 'ETH/USD',
+  position: { symbol: 'ETHUSD', qty: '0', qty_available: '0' },
+  openOrders: [],
+});
+assert.equal(zeroQtySellability.availableQty, 0);
+assert.equal(zeroQtySellability.sellabilitySource, 'blocked');
+assert.equal(zeroQtySellability.blockedReason, 'no_position_qty');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
@@ -233,6 +257,8 @@ assert.match(tradeSource, /minVolThresholdApplied: symbolTier === 'tier1'[\s\S]*
 assert.match(tradeSource, /console\.log\('entry_regime_gate',[\s\S]*symbolTier,[\s\S]*minVolThresholdApplied:/);
 assert.match(tradeSource, /logEntrySkip\(\{[\s\S]*symbolTier,[\s\S]*reason: 'vol_compression_gate',/);
 assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orderbookMeta\.depthState,[\s\S]*bidDepthUsd: orderbookMeta\.bidDepthUsd,[\s\S]*askDepthUsd: orderbookMeta\.askDepthUsd,[\s\S]*actualDepthUsd: orderbookMeta\.actualDepthUsd,[\s\S]*orderbookLevelCounts: orderbookMeta\.orderbookLevelCounts,/);
+assert.match(tradeSource, /actionTaken = 'defer_no_sellable_qty';/);
+assert.match(tradeSource, /sellabilitySource: sellability\.sellabilitySource,/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
 assert.ok(attachStart !== -1 && attachEnd !== -1);
