@@ -4922,11 +4922,13 @@ async function getAvailablePositionQty(symbol) {
       logPositionNoneOnce(normalized, 404);
       return 0;
     }
-    const { availableQty, totalQty, hasAvailableQtyField } = extractBrokerPositionQty(pos);
-    if (hasAvailableQtyField) {
-      return Math.max(0, availableQty);
-    }
-    return Math.max(0, totalQty);
+    const openOrders = await fetchLiveOrders();
+    const sellability = computeExitSellability({
+      symbol: normalized,
+      position: pos,
+      openOrders: Array.isArray(openOrders) ? openOrders : [],
+    });
+    return Math.max(0, sellability.availableQty);
   } catch (err) {
     if (err?.statusCode === 404) {
       logPositionNoneOnce(normalized, 404);
@@ -5423,18 +5425,45 @@ function computeExitSellability({
   const totalPositionQty = Number.isFinite(qty.totalQty) && qty.totalQty > 0 ? qty.totalQty : 0;
   const brokerAvailableQty = Number.isFinite(qty.availableQty) && qty.availableQty > 0 ? qty.availableQty : 0;
   const inferredAvailableQty = Math.max(0, totalPositionQty - reservedQty);
-  const availableQty = qty.hasAvailableQtyField ? brokerAvailableQty : inferredAvailableQty;
+  const hasOpenSell = openSellCount > 0 || openSellQty > 0;
+  const hasReservedQty = reservedQty > 0;
+  const canUseInferredFallback =
+    totalPositionQty > 0 &&
+    !hasOpenSell &&
+    !hasReservedQty &&
+    brokerAvailableQty <= 0;
+  let availableQty = 0;
+  let sellabilitySource = 'blocked';
+  let blockedReason = null;
+
+  if (hasOpenSell) {
+    blockedReason = 'open_sell_exists';
+  } else if (hasReservedQty) {
+    blockedReason = 'qty_reserved';
+  } else if (qty.hasAvailableQtyField && brokerAvailableQty > 0) {
+    availableQty = brokerAvailableQty;
+    sellabilitySource = 'broker_available';
+  } else if ((!qty.hasAvailableQtyField || canUseInferredFallback) && inferredAvailableQty > 0) {
+    availableQty = inferredAvailableQty;
+    sellabilitySource = 'inferred_from_position';
+  } else {
+    blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
+  }
   const sellableQty = Math.max(0, availableQty);
   return {
     symbol,
     canonicalSymbol,
     totalPositionQty,
     availableQty: sellableQty,
+    brokerAvailableQty,
+    inferredAvailableQty,
     reservedQty,
     openSellQty,
     openSellCount,
     openSellOrders,
     hasAvailableQtyField: qty.hasAvailableQtyField,
+    sellabilitySource,
+    blockedReason,
   };
 }
 
@@ -6732,12 +6761,27 @@ async function submitLimitSell({
     canonicalSymbol: normalizedSymbol,
     totalPositionQty: sellability.totalPositionQty,
     availableQty: sellability.availableQty,
+    brokerAvailableQty: sellability.brokerAvailableQty,
+    inferredAvailableQty: sellability.inferredAvailableQty,
     reservedQty: sellability.reservedQty,
     openSellFound: sellability.openSellCount > 0,
     openSellCount: sellability.openSellCount,
     openSellQty: sellability.openSellQty,
+    sellabilitySource: sellability.sellabilitySource,
+    blockedReason: sellability.blockedReason,
     pendingExitAttach: hasPendingExitAttach(normalizedSymbol),
   });
+  if (sellability.sellabilitySource === 'inferred_from_position') {
+    console.log('exit_sellability_inferred_fallback', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      totalPositionQty: sellability.totalPositionQty,
+      brokerAvailableQty: sellability.brokerAvailableQty,
+      reservedQty: sellability.reservedQty,
+      openSellCount: sellability.openSellCount,
+      inferredAvailableQty: sellability.inferredAvailableQty,
+    });
+  }
   if (sellability.openSellCount > 0) {
     console.log('open_sell_qty_reserved', {
       symbol,
@@ -6800,6 +6844,8 @@ async function submitLimitSell({
       openSellFound: sellability.openSellCount > 0,
       openSellCount: sellability.openSellCount,
       openSellQty: sellability.openSellQty,
+      sellabilitySource: sellability.sellabilitySource,
+      blockedReason: sellability.blockedReason,
     });
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
     return { skipped: true, reason: 'qty_reserved_or_unavailable' };
@@ -9104,8 +9150,13 @@ async function manageExitStates() {
             reasonCode = 'place_gtc_tp';
             lastActionAt.set(symbol, now);
           } else {
-            actionTaken = 'hold_existing_order';
-            reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
+            if (replacement?.reason === 'qty_reserved_or_unavailable' && openSellCount === 0) {
+              actionTaken = 'defer_no_sellable_qty';
+              reasonCode = 'defer_no_sellable_qty';
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
+            }
           }
           const decisionPath = 'place_gtc_tp';
           logExitDecision({
