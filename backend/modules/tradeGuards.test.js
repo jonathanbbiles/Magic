@@ -111,7 +111,7 @@ const tier1Compression = evaluateVolCompression({
   longVolBps: 3.1,
   minLongVolBps: 8,
   minLongVolBpsTier1: 2,
-  minLongVolBpsTier2: 7,
+  minLongVolBpsTier2: 4,
   minCompressionRatio: 0.60,
   lookbackShort: 6,
   lookbackLong: 30,
@@ -121,19 +121,55 @@ assert.equal(tier1Compression.ok, true);
 assert.equal(tier1Compression.minLongVolThresholdApplied, 2);
 assert.notEqual(tier1Compression.minLongVolThresholdApplied, 8);
 
-const tier2Compression = evaluateVolCompression({
+const tier2CompressionLink = evaluateVolCompression({
   symbolTier: 'tier2',
-  shortVolBps: 8,
-  longVolBps: 6.5,
+  shortVolBps: 3.9,
+  longVolBps: 6.2,
   minLongVolBps: 8,
   minLongVolBpsTier1: 2,
-  minLongVolBpsTier2: 7,
+  minLongVolBpsTier2: 4,
   minCompressionRatio: 0.60,
   enabled: true,
 });
-assert.equal(tier2Compression.ok, false);
-assert.equal(tier2Compression.reason, 'long_vol_below_threshold');
-assert.equal(tier2Compression.minLongVolThresholdApplied, 7);
+assert.equal(tier2CompressionLink.ok, true);
+
+const tier2CompressionSol = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 3.4,
+  longVolBps: 5.3,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 4,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier2CompressionSol.ok, true);
+
+const tier2CompressionAvax = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 2.8,
+  longVolBps: 4.4,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 4,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier2CompressionAvax.ok, true);
+
+const tier2CompressionBelowFloor = evaluateVolCompression({
+  symbolTier: 'tier2',
+  shortVolBps: 2.2,
+  longVolBps: 3.9,
+  minLongVolBps: 8,
+  minLongVolBpsTier1: 2,
+  minLongVolBpsTier2: 4,
+  minCompressionRatio: 0.60,
+  enabled: true,
+});
+assert.equal(tier2CompressionBelowFloor.ok, false);
+assert.equal(tier2CompressionBelowFloor.reason, 'long_vol_below_threshold');
+assert.equal(tier2CompressionBelowFloor.minLongVolThresholdApplied, 4);
 
 const tier3Compression = evaluateVolCompression({
   symbolTier: 'tier3',
@@ -141,7 +177,7 @@ const tier3Compression = evaluateVolCompression({
   longVolBps: 8.1,
   minLongVolBps: 8,
   minLongVolBpsTier1: 2,
-  minLongVolBpsTier2: 7,
+  minLongVolBpsTier2: 4,
   minCompressionRatio: 0.60,
   enabled: true,
 });
@@ -155,7 +191,7 @@ const missingTierCompression = evaluateVolCompression({
   longVolBps: 12,
   minLongVolBps: 8,
   minLongVolBpsTier1: 2,
-  minLongVolBpsTier2: 7,
+  minLongVolBpsTier2: 4,
   minCompressionRatio: 0.60,
   enabled: true,
 });

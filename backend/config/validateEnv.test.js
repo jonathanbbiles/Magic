@@ -40,7 +40,7 @@ withEnv({}, () => {
   assert.equal(guardrails.regime.minVolBpsTier1, 4);
   assert.equal(guardrails.volCompression.minLongVolBps, 8);
   assert.equal(guardrails.volCompression.minLongVolBpsTier1, 2);
-  assert.equal(guardrails.volCompression.minLongVolBpsTier2, 7);
+  assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
 });

@@ -10,6 +10,17 @@ const ORDERBOOK_RETRY_ATTEMPTS = Math.max(1, Math.floor(readNumber('ORDERBOOK_RE
 const ORDERBOOK_RETRY_BACKOFF_MS = [200, 500, 1200];
 
 const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.53);
+const hasGlobalMinProbEnv = String(process.env.MIN_PROB_TO_ENTER ?? '').trim().length > 0;
+const hasTier1MinProbEnv = String(process.env.MIN_PROB_TO_ENTER_TIER1 ?? '').trim().length > 0;
+const hasTier2MinProbEnv = String(process.env.MIN_PROB_TO_ENTER_TIER2 ?? '').trim().length > 0;
+const MIN_PROB_TO_ENTER_TIER1 = readNumber(
+  'MIN_PROB_TO_ENTER_TIER1',
+  hasGlobalMinProbEnv && !hasTier1MinProbEnv ? MIN_PROB_TO_ENTER : 0.35,
+);
+const MIN_PROB_TO_ENTER_TIER2 = readNumber(
+  'MIN_PROB_TO_ENTER_TIER2',
+  hasGlobalMinProbEnv && !hasTier2MinProbEnv ? MIN_PROB_TO_ENTER : 0.40,
+);
 const MIN_PROB_TO_ENTER_TP = readNumber('MIN_PROB_TO_ENTER_TP', MIN_PROB_TO_ENTER);
 // 0 disables the stretch gate entirely
 const MIN_PROB_TO_ENTER_STRETCH = readNumber('MIN_PROB_TO_ENTER_STRETCH', 0);
@@ -20,6 +31,8 @@ module.exports = {
   ORDERBOOK_RETRY_ATTEMPTS,
   ORDERBOOK_RETRY_BACKOFF_MS,
   MIN_PROB_TO_ENTER,
+  MIN_PROB_TO_ENTER_TIER1,
+  MIN_PROB_TO_ENTER_TIER2,
   MIN_PROB_TO_ENTER_TP,
   MIN_PROB_TO_ENTER_STRETCH,
 };
