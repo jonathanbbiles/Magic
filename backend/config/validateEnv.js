@@ -197,6 +197,7 @@ const validateEnv = () => {
     const regimeMaxVolBps = parseFiniteNumberEnv('REGIME_MAX_VOL_BPS', 250);
     const volCompressionMinRatio = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_RATIO', 0.45);
     const volCompressionMinLongVolBps = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
+    const volCompressionMinLongVolBpsTier1 = parseFiniteNumberEnv('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 6);
     const regimeRequireMomentum = parseBooleanEnv('REGIME_REQUIRE_MOMENTUM', true);
     const regimeBlockWeakLiquidity = parseBooleanEnv('REGIME_BLOCK_WEAK_LIQUIDITY', true);
     const regimeAllowUnknownVol = parseBooleanEnv('REGIME_ALLOW_UNKNOWN_VOL', false);
@@ -255,6 +256,7 @@ const validateEnv = () => {
     assertInRange('REGIME_MAX_VOL_BPS', regimeMaxVolBps, 0, 10000);
     assertInRange('VOL_COMPRESSION_MIN_RATIO', volCompressionMinRatio, 0, 10);
     assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS', volCompressionMinLongVolBps, 0, 10000);
+    assertInRange('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', volCompressionMinLongVolBpsTier1, 0, 10000);
     if (volCompressionMinRatio <= 0) {
       throw new Error(`VOL_COMPRESSION_MIN_RATIO must be > 0. Received: "${volCompressionMinRatio}"`);
     }
@@ -266,6 +268,9 @@ const validateEnv = () => {
     }
     if (volCompressionMinLongVolBps <= 0) {
       throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS must be > 0. Received: "${volCompressionMinLongVolBps}"`);
+    }
+    if (volCompressionMinLongVolBpsTier1 <= 0) {
+      throw new Error(`VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 must be > 0. Received: "${volCompressionMinLongVolBpsTier1}"`);
     }
     if (regimeMinVolBps > regimeMaxVolBps) {
       throw new Error(`REGIME_MIN_VOL_BPS cannot exceed REGIME_MAX_VOL_BPS. Received min=${regimeMinVolBps}, max=${regimeMaxVolBps}`);
@@ -351,6 +356,7 @@ const validateEnv = () => {
       volCompression: {
         minRatio: volCompressionMinRatio,
         minLongVolBps: volCompressionMinLongVolBps,
+        minLongVolBpsTier1: volCompressionMinLongVolBpsTier1,
       },
       failedTrade: {
         maxAgeSec: failedTradeMaxAgeSec,

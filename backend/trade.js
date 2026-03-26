@@ -420,6 +420,7 @@ const VOL_COMPRESSION_LOOKBACK_SHORT = readNumber('VOL_COMPRESSION_LOOKBACK_SHOR
 const VOL_COMPRESSION_LOOKBACK_LONG = readNumber('VOL_COMPRESSION_LOOKBACK_LONG', 60);
 const VOL_COMPRESSION_MIN_RATIO = readNumber('VOL_COMPRESSION_MIN_RATIO', 0.45);
 const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10);
+const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 6);
 
 // 4) Orderbook absorption
 const ORDERBOOK_ABSORPTION_ENABLED = readFlag('ORDERBOOK_ABSORPTION_ENABLED', true);
@@ -1440,13 +1441,17 @@ async function computeEntrySignal(symbol, opts = {}) {
   ).filter((value) => Number.isFinite(value) && value > 0);
   const shortVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_SHORT);
   const longVolBps = computeRealizedVolBps(closes1m, VOL_COMPRESSION_LOOKBACK_LONG);
+  const minLongVolThresholdApplied = symbolTier === 'tier1'
+    ? VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1
+    : VOL_COMPRESSION_MIN_LONG_VOL_BPS;
   const compressionRatio = Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)
     ? shortVolBps / Math.max(longVolBps, 1e-6)
     : null;
   const volCompressionMeta = {
+    symbolTier,
     shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
     longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
-    minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+    minLongVolThresholdApplied,
     minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
     compressionRatio,
     lookbackShort: VOL_COMPRESSION_LOOKBACK_SHORT,
@@ -1455,9 +1460,10 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
 
   if (VOL_COMPRESSION_ENABLED && Number.isFinite(shortVolBps) && Number.isFinite(longVolBps)) {
-    if (longVolBps < VOL_COMPRESSION_MIN_LONG_VOL_BPS || compressionRatio < VOL_COMPRESSION_MIN_RATIO) {
+    if (longVolBps < minLongVolThresholdApplied || compressionRatio < VOL_COMPRESSION_MIN_RATIO) {
       logEntrySkip({
         symbol: asset.symbol,
+        symbolTier,
         spreadBps,
         requiredEdgeBps,
         reason: 'vol_compression_gate',
@@ -1465,7 +1471,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,
         shortVolBps: Number.isFinite(shortVolBps) ? shortVolBps : null,
         longVolBps: Number.isFinite(longVolBps) ? longVolBps : null,
-        minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,
+        minLongVolThresholdApplied,
         volCompression: volCompressionMeta,
       });
       return {

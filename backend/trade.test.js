@@ -201,7 +201,10 @@ assert.match(tradeSource, /const ORDERBOOK_MIN_DEPTH_USD = readNumber\('ORDERBOO
 assert.match(tradeSource, /const \{ computeOrderbookMetrics \} = require\('\.\/modules\/orderbookMetrics'\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_RATIO = readNumber\('VOL_COMPRESSION_MIN_RATIO', 0\.45\);/);
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS', 10\);/);
-assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,[\s\S]*shortVolBps:[\s\S]*longVolBps:[\s\S]*minLongVolThreshold: VOL_COMPRESSION_MIN_LONG_VOL_BPS,/);
+assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1', 6\);/);
+assert.match(tradeSource, /const minLongVolThresholdApplied = symbolTier === 'tier1'[\s\S]*\? VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1[\s\S]*: VOL_COMPRESSION_MIN_LONG_VOL_BPS;/);
+assert.match(tradeSource, /reason: 'vol_compression_gate',[\s\S]*minCompressionRatioThreshold: VOL_COMPRESSION_MIN_RATIO,[\s\S]*shortVolBps:[\s\S]*longVolBps:[\s\S]*minLongVolThresholdApplied,/);
+assert.match(tradeSource, /logEntrySkip\(\{[\s\S]*symbolTier,[\s\S]*reason: 'vol_compression_gate',/);
 assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orderbookMeta\.depthState,[\s\S]*bidDepthUsd: orderbookMeta\.bidDepthUsd,[\s\S]*askDepthUsd: orderbookMeta\.askDepthUsd,[\s\S]*actualDepthUsd: orderbookMeta\.actualDepthUsd,[\s\S]*orderbookLevelCounts: orderbookMeta\.orderbookLevelCounts,/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
