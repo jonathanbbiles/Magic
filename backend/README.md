@@ -153,7 +153,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `ORDERBOOK_ABSORPTION_ENABLED=false`
 - `REGIME_MIN_VOL_BPS_TIER1=4`
 - `VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2=7`
-- `MAX_CONCURRENT_POSITIONS=3` (`0` still disables the cap, but default is explicit cap of 3)
+- `MAX_CONCURRENT_POSITIONS=0` (disabled by default; set a positive value only if you explicitly want a cap)
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
 - `PER_SCAN_BARS_FALLBACK_BUDGET=2`
