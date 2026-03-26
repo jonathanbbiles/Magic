@@ -221,8 +221,10 @@ const validateEnv = () => {
     const marketdataOrderbookTtlMs = parseFiniteNumberEnv('MARKETDATA_ORDERBOOK_TTL_MS', 2000);
     const marketdataBarsTtlMs = parseFiniteNumberEnv('MARKETDATA_BARS_TTL_MS', 10000);
     const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000);
-    const entrySymbolsPrimary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_PRIMARY', 'BTC/USD,ETH/USD,LINK/USD,AVAX/USD,SOL/USD'));
-    const entrySymbolsSecondary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_SECONDARY', 'ARB/USD,UNI/USD,RENDER/USD'))
+    const entryUniverseModeRaw = String(process.env.ENTRY_UNIVERSE_MODE || 'dynamic').trim().toLowerCase();
+    const entryUniverseMode = entryUniverseModeRaw === 'configured' ? 'configured' : 'dynamic';
+    const entrySymbolsPrimary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_PRIMARY', ''));
+    const entrySymbolsSecondary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_SECONDARY', ''))
       .filter((symbol) => !entrySymbolsPrimary.includes(symbol));
     const entrySymbolsIncludeSecondary = parseBooleanEnv('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
     const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1);
@@ -325,8 +327,8 @@ const validateEnv = () => {
     if (!sparseFallbackSymbols.length) {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
-    if (!entrySymbolsPrimary.length) {
-      throw new Error('ENTRY_SYMBOLS_PRIMARY must include at least one symbol.');
+    if (entryUniverseMode === 'configured' && !entrySymbolsPrimary.length) {
+      throw new Error('ENTRY_SYMBOLS_PRIMARY must include at least one symbol when ENTRY_UNIVERSE_MODE=configured.');
     }
     if (!executionTier1Symbols.length) {
       throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
@@ -361,6 +363,7 @@ const validateEnv = () => {
         tier3Default: executionTier3Default,
       },
       entryUniverse: {
+        mode: entryUniverseMode,
         primarySymbols: entrySymbolsPrimary,
         secondarySymbols: entrySymbolsSecondary,
         includeSecondary: entrySymbolsIncludeSecondary,

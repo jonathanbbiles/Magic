@@ -37,6 +37,12 @@ Optional:
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
+- `ENTRY_UNIVERSE_MODE` (`dynamic` by default; set `configured` to use `ENTRY_SYMBOLS_PRIMARY`/`ENTRY_SYMBOLS_SECONDARY`)
+- `ENTRY_SYMBOLS_PRIMARY` (manual primary universe when `ENTRY_UNIVERSE_MODE=configured`)
+- `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
+- `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
+- `AUTO_SCAN_SYMBOLS` (optional hard override universe; when set it overrides both dynamic and configured modes)
+- `SUPPORTED_CRYPTO_PAIRS_REFRESH_MS` (default `3600000`, refresh interval for Alpaca tradable crypto asset universe cache)
 
 ## Trading Gates
 

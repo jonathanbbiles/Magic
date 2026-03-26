@@ -50,7 +50,7 @@ const {
 const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
-const { buildEntryUniverse } = require('./modules/entryUniversePolicy');
+const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets } = require('./modules/entryUniversePolicy');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -504,9 +504,12 @@ const MARKETDATA_QUOTE_TTL_MS = Math.max(250, readNumber('MARKETDATA_QUOTE_TTL_M
 const MARKETDATA_ORDERBOOK_TTL_MS = Math.max(250, readNumber('MARKETDATA_ORDERBOOK_TTL_MS', 2000));
 const MARKETDATA_BARS_TTL_MS = Math.max(1000, readNumber('MARKETDATA_BARS_TTL_MS', 10000));
 const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, readNumber('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000));
-const ENTRY_SYMBOLS_PRIMARY = String(process.env.ENTRY_SYMBOLS_PRIMARY || 'BTC/USD,ETH/USD,LINK/USD,AVAX/USD,SOL/USD');
-const ENTRY_SYMBOLS_SECONDARY = String(process.env.ENTRY_SYMBOLS_SECONDARY || 'ARB/USD,UNI/USD,RENDER/USD');
+const ENTRY_SYMBOLS_PRIMARY = String(process.env.ENTRY_SYMBOLS_PRIMARY || '');
+const ENTRY_SYMBOLS_SECONDARY = String(process.env.ENTRY_SYMBOLS_SECONDARY || '');
 const ENTRY_SYMBOLS_INCLUDE_SECONDARY = readEnvFlag('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
+const ENTRY_UNIVERSE_MODE_RAW = String(process.env.ENTRY_UNIVERSE_MODE || 'dynamic').trim().toLowerCase();
+const ENTRY_UNIVERSE_MODE = ENTRY_UNIVERSE_MODE_RAW === 'configured' ? 'configured' : 'dynamic';
+const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
 const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
 const EXECUTION_TIER3_DEFAULT = readEnvFlag('EXECUTION_TIER3_DEFAULT', true);
@@ -551,6 +554,8 @@ function printConfigOnce() {
     tradePortfolioPctRequested: TRADE_PORTFOLIO_PCT_RAW,
     tradePortfolioPctEffective: TRADE_PORTFOLIO_PCT,
     maxPortfolioAllocationPerTradePct: MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT,
+    entryUniverseMode: ENTRY_UNIVERSE_MODE,
+    supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
   });
   console.log('runtime_config', {
     MIN_PROB_TO_ENTER,
@@ -3270,10 +3275,21 @@ const supportedCryptoPairsState = {
   loaded: false,
   pairs: new Set(),
   lastUpdated: null,
+  stats: {
+    tradableCryptoCount: 0,
+    acceptedCount: 0,
+    malformedCount: 0,
+    unsupportedCount: 0,
+    duplicateCount: 0,
+  },
 };
 
 async function loadSupportedCryptoPairs({ force = false } = {}) {
-  if (supportedCryptoPairsState.loaded && !force) return supportedCryptoPairsState.pairs;
+  const nowMs = Date.now();
+  const stale =
+    !supportedCryptoPairsState.lastUpdated ||
+    nowMs - Date.parse(supportedCryptoPairsState.lastUpdated) > SUPPORTED_CRYPTO_PAIRS_REFRESH_MS;
+  if (supportedCryptoPairsState.loaded && !force && !stale) return supportedCryptoPairsState.pairs;
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'assets',
@@ -3286,17 +3302,23 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       url,
       headers: alpacaHeaders(),
     });
-    const nextPairs = new Set();
-    (Array.isArray(data) ? data : []).forEach((asset) => {
-      if (!asset?.tradable || asset?.status !== 'active') return;
-      const normalized = toDataSymbol(asset.symbol);
-      if (normalized && normalized.endsWith('/USD')) {
-        nextPairs.add(normalized);
-      }
-    });
-    supportedCryptoPairsState.pairs = nextPairs;
+    const allowedSet = null;
+    const dynamicUniverse = buildDynamicCryptoUniverseFromAssets(Array.isArray(data) ? data : [], { allowedSymbols: allowedSet });
+    supportedCryptoPairsState.pairs = new Set(dynamicUniverse.symbols);
     supportedCryptoPairsState.loaded = true;
     supportedCryptoPairsState.lastUpdated = new Date().toISOString();
+    supportedCryptoPairsState.stats = dynamicUniverse.stats;
+    console.log('entry_universe_dynamic_sync', {
+      mode: 'dynamic_full_universe',
+      tradableCryptoSymbolsFound: dynamicUniverse.stats.tradableCryptoCount,
+      acceptedSymbols: dynamicUniverse.stats.acceptedCount,
+      malformedExcluded: dynamicUniverse.stats.malformedCount,
+      unsupportedExcluded: dynamicUniverse.stats.unsupportedCount,
+      duplicateExcluded: dynamicUniverse.stats.duplicateCount,
+      sampleSymbols: dynamicUniverse.symbols.slice(0, 10),
+      refreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
+      loadedAt: supportedCryptoPairsState.lastUpdated,
+    });
   } catch (err) {
     console.warn('supported_pairs_fetch_failed', err?.errorMessage || err?.message || err);
   }
@@ -3307,6 +3329,7 @@ function getSupportedCryptoPairsSnapshot() {
   return {
     pairs: Array.from(supportedCryptoPairsState.pairs),
     lastUpdated: supportedCryptoPairsState.lastUpdated,
+    stats: supportedCryptoPairsState.stats,
   };
 }
 
@@ -10656,28 +10679,54 @@ async function runEntryScanOnce() {
       includeSecondary: ENTRY_SYMBOLS_INCLUDE_SECONDARY,
     });
     let universe = [];
-    let universeMode = 'configured_primary_secondary';
+    let universeMode = 'dynamic_full_universe';
+    let dynamicUniverseStats = getSupportedCryptoPairsSnapshot().stats || null;
     if (autoScanSymbols.length) {
       universe = autoScanSymbols;
       universeMode = 'auto_scan_override';
+    } else if (ENTRY_UNIVERSE_MODE === 'configured') {
+      universe = configuredUniverse.scanSymbols;
+      universeMode = 'configured_primary_secondary';
     } else if (SIMPLE_SCALPER_ENABLED) {
-      universe = configuredUniverse.scanSymbols;
-    } else {
-      universe = configuredUniverse.scanSymbols;
+      await loadSupportedCryptoPairs();
+      const snapshot = getSupportedCryptoPairsSnapshot();
+      dynamicUniverseStats = snapshot.stats || dynamicUniverseStats;
+      universe = snapshot.pairs;
       if (!universe.length) {
-        await loadSupportedCryptoPairs();
-        universe = Array.from(supportedCryptoPairsState.pairs);
-        universeMode = 'supported_pairs_fallback';
+        universe = configuredUniverse.scanSymbols;
+        universeMode = 'configured_fallback';
+      }
+    } else {
+      await loadSupportedCryptoPairs();
+      const snapshot = getSupportedCryptoPairsSnapshot();
+      dynamicUniverseStats = snapshot.stats || dynamicUniverseStats;
+      universe = snapshot.pairs;
+      if (!universe.length) {
+        universe = configuredUniverse.scanSymbols;
+        universeMode = 'configured_fallback';
       }
       if (!universe.length) {
         universe = CRYPTO_CORE_TRACKED;
         universeMode = 'core_tracked_fallback';
       }
     }
+    if (ENTRY_UNIVERSE_MODE === 'configured' && !universe.length) {
+      universe = configuredUniverse.scanSymbols;
+      if (!universe.length) {
+        await loadSupportedCryptoPairs();
+        const snapshot = getSupportedCryptoPairsSnapshot();
+        dynamicUniverseStats = snapshot.stats || dynamicUniverseStats;
+        universe = snapshot.pairs;
+        universeMode = 'dynamic_fallback';
+      }
+    }
     const scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
     const universeSize = scanSymbols.length;
+    const isDynamicMode = universeMode.startsWith('dynamic');
+    const primarySymbolsCount = isDynamicMode ? universeSize : configuredUniverse.primaryCount;
+    const secondarySymbolsCount = isDynamicMode ? 0 : configuredUniverse.secondaryCount;
 
     let positions = [];
     let openOrders = [];
@@ -11006,8 +11055,11 @@ async function runEntryScanOnce() {
       capEnabled,
       heldPositionsCount,
       universeMode,
-      primarySymbols: configuredUniverse.primaryCount,
-      secondarySymbols: configuredUniverse.secondaryCount,
+      primarySymbols: primarySymbolsCount,
+      secondarySymbols: secondarySymbolsCount,
+      dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      dynamicAcceptedSymbols: dynamicUniverseStats?.acceptedCount ?? null,
+      dynamicSampleSymbols: scanSymbols.slice(0, 10),
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -11075,8 +11127,18 @@ function startEntryManager() {
   if (PREDICTOR_WARMUP_ENABLED) {
     setTimeout(async () => {
       try {
-        await loadSupportedCryptoPairs();
-        const universe = Array.from(supportedCryptoPairsState.pairs || []);
+        let universe = [];
+        if (ENTRY_UNIVERSE_MODE === 'configured') {
+          const configuredUniverse = buildEntryUniverse({
+            primaryRaw: ENTRY_SYMBOLS_PRIMARY,
+            secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
+            includeSecondary: ENTRY_SYMBOLS_INCLUDE_SECONDARY,
+          });
+          universe = configuredUniverse.scanSymbols;
+        } else {
+          await loadSupportedCryptoPairs();
+          universe = Array.from(supportedCryptoPairsState.pairs || []);
+        }
         await prefetchEntryScanMarketData(universe, { force: true });
       } catch (err) {
         console.warn('predictor_warmup_prefetch_failed', {
