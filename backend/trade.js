@@ -45,6 +45,7 @@ const {
   shouldExitFailedTrade,
 } = require('./modules/tradeGuards');
 const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
+const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -467,6 +468,20 @@ const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN'
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
 const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
+const ORDERBOOK_MIN_LEVELS_PER_SIDE = Math.max(1, Math.floor(readNumber('ORDERBOOK_MIN_LEVELS_PER_SIDE', 2)));
+const ORDERBOOK_SPARSE_CONFIRM_RETRY = readEnvFlag('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
+const ORDERBOOK_SPARSE_CONFIRM_RETRY_MS = Math.max(0, readNumber('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150));
+const ORDERBOOK_SPARSE_FALLBACK_ENABLED = readEnvFlag('ORDERBOOK_SPARSE_FALLBACK_ENABLED', true);
+const ORDERBOOK_SPARSE_FALLBACK_SYMBOLS = parseSymbolSet(process.env.ORDERBOOK_SPARSE_FALLBACK_SYMBOLS || 'BTC/USD,ETH/USD');
+const ORDERBOOK_SPARSE_MAX_SPREAD_BPS = readNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
+const ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS = readNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
+const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = readNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
+const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBABILITY', 0.60);
+const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
+const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
+const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
+const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
+const EXECUTION_TIER3_DEFAULT = readEnvFlag('EXECUTION_TIER3_DEFAULT', true);
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
@@ -822,6 +837,30 @@ function updateOrderbookFeatureHistory(symbol, orderbookMeta, orderbook, nowMs) 
   return history;
 }
 
+function getExecutionTierPolicy() {
+  return {
+    tier1Symbols: EXECUTION_TIER1_SYMBOLS,
+    tier2Symbols: EXECUTION_TIER2_SYMBOLS,
+    tier3Default: EXECUTION_TIER3_DEFAULT,
+  };
+}
+
+function getEntryMarketDataPolicy() {
+  return {
+    maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
+    quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+    sparseFallback: {
+      enabled: ORDERBOOK_SPARSE_FALLBACK_ENABLED,
+      symbols: ORDERBOOK_SPARSE_FALLBACK_SYMBOLS,
+      maxSpreadBps: ORDERBOOK_SPARSE_MAX_SPREAD_BPS,
+      requireStrongerEdgeBps: ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS,
+      requireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+      minProbability: ORDERBOOK_SPARSE_MIN_PROBABILITY,
+      confidenceCapMultiplier: ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT,
+    },
+  };
+}
+
 const emaArr = (arr, span) => {
   if (!arr?.length) return [];
   const k = 2 / (span + 1);
@@ -1078,14 +1117,22 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+  const weakLiquidity = Number.isFinite(spreadBps) && Number.isFinite(requiredEdgeBps)
+    ? spreadBps > (requiredEdgeBps * 0.25)
+    : false;
+  const executionTierPolicy = getExecutionTierPolicy();
+  const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
+  const quoteAgeMs = Number.isFinite(quote.tsMs) ? Math.max(0, nowMs - quote.tsMs) : null;
+
+  let obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
   if (!obResult.ok) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
     return {
       entryReady: false,
-      why: 'orderbook_unavailable',
+      why: obResult.reason === 'orderbook_rate_limited' ? 'orderbook_rate_limited' : 'marketdata_unavailable',
       meta: {
         symbol: asset.symbol,
+        symbolTier,
         spreadBps,
         obReason: obResult.reason,
         obDetails: obResult.details,
@@ -1105,27 +1152,58 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const orderbookMeta = computeOrderbookMetrics(
-    obResult.orderbook,
-    {
-      bid: obResult.orderbook.bestBid,
-      ask: obResult.orderbook.bestAsk,
-    },
-    {
-      bandBps: ORDERBOOK_BAND_BPS,
-      minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
-      maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
-      impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-      imbalanceBiasScale: ORDERBOOK_IMBALANCE_BIAS_SCALE,
-    },
-  );
+  const buildOrderbookMeta = (resolvedObResult) =>
+    computeOrderbookMetrics(
+      resolvedObResult.orderbook,
+      {
+        bid: resolvedObResult.orderbook.bestBid,
+        ask: resolvedObResult.orderbook.bestAsk,
+      },
+      {
+        bandBps: ORDERBOOK_BAND_BPS,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        imbalanceBiasScale: ORDERBOOK_IMBALANCE_BIAS_SCALE,
+        minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
+      },
+    );
+
+  let orderbookMeta = buildOrderbookMeta(obResult);
+  const sparseByLevelCount =
+    (orderbookMeta?.orderbookLevelCounts?.asks?.valid || 0) < ORDERBOOK_MIN_LEVELS_PER_SIDE ||
+    (orderbookMeta?.orderbookLevelCounts?.bids?.valid || 0) < ORDERBOOK_MIN_LEVELS_PER_SIDE;
+  const shouldConfirmSparse =
+    ORDERBOOK_SPARSE_CONFIRM_RETRY &&
+    (orderbookMeta?.depthState === 'orderbook_sparse' || sparseByLevelCount);
+  if (shouldConfirmSparse && ORDERBOOK_SPARSE_RETRY_ONCE) {
+    if (ORDERBOOK_SPARSE_CONFIRM_RETRY_MS > 0) {
+      await sleep(ORDERBOOK_SPARSE_CONFIRM_RETRY_MS);
+    }
+    const obRetry = await getLatestOrderbook(asset.symbol, {
+      maxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      bypassCache: true,
+    });
+    if (obRetry.ok) {
+      obResult = obRetry;
+      orderbookMeta = buildOrderbookMeta(obResult);
+      console.log('entry_sparse_fallback_eval', {
+        symbol: asset.symbol,
+        symbolTier,
+        action: 'confirm_retry',
+        retrySource: obRetry.source || null,
+        depthState: orderbookMeta.depthState,
+        levelsConsideredPerSide: orderbookMeta.levelsConsideredPerSide,
+      });
+    }
+  }
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
   baseRecord.orderbookBidDepthUsd = orderbookMeta.bidDepthUsd;
   baseRecord.orderbookImpactBpsBuy = orderbookMeta.impactBpsBuy;
   baseRecord.orderbookImbalance = orderbookMeta.imbalance;
   baseRecord.orderbookLiquidityScore = orderbookMeta.liquidityScore;
 
-  if (!orderbookMeta.ok) {
+  if (!orderbookMeta.ok && orderbookMeta.depthState !== 'orderbook_sparse') {
     if (orderbookMeta.reason === 'ob_depth_insufficient') {
       const obMidPrice = Number.isFinite(obResult.orderbook.bestAsk) && Number.isFinite(obResult.orderbook.bestBid)
         ? (obResult.orderbook.bestAsk + obResult.orderbook.bestBid) / 2
@@ -1152,9 +1230,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
     return {
       entryReady: false,
-      why: 'orderbook_liquidity_gate',
+      why: orderbookMeta.depthState === 'orderbook_malformed' ? 'data_quality_bad' : 'entry_liquidity_gate',
       meta: {
         symbol: asset.symbol,
+        symbolTier,
         spreadBps,
         ...orderbookMeta,
         obBestAsk: obResult.orderbook.bestAsk,
@@ -1175,6 +1254,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       why: 'orderbook_liquidity_gate',
       meta: {
         symbol: asset.symbol,
+        symbolTier,
         spreadBps,
         ...orderbookMeta,
         obBestAsk: obResult.orderbook.bestAsk,
@@ -1197,9 +1277,6 @@ async function computeEntrySignal(symbol, opts = {}) {
   const imbalanceDelta = hasOrderbookAbsorptionSamples ? (orderbookLatest.imbalance - orderbookOldest.imbalance) : null;
   const bidReplenishUsd = hasOrderbookAbsorptionSamples ? (orderbookLatest.bidDepthUsd - orderbookOldest.bidDepthUsd) : null;
   const askReplenishUsd = hasOrderbookAbsorptionSamples ? (orderbookLatest.askDepthUsd - orderbookOldest.askDepthUsd) : null;
-  const weakLiquidity = Number.isFinite(spreadBps) && Number.isFinite(requiredEdgeBps)
-    ? spreadBps > (requiredEdgeBps * 0.25)
-    : false;
   const orderbookAbsorptionMeta = {
     samples: orderbookHistory.length,
     windowMs: ORDERBOOK_ABSORPTION_WINDOW_MS,
@@ -1683,16 +1760,6 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  if (weakLiquidity) {
-    console.log('entry_liquidity_gate', { symbol: asset.symbol, spreadBps, weakLiquidity, reason: 'weak_liquidity' });
-    return {
-      entryReady: false,
-      why: 'entry_liquidity_gate',
-      meta: { symbol: asset.symbol, spreadBps, weakLiquidity, reason: 'weak_liquidity' },
-      record: baseRecord,
-    };
-  }
-
   if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
     logEntrySkip({ symbol: asset.symbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
     return {
@@ -1729,11 +1796,95 @@ async function computeEntrySignal(symbol, opts = {}) {
   });
   console.log('entry_edge_gate', {
     symbol: asset.symbol,
+    symbolTier,
     spreadBps,
     requiredEdgeBps,
     grossEdgeBps: edge.grossEdgeBps,
     netEdgeBps: edge.netEdgeBps,
   });
+
+  const marketDataEval = evaluateEntryMarketData({
+    symbol: asset.symbol,
+    symbolTier,
+    spreadBps,
+    quoteAgeMs,
+    requiredEdgeBps,
+    netEdgeBps: edge.netEdgeBps,
+    predictorProbability: predictorTp?.probability ?? null,
+    weakLiquidity,
+    orderbookMeta,
+    policy: getEntryMarketDataPolicy(),
+  });
+  console.log('entry_marketdata_eval', {
+    symbol: asset.symbol,
+    symbolTier,
+    executionMode: marketDataEval.executionMode,
+    dataQualityState: marketDataEval.dataQualityState,
+    spreadState: marketDataEval.spreadState,
+    liquidityState: marketDataEval.liquidityState,
+    depthState: marketDataEval.depthState,
+    bidDepthUsd: orderbookMeta.bidDepthUsd,
+    askDepthUsd: orderbookMeta.askDepthUsd,
+    actualDepthUsd: orderbookMeta.actualDepthUsd,
+    impactBps: orderbookMeta.impactBpsBuy,
+    spreadBps,
+    probability: predictorTp?.probability ?? null,
+    confidenceCap: marketDataEval.confidenceMultiplierCap,
+    reason: marketDataEval.reason,
+  });
+  if (marketDataEval.dataQualityState !== 'ok') {
+    if (marketDataEval.depthState === 'orderbook_sparse') {
+      console.log('entry_sparse_fallback_reject', {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        probability: predictorTp?.probability ?? null,
+        netEdgeBps: edge.netEdgeBps,
+        reason: marketDataEval.reason,
+      });
+    }
+    console.log('entry_data_quality_gate', {
+      symbol: asset.symbol,
+      symbolTier,
+      executionMode: marketDataEval.executionMode,
+      reason: marketDataEval.reason,
+      depthState: marketDataEval.depthState,
+    });
+    return {
+      entryReady: false,
+      why: marketDataEval.reason || 'data_quality_bad',
+      meta: { symbol: asset.symbol, symbolTier, spreadBps, quoteAgeMs, ...orderbookMeta, marketDataEval },
+      record: baseRecord,
+    };
+  }
+  if (!marketDataEval.finalEntryDataEligible) {
+    console.log('entry_liquidity_gate', {
+      symbol: asset.symbol,
+      symbolTier,
+      executionMode: marketDataEval.executionMode,
+      spreadBps,
+      weakLiquidity,
+      reason: marketDataEval.reason || 'entry_liquidity_gate',
+    });
+    return {
+      entryReady: false,
+      why: marketDataEval.reason || 'entry_liquidity_gate',
+      meta: { symbol: asset.symbol, symbolTier, spreadBps, weakLiquidity, ...orderbookMeta, marketDataEval },
+      record: baseRecord,
+    };
+  }
+
+  if (marketDataEval.executionMode === 'sparse_fallback') {
+    console.log('entry_sparse_fallback_accept', {
+      symbol: asset.symbol,
+      symbolTier,
+      spreadBps,
+      probability: predictorTp?.probability ?? null,
+      netEdgeBps: edge.netEdgeBps,
+      confidenceCap: marketDataEval.confidenceMultiplierCap,
+    });
+  }
+
   if (edge.netEdgeBps < requiredEdgeBps) {
     return {
       entryReady: false,
@@ -1761,11 +1912,15 @@ async function computeEntrySignal(symbol, opts = {}) {
   const confidenceMultiplier = CONFIDENCE_SIZING_ENABLED
     ? clamp(CONFIDENCE_MIN_MULTIPLIER + ((CONFIDENCE_MAX_MULTIPLIER - CONFIDENCE_MIN_MULTIPLIER) * confidence.confidenceScore), CONFIDENCE_MIN_MULTIPLIER, CONFIDENCE_MAX_MULTIPLIER)
     : 1;
+  const confidenceMultiplierCapped = Math.min(confidenceMultiplier, marketDataEval?.confidenceMultiplierCap ?? 1);
 
   console.log('entry_confidence_sizing', {
     symbol: asset.symbol,
+    symbolTier,
+    executionMode: marketDataEval.executionMode,
     confidenceScore: confidence.confidenceScore,
     confidenceMultiplier,
+    confidenceMultiplierCapped,
     components: confidence.components,
   });
 
@@ -1901,8 +2056,11 @@ async function computeEntrySignal(symbol, opts = {}) {
       orderbookAbsorption: orderbookAbsorptionMeta,
       momentumState,
       regimeDecision,
+      symbolTier,
+      executionMode: marketDataEval.executionMode,
+      marketDataEval,
       edge,
-      confidence: { ...confidence, confidenceMultiplier },
+      confidence: { ...confidence, confidenceMultiplier: confidenceMultiplierCapped },
     },
     record: baseRecord,
   };
@@ -5512,14 +5670,15 @@ async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   return withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') }), `ORDERBOOK:${location}:${dataSymbols.join(',')}`);
 }
 
-async function getLatestOrderbook(symbol, { maxAgeMs }) {
+async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}) {
   const now = Date.now();
   const passCached = orderbookPassCache.get(symbol);
-  if (passCached?.passId === marketDataPassId && passCached?.orderbook) {
+  if (!bypassCache && passCached?.passId === marketDataPassId && passCached?.orderbook) {
     return { ok: true, orderbook: passCached.orderbook, source: 'pass_cache' };
   }
   const cached = orderbookCache.get(symbol);
   if (
+    !bypassCache &&
     cached &&
     Number.isFinite(cached.receivedAtMs) &&
     (now - cached.receivedAtMs) <= Math.max(250, maxAgeMs)
@@ -5543,7 +5702,14 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     try {
       resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
     } catch (err) {
-      const reason = err?.errorType === 'timeout' ? 'ob_timeout' : err?.errorType === 'network_error' ? 'ob_network_error' : 'ob_http_empty';
+      const statusCode = Number(err?.statusCode);
+      const reason = statusCode === 429
+        ? 'orderbook_rate_limited'
+        : err?.errorType === 'timeout'
+          ? 'ob_timeout'
+          : err?.errorType === 'network_error'
+            ? 'ob_network_error'
+            : 'ob_http_empty';
       lastFailure = {
         reason,
         details: {
@@ -5551,7 +5717,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
           attempt,
           error: err?.message || String(err),
           requestId: err?.requestId || null,
-          statusCode: err?.statusCode ?? null,
+          statusCode: statusCode || null,
           rawTsCandidates: null,
           bookKeys: [],
         },
