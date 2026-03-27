@@ -9,7 +9,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { theme } from './src/theme';
 import PortfolioHero from './src/components/PortfolioHero';
 import HeldPositionsHeroChart from './src/components/HeldPositionsHeroChart';
@@ -115,7 +114,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={[theme.colors.bg, theme.colors.bgAlt]} style={styles.screen}>
+      <View style={styles.screen}>
         <FlatList
           data={positions}
           numColumns={2}
@@ -169,14 +168,14 @@ export default function App() {
             );
           }}
         />
-      </LinearGradient>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
-  screen: { flex: 1 },
+  screen: { flex: 1, backgroundColor: theme.colors.bg },
   content: { padding: theme.spacing.md, paddingBottom: 120 },
   gridRow: {
     justifyContent: 'space-between',

@@ -1,6 +1,5 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { theme } from '../theme';
 import { toFiniteNumber } from '../utils/chartUtils';
 
@@ -20,12 +19,7 @@ export default function PortfolioHero({ portfolioValue, dayChangePct, buyingPowe
   const positive = (toFiniteNumber(dayChangePct) || 0) >= 0;
 
   return (
-    <LinearGradient
-      colors={['rgba(155,108,255,0.28)', 'rgba(83,216,255,0.12)', 'rgba(255,141,189,0.08)']}
-      start={{ x: 0, y: 0 }}
-      end={{ x: 1, y: 1 }}
-      style={styles.card}
-    >
+    <View style={styles.card}>
       <Text style={styles.eyebrow}>Magic Portfolio</Text>
       <Text style={styles.balance}>{usd(portfolioValue)}</Text>
 
@@ -47,12 +41,13 @@ export default function PortfolioHero({ portfolioValue, dayChangePct, buyingPowe
         <View style={[styles.statusDot, { backgroundColor: hasError ? theme.colors.negative : theme.colors.positive }]} />
         <Text style={styles.statusText}>{hasError ? 'Connection degraded' : 'Live polling active'}</Text>
       </View>
-    </LinearGradient>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
+    backgroundColor: 'rgba(155,108,255,0.18)',
     borderRadius: theme.radius.xl,
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.2)',

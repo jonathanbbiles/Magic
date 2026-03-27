@@ -1,6 +1,5 @@
 import React, { useMemo } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import Svg, { Line, Path } from 'react-native-svg';
 import { theme } from '../theme';
 import SegmentedPills from './SegmentedPills';
@@ -74,15 +73,15 @@ export default function HeldPositionsHeroChart({
 
   if (!Array.isArray(positions) || positions.length === 0) {
     return (
-      <LinearGradient colors={['rgba(83,216,255,0.12)', 'rgba(155,108,255,0.1)']} style={styles.card}>
+      <View style={[styles.card, styles.cardEmpty]}>
         <Text style={styles.title}>Held Positions Live</Text>
         <Text style={styles.empty}>No held positions yet.</Text>
-      </LinearGradient>
+      </View>
     );
   }
 
   return (
-    <LinearGradient colors={['rgba(83,216,255,0.14)', 'rgba(155,108,255,0.12)']} style={styles.card}>
+    <View style={[styles.card, styles.cardDefault]}>
       <View style={styles.headerRow}>
         <Text style={styles.title}>Held Positions Live</Text>
         <SegmentedPills
@@ -152,7 +151,7 @@ export default function HeldPositionsHeroChart({
           </View>
         ))}
       </View>
-    </LinearGradient>
+    </View>
   );
 }
 
@@ -163,6 +162,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.16)',
     padding: 14,
+  },
+  cardDefault: {
+    backgroundColor: 'rgba(83,216,255,0.14)',
+  },
+  cardEmpty: {
+    backgroundColor: 'rgba(83,216,255,0.12)',
   },
   headerRow: {
     flexDirection: 'row',
