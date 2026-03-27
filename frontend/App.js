@@ -1,7 +1,19 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { SafeAreaView, StatusBar, StyleSheet } from 'react-native';
-import DashboardScreen from './screens/DashboardScreen';
+import {
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  ActivityIndicator,
+  FlatList,
+  RefreshControl,
+  Text,
+  View,
+} from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
 import { theme } from './src/theme';
+import PortfolioHero from './src/components/PortfolioHero';
+import HeldPositionsHeroChart from './src/components/HeldPositionsHeroChart';
+import PositionVisualCard from './src/components/PositionVisualCard';
 import {
   DEFAULT_RANGE_MS,
   extractBuyingPower,
@@ -9,16 +21,11 @@ import {
   extractPortfolioValue,
   extractUnrealizedPl,
   toFiniteNumber,
+  extractSymbol,
+  RANGE_OPTIONS,
 } from './src/utils/chartUtils';
 import { updatePositionHistory } from './src/utils/positionHistory';
-import {
-  AUTO_TUNE_SWEEP_INTERVAL_MS,
-  EXIT_MANAGER_INTERVAL_MS,
-  HOLDINGS_POLL_INTERVAL_MS,
-  LOG_UI_FLUSH_INTERVAL_MS,
-  SUPPORTED_CRYPTO_REFRESH_MS,
-} from './src/config/polling';
-
+import { EXIT_MANAGER_INTERVAL_MS } from './src/config/polling';
 
 const POLL_MS = EXIT_MANAGER_INTERVAL_MS;
 
@@ -108,27 +115,94 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <DashboardScreen
-        positions={positions}
-        dashboard={dashboard}
-        historyBySymbol={historyBySymbol}
-        selectedRangeMs={selectedRangeMs}
-        onSelectRange={setSelectedRangeMs}
-        chartMode={chartMode}
-        onChartMode={setChartMode}
-        tickNowMs={tickNowMs}
-        loading={loading}
-        refreshing={refreshing}
-        onRefresh={() => load({ isRefresh: true })}
-        error={error}
-        portfolioValue={portfolioValue}
-        dayChangePct={dayChangePct}
-        buyingPower={buyingPower}
-      />
+      <LinearGradient colors={[theme.colors.bg, theme.colors.bgAlt]} style={styles.screen}>
+        <FlatList
+          data={positions}
+          numColumns={2}
+          columnWrapperStyle={styles.gridRow}
+          keyExtractor={(item, idx) => `${extractSymbol(item) || 'unknown'}-${idx}`}
+          contentContainerStyle={styles.content}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />}
+          ListHeaderComponent={
+            <View>
+              <PortfolioHero
+                portfolioValue={portfolioValue}
+                dayChangePct={dayChangePct}
+                buyingPower={buyingPower}
+                hasError={Boolean(error)}
+              />
+
+              <HeldPositionsHeroChart
+                positions={positions}
+                historyBySymbol={historyBySymbol}
+                rangeOptions={RANGE_OPTIONS}
+                selectedRange={selectedRangeMs}
+                onSelectRange={setSelectedRangeMs}
+                mode={chartMode}
+                onModeChange={setChartMode}
+                nowMs={tickNowMs}
+              />
+
+              {error ? (
+                <View style={styles.errorBanner}>
+                  <Text style={styles.errorText}>{error}</Text>
+                </View>
+              ) : null}
+
+              {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
+              {!loading && positions.length === 0 ? <Text style={styles.empty}>No active positions.</Text> : null}
+
+              <Text style={styles.sectionTitle}>Positions</Text>
+            </View>
+          }
+          renderItem={({ item, index }) => {
+            const symbol = extractSymbol(item);
+            const historyPoints = historyBySymbol?.[symbol]?.points || [];
+            return (
+              <PositionVisualCard
+                position={item}
+                historyPoints={historyPoints}
+                rangeMs={selectedRangeMs}
+                nowMs={tickNowMs}
+                index={index}
+              />
+            );
+          }}
+        />
+      </LinearGradient>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
+  screen: { flex: 1 },
+  content: { padding: theme.spacing.md, paddingBottom: 120 },
+  gridRow: {
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  sectionTitle: {
+    marginTop: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
+    color: theme.colors.text,
+    fontSize: 18,
+    fontWeight: '900',
+  },
+  errorBanner: {
+    marginTop: theme.spacing.md,
+    backgroundColor: theme.colors.errorBg,
+    borderColor: '#8A2A3C',
+    borderWidth: 1,
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.sm,
+  },
+  errorText: { color: theme.colors.errorText, fontWeight: '900' },
+  loader: { marginVertical: theme.spacing.md },
+  empty: {
+    color: theme.colors.muted,
+    marginTop: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+    fontWeight: '800',
+  },
 });
