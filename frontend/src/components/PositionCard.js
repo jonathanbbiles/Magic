@@ -1,6 +1,5 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { theme } from '../theme';
 
 function num(value) {
@@ -48,7 +47,7 @@ export default function PositionCard({ position }) {
   const pnlPositive = (upnl || 0) >= 0;
 
   return (
-    <LinearGradient colors={[theme.colors.cardAlt, theme.colors.card]} style={styles.card}>
+    <View style={styles.card}>
       <View style={styles.headerRow}>
         <Text style={styles.symbol}>{position?.symbol || '—'}</Text>
         <Text style={styles.qty}>Qty {position?.qty ?? '—'}</Text>
@@ -81,7 +80,7 @@ export default function PositionCard({ position }) {
         <Stat label="Age" value={ageLabel(position?.heldSeconds)} playful="⏳" />
         <Stat label="Sell Source" value={position?.sell?.source || '—'} />
       </View>
-    </LinearGradient>
+    </View>
   );
 }
 
@@ -98,6 +97,7 @@ function Stat({ label, value, valueStyle, playful }) {
 
 const styles = StyleSheet.create({
   card: {
+    backgroundColor: theme.colors.cardAlt,
     borderRadius: theme.radius.lg,
     padding: theme.spacing.md,
     marginBottom: theme.spacing.md,

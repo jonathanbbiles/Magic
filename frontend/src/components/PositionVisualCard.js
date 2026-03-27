@@ -1,6 +1,5 @@
 import React, { useMemo } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import Sparkline from './Sparkline';
 import { theme } from '../theme';
 import {
@@ -12,11 +11,11 @@ import {
   toFiniteNumber,
 } from '../utils/chartUtils';
 
-const CARD_GRADIENTS = [
-  ['rgba(155,108,255,0.26)', 'rgba(83,216,255,0.12)'],
-  ['rgba(123,255,216,0.22)', 'rgba(83,216,255,0.08)'],
-  ['rgba(255,192,138,0.22)', 'rgba(255,141,189,0.08)'],
-  ['rgba(255,141,189,0.2)', 'rgba(155,108,255,0.1)'],
+const CARD_BACKGROUNDS = [
+  'rgba(155,108,255,0.26)',
+  'rgba(123,255,216,0.22)',
+  'rgba(255,192,138,0.22)',
+  'rgba(255,141,189,0.2)',
 ];
 
 function signedUsd(v) {
@@ -40,10 +39,10 @@ export default function PositionVisualCard({ position, historyPoints, rangeMs, n
 
   const positive = relativeMove >= 0;
   const color = positive ? theme.colors.accentMint : theme.colors.accentBlush;
-  const gradients = CARD_GRADIENTS[index % CARD_GRADIENTS.length];
+  const backgroundColor = CARD_BACKGROUNDS[index % CARD_BACKGROUNDS.length];
 
   return (
-    <LinearGradient colors={gradients} style={styles.card}>
+    <View style={[styles.card, { backgroundColor }]}>
       <View style={styles.topRow}>
         <Text style={styles.symbol}>{symbol}</Text>
         <Text style={[styles.badge, { color }]}>{`${relativeMove >= 0 ? '+' : ''}${relativeMove.toFixed(2)}%`}</Text>
@@ -53,7 +52,7 @@ export default function PositionVisualCard({ position, historyPoints, rangeMs, n
       <Sparkline points={historyPoints} rangeMs={rangeMs} nowMs={nowMs} mode="raw" showDelta={false} />
 
       <Text style={styles.secondary}>P/L {signedUsd(upl)}</Text>
-    </LinearGradient>
+    </View>
   );
 }
 
