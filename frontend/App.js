@@ -24,6 +24,12 @@ import {
   toFiniteNumber,
 } from './src/utils/chartUtils';
 
+const SUPPORTED_CRYPTO_REFRESH_MS = 24 * 60 * 60 * 1000;
+const HOLDINGS_POLL_INTERVAL_MS = 4000;
+const EXIT_MANAGER_INTERVAL_MS = 20000;
+const AUTO_TUNE_SWEEP_INTERVAL_MS = 15000;
+const LOG_UI_FLUSH_INTERVAL_MS = 350;
+
 const POLL_MS = 20000;
 
 const BASE_URL =
