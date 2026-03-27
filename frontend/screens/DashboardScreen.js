@@ -8,11 +8,11 @@ import {
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
-import PortfolioHero from '../src/components/PortfolioHero';
-import HeldPositionsHeroChart from '../src/components/HeldPositionsHeroChart';
-import PositionVisualCard from '../src/components/PositionVisualCard';
-import { theme } from '../src/theme';
-import { extractSymbol, RANGE_OPTIONS } from '../src/utils/chartUtils';
+import PortfolioHero from '../src/components/PortfolioHero.js';
+import HeldPositionsHeroChart from '../src/components/HeldPositionsHeroChart.js';
+import PositionVisualCard from '../src/components/PositionVisualCard.js';
+import { theme } from '../src/theme.js';
+import { extractSymbol, RANGE_OPTIONS } from '../src/utils/chartUtils.js';
 
 export default function DashboardScreen({
   positions,
