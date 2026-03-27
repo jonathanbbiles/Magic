@@ -5453,8 +5453,8 @@ function computeExitSellability({
     availableQty = brokerAvailableQty;
     sellabilitySource = 'broker_available';
   } else if (inferredAvailableQty > 0) {
-    sellabilitySource = 'blocked_broker_unavailable';
-    blockedReason = 'awaiting_broker_sellable_qty';
+    availableQty = inferredAvailableQty;
+    sellabilitySource = qty.hasAvailableQtyField ? 'inferred_from_total_qty' : 'inferred_from_position_qty';
   } else {
     blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
   }
@@ -5474,6 +5474,78 @@ function computeExitSellability({
     sellabilitySource,
     blockedReason,
   };
+}
+
+async function resolveExitSellabilityFromBrokerTruth({
+  symbol,
+  openOrders = null,
+  maxAttempts = 3,
+  retryMs = 400,
+}) {
+  const canonicalSymbol = normalizePair(symbol);
+  let currentOpenOrders = Array.isArray(openOrders) ? openOrders : null;
+  let finalSellability = computeExitSellability({ symbol: canonicalSymbol, position: null, openOrders: [] });
+
+  for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt += 1) {
+    if (!currentOpenOrders) {
+      currentOpenOrders = await fetchLiveOrders({ force: true });
+    }
+
+    let brokerPosition = null;
+    try {
+      const snapshot = await fetchPositionsSnapshot();
+      brokerPosition = findPositionInSnapshot(snapshot, canonicalSymbol)?.position || null;
+      if (!brokerPosition) {
+        brokerPosition = await fetchPosition(canonicalSymbol);
+      }
+    } catch (err) {
+      brokerPosition = null;
+    }
+
+    const openList = Array.isArray(currentOpenOrders) ? currentOpenOrders : [];
+    finalSellability = computeExitSellability({
+      symbol: canonicalSymbol,
+      position: brokerPosition,
+      openOrders: openList,
+    });
+
+    console.log('broker_truth_position_found', {
+      symbol: canonicalSymbol,
+      attempt,
+      brokerPositionQty: finalSellability.totalPositionQty,
+      brokerAvailableQty: finalSellability.brokerAvailableQty,
+      openSellQty: finalSellability.openSellQty,
+      openSellCount: finalSellability.openSellCount,
+    });
+    console.log('broker_truth_open_sell_found', {
+      symbol: canonicalSymbol,
+      attempt,
+      openSellCount: finalSellability.openSellCount,
+      openSellQty: finalSellability.openSellQty,
+      brokerPositionQty: finalSellability.totalPositionQty,
+    });
+
+    if (finalSellability.openSellCount > 0 || finalSellability.availableQty > 0 || finalSellability.totalPositionQty <= 0) {
+      break;
+    }
+
+    if (attempt < maxAttempts) {
+      currentOpenOrders = await fetchLiveOrders({ force: true });
+      await sleep(retryMs);
+    }
+  }
+
+  console.log('sellability_resolved', {
+    symbol: canonicalSymbol,
+    brokerPositionQty: finalSellability.totalPositionQty,
+    brokerAvailableQty: finalSellability.brokerAvailableQty,
+    openSellQty: finalSellability.openSellQty,
+    reservedQty: finalSellability.reservedQty,
+    finalSellableQty: finalSellability.availableQty,
+    blockedReason: finalSellability.blockedReason,
+  });
+
+  return finalSellability;
 }
 
 function orderHasValidLimit(order) {
@@ -6733,13 +6805,6 @@ async function submitLimitSell({
   const open = openOrders || (await fetchLiveOrders({ force: true }));
   const openList = Array.isArray(open) ? open : [];
   const normalizedSymbol = normalizePair(symbol);
-  let position = null;
-  try {
-    const snapshot = await fetchPositionsSnapshot();
-    position = findPositionInSnapshot(snapshot, normalizedSymbol)?.position || null;
-  } catch (err) {
-    position = null;
-  }
 
   const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
   const openSellOrders = getOpenSellOrdersForSymbol(openList, normalizedSymbol);
@@ -6760,10 +6825,10 @@ async function submitLimitSell({
 
     return true;
   });
-  const sellability = computeExitSellability({
+  const sellability = await resolveExitSellabilityFromBrokerTruth({
     symbol: normalizedSymbol,
-    position,
     openOrders: openList,
+    maxAttempts: 1,
   });
   console.log('exit_sellability_check', {
     symbol,
@@ -6780,16 +6845,6 @@ async function submitLimitSell({
     blockedReason: sellability.blockedReason,
     pendingExitAttach: hasPendingExitAttach(normalizedSymbol),
   });
-  console.log('exit_sellability_inferred_fallback', {
-    symbol,
-    canonicalSymbol: normalizedSymbol,
-    totalPositionQty: sellability.totalPositionQty,
-    brokerAvailableQty: sellability.brokerAvailableQty,
-    reservedQty: sellability.reservedQty,
-    openSellCount: sellability.openSellCount,
-    inferredAvailableQty: sellability.inferredAvailableQty,
-    sellabilitySource: 'inferred_for_diagnostics_only',
-  });
   if (sellability.openSellCount > 0) {
     console.log('open_sell_qty_reserved', {
       symbol,
@@ -6799,45 +6854,12 @@ async function submitLimitSell({
     });
   }
   const qtyNum = Number(qty);
-  let brokerRecheckSellability = sellability;
-  try {
-    const refreshedPosition = await fetchPosition(normalizedSymbol);
-    brokerRecheckSellability = computeExitSellability({
-      symbol: normalizedSymbol,
-      position: refreshedPosition || null,
-      openOrders: openList,
-    });
-    console.log('exit_sellability_recheck', {
-      symbol,
-      canonicalSymbol: normalizedSymbol,
-      totalPositionQty: brokerRecheckSellability.totalPositionQty,
-      brokerAvailableQty: brokerRecheckSellability.brokerAvailableQty,
-      reservedQty: brokerRecheckSellability.reservedQty,
-      openSellCount: brokerRecheckSellability.openSellCount,
-      inferredAvailableQty: brokerRecheckSellability.inferredAvailableQty,
-      availableQty: brokerRecheckSellability.availableQty,
-      sellabilitySource: brokerRecheckSellability.sellabilitySource,
-      blockedReason: brokerRecheckSellability.blockedReason,
-      recheckSource: 'positions_single',
-    });
-  } catch (err) {
-    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
-    if (statusCode === 404) {
-      brokerRecheckSellability = computeExitSellability({
-        symbol: normalizedSymbol,
-        position: null,
-        openOrders: openList,
-      });
-    } else {
-      console.warn('exit_sellability_recheck_failed', {
-        symbol,
-        canonicalSymbol: normalizedSymbol,
-        statusCode,
-        error: err?.errorMessage || err?.message || String(err),
-      });
-      return { skipped: true, reason: 'awaiting_broker_sellable_qty' };
-    }
-  }
+  const brokerRecheckSellability = await resolveExitSellabilityFromBrokerTruth({
+    symbol: normalizedSymbol,
+    openOrders: null,
+    maxAttempts: 3,
+    retryMs: 500,
+  });
   const baseAvailableQty = Number.isFinite(availableQtyOverride) && availableQtyOverride >= 0
     ? Math.min(availableQtyOverride, brokerRecheckSellability.availableQty)
     : brokerRecheckSellability.availableQty;
@@ -6881,8 +6903,8 @@ async function submitLimitSell({
     };
   }
   if (!(availableQty > 0)) {
-    const deferReason = brokerRecheckSellability.blockedReason === 'awaiting_broker_sellable_qty'
-      ? 'awaiting_broker_sellable_qty'
+    const deferReason = brokerRecheckSellability.blockedReason === 'no_position_qty'
+      ? 'no_position_qty'
       : 'qty_reserved_or_unavailable';
     console.log('tp_attach_deferred', {
       symbol,
@@ -6898,6 +6920,7 @@ async function submitLimitSell({
       inferredAvailableQty: brokerRecheckSellability.inferredAvailableQty,
       sellabilitySource: brokerRecheckSellability.sellabilitySource,
       blockedReason: brokerRecheckSellability.blockedReason,
+      symbolBlockedForEntry: brokerRecheckSellability.totalPositionQty > 0 || brokerRecheckSellability.openSellCount > 0,
     });
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
     return {
@@ -6998,6 +7021,16 @@ async function submitLimitSell({
   }
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice: roundedLimit, reason, orderId: response?.id });
+  console.log('tp_attach_submitted', {
+    symbol,
+    canonicalSymbol: normalizedSymbol,
+    brokerPositionQty: brokerRecheckSellability.totalPositionQty,
+    brokerAvailableQty: brokerRecheckSellability.brokerAvailableQty,
+    openSellQty: brokerRecheckSellability.openSellQty,
+    reservedQty: brokerRecheckSellability.reservedQty,
+    finalSellableQty: availableQty,
+    symbolBlockedForEntry: true,
+  });
 
   const responseStatus = String(response?.status || response?.order_status || '').toLowerCase();
   if (responseStatus === 'rejected' || responseStatus === 'canceled' || responseStatus === 'cancelled') {
@@ -8439,7 +8472,8 @@ async function manageExitStates() {
         continue;
       }
 
-      const missingCount = missingCountBefore;
+      const missingCount = missingCountBefore + 1;
+      positionMissingCountBySymbol.set(normalizedSymbol, missingCount);
       const millisSinceConfirmed = getExitStateReferenceMs(normalizedSymbol, now);
 
       const canDrop =
@@ -8480,6 +8514,25 @@ async function manageExitStates() {
           openSell: hasMatchingOpenSell,
           pending: pendingExitAttach,
         });
+      console.log('manual_sell_detected', {
+        symbol: normalizedSymbol,
+        brokerPositionQty: 0,
+        brokerAvailableQty: 0,
+        openSellQty: 0,
+        reservedQty: 0,
+        finalSellableQty: 0,
+        symbolBlockedForEntry: false,
+      });
+      console.log('stale_state_cleared', {
+        symbol: normalizedSymbol,
+        reason: 'not_in_broker_positions',
+        missingCount,
+        symbolBlockedForEntry: false,
+      });
+      console.log('symbol_unblocked_for_entry', {
+        symbol: normalizedSymbol,
+        reason: 'broker_exposure_gone',
+      });
 
       clearExitTracking(normalizedSymbol, {
         reason: 'not_in_broker_positions',
@@ -8828,6 +8881,25 @@ async function manageExitStates() {
                 msSinceRef: millisSinceConfirmed,
                 openSell: hasMatchingOpenSell,
                 pending: pendingExitAttach,
+              });
+              console.log('manual_sell_detected', {
+                symbol: canonicalSymbol,
+                brokerPositionQty: 0,
+                brokerAvailableQty: 0,
+                openSellQty: 0,
+                reservedQty: 0,
+                finalSellableQty: 0,
+                symbolBlockedForEntry: false,
+              });
+              console.log('stale_state_cleared', {
+                symbol: canonicalSymbol,
+                reason: 'alpaca_position_missing_or_zero',
+                missingCount,
+                symbolBlockedForEntry: false,
+              });
+              console.log('symbol_unblocked_for_entry', {
+                symbol: canonicalSymbol,
+                reason: 'broker_exposure_gone',
               });
 
               clearExitTracking(canonicalSymbol, {
@@ -10908,13 +10980,11 @@ async function runEntryScanOnce() {
       if (SIMPLE_SCALPER_ENABLED && isTerminalOrderStatus(order?.status)) return;
       const orderSymbol = normalizeSymbol(order.symbol || order.rawSymbol || '');
       if (!orderSymbol) return;
-      if (SIMPLE_SCALPER_ENABLED) {
+      const side = String(order.side || '').toLowerCase();
+      if (side === 'buy') {
         openBuySymbols.add(orderSymbol);
         return;
       }
-      const side = String(order.side || '').toLowerCase();
-      if (side !== 'buy') return;
-      openBuySymbols.add(orderSymbol);
     });
     if (!capEnabled) {
       console.log('max_concurrent_positions_disabled', { env: MAX_CONCURRENT_POSITIONS });
@@ -10991,6 +11061,16 @@ async function runEntryScanOnce() {
       if (heldSymbols.has(symbol)) {
         skipped += 1;
         recordSkip('held_position', symbol, null);
+        console.log('entry_block_reason', {
+          symbol,
+          reason: 'held_position',
+          brokerPositionQty: 'present',
+          brokerAvailableQty: null,
+          openSellQty: null,
+          reservedQty: null,
+          finalSellableQty: null,
+          symbolBlockedForEntry: true,
+        });
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, 'held_position');
         }
@@ -11000,6 +11080,16 @@ async function runEntryScanOnce() {
         skipped += 1;
         const reason = SIMPLE_SCALPER_ENABLED ? 'open_order' : 'open_buy';
         recordSkip(reason, symbol, null);
+        console.log('entry_block_reason', {
+          symbol,
+          reason,
+          brokerPositionQty: 0,
+          brokerAvailableQty: null,
+          openSellQty: 0,
+          reservedQty: 0,
+          finalSellableQty: 0,
+          symbolBlockedForEntry: true,
+        });
         if (SIMPLE_SCALPER_ENABLED) {
           logSimpleScalperSkip(symbol, 'open_order');
         }

@@ -216,10 +216,10 @@ const inferredSellability = computeExitSellability({
   position: { symbol: 'DOTUSD', qty: '10' },
   openOrders: [],
 });
-assert.equal(inferredSellability.availableQty, 0);
+assert.equal(inferredSellability.availableQty, 10);
 assert.equal(inferredSellability.reservedQty, 0);
-assert.equal(inferredSellability.sellabilitySource, 'blocked_broker_unavailable');
-assert.equal(inferredSellability.blockedReason, 'awaiting_broker_sellable_qty');
+assert.equal(inferredSellability.sellabilitySource, 'inferred_from_position_qty');
+assert.equal(inferredSellability.blockedReason, null);
 
 const fallbackSellability = computeExitSellability({
   symbol: 'AVAX/USD',
@@ -230,9 +230,9 @@ assert.equal(fallbackSellability.openSellCount, 0);
 assert.equal(fallbackSellability.reservedQty, 0);
 assert.equal(fallbackSellability.brokerAvailableQty, 0);
 assert.equal(fallbackSellability.inferredAvailableQty, 4.25);
-assert.equal(fallbackSellability.availableQty, 0);
-assert.equal(fallbackSellability.sellabilitySource, 'blocked_broker_unavailable');
-assert.equal(fallbackSellability.blockedReason, 'awaiting_broker_sellable_qty');
+assert.equal(fallbackSellability.availableQty, 4.25);
+assert.equal(fallbackSellability.sellabilitySource, 'inferred_from_total_qty');
+assert.equal(fallbackSellability.blockedReason, null);
 
 const zeroQtySellability = computeExitSellability({
   symbol: 'ETH/USD',
@@ -283,8 +283,9 @@ assert.match(tradeSource, /logEntrySkip\(\{[\s\S]*symbolTier,[\s\S]*reason: 'vol
 assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orderbookMeta\.depthState,[\s\S]*bidDepthUsd: orderbookMeta\.bidDepthUsd,[\s\S]*askDepthUsd: orderbookMeta\.askDepthUsd,[\s\S]*actualDepthUsd: orderbookMeta\.actualDepthUsd,[\s\S]*orderbookLevelCounts: orderbookMeta\.orderbookLevelCounts,/);
 assert.match(tradeSource, /actionTaken = 'defer_no_sellable_qty';/);
 assert.match(tradeSource, /sellabilitySource: sellability\.sellabilitySource,/);
-assert.match(tradeSource, /reason: 'awaiting_broker_sellable_qty'/);
-assert.match(tradeSource, /sellabilitySource: 'inferred_for_diagnostics_only'/);
+assert.match(tradeSource, /console\.log\('sellability_resolved',/);
+assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);
+assert.match(tradeSource, /console\.log\('tp_attach_submitted',/);
 assert.match(tradeSource, /console\.log\('entry_universe_selection', \{/);
 const attachStart = tradeSource.indexOf('async function attachInitialExitLimit');
 const attachEnd = tradeSource.indexOf('async function handleBuyFill');
