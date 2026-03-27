@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, StatusBar, StyleSheet } from 'react-native';
-import DashboardScreen from './screens/DashboardScreen';
-import { theme } from './src/theme';
+import DashboardScreen from './screens/DashboardScreen.js';
+import { theme } from './src/theme.js';
 import {
   DEFAULT_RANGE_MS,
   extractBuyingPower,
@@ -9,15 +9,15 @@ import {
   extractPortfolioValue,
   extractUnrealizedPl,
   toFiniteNumber,
-} from './src/utils/chartUtils';
-import { updatePositionHistory } from './src/utils/positionHistory';
+} from './src/utils/chartUtils.js';
+import { updatePositionHistory } from './src/utils/positionHistory.js';
 import {
   AUTO_TUNE_SWEEP_INTERVAL_MS,
   EXIT_MANAGER_INTERVAL_MS,
   HOLDINGS_POLL_INTERVAL_MS,
   LOG_UI_FLUSH_INTERVAL_MS,
   SUPPORTED_CRYPTO_REFRESH_MS,
-} from './src/config/polling';
+} from './src/config/polling.js';
 
 
 const POLL_MS = EXIT_MANAGER_INTERVAL_MS;
