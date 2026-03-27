@@ -30,6 +30,13 @@ export function safePercentChange(first, last) {
   return ((last - first) / first) * 100;
 }
 
+export function sanitizePoint(point) {
+  const ts = toFiniteNumber(point?.ts);
+  const price = toFiniteNumber(point?.price);
+  if (!Number.isFinite(ts) || !Number.isFinite(price)) return null;
+  return { ts, price };
+}
+
 export function extractSymbol(position) {
   const raw =
     position?.symbol ??
@@ -67,11 +74,48 @@ export function extractUnrealizedPl(position) {
   );
 }
 
-function sanitizePoint(point) {
-  const ts = toFiniteNumber(point?.ts);
-  const price = toFiniteNumber(point?.price);
-  if (!Number.isFinite(ts) || !Number.isFinite(price)) return null;
-  return { ts, price };
+export function extractPositionValue(position) {
+  return (
+    toFiniteNumber(position?.market_value) ??
+    toFiniteNumber(position?.position_value) ??
+    toFiniteNumber(position?.value)
+  );
+}
+
+export function extractPortfolioValue(payload) {
+  const account = payload?.account || {};
+  return (
+    toFiniteNumber(account?.portfolio_value) ??
+    toFiniteNumber(account?.equity) ??
+    toFiniteNumber(payload?.portfolio_value)
+  );
+}
+
+export function extractBuyingPower(payload) {
+  const account = payload?.account || {};
+  return toFiniteNumber(account?.buying_power) ?? toFiniteNumber(account?.buyingPower);
+}
+
+export function extractDayChangePct(payload, positions = []) {
+  const direct =
+    toFiniteNumber(payload?.meta?.dailyChangePct) ??
+    toFiniteNumber(payload?.meta?.dayChangePct) ??
+    toFiniteNumber(payload?.meta?.weeklyChangePct);
+  if (Number.isFinite(direct)) return direct;
+
+  const totalValue = positions.reduce((sum, position) => {
+    const val = extractPositionValue(position);
+    if (Number.isFinite(val)) return sum + val;
+
+    const price = extractCurrentPrice(position);
+    const qty = toFiniteNumber(position?.qty);
+    if (Number.isFinite(price) && Number.isFinite(qty)) return sum + price * qty;
+    return sum;
+  }, 0);
+
+  const totalUpl = positions.reduce((sum, position) => sum + (extractUnrealizedPl(position) || 0), 0);
+  if (!Number.isFinite(totalValue) || totalValue <= 0) return 0;
+  return (totalUpl / totalValue) * 100;
 }
 
 export function appendSnapshotToHistory(prevHistory, positions, nowMs = Date.now(), options = {}) {

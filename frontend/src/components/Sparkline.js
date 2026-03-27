@@ -7,88 +7,59 @@ import {
   calculateDomain,
   filterHistoryPoints,
   safePercentChange,
-  toFiniteNumber,
   toValueSeries,
 } from '../utils/chartUtils';
 
-const WIDTH = 124;
-const HEIGHT = 40;
-
-function usd(v) {
-  const n = toFiniteNumber(v);
-  if (!Number.isFinite(n)) return '—';
-  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
+const WIDTH = 140;
+const HEIGHT = 44;
 
 function pct(v) {
-  const n = toFiniteNumber(v);
-  if (!Number.isFinite(n)) return '0.00%';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  if (!Number.isFinite(v)) return '—';
+  return `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
 }
 
-export default function Sparkline({
-  points,
-  rangeMs,
-  nowMs,
-  currentPrice,
-  style,
-}) {
+export default function Sparkline({ points, rangeMs, nowMs, mode = 'raw', showDelta = true }) {
   const chart = useMemo(() => {
     const visible = filterHistoryPoints(points, rangeMs, nowMs);
-    const valueSeries = toValueSeries(visible, 'raw');
-    const domain = calculateDomain([valueSeries], { min: 0, max: 1 });
-    const path = buildLinePath(valueSeries, WIDTH, HEIGHT, domain, 3);
+    const series = toValueSeries(visible, mode);
+    const domain = calculateDomain([series], mode === 'normalized' ? { min: 98, max: 102 } : { min: 0, max: 1 });
+    const path = buildLinePath(series, WIDTH, HEIGHT, domain, 3);
 
-    const first = valueSeries[0]?.value;
-    const last = valueSeries[valueSeries.length - 1]?.value;
+    const first = series[0]?.value;
+    const last = series[series.length - 1]?.value;
     const changePct = safePercentChange(first, last);
-    return {
-      path,
-      valueSeries,
-      changePct,
-      first,
-      last,
-    };
-  }, [points, rangeMs, nowMs]);
+    return { path, changePct, hasEnough: series.length >= 2 };
+  }, [points, rangeMs, nowMs, mode]);
 
-  const displayPrice = Number.isFinite(toFiniteNumber(currentPrice))
-    ? toFiniteNumber(currentPrice)
-    : chart.last;
-
-  const isPositive = chart.changePct >= 0;
-  const stroke = isPositive ? theme.colors.positive : theme.colors.negative;
+  const positive = chart.changePct >= 0;
+  const stroke = positive ? theme.colors.accentMint : theme.colors.accentBlush;
 
   return (
-    <View style={[styles.wrap, style]}>
+    <View style={styles.wrap}>
       <Svg width={WIDTH} height={HEIGHT}>
         <Line
           x1="0"
           y1={HEIGHT / 2}
           x2={WIDTH}
           y2={HEIGHT / 2}
-          stroke="rgba(255,255,255,0.07)"
+          stroke="rgba(255,255,255,0.08)"
           strokeWidth="1"
         />
         {chart.path ? (
-          <Path d={chart.path} stroke={stroke} strokeWidth="2" fill="none" strokeLinecap="round" />
+          <Path d={chart.path} stroke={stroke} strokeWidth="2.3" fill="none" strokeLinecap="round" />
         ) : (
           <Line
             x1="3"
             y1={HEIGHT / 2}
             x2={WIDTH - 3}
             y2={HEIGHT / 2}
-            stroke="rgba(255,255,255,0.16)"
+            stroke="rgba(255,255,255,0.2)"
             strokeWidth="2"
           />
         )}
       </Svg>
-
-      <View style={styles.meta}>
-        <Text style={styles.price}>{usd(displayPrice)}</Text>
-        <Text style={[styles.change, { color: stroke }]}>{pct(chart.changePct)}</Text>
-      </View>
-
-      {chart.valueSeries.length < 2 ? <Text style={styles.waiting}>Waiting for live data</Text> : null}
+      {showDelta ? <Text style={[styles.delta, { color: stroke }]}>{pct(chart.changePct)}</Text> : null}
+      {!chart.hasEnough ? <Text style={styles.waiting}>Live data incoming</Text> : null}
     </View>
   );
 }
@@ -97,23 +68,13 @@ const styles = StyleSheet.create({
   wrap: {
     marginTop: 8,
   },
-  meta: {
+  delta: {
     marginTop: 4,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  price: {
-    color: theme.colors.text,
-    fontSize: 11,
-    fontWeight: '800',
-  },
-  change: {
     fontSize: 11,
     fontWeight: '900',
   },
   waiting: {
-    marginTop: 2,
+    marginTop: 3,
     color: theme.colors.muted,
     fontSize: 10,
     fontWeight: '700',
