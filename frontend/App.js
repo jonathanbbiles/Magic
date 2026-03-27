@@ -12,7 +12,13 @@ import {
 } from './src/utils/chartUtils';
 import { updatePositionHistory } from './src/utils/positionHistory';
 
-const POLL_MS = 20000;
+const SUPPORTED_CRYPTO_REFRESH_MS = 24 * 60 * 60 * 1000;
+const HOLDINGS_POLL_INTERVAL_MS = 4000;
+const EXIT_MANAGER_INTERVAL_MS = 20000;
+const AUTO_TUNE_SWEEP_INTERVAL_MS = 15000;
+const LOG_UI_FLUSH_INTERVAL_MS = 350;
+
+const POLL_MS = EXIT_MANAGER_INTERVAL_MS;
 
 const BASE_URL =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
