@@ -12,16 +12,16 @@ export function SystemHealthPanel({ diagnostics, staleMinutes, lastSuccessAt }) 
 
   return (
     <Panel
-      title="Safety + Health"
-      right={<StatusChip label={staleMinutes >= 2 ? 'stale' : 'live'} tone={staleMinutes >= 2 ? 'warn' : 'good'} />}
+      title="Safety / System Health"
+      right={<StatusChip label={staleMinutes >= 2 ? 'stale data' : 'live feed'} tone={staleMinutes >= 2 ? 'warn' : 'good'} />}
     >
       <View style={styles.row}>
-        <Metric label="Auth" value={authOk ? 'Connected' : 'Missing creds'} tone={authOk ? 'good' : 'bad'} />
-        <Metric label="Trading" value={trading ? 'Enabled' : 'Paused'} tone={trading ? 'good' : 'warn'} />
+        <Metric label="Broker auth" value={authOk ? 'Connected' : 'Missing creds'} tone={authOk ? 'good' : 'bad'} />
+        <Metric label="Trading mode" value={trading ? 'Enabled' : 'Paused'} tone={trading ? 'good' : 'warn'} />
       </View>
       <View style={styles.row}>
-        <Metric label="Last refresh" value={sinceLabel(lastSuccessAt)} />
-        <Metric label="Last quote" value={sinceLabel(quoteTs)} />
+        <Metric label="Last frontend refresh" value={sinceLabel(lastSuccessAt)} />
+        <Metric label="Last market quote" value={sinceLabel(quoteTs)} />
       </View>
 
       {httpErr?.errorMessage ? (

@@ -1,58 +1,47 @@
-# Frontend Redesign Notes
+# FRONTEND_REDESIGN_NOTES
 
-## What was changed
-- Rebuilt the Expo frontend into a Mission Control style experience focused on real-time observability.
-- Added a clear screen model with:
+## What changed
+- Rebuilt the frontend presentation into a mission-control style shell with dedicated screens for:
   - Command Deck
-  - Position Detail view
-  - System / Diagnostics
-- Replaced previous dashboard visuals with a coherent dark neon design system and reusable UI primitives.
-- Introduced a dedicated frontend data hook for polling `/dashboard` and `/debug/status` with stale/error handling.
-- Added richer position instrumentation including target progress visualization, hold age, P/L emphasis, and backend forensics display.
-- Added a dedicated safety/health surface for connectivity/auth/trading manager and last HTTP error signals.
+  - Position Detail
+  - System/Diagnostics
+- Preserved frontend data contracts with backend `GET /dashboard` and `GET /debug/status`.
+- Upgraded visual hierarchy with premium dark-mode styling, status chips, action pills, and stronger position/trajectory presentation.
+- Improved watchability by emphasizing live state chips, health strips, and event feed readability.
 
 ## Files added
-- `FRONTEND_REDESIGN_PLAN.md`
-- `FRONTEND_REDESIGN_NOTES.md`
-- `frontend/src/theme/tokens.js`
-- `frontend/src/utils/formatters.js`
-- `frontend/src/api/client.js`
-- `frontend/src/hooks/useMissionControlData.js`
-- `frontend/src/components/ui.js`
-- `frontend/src/components/ProgressTrack.js`
-- `frontend/src/components/EventFeed.js`
-- `frontend/src/components/SystemHealthPanel.js`
+- `frontend/src/screens/CommandDeckScreen.js`
+- `frontend/src/screens/PositionDetailScreen.js`
+- `frontend/src/screens/SystemDiagnosticsScreen.js`
 
-## Files rewritten
-- `frontend/App.js`
-- `frontend/src/components/PositionCard.js`
+## Files removed
+- None.
 
-## Files removed (obsolete frontend dashboard pieces)
-- `frontend/src/api.js`
-- `frontend/src/theme.js`
-- `frontend/src/components/HeldPositionsHeroChart.js`
-- `frontend/src/components/SegmentedPills.js`
-- `frontend/src/components/HeldPositionsLiveChart.js`
-- `frontend/src/components/PortfolioHero.js`
-- `frontend/src/components/PositionVisualCard.js`
-- `frontend/src/components/Sparkline.js`
-- `frontend/src/utils/chartUtils.js`
-- `frontend/src/utils/positionHistory.js`
-- `frontend/src/config/polling.js`
+## Files intentionally untouched
+- Entire backend (`backend/**`) intentionally untouched.
+- Frontend API transport and polling hook semantics preserved:
+  - `frontend/src/api/client.js`
+  - `frontend/src/hooks/useMissionControlData.js`
+
+## Dependency changes
+- Removed unused frontend dependency:
+  - `react-native-svg`
+- Kept dependencies minimal and reused existing `expo-linear-gradient`.
 
 ## Assumptions made
-- Existing backend contracts at `/dashboard` and `/debug/status` are stable and remain unchanged.
-- Authentication may be configured as either `Authorization: Bearer ...` or `x-api-token`; frontend now sends both when token is present for compatibility.
-- No backend route or payload changes were required.
-
-## Intentionally left untouched
-- Entire `backend/` codebase, including routes, business logic, data models, and trading behavior.
-- Existing backend env/config/trading safeguards.
+- Existing backend payload fields are the source of truth; UI only derives view state.
+- Lightweight in-app state navigation is safer than router migration.
+- Offline/CI-safe boot verification via Expo start logs is sufficient in this environment.
 
 ## How to run the frontend
 1. `cd frontend`
-2. Ensure env vars are set as needed:
-   - `EXPO_PUBLIC_BACKEND_URL`
-   - `EXPO_PUBLIC_API_TOKEN`
+2. `npm install`
 3. `npm run start`
-4. Launch iOS/Android/Web target through Expo.
+4. Open in Expo Go, iOS simulator, Android emulator, or web target.
+
+## Known limitations
+- No visual screenshot artifact was captured because the required browser screenshot tooling is unavailable in this execution environment.
+- `expo-doctor` could not be installed due to npm registry access policy (`403 Forbidden`).
+
+## Backend untouched confirmation
+- Backend logic, routes, contracts, trading behavior, order logic, safety controls, and persistence were left untouched.

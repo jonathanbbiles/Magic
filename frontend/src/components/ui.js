@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Animated, StyleSheet, Text, View } from 'react-native';
+import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { gradients, tokens } from '../theme/tokens';
 
@@ -8,7 +8,7 @@ export function Panel({ title, right, children, style }) {
     <LinearGradient colors={gradients.panel} style={[styles.panel, style]}>
       {(title || right) ? (
         <View style={styles.panelHeader}>
-          <Text style={styles.panelTitle}>{title}</Text>
+          {title ? <Text style={styles.panelTitle}>{title}</Text> : <View />}
           {right ? <View>{right}</View> : null}
         </View>
       ) : null}
@@ -27,19 +27,20 @@ export function StatusChip({ label, tone = 'info' }) {
   };
   const color = colorMap[tone] || tokens.colors.info;
   return (
-    <View style={[styles.chip, { borderColor: color, backgroundColor: `${color}22` }]}>
+    <View style={[styles.chip, { borderColor: color, backgroundColor: `${color}26` }]}>
       <Text style={[styles.chipText, { color }]}>{String(label || '').toUpperCase()}</Text>
     </View>
   );
 }
 
 export function LivePulse({ online = true, label }) {
-  const anim = useRef(new Animated.Value(0.35)).current;
+  const anim = useRef(new Animated.Value(0.3)).current;
+
   useEffect(() => {
     const loop = Animated.loop(
       Animated.sequence([
-        Animated.timing(anim, { toValue: 1, duration: 900, useNativeDriver: true }),
-        Animated.timing(anim, { toValue: 0.35, duration: 900, useNativeDriver: true }),
+        Animated.timing(anim, { toValue: 1, duration: 850, useNativeDriver: true }),
+        Animated.timing(anim, { toValue: 0.3, duration: 850, useNativeDriver: true }),
       ])
     );
     loop.start();
@@ -60,12 +61,20 @@ export function LivePulse({ online = true, label }) {
 }
 
 export function Metric({ label, value, tone = 'default' }) {
-  const color = tone === 'good' ? tokens.colors.good : tone === 'bad' ? tokens.colors.bad : tokens.colors.text;
+  const color = tone === 'good' ? tokens.colors.good : tone === 'bad' ? tokens.colors.bad : tone === 'warn' ? tokens.colors.warn : tokens.colors.text;
   return (
     <View style={styles.metric}>
       <Text style={styles.metricLabel}>{label}</Text>
       <Text style={[styles.metricValue, { color }]}>{value}</Text>
     </View>
+  );
+}
+
+export function ActionPill({ label, onPress }) {
+  return (
+    <Pressable onPress={onPress} style={styles.actionPill}>
+      <Text style={styles.actionPillText}>{label}</Text>
+    </Pressable>
   );
 }
 
@@ -100,22 +109,19 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 0.6,
   },
-  pulseRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  pulseRow: { flexDirection: 'row', alignItems: 'center', gap: tokens.spacing.xs },
   pulse: { width: 10, height: 10, borderRadius: 99 },
   pulseText: { color: tokens.colors.textMuted, fontWeight: '700' },
-  metric: {
-    flex: 1,
-    minWidth: '45%',
-    marginBottom: tokens.spacing.xs,
+  metric: { flex: 1, minWidth: '46%', marginBottom: tokens.spacing.xs },
+  metricLabel: { color: tokens.colors.textFaint, fontSize: tokens.type.tiny, marginBottom: 2 },
+  metricValue: { color: tokens.colors.text, fontSize: tokens.type.body, fontWeight: '800' },
+  actionPill: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(102,216,255,0.35)',
+    backgroundColor: 'rgba(102,216,255,0.15)',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
   },
-  metricLabel: {
-    color: tokens.colors.textFaint,
-    fontSize: tokens.type.tiny,
-    marginBottom: 2,
-  },
-  metricValue: {
-    color: tokens.colors.text,
-    fontSize: tokens.type.body,
-    fontWeight: '800',
-  },
+  actionPillText: { color: tokens.colors.text, fontWeight: '800', fontSize: 12, letterSpacing: 0.5 },
 });

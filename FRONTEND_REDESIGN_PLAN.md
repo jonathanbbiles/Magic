@@ -1,48 +1,94 @@
-# Frontend Redesign Plan
+# FRONTEND_REDESIGN_PLAN
 
-## Scope and boundaries
-- Redesign only the Expo/React Native frontend in `frontend/`.
-- Leave backend code, routes, response shapes, and trading logic untouched.
-- Continue using current backend contracts (`/dashboard`, `/debug/status`) and existing env vars.
+## Repo structure summary
+- `frontend/`: Expo + React Native application.
+- `backend/`: Trading engine and HTTP API (read-only for this redesign).
+- `shared/`: Shared utility modules.
+- Root docs include redesign planning/notes.
 
-## Architecture plan
-1. **Data layer cleanup (frontend-only)**
-   - Centralize API access under `frontend/src/api/client.js`.
-   - Keep token/base URL behavior compatible with existing env usage.
-   - Poll with existing cadence and track refresh metadata (last success, stale state).
+## Frontend/backend boundary assumptions
+- Backend is strictly read-only for this effort.
+- Existing backend routes and contracts used by frontend remain unchanged:
+  - `GET /dashboard`
+  - `GET /debug/status`
+- No modifications to backend strategy/order/risk/safety logic are allowed.
 
-2. **Mission Control design system**
-   - Introduce cohesive dark/neon visual tokens for colors, spacing, radii, typography.
-   - Add reusable UI primitives for panels, chips, pulse indicators, and metric rows.
+## Current frontend entrypoints
+- App entrypoint: `frontend/App.js`
+- Data layer:
+  - `frontend/src/api/client.js`
+  - `frontend/src/hooks/useMissionControlData.js`
 
-3. **Screen model (single-app navigator without risky routing migration)**
-   - Build 3-screen experience with in-app tab state:
-     - Command Deck
-     - Position Detail
-     - System / Diagnostics
-   - Avoid introducing heavy navigation dependencies; stay Expo-compatible.
+## Navigation structure (current and target)
+### Current
+- In-app state toggle between command deck and diagnostics.
+- Position detail rendered conditionally inside the same screen.
 
-4. **Command Deck redesign**
-   - Portfolio hero (equity/account value, open P/L, weekly change).
-   - Connectivity/status pulse + bot mood chip.
-   - Rich position cards with:
-     - symbol, unrealized P/L, hold age, position status
-     - entry/breakeven/current/target progress visualization
-   - Live forensics event feed from position forensics + diagnostics errors.
-   - Safety/system panel for stale data, auth, drawdown/safety cues from backend payloads.
+### Target
+- Keep lightweight internal navigation (no risky router migration):
+  - `CommandDeck` (home)
+  - `PositionDetail` (focused position drilldown)
+  - `SystemDiagnostics`
+- Implement navigation using app-level screen state to avoid new dependency risk.
 
-5. **Position Detail redesign**
-   - Expanded premium panel with large progress instrument.
-   - Clear display for entry/current/breakeven/target and P/L.
-   - Hold duration and backend-provided diagnostics/forensics details.
+## Data fetching approach
+- Preserve polling model from `useMissionControlData`.
+- Keep concurrent fetching of dashboard + debug status.
+- Maintain refresh control and stale/error detection.
+- Improve derived frontend-only view models for bot state, safety chips, event feed, and progress displays.
 
-6. **System / Diagnostics redesign**
-   - Dedicated status panels for backend health, polling health, connectivity/auth indicators.
-   - Last-updated timestamps and warning chips.
+## Target screen architecture
+- `App.js` orchestrates top-level shell and screen switching.
+- `src/screens/CommandDeckScreen.js`
+  - Hero account block
+  - Bot state strip
+  - Position observatory list
+  - Forensics/event feed
+  - Safety/system health compact panel
+- `src/screens/PositionDetailScreen.js`
+  - Premium symbol-centric detail
+  - Strong hierarchy for P/L and price ladder (entry/current/breakeven/target)
+  - Hold duration and diagnostics/forensics context
+- `src/screens/SystemDiagnosticsScreen.js`
+  - Connectivity
+  - Polling/freshness
+  - stale-data warnings
+  - account/system/safety flags
 
-7. **Cleanup**
-   - Remove obsolete dashboard components/styles no longer used.
-   - Consolidate duplicated formatting/math helpers.
+## Design system plan
+- Keep dark-mode-first cinematic look.
+- Consolidate reusable primitives:
+  - surfaces/panels
+  - status pills
+  - metric tiles
+  - timeline/progress primitives
+- Extend theme tokens for spacing, typography, glow colors, and panel elevations.
+- Use subtle motion with RN Animated for “alive” feel without noisy animations.
 
-8. **Documentation**
-   - Add `FRONTEND_REDESIGN_NOTES.md` summarizing changes, assumptions, untouched areas, and run instructions.
+## Dependency decisions
+- Minimize dependencies.
+- Reuse existing dependencies:
+  - `expo-linear-gradient`
+  - `react-native-svg`
+- Add **no new dependencies** unless implementation becomes impossible without them.
+- Avoid heavy chart/router/animation libraries.
+
+## Phased implementation plan
+1. **Architecture setup**
+   - Create `screens/` and shell layout.
+   - Keep API/hook contracts stable.
+2. **Design primitives refresh**
+   - Upgrade theme tokens and reusable UI components.
+   - Build mission-control-specific visual primitives.
+3. **Command Deck redesign**
+   - Hero, bot state, watchable positions, progress ladders, forensics feed, safety strip.
+4. **Position Detail redesign**
+   - Focused premium drilldown with clear pricing/diagnostic hierarchy.
+5. **System Diagnostics redesign**
+   - Connectivity, freshness, stale warnings, backend flags visualization.
+6. **Cleanup**
+   - Remove obsolete/unreferenced frontend UI code.
+   - Ensure imports resolve and app starts.
+7. **Verification + notes**
+   - Run frontend checks/start command.
+   - Document final notes and backend untouched confirmation.
