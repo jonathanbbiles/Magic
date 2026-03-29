@@ -10,6 +10,7 @@ import {
   Text,
   View,
 } from 'react-native';
+import Constants from 'expo-constants';
 
 const THEME = {
   bg: '#06080F',
@@ -65,19 +66,32 @@ const durationLabel = (secondsValue) => {
 
 const endpointUrl = (base, path) => `${String(base || '').replace(/\/$/, '')}${path}`;
 
+const getRuntimeConfig = () => {
+  const extra = Constants?.expoConfig?.extra || {};
+  return {
+    backendUrl: typeof extra.backendUrl === 'string' ? extra.backendUrl : '',
+    apiToken: typeof extra.apiToken === 'string' ? extra.apiToken : '',
+  };
+};
+
 const resolveBaseUrl = () => {
-  const explicit = process.env.EXPO_PUBLIC_BACKEND_URL;
-  if (explicit && explicit.trim()) return explicit.trim();
-  return 'http://localhost:3000';
+  const runtimeConfig = getRuntimeConfig();
+  const explicit = runtimeConfig.backendUrl || process.env.EXPO_PUBLIC_BACKEND_URL || 'https://magic-lw8t.onrender.com';
+  return String(explicit).trim().replace(/\/$/, '');
+};
+
+const resolveApiToken = () => {
+  const runtimeConfig = getRuntimeConfig();
+  return String(runtimeConfig.apiToken || process.env.EXPO_PUBLIC_API_TOKEN || '').trim();
 };
 
 const buildHeaders = () => {
-  const token = process.env.EXPO_PUBLIC_API_TOKEN;
+  const token = resolveApiToken();
   const headers = { Accept: 'application/json' };
-  if (token && token.trim()) {
-    headers.Authorization = `Bearer ${token.trim()}`;
-    headers['x-api-key'] = token.trim();
-    headers['x-api-token'] = token.trim();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    headers['x-api-key'] = token;
+    headers['x-api-token'] = token;
   }
   return headers;
 };
@@ -142,7 +156,12 @@ const normalizeDiagnostics = (raw) => ({
 });
 
 const fetchJson = async (url, headers) => {
-  const response = await fetch(url, { headers });
+  let response;
+  try {
+    response = await fetch(url, { headers });
+  } catch {
+    throw new Error('Network request failed. Check backend URL, server status, or device connectivity.');
+  }
   const text = await response.text();
   let parsed = null;
   try {
@@ -222,7 +241,8 @@ export default function App() {
   const [mode, setMode] = useState('command');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
+  const [dashboardError, setDashboardError] = useState(null);
+  const [diagnosticsError, setDiagnosticsError] = useState(null);
   const [dashboard, setDashboard] = useState(null);
   const [diag, setDiag] = useState(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
@@ -235,18 +255,34 @@ export default function App() {
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
 
+    let hadSuccess = false;
     try {
-      const [dashboardRaw, diagRaw] = await Promise.all([
-        fetchJson(endpointUrl(baseUrl, '/dashboard'), headers),
-        fetchJson(endpointUrl(baseUrl, '/debug/status'), headers),
-      ]);
-      setDashboard(normalizeDashboard(dashboardRaw));
-      setDiag(normalizeDiagnostics(diagRaw));
-      setLastUpdatedAt(Date.now());
-      setError(null);
-    } catch (err) {
-      setError(err?.message || 'Unknown network error');
+      try {
+        const diagRaw = await fetchJson(endpointUrl(baseUrl, '/debug/status'), headers);
+        setDiag(normalizeDiagnostics(diagRaw));
+        setDiagnosticsError(null);
+        hadSuccess = true;
+      } catch (err) {
+        setDiagnosticsError(err?.message || 'Unknown diagnostics error');
+      }
+
+      try {
+        await fetchJson(endpointUrl(baseUrl, '/health'), { Accept: 'application/json' });
+      } catch {
+        setDashboardError('Backend health check failed.');
+        return;
+      }
+
+      try {
+        const dashboardRaw = await fetchJson(endpointUrl(baseUrl, '/dashboard'), headers);
+        setDashboard(normalizeDashboard(dashboardRaw));
+        setDashboardError(null);
+        hadSuccess = true;
+      } catch (err) {
+        setDashboardError(err?.message || 'Unknown dashboard error');
+      }
     } finally {
+      if (hadSuccess) setLastUpdatedAt(Date.now());
       setLoading(false);
       setRefreshing(false);
     }
@@ -262,6 +298,8 @@ export default function App() {
 
   const isStale = lastUpdatedAt ? Date.now() - lastUpdatedAt > STALE_MS : true;
   const positions = dashboard?.positions || [];
+  const apiToken = useMemo(resolveApiToken, []);
+  const tokenPresent = Boolean(apiToken);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -273,6 +311,16 @@ export default function App() {
       >
         <Text style={styles.kicker}>Mission Control</Text>
         <Text style={styles.headline}>Trading Command Surface</Text>
+
+        <Card title="Connection">
+          <Text style={styles.heroMeta}>Base URL {baseUrl}</Text>
+          <Text style={styles.heroMeta}>Token present {tokenPresent ? 'Yes' : 'No'}</Text>
+          <Text style={styles.heroMeta}>Last refresh {lastUpdatedAt ? new Date(lastUpdatedAt).toLocaleTimeString() : '—'}</Text>
+          <Text style={styles.heroMeta}>Dashboard status: {dashboardError ? 'FAIL' : 'OK'}</Text>
+          <Text style={styles.heroMeta}>Diagnostics status: {diagnosticsError ? 'FAIL' : 'OK'}</Text>
+          {!!dashboardError && <Text style={styles.errorText}>Dashboard error: {dashboardError}</Text>}
+          {!!diagnosticsError && <Text style={styles.errorText}>Diagnostics error: {diagnosticsError}</Text>}
+        </Card>
 
         <View style={styles.segmentWrap}>
           <Pressable onPress={() => setMode('command')} style={[styles.segmentBtn, mode === 'command' && styles.segmentBtnActive]}>
@@ -289,8 +337,8 @@ export default function App() {
         >
           {loading ? (
             <ActivityIndicator color={THEME.accent} />
-          ) : error ? (
-            <Text style={styles.errorText}>Load error: {error}</Text>
+          ) : dashboardError ? (
+            <Text style={styles.errorText}>Load error: {dashboardError}</Text>
           ) : (
             <>
               <Text style={styles.heroValue}>{currency(dashboard?.accountValue)}</Text>
@@ -303,6 +351,7 @@ export default function App() {
         {mode === 'command' ? (
           <>
             <Card title="Bot State">
+              {diagnosticsError && <Text style={styles.errorText}>Diagnostics error: {diagnosticsError}</Text>}
               <View style={styles.pillRow}>
                 <StatePill label={diag?.tradingEnabled ? 'Trading ON' : 'Trading OFF'} ok={diag?.tradingEnabled} />
                 <StatePill label={diag?.entryManagerRunning ? 'Entry Loop' : 'Entry Halted'} ok={diag?.entryManagerRunning} />
@@ -313,8 +362,8 @@ export default function App() {
 
             <Card title="Open Positions">
               {loading && <ActivityIndicator color={THEME.accent} />}
-              {!loading && !error && positions.length === 0 && <Text style={styles.emptyText}>No open positions.</Text>}
-              {!loading && !error && positions.map((position) => (
+              {!loading && !dashboardError && positions.length === 0 && <Text style={styles.emptyText}>No open positions.</Text>}
+              {!loading && !dashboardError && positions.map((position) => (
                 <PositionRow
                   key={position.symbol}
                   position={position}
@@ -338,6 +387,7 @@ export default function App() {
         ) : (
           <>
             <Card title="System Health">
+              {diagnosticsError && <Text style={styles.errorText}>Diagnostics error: {diagnosticsError}</Text>}
               <View style={styles.grid2}>
                 <Metric label="Uptime" value={diag?.uptimeSec !== null && diag?.uptimeSec !== undefined ? `${diag.uptimeSec}s` : '—'} />
                 <Metric label="Server Time" value={diag?.serverTime ? String(diag.serverTime).replace('T', ' ').replace('Z', '') : '—'} />
