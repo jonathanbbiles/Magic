@@ -1,26 +1,27 @@
 import React from 'react';
 import { StyleSheet, Text, View } from 'react-native';
-import { Panel } from './ui';
+import { Panel, StatusChip } from './ui';
 import { tokens } from '../theme/tokens';
 import { sinceLabel } from '../utils/formatters';
 
 export function EventFeed({ positions, diagnostics }) {
   const events = [];
+
   (positions || []).forEach((p) => {
-    if (p?.forensics?.label) {
+    if (p?.forensics?.label || p?.forensics?.reason || p?.forensics?.summary) {
       events.push({
-        id: `${p.symbol}-forensics`,
+        id: `${p.symbol}-${p.forensics?.ts || p.forensics?.label || 'evt'}`,
         symbol: p.symbol,
-        title: p.forensics.label,
-        detail: p.forensics.reason || p.forensics.summary || 'No detail',
-        ts: p.forensics.ts,
+        title: p.forensics?.label || 'Position update',
+        detail: p.forensics?.reason || p.forensics?.summary || 'No detail',
+        ts: p.forensics?.ts,
       });
     }
   });
 
   if (diagnostics?.lastHttpError?.errorMessage) {
     events.unshift({
-      id: 'http-error',
+      id: 'network-alert',
       symbol: 'NET',
       title: diagnostics.lastHttpError.errorCode || 'HTTP issue',
       detail: diagnostics.lastHttpError.errorMessage,
@@ -28,11 +29,11 @@ export function EventFeed({ positions, diagnostics }) {
     });
   }
 
-  const top = events.slice(0, 8);
+  const top = events.slice(0, 10);
 
   return (
-    <Panel title="Forensics Feed">
-      {top.length === 0 ? <Text style={styles.empty}>No recent reasoning events.</Text> : null}
+    <Panel title="Forensics / Event Feed" right={<StatusChip label={`${top.length} events`} tone="info" />}>
+      {top.length === 0 ? <Text style={styles.empty}>No recent reasoning events. Observatory is quiet.</Text> : null}
       {top.map((e) => (
         <View key={e.id} style={styles.item}>
           <Text style={styles.title}>{e.symbol} · {e.title}</Text>
@@ -49,7 +50,7 @@ const styles = StyleSheet.create({
   item: {
     paddingVertical: tokens.spacing.xs,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.06)',
+    borderBottomColor: 'rgba(255,255,255,0.07)',
   },
   title: { color: tokens.colors.text, fontWeight: '800' },
   detail: { color: tokens.colors.textMuted, marginTop: 2 },
