@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Pressable,
   RefreshControl,
   SafeAreaView,
   StatusBar,
@@ -10,449 +11,210 @@ import {
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import { EventFeed } from './src/components/EventFeed';
+import { PositionCard } from './src/components/PositionCard';
+import { ProgressTrack } from './src/components/ProgressTrack';
+import { SystemHealthPanel } from './src/components/SystemHealthPanel';
+import { LivePulse, Metric, Panel, StatusChip } from './src/components/ui';
+import { useMissionControlData } from './src/hooks/useMissionControlData';
+import { gradients, tokens } from './src/theme/tokens';
+import { ageLabel, deriveBotMood, getHoldSeconds, getProgressModel, pct, signedUsd, toNum, usd } from './src/utils/formatters';
 
-const theme = {
-  colors: {
-    bg: '#070A12',
-    text: 'rgba(255,255,255,0.92)',
-    muted: 'rgba(255,255,255,0.65)',
-    faint: 'rgba(255,255,255,0.45)',
-    card: '#0B1220',
-    cardAlt: '#0F1730',
-    positive: '#72FFB6',
-    negative: '#FF5C8A',
-    warning: '#FFD36E',
-    border: 'rgba(255,255,255,0.10)',
-    glowPos: 'rgba(114,255,182,0.55)',
-    glowNeg: 'rgba(255,92,138,0.55)',
-    errorBg: 'rgba(255,60,90,0.18)',
-    errorText: 'rgba(255,220,230,0.95)',
-  },
-  spacing: { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 },
-  radius: { md: 14, lg: 18, xl: 24 },
-};
-
-const POLL_MS = 20000;
-
-const BASE_URL =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
-  'https://magic-lw8t.onrender.com';
-
-const API_TOKEN =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
-
-async function fetchDashboard() {
-  const url = `${String(BASE_URL).replace(/\/$/, '')}/dashboard`;
-  const headers = { Accept: 'application/json' };
-  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
-
-  const res = await fetch(url, { headers });
-  const text = await res.text();
-  let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    // ignore
-  }
-
-  if (!res.ok) {
-    const err = new Error(json?.error || json?.message || text || 'Request failed');
-    err.status = res.status;
-    throw err;
-  }
-  return json;
-}
-
-function toNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function usd(v) {
-  const n = toNum(v);
-  if (!Number.isFinite(n)) return '—';
-  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function signedUsd(v) {
-  const n = toNum(v);
-  if (!Number.isFinite(n)) return '—';
-  const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return `${n >= 0 ? '+' : '-'}$${abs}`;
-}
-
-function pct(v) {
-  const n = toNum(v);
-  if (!Number.isFinite(n)) return '—';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-}
-
-function minsSince(isoTs) {
-  const ms = Date.parse(String(isoTs || ''));
-  if (!Number.isFinite(ms)) return '—';
-  const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000));
-  return `${mins}m`;
-}
-
-function ageLabelFromPosition(position) {
-  const heldDirect = toNum(position?.heldSeconds);
-  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
-    const mins = Math.floor(heldDirect / 60);
-    const rem = Math.floor(heldDirect % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const heldSnake = toNum(position?.held_seconds);
-  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
-    const mins = Math.floor(heldSnake / 60);
-    const rem = Math.floor(heldSnake % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const createdMs = Date.parse(String(position?.created_at || ''));
-  if (Number.isFinite(createdMs)) {
-    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
-    const mins = Math.floor(seconds / 60);
-    const rem = Math.floor(seconds % 60);
-    return `${mins}m ${rem}s`;
-  }
-  return '—';
-}
-
-function ageLabelShort(position) {
-  const heldDirect = toNum(position?.heldSeconds);
-  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
-    return `${Math.floor(heldDirect / 60)}m`;
-  }
-  const heldSnake = toNum(position?.held_seconds);
-  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
-    return `${Math.floor(heldSnake / 60)}m`;
-  }
-  const createdMs = Date.parse(String(position?.created_at || ''));
-  if (Number.isFinite(createdMs)) {
-    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
-    return `${Math.floor(seconds / 60)}m`;
-  }
-  return '—';
-}
-
-
-function distToTargetPct(position) {
-  const current = toNum(position?.current_price);
-  const sellLimit =
-    toNum(position?.sell?.activeLimit) ??
-    toNum(position?.bot?.sellOrderLimit);
-
-  if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) return null;
-  return ((sellLimit - current) / current) * 100;
-}
-
-function Chip({ value }) {
-  return (
-    <View style={headerStyles.chip}>
-      <Text style={headerStyles.chipValue}>{value}</Text>
-    </View>
-  );
-}
-
-function CompactPositionRow({ position }) {
-  const symbol = position?.symbol || '—';
-
-  const upnl = toNum(position?.unrealized_pl);
-  const upnlPctRaw = toNum(position?.unrealized_plpc);
-  const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
-  const pnlPositive = (upnl || 0) >= 0;
-
-  const dist = distToTargetPct(position);
-
-  const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
-  const pnlDollar = signedUsd(upnl);
-  const pnlPercent = pct(upnlPct);
-  const timeShort = ageLabelShort(position);
-
-  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
-
-  return (
-    <View style={[compactStyles.tile, { borderColor: glow }]}>
-      <View style={compactStyles.line1}>
-        <Text style={compactStyles.sym} numberOfLines={1} ellipsizeMode="tail">
-          {symbol}
-        </Text>
-        <Text style={compactStyles.delta} numberOfLines={1} ellipsizeMode="tail">
-          Δ🎯 {distText}
-        </Text>
-      </View>
-
-      <View style={compactStyles.line2}>
-        <Text
-          style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
-          numberOfLines={1}
-          ellipsizeMode="tail"
-        >
-          📌 {pnlDollar} ({pnlPercent})
-        </Text>
-
-        <Text style={compactStyles.timeInline} numberOfLines={1} ellipsizeMode="tail">
-          ⏱️ {timeShort}
-        </Text>
-      </View>
-    </View>
-  );
-}
+const TABS = ['Command Deck', 'Diagnostics'];
 
 export default function App() {
-  const [dashboard, setDashboard] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
-  const load = useCallback(async ({ isRefresh = false } = {}) => {
-    if (isRefresh) setRefreshing(true);
-    if (!isRefresh) setLoading(true);
-    try {
-      const payload = await fetchDashboard();
-      setDashboard(payload);
-      setError(null);
-    } catch (err) {
-      const message = err?.message || 'Request failed';
-      const status = err?.status ? `HTTP ${err.status}` : 'HTTP ?';
-      setError(`${status}: ${message}`);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }, []);
+  const [tab, setTab] = useState('Command Deck');
+  const [selectedPosition, setSelectedPosition] = useState(null);
+  const data = useMissionControlData();
 
-  useEffect(() => {
-    load();
-    const timer = setInterval(() => load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [load]);
+  const mood = useMemo(
+    () => deriveBotMood({ positions: data.positions, diagnostics: data.diagnostics, staleMinutes: data.staleMinutes }),
+    [data.positions, data.diagnostics, data.staleMinutes]
+  );
 
-  const positions = useMemo(() => {
-    const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
-
-    list.sort((a, b) => {
-      const aDist = distToTargetPct(a);
-      const bDist = distToTargetPct(b);
-      if (!Number.isFinite(aDist)) return 1;
-      if (!Number.isFinite(bDist)) return -1;
-      return aDist - bDist; // closest to fill first
-    });
-
-    return list;
-  }, [dashboard]);
-
-  const account = dashboard?.account || {};
-  const portfolioValue = account?.portfolio_value ?? account?.equity;
-
-  const weeklyChangePct = toNum(dashboard?.meta?.weeklyChangePct);
-
-  const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
-
+  const weeklyPct = toNum(data.dashboard?.meta?.weeklyChangePct);
   const openPLPct = useMemo(() => {
-    const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
-    if (!Number.isFinite(mv) || mv <= 0) return null;
-    return (openPL / mv) * 100;
-  }, [positions, openPL]);
+    const mv = data.positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
+    if (!mv) return null;
+    return (data.openPL / mv) * 100;
+  }, [data.positions, data.openPL]);
+
+  const header = (
+    <View>
+      <LinearGradient colors={gradients.hero} style={styles.hero}>
+        <View style={styles.heroTop}>
+          <Text style={styles.brand}>MISSION CONTROL</Text>
+          <LivePulse online={!data.error && !data.isStale} label={data.error ? 'Degraded' : 'Streaming'} />
+        </View>
+
+        <Text style={styles.heroEquity}>{usd(data.equity)}</Text>
+        <Text style={styles.heroSub}>Total Equity</Text>
+
+        <View style={styles.heroMetrics}>
+          <Metric label="Open P/L" value={`${signedUsd(data.openPL)} (${pct(openPLPct)})`} tone={data.openPL >= 0 ? 'good' : 'bad'} />
+          <Metric label="Weekly" value={pct(weeklyPct)} tone={(weeklyPct || 0) >= 0 ? 'good' : 'bad'} />
+        </View>
+
+        <View style={styles.chipsRow}>
+          <StatusChip label={mood.label} tone={mood.tone} />
+          <StatusChip label={`${data.positions.length} open`} tone="info" />
+          <StatusChip label={data.isStale ? 'stale feed' : 'fresh feed'} tone={data.isStale ? 'warn' : 'good'} />
+        </View>
+      </LinearGradient>
+
+      <View style={styles.tabBar}>
+        {TABS.map((t) => (
+          <Pressable key={t} style={[styles.tabBtn, tab === t && styles.tabBtnActive]} onPress={() => setTab(t)}>
+            <Text style={[styles.tabText, tab === t && styles.tabTextActive]}>{t}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      {data.error ? (
+        <Panel title="Connection Warning">
+          <Text style={styles.errText}>{data.error}</Text>
+          <Text style={styles.errHint}>Check EXPO_PUBLIC_BACKEND_URL and EXPO_PUBLIC_API_TOKEN values.</Text>
+        </Panel>
+      ) : null}
+
+      {data.loading ? <ActivityIndicator color={tokens.colors.info} style={{ marginVertical: 20 }} /> : null}
+
+      {selectedPosition ? (
+        <PositionDetail position={selectedPosition} onBack={() => setSelectedPosition(null)} />
+      ) : tab === 'Command Deck' ? (
+        <>
+          <Panel title="Open Positions Observatory">
+            {data.positions.length === 0 ? <Text style={styles.empty}>No open positions. Engine appears to be hunting.</Text> : null}
+          </Panel>
+
+          {data.positions.map((position) => (
+            <PositionCard key={position?.symbol || Math.random()} position={position} onPress={() => setSelectedPosition(position)} />
+          ))}
+
+          <EventFeed positions={data.positions} diagnostics={data.diagnostics} />
+          <SystemHealthPanel diagnostics={data.diagnostics} staleMinutes={data.staleMinutes || 0} lastSuccessAt={data.lastSuccessAt} />
+        </>
+      ) : (
+        <DiagnosticsScreen data={data} />
+      )}
+    </View>
+  );
 
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
+      <LinearGradient colors={gradients.screen} style={styles.screen}>
         <FlatList
-          data={positions}
-          numColumns={2}
-          columnWrapperStyle={styles.gridRow}
-          keyExtractor={(item) => String(item?.symbol || 'unknown')}
+          data={[]}
+          renderItem={null}
+          ListHeaderComponent={header}
           contentContainerStyle={styles.content}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
-          }
-          ListHeaderComponent={
-            <View style={headerStyles.wrap}>
-              <View style={headerStyles.topRow}>
-                <Text style={headerStyles.title}>🎩 Magic Money</Text>
-                <Text style={headerStyles.titleRight}>{usd(portfolioValue)}</Text>
-              </View>
-
-              <View style={headerStyles.chipsRow}>
-                <Chip value={`Weekly: ${Number.isFinite(weeklyChangePct) ? pct(weeklyChangePct) : '—'}`} />
-              </View>
-
-              <View style={headerStyles.openRow}>
-                <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
-              </View>
-
-              {error ? (
-                <View style={styles.errorBanner}>
-                  <Text style={styles.errorText}>{error}</Text>
-                  <Text style={styles.errorHint}>
-                    🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
-                  </Text>
-                </View>
-              ) : null}
-
-              {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
-              {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
-            </View>
-          }
-          renderItem={({ item }) => <CompactPositionRow position={item} />}
+          refreshControl={<RefreshControl refreshing={data.refreshing} onRefresh={data.refresh} tintColor="#fff" />}
         />
       </LinearGradient>
     </SafeAreaView>
   );
 }
 
+function PositionDetail({ position, onBack }) {
+  const model = getProgressModel(position);
+  const pl = toNum(position?.unrealized_pl);
+  const up = (pl || 0) >= 0;
+
+  return (
+    <Panel title={`${position?.symbol || 'Position'} • Detail`} right={<StatusChip label="Detail" tone="info" />}>
+      <Pressable onPress={onBack}><Text style={styles.backBtn}>← Back to deck</Text></Pressable>
+
+      <Text style={[styles.detailPL, { color: up ? tokens.colors.good : tokens.colors.bad }]}>
+        {signedUsd(pl)} ({pct(position?.unrealized_plpc, { ratio: true })})
+      </Text>
+
+      <View style={styles.detailMetricsWrap}>
+        <Metric label="Hold" value={ageLabel(getHoldSeconds(position))} />
+        <Metric label="Fee bps RT" value={String(toNum(position?.bot?.feeBpsRoundTrip) ?? '—')} />
+      </View>
+
+      <ProgressTrack model={model} />
+
+      <Panel title="Forensics + Bot Reasoning" style={{ marginTop: tokens.spacing.sm, marginBottom: 0 }}>
+        <Text style={styles.metaLine}>Label: {position?.forensics?.label || '—'}</Text>
+        <Text style={styles.metaLine}>Reason: {position?.forensics?.reason || position?.forensics?.summary || '—'}</Text>
+        <Text style={styles.metaLine}>Sell Order Id: {position?.bot?.sellOrderId || '—'}</Text>
+        <Text style={styles.metaLine}>Required Exit: {pct((toNum(position?.bot?.requiredExitBps) || 0) / 100)}</Text>
+      </Panel>
+    </Panel>
+  );
+}
+
+function DiagnosticsScreen({ data }) {
+  const status = data.diagnostics;
+  return (
+    <>
+      <Panel title="Backend Connectivity">
+        <View style={styles.detailMetricsWrap}>
+          <Metric label="Alpaca Auth" value={status?.alpaca?.alpacaAuthOk ? 'OK' : 'Missing'} tone={status?.alpaca?.alpacaAuthOk ? 'good' : 'bad'} />
+          <Metric label="API Token" value={status?.env?.apiTokenSet ? 'Set' : 'Missing'} tone={status?.env?.apiTokenSet ? 'good' : 'bad'} />
+        </View>
+      </Panel>
+
+      <Panel title="Polling Health">
+        <View style={styles.detailMetricsWrap}>
+          <Metric label="Poll interval" value={`${Math.round((data.pollMs || 0) / 1000)}s`} />
+          <Metric label="Stale" value={data.isStale ? 'Yes' : 'No'} tone={data.isStale ? 'warn' : 'good'} />
+        </View>
+      </Panel>
+
+      <Panel title="Safety and Limits">
+        <Text style={styles.metaLine}>Entry manager: {status?.trading?.entryManagerRunning ? 'running' : 'stopped'}</Text>
+        <Text style={styles.metaLine}>Exit manager: {status?.trading?.exitManagerRunning ? 'running' : 'stopped'}</Text>
+        <Text style={styles.metaLine}>Active slots: {status?.diagnostics?.activeSlotsUsed ?? '—'} / {status?.diagnostics?.capMaxEffective ?? '—'}</Text>
+        <Text style={styles.metaLine}>Rate window: {status?.limiter?.windowMs ?? '—'} ms</Text>
+      </Panel>
+
+      <SystemHealthPanel diagnostics={status} staleMinutes={data.staleMinutes || 0} lastSuccessAt={data.lastSuccessAt} />
+    </>
+  );
+}
+
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: theme.colors.bg },
+  safe: { flex: 1, backgroundColor: tokens.colors.bg0 },
   screen: { flex: 1 },
-  content: { padding: theme.spacing.md, paddingBottom: 100 },
-  gridRow: {
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  errorBanner: {
-    backgroundColor: theme.colors.errorBg,
-    borderColor: '#8A2A3C',
+  content: { padding: tokens.spacing.md, paddingBottom: 80 },
+  hero: {
+    borderRadius: tokens.radius.xl,
     borderWidth: 1,
-    borderRadius: theme.radius.md,
-    padding: theme.spacing.sm,
-    marginTop: theme.spacing.md,
+    borderColor: tokens.colors.border,
+    padding: tokens.spacing.lg,
+    marginBottom: tokens.spacing.md,
+    backgroundColor: tokens.colors.panel,
   },
-  errorText: { color: theme.colors.errorText, fontWeight: '900' },
-  errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
-  loader: { marginVertical: theme.spacing.md },
-  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
-});
-
-const headerStyles = StyleSheet.create({
-  wrap: { paddingBottom: theme.spacing.md },
-  topRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
-  },
-  title: { color: theme.colors.text, fontSize: 26, fontWeight: '900', letterSpacing: 0.6 },
-  titleRight: { color: theme.colors.text, fontSize: 26, fontWeight: '900' },
-  chipsRow: {
-    flexDirection: 'row',
-    gap: theme.spacing.sm,
-    flexWrap: 'wrap',
-    marginBottom: theme.spacing.sm,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.16)',
-    backgroundColor: 'rgba(255,255,255,0.06)',
-  },
-  chipValue: { color: theme.colors.text, fontSize: 14, fontWeight: '800' },
-  openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
-  openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
-});
-
-const cardStyles = StyleSheet.create({
-  card: {
-    borderRadius: theme.radius.lg,
-    padding: theme.spacing.md,
-    marginBottom: theme.spacing.md,
-    borderWidth: 1.25,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
-  },
-  symWrap: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  symbol: { color: theme.colors.text, fontSize: 19, fontWeight: '900', letterSpacing: 0.8 },
-  qty: { color: theme.colors.muted, fontSize: 14, fontWeight: '800' },
-  pill: {
-    flexDirection: 'row',
-    gap: 6,
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 999,
-    borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.06)',
-  },
-  pillText: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
-  grid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    gap: theme.spacing.sm,
-    marginBottom: theme.spacing.sm,
-  },
-  stat: {
-    minWidth: '48%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 6,
-  },
-  statIcon: { color: theme.colors.muted, fontSize: 14, fontWeight: '900' },
-  statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
-  bigRow: { marginBottom: theme.spacing.sm },
-  forensicsWrap: {
-    marginTop: theme.spacing.xs,
-    paddingTop: theme.spacing.xs,
-    borderTopWidth: 1,
-    borderTopColor: theme.colors.border,
-  },
-  forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
-  forensicsDebug: { color: theme.colors.faint, fontSize: 11, marginTop: 2 },
-});
-
-
-const compactStyles = StyleSheet.create({
-  tile: {
-    flex: 1,
-    borderWidth: 1.1,
-    borderRadius: theme.radius.md,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    marginBottom: 10,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    minHeight: 0,
-  },
-  line1: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  line2: {
-    marginTop: 6,
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    justifyContent: 'space-between',
-    gap: 8,
-  },
-  sym: {
-    flex: 1,
-    color: theme.colors.text,
-    fontSize: 15,
-    fontWeight: '900',
-    letterSpacing: 0.4,
-  },
-  delta: {
-    color: theme.colors.warning,
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  pnl: {
-    flex: 1,
-    fontSize: 12,
-    fontWeight: '900',
-  },
-  timeInline: {
-    color: theme.colors.muted,
-    fontSize: 11,
+  heroTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  brand: {
+    color: tokens.colors.textMuted,
     fontWeight: '800',
+    letterSpacing: 1,
+    fontSize: tokens.type.tiny,
   },
+  heroEquity: { color: tokens.colors.text, fontSize: tokens.type.title, fontWeight: '900', marginTop: 8 },
+  heroSub: { color: tokens.colors.textMuted, fontSize: 12 },
+  heroMetrics: { flexDirection: 'row', gap: tokens.spacing.md, marginTop: tokens.spacing.sm },
+  chipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: tokens.spacing.sm },
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: tokens.colors.panelSoft,
+    borderRadius: 999,
+    padding: 4,
+    marginBottom: tokens.spacing.md,
+  },
+  tabBtn: { flex: 1, paddingVertical: 10, borderRadius: 999, alignItems: 'center' },
+  tabBtnActive: { backgroundColor: 'rgba(74,216,255,0.2)' },
+  tabText: { color: tokens.colors.textMuted, fontWeight: '700' },
+  tabTextActive: { color: tokens.colors.text, fontWeight: '900' },
+  errText: { color: tokens.colors.bad, fontWeight: '900' },
+  errHint: { color: tokens.colors.textMuted, marginTop: 5 },
+  empty: { color: tokens.colors.textMuted },
+  backBtn: { color: tokens.colors.info, marginBottom: tokens.spacing.sm, fontWeight: '700' },
+  detailPL: { fontWeight: '900', fontSize: 20, marginBottom: tokens.spacing.sm },
+  detailMetricsWrap: { flexDirection: 'row', gap: tokens.spacing.sm, marginBottom: tokens.spacing.sm },
+  metaLine: { color: tokens.colors.textMuted, marginBottom: 4 },
 });
