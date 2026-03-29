@@ -11,6 +11,7 @@ import {
   View,
 } from 'react-native';
 import Constants from 'expo-constants';
+import { VictoryAxis, VictoryChart, VictoryLine, VictoryTheme } from 'victory-native';
 
 const THEME = {
   bg: '#06080F',
@@ -27,6 +28,7 @@ const THEME = {
 
 const POLL_MS = 15000;
 const STALE_MS = 45000;
+const maxHistoryPoints = 90;
 
 const parseNum = (value) => {
   const n = Number(value);
@@ -65,6 +67,38 @@ const durationLabel = (secondsValue) => {
 };
 
 const endpointUrl = (base, path) => `${String(base || '').replace(/\/$/, '')}${path}`;
+
+const appendHistoryPoint = (prev, point, maxPoints) => {
+  const next = [...prev, point];
+  return next.slice(Math.max(0, next.length - maxPoints));
+};
+
+const getChartSeries = (history, key) => history
+  .map((point, index) => {
+    const y = parseNum(point?.[key]);
+    return y === null ? null : { x: index + 1, y, ts: point?.ts ?? null };
+  })
+  .filter(Boolean);
+
+const formatTimeAgo = (ts) => {
+  const n = parseNum(ts);
+  if (n === null) return '—';
+  const diff = Math.max(0, Date.now() - n);
+  if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  return `${Math.floor(diff / 3600000)}h ago`;
+};
+
+const getTrendColor = (series, positiveColor, negativeColor) => {
+  if (series.length < 2) return positiveColor;
+  return series[series.length - 1].y >= series[0].y ? positiveColor : negativeColor;
+};
+
+const formatWindow = (pointsCount) => {
+  const totalSec = Math.floor((pointsCount * POLL_MS) / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  return `${(totalSec / 60).toFixed(1)}m`;
+};
 
 const getRuntimeConfig = () => {
   const extra = Constants?.expoConfig?.extra || {};
@@ -247,6 +281,7 @@ export default function App() {
   const [diag, setDiag] = useState(null);
   const [lastUpdatedAt, setLastUpdatedAt] = useState(null);
   const [expanded, setExpanded] = useState({});
+  const [history, setHistory] = useState([]);
 
   const baseUrl = useMemo(resolveBaseUrl, []);
   const headers = useMemo(buildHeaders, []);
@@ -256,10 +291,13 @@ export default function App() {
     else setLoading(true);
 
     let hadSuccess = false;
+    let diagnosticsOk = false;
     try {
       try {
         const diagRaw = await fetchJson(endpointUrl(baseUrl, '/debug/status'), headers);
-        setDiag(normalizeDiagnostics(diagRaw));
+        const normalizedDiag = normalizeDiagnostics(diagRaw);
+        diagnosticsOk = Boolean(normalizedDiag?.ok);
+        setDiag(normalizedDiag);
         setDiagnosticsError(null);
         hadSuccess = true;
       } catch (err) {
@@ -275,7 +313,22 @@ export default function App() {
 
       try {
         const dashboardRaw = await fetchJson(endpointUrl(baseUrl, '/dashboard'), headers);
-        setDashboard(normalizeDashboard(dashboardRaw));
+        const normalizedDashboard = normalizeDashboard(dashboardRaw);
+        setDashboard(normalizedDashboard);
+
+        const portfolioValue = parseNum(normalizedDashboard?.accountValue);
+        const openPL = normalizedDashboard?.positions
+          ?.reduce((sum, position) => sum + (parseNum(position?.unrealizedPl) ?? 0), 0);
+        const positionsCount = asArray(normalizedDashboard?.positions).length;
+
+        setHistory((prev) => appendHistoryPoint(prev, {
+          ts: Date.now(),
+          portfolioValue,
+          openPL: parseNum(openPL),
+          positionsCount,
+          diagnosticsOk,
+        }, maxHistoryPoints));
+
         setDashboardError(null);
         hadSuccess = true;
       } catch (err) {
@@ -300,6 +353,13 @@ export default function App() {
   const positions = dashboard?.positions || [];
   const apiToken = useMemo(resolveApiToken, []);
   const tokenPresent = Boolean(apiToken);
+  const portfolioSeries = useMemo(() => getChartSeries(history, 'portfolioValue'), [history]);
+  const openPlSeries = useMemo(() => getChartSeries(history, 'openPL'), [history]);
+  const positionsSeries = useMemo(() => getChartSeries(history, 'positionsCount'), [history]);
+
+  const portfolioColor = getTrendColor(portfolioSeries, THEME.positive, THEME.negative);
+  const openPlLatest = openPlSeries.length > 0 ? openPlSeries[openPlSeries.length - 1].y : null;
+  const openPlColor = openPlLatest !== null && openPlLatest < 0 ? THEME.negative : THEME.positive;
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -373,15 +433,103 @@ export default function App() {
               ))}
             </Card>
 
-            <Card title="Event / Forensics Feed">
-              {positions.filter((p) => p.forensics).length === 0 ? (
-                <Text style={styles.emptyText}>No forensics events available.</Text>
-              ) : positions.filter((p) => p.forensics).map((p) => (
-                <View key={`${p.symbol}-forensics`} style={styles.feedRow}>
-                  <Text style={styles.feedSymbol}>{p.symbol}</Text>
-                  <Text style={styles.feedText}>{JSON.stringify(p.forensics)}</Text>
-                </View>
-              ))}
+            <Card title="Live Trend">
+              {!!dashboardError && <Text style={styles.errorText}>Dashboard error: {dashboardError}</Text>}
+              {!!diagnosticsError && <Text style={styles.errorText}>Diagnostics error: {diagnosticsError}</Text>}
+
+              {portfolioSeries.length < 2 || openPlSeries.length < 2 ? (
+                <Text style={styles.emptyText}>Waiting for live data…</Text>
+              ) : (
+                <>
+                  <Text style={styles.chartLabel}>Portfolio Value</Text>
+                  <View style={styles.chartWrap}>
+                    <VictoryChart
+                      theme={VictoryTheme.material}
+                      padding={{ top: 8, bottom: 24, left: 42, right: 8 }}
+                      height={170}
+                    >
+                      <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
+                      <VictoryAxis
+                        dependentAxis
+                        tickCount={4}
+                        style={{
+                          axis: { stroke: 'transparent' },
+                          ticks: { stroke: THEME.border },
+                          tickLabels: { fill: THEME.textMuted, fontSize: 10 },
+                          grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
+                        }}
+                      />
+                      <VictoryLine
+                        interpolation="natural"
+                        data={portfolioSeries}
+                        style={{ data: { stroke: portfolioColor, strokeWidth: 2.5 } }}
+                      />
+                    </VictoryChart>
+                  </View>
+
+                  <Text style={styles.chartLabel}>Open P/L</Text>
+                  <View style={styles.chartWrap}>
+                    <VictoryChart
+                      theme={VictoryTheme.material}
+                      padding={{ top: 8, bottom: 24, left: 42, right: 8 }}
+                      height={150}
+                    >
+                      <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
+                      <VictoryAxis
+                        dependentAxis
+                        tickCount={4}
+                        style={{
+                          axis: { stroke: 'transparent' },
+                          ticks: { stroke: THEME.border },
+                          tickLabels: { fill: THEME.textMuted, fontSize: 10 },
+                          grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
+                        }}
+                      />
+                      <VictoryLine
+                        interpolation="natural"
+                        data={openPlSeries}
+                        style={{ data: { stroke: openPlColor, strokeWidth: 2.5 } }}
+                      />
+                    </VictoryChart>
+                  </View>
+
+                  <Text style={styles.chartLabel}>Positions Count</Text>
+                  {positionsSeries.length < 2 ? (
+                    <Text style={styles.emptyText}>Waiting for live data…</Text>
+                  ) : (
+                    <View style={styles.chartWrapMini}>
+                      <VictoryChart
+                        theme={VictoryTheme.material}
+                        padding={{ top: 6, bottom: 18, left: 28, right: 8 }}
+                        height={105}
+                      >
+                        <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
+                        <VictoryAxis
+                          dependentAxis
+                          tickCount={3}
+                          style={{
+                            axis: { stroke: 'transparent' },
+                            ticks: { stroke: 'transparent' },
+                            tickLabels: { fill: THEME.textMuted, fontSize: 9 },
+                            grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
+                          }}
+                        />
+                        <VictoryLine
+                          interpolation="natural"
+                          data={positionsSeries}
+                          style={{ data: { stroke: THEME.accent, strokeWidth: 1.6 } }}
+                        />
+                      </VictoryChart>
+                    </View>
+                  )}
+
+                  <View style={styles.summaryRow}>
+                    <Text style={styles.summaryText}>Points: {history.length}</Text>
+                    <Text style={styles.summaryText}>Window: {formatWindow(history.length)}</Text>
+                    <Text style={styles.summaryText}>Last update: {formatTimeAgo(lastUpdatedAt)}</Text>
+                  </View>
+                </>
+              )}
             </Card>
           </>
         ) : (
@@ -457,4 +605,29 @@ const styles = StyleSheet.create({
   feedRow: { gap: 4, borderBottomWidth: 1, borderBottomColor: THEME.border, paddingVertical: 8 },
   feedSymbol: { color: THEME.warning, fontWeight: '700' },
   feedText: { color: THEME.textMuted, fontSize: 12 },
+  chartWrap: {
+    borderWidth: 1,
+    borderColor: THEME.border,
+    borderRadius: 10,
+    backgroundColor: 'rgba(18, 26, 45, 0.55)',
+    overflow: 'hidden',
+  },
+  chartWrapMini: {
+    borderWidth: 1,
+    borderColor: THEME.border,
+    borderRadius: 10,
+    backgroundColor: 'rgba(18, 26, 45, 0.45)',
+    overflow: 'hidden',
+  },
+  chartLabel: { color: THEME.text, fontSize: 13, fontWeight: '600', marginBottom: -2 },
+  summaryRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: 8,
+    borderTopWidth: 1,
+    borderTopColor: THEME.border,
+    paddingTop: 8,
+  },
+  summaryText: { color: THEME.textMuted, fontSize: 11 },
 });
