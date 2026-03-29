@@ -1,53 +1,30 @@
-# FRONTEND REBUILD NOTES
+# FRONTEND_REBUILD_NOTES
 
-## What was deleted
-- Deleted old frontend UI implementation directory: `frontend/src/`.
+## What frontend files were rebuilt
+- `frontend/App.js` (single-file Mission Control UI rebuild).
+- `frontend/package.json` (minimal Expo manifest for boot).
+- `frontend/app.json` (minimal Expo app configuration).
+- `FRONTEND_REBUILD_PLAN.md` (repo-root plan document).
+- `FRONTEND_REBUILD_NOTES.md` (this notes document).
 
-## What was rebuilt
-- Rebuilt Expo frontend UI from scratch around a Mission Control command deck.
-- Implemented a fresh polling data layer on top of existing backend endpoints (`/dashboard`, `/debug/status`).
-- Implemented manual mode switching (Command Deck / Diagnostics) without adding navigation dependencies.
+## What was intentionally not recreated yet
+- No multi-file frontend architecture (`components/`, `lib/`, `src/`) in this first pass.
+- No navigation library.
+- No UI kit.
+- No animation/effects dependencies.
+- No backend modifications.
 
-## Exact files added
-- `frontend/components/PortfolioHero.js`
-- `frontend/components/BotStatusChip.js`
-- `frontend/components/PositionCard.js`
-- `frontend/components/TargetProgressBar.js`
-- `frontend/components/EventFeed.js`
-- `frontend/components/SystemHealthPanel.js`
-- `frontend/lib/api.js`
-- `frontend/lib/format.js`
-- `frontend/lib/theme.js`
-- `FRONTEND_REBUILD_PLAN.md`
-- `FRONTEND_REBUILD_NOTES.md`
+## How to run the frontend
+```bash
+cd frontend
+npm start
+```
 
-## Exact files removed
-- `frontend/src/api/client.js`
-- `frontend/src/components/EventFeed.js`
-- `frontend/src/components/PositionCard.js`
-- `frontend/src/components/ProgressTrack.js`
-- `frontend/src/components/SystemHealthPanel.js`
-- `frontend/src/components/ui.js`
-- `frontend/src/hooks/useMissionControlData.js`
-- `frontend/src/screens/CommandDeckScreen.js`
-- `frontend/src/screens/PositionDetailScreen.js`
-- `frontend/src/screens/SystemDiagnosticsScreen.js`
-- `frontend/src/theme/tokens.js`
-- `frontend/src/utils/formatters.js`
+Safer non-interactive startup check used during rebuild:
+```bash
+cd frontend
+CI=1 npx expo start --offline --non-interactive --port 8088
+```
 
-## Exact dependencies changed
-- No dependency additions.
-- No dependency removals.
-
-## How to run frontend
-1. `cd frontend`
-2. `npm start`
-3. Launch with Expo target (`a`, `i`, or `w`) as available.
-
-## Known limitations
-- UI depends on backend payload quality; missing fields degrade to em-dash placeholders.
-- No chart/animation dependencies were added by design.
-- Position detail mode is implemented as expandable cards (no modal dependency).
-
-## Backend untouched
-- Backend code and behavior were not modified.
+## Explicit backend statement
+Backend was untouched (no code, route, logic, auth, calculations, persistence, or safety changes).
