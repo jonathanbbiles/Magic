@@ -11,7 +11,7 @@ import {
   View,
 } from 'react-native';
 import Constants from 'expo-constants';
-import { VictoryAxis, VictoryChart, VictoryLine, VictoryTheme } from 'victory-native';
+import Svg, { Line, Path, Text as SvgText } from 'react-native-svg';
 
 const THEME = {
   bg: '#06080F',
@@ -92,6 +92,50 @@ const formatTimeAgo = (ts) => {
 const getTrendColor = (series, positiveColor, negativeColor) => {
   if (series.length < 2) return positiveColor;
   return series[series.length - 1].y >= series[0].y ? positiveColor : negativeColor;
+};
+
+const sanitizeSeries = (data) => asArray(data)
+  .map((point, index) => {
+    const y = parseNum(point?.y);
+    if (y === null) return null;
+    return {
+      x: parseNum(point?.x) ?? index + 1,
+      y,
+      ts: point?.ts ?? null,
+    };
+  })
+  .filter(Boolean);
+
+const getRange = (values) => {
+  if (!values.length) return { min: 0, max: 1 };
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) {
+    const pad = Math.abs(min || 1) * 0.05 || 1;
+    min -= pad;
+    max += pad;
+  }
+  return { min, max };
+};
+
+const buildLinePath = (points, width, height, padding) => {
+  if (!points.length) return '';
+  const innerWidth = Math.max(1, width - padding.left - padding.right);
+  const innerHeight = Math.max(1, height - padding.top - padding.bottom);
+  const yValues = points.map((point) => point.y);
+  const { min, max } = getRange(yValues);
+  const yRange = max - min;
+  const total = points.length - 1;
+
+  const coords = points.map((point, index) => {
+    const ratioX = total <= 0 ? 0 : index / total;
+    const x = padding.left + (ratioX * innerWidth);
+    const y = padding.top + ((max - point.y) / yRange) * innerHeight;
+    return { x, y };
+  });
+
+  const path = coords.map((coord, index) => `${index === 0 ? 'M' : 'L'} ${coord.x} ${coord.y}`).join(' ');
+  return { path, min, max };
 };
 
 const formatWindow = (pointsCount) => {
@@ -271,6 +315,92 @@ const PositionRow = ({ position, expanded, onToggle }) => {
   );
 };
 
+const MiniLineChart = ({
+  data,
+  height = 160,
+  color,
+  strokeWidth = 2.5,
+  showYAxis = true,
+  compact = false,
+}) => {
+  const [width, setWidth] = useState(0);
+  const padding = useMemo(() => ({
+    left: showYAxis ? 38 : 10,
+    right: 8,
+    top: 10,
+    bottom: compact ? 10 : 18,
+  }), [compact, showYAxis]);
+  const points = useMemo(() => sanitizeSeries(data), [data]);
+
+  const chartData = useMemo(() => {
+    if (points.length < 2 || width <= 0) return null;
+    return buildLinePath(points, width, height, padding);
+  }, [height, padding, points, width]);
+
+  const onLayout = useCallback((event) => {
+    const nextWidth = Math.floor(event?.nativeEvent?.layout?.width ?? 0);
+    if (nextWidth > 0 && nextWidth !== width) {
+      setWidth(nextWidth);
+    }
+  }, [width]);
+
+  if (points.length < 2) {
+    return (
+      <View style={[styles.chartFallback, { height }]}>
+        <Text style={styles.emptyText}>Waiting for live data…</Text>
+      </View>
+    );
+  }
+
+  const lineColor = color || THEME.accent;
+  const innerWidth = Math.max(1, width - padding.left - padding.right);
+  const innerHeight = Math.max(1, height - padding.top - padding.bottom);
+
+  return (
+    <View style={{ height }} onLayout={onLayout}>
+      {width > 0 && chartData ? (
+        <Svg width={width} height={height}>
+          {[0, 1, 2].map((idx) => {
+            const y = padding.top + (idx / 2) * innerHeight;
+            return (
+              <Line
+                key={`grid-${idx}`}
+                x1={padding.left}
+                y1={y}
+                x2={padding.left + innerWidth}
+                y2={y}
+                stroke="#1A2340"
+                strokeWidth={1}
+                strokeDasharray="4 4"
+              />
+            );
+          })}
+
+          {showYAxis && (
+            <>
+              <SvgText x={4} y={padding.top + 8} fill={THEME.textMuted} fontSize={10}>
+                {chartData.max.toFixed(2)}
+              </SvgText>
+              <SvgText x={4} y={height - padding.bottom} fill={THEME.textMuted} fontSize={10}>
+                {chartData.min.toFixed(2)}
+              </SvgText>
+            </>
+          )}
+
+          <Path
+            d={chartData.path}
+            stroke={lineColor}
+            strokeWidth={strokeWidth}
+            fill="none"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        </Svg>
+      ) : null}
+    </View>
+  );
+};
+
 export default function App() {
   const [mode, setMode] = useState('command');
   const [loading, setLoading] = useState(true);
@@ -437,99 +567,35 @@ export default function App() {
               {!!dashboardError && <Text style={styles.errorText}>Dashboard error: {dashboardError}</Text>}
               {!!diagnosticsError && <Text style={styles.errorText}>Diagnostics error: {diagnosticsError}</Text>}
 
-              {portfolioSeries.length < 2 || openPlSeries.length < 2 ? (
-                <Text style={styles.emptyText}>Waiting for live data…</Text>
-              ) : (
-                <>
-                  <Text style={styles.chartLabel}>Portfolio Value</Text>
-                  <View style={styles.chartWrap}>
-                    <VictoryChart
-                      theme={VictoryTheme.material}
-                      padding={{ top: 8, bottom: 24, left: 42, right: 8 }}
-                      height={170}
-                    >
-                      <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
-                      <VictoryAxis
-                        dependentAxis
-                        tickCount={4}
-                        style={{
-                          axis: { stroke: 'transparent' },
-                          ticks: { stroke: THEME.border },
-                          tickLabels: { fill: THEME.textMuted, fontSize: 10 },
-                          grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
-                        }}
-                      />
-                      <VictoryLine
-                        interpolation="natural"
-                        data={portfolioSeries}
-                        style={{ data: { stroke: portfolioColor, strokeWidth: 2.5 } }}
-                      />
-                    </VictoryChart>
-                  </View>
+              <>
+                <Text style={styles.chartLabel}>Portfolio Value</Text>
+                <View style={styles.chartWrap}>
+                  <MiniLineChart data={portfolioSeries} color={portfolioColor} height={170} />
+                </View>
 
-                  <Text style={styles.chartLabel}>Open P/L</Text>
-                  <View style={styles.chartWrap}>
-                    <VictoryChart
-                      theme={VictoryTheme.material}
-                      padding={{ top: 8, bottom: 24, left: 42, right: 8 }}
-                      height={150}
-                    >
-                      <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
-                      <VictoryAxis
-                        dependentAxis
-                        tickCount={4}
-                        style={{
-                          axis: { stroke: 'transparent' },
-                          ticks: { stroke: THEME.border },
-                          tickLabels: { fill: THEME.textMuted, fontSize: 10 },
-                          grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
-                        }}
-                      />
-                      <VictoryLine
-                        interpolation="natural"
-                        data={openPlSeries}
-                        style={{ data: { stroke: openPlColor, strokeWidth: 2.5 } }}
-                      />
-                    </VictoryChart>
-                  </View>
+                <Text style={styles.chartLabel}>Open P/L</Text>
+                <View style={styles.chartWrap}>
+                  <MiniLineChart data={openPlSeries} color={openPlColor} height={150} />
+                </View>
 
-                  <Text style={styles.chartLabel}>Positions Count</Text>
-                  {positionsSeries.length < 2 ? (
-                    <Text style={styles.emptyText}>Waiting for live data…</Text>
-                  ) : (
-                    <View style={styles.chartWrapMini}>
-                      <VictoryChart
-                        theme={VictoryTheme.material}
-                        padding={{ top: 6, bottom: 18, left: 28, right: 8 }}
-                        height={105}
-                      >
-                        <VictoryAxis style={{ axis: { stroke: 'transparent' }, ticks: { stroke: 'transparent' }, tickLabels: { fill: 'transparent' }, grid: { stroke: 'transparent' } }} />
-                        <VictoryAxis
-                          dependentAxis
-                          tickCount={3}
-                          style={{
-                            axis: { stroke: 'transparent' },
-                            ticks: { stroke: 'transparent' },
-                            tickLabels: { fill: THEME.textMuted, fontSize: 9 },
-                            grid: { stroke: '#1A2340', strokeDasharray: '4,4' },
-                          }}
-                        />
-                        <VictoryLine
-                          interpolation="natural"
-                          data={positionsSeries}
-                          style={{ data: { stroke: THEME.accent, strokeWidth: 1.6 } }}
-                        />
-                      </VictoryChart>
-                    </View>
-                  )}
+                <Text style={styles.chartLabel}>Positions Count</Text>
+                <View style={styles.chartWrapMini}>
+                  <MiniLineChart
+                    data={positionsSeries}
+                    color={THEME.accent}
+                    height={105}
+                    compact
+                    showYAxis
+                    strokeWidth={1.8}
+                  />
+                </View>
 
-                  <View style={styles.summaryRow}>
-                    <Text style={styles.summaryText}>Points: {history.length}</Text>
-                    <Text style={styles.summaryText}>Window: {formatWindow(history.length)}</Text>
-                    <Text style={styles.summaryText}>Last update: {formatTimeAgo(lastUpdatedAt)}</Text>
-                  </View>
-                </>
-              )}
+                <View style={styles.summaryRow}>
+                  <Text style={styles.summaryText}>Points: {history.length}</Text>
+                  <Text style={styles.summaryText}>Window: {formatWindow(history.length)}</Text>
+                  <Text style={styles.summaryText}>Last update: {formatTimeAgo(lastUpdatedAt)}</Text>
+                </View>
+              </>
             </Card>
           </>
         ) : (
@@ -620,6 +686,10 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   chartLabel: { color: THEME.text, fontSize: 13, fontWeight: '600', marginBottom: -2 },
+  chartFallback: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   summaryRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
