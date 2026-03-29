@@ -1,11 +1,10 @@
 import React, { useEffect, useRef } from 'react';
 import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
-import { gradients, tokens } from '../theme/tokens';
+import { tokens } from '../theme/tokens';
 
 export function Panel({ title, right, children, style }) {
   return (
-    <LinearGradient colors={gradients.panel} style={[styles.panel, style]}>
+    <View style={[styles.panel, style]}>
       {(title || right) ? (
         <View style={styles.panelHeader}>
           {title ? <Text style={styles.panelTitle}>{title}</Text> : <View />}
@@ -13,7 +12,7 @@ export function Panel({ title, right, children, style }) {
         </View>
       ) : null}
       {children}
-    </LinearGradient>
+    </View>
   );
 }
 

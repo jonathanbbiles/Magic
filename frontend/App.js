@@ -1,8 +1,7 @@
 import React, { useMemo, useState } from 'react';
-import { FlatList, RefreshControl, SafeAreaView, StatusBar, StyleSheet } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
+import { FlatList, RefreshControl, SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
 import { useMissionControlData } from './src/hooks/useMissionControlData';
-import { gradients, tokens } from './src/theme/tokens';
+import { tokens } from './src/theme/tokens';
 import { deriveBotMood } from './src/utils/formatters';
 import { CommandDeckScreen } from './src/screens/CommandDeckScreen';
 import { PositionDetailScreen } from './src/screens/PositionDetailScreen';
@@ -40,7 +39,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={gradients.screen} style={styles.screen}>
+      <View style={styles.screen}>
         <FlatList
           data={[]}
           renderItem={null}
@@ -48,13 +47,13 @@ export default function App() {
           contentContainerStyle={styles.content}
           refreshControl={<RefreshControl refreshing={data.refreshing} onRefresh={data.refresh} tintColor={tokens.colors.text} />}
         />
-      </LinearGradient>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: tokens.colors.bg0 },
-  screen: { flex: 1 },
+  screen: { flex: 1, backgroundColor: tokens.colors.bg0 },
   content: { padding: tokens.spacing.md, paddingBottom: tokens.spacing.xxl },
 });

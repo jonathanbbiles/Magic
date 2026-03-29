@@ -1,9 +1,8 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { ProgressTrack } from './ProgressTrack';
 import { StatusChip } from './ui';
-import { gradients, tokens } from '../theme/tokens';
+import { tokens } from '../theme/tokens';
 import { ageLabel, getHoldSeconds, getProgressModel, pct, signedUsd, toNum } from '../utils/formatters';
 
 function positionState(position) {
@@ -24,7 +23,7 @@ export function PositionCard({ position, onPress }) {
 
   return (
     <Pressable onPress={onPress} style={styles.pressable}>
-      <LinearGradient colors={gradients.panel} style={styles.card}>
+      <View style={styles.card}>
         <View style={styles.headRow}>
           <View>
             <Text style={styles.symbol}>{symbol}</Text>
@@ -43,7 +42,7 @@ export function PositionCard({ position, onPress }) {
           <Text style={styles.footerText}>Exit source: {position?.sell?.source || '—'}</Text>
           <Text style={styles.footerText}>Tap for detail →</Text>
         </View>
-      </LinearGradient>
+      </View>
     </Pressable>
   );
 }
