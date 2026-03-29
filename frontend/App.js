@@ -1,11 +1,11 @@
 import React, { useMemo, useState } from 'react';
 import { FlatList, RefreshControl, SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
-import { useMissionControlData } from './src/hooks/useMissionControlData';
-import { tokens } from './src/theme/tokens';
-import { deriveBotMood } from './src/utils/formatters';
-import { CommandDeckScreen } from './src/screens/CommandDeckScreen';
-import { PositionDetailScreen } from './src/screens/PositionDetailScreen';
-import { SystemDiagnosticsScreen } from './src/screens/SystemDiagnosticsScreen';
+import { useMissionControlData } from './src/hooks/useMissionControlData.js';
+import { tokens } from './src/theme/tokens.js';
+import { deriveBotMood } from './src/utils/formatters.js';
+import { CommandDeckScreen } from './src/screens/CommandDeckScreen.js';
+import { PositionDetailScreen } from './src/screens/PositionDetailScreen.js';
+import { SystemDiagnosticsScreen } from './src/screens/SystemDiagnosticsScreen.js';
 
 export default function App() {
   const [screen, setScreen] = useState('deck');
