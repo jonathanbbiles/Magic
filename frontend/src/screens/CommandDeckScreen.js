@@ -1,11 +1,10 @@
 import React, { useMemo } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { EventFeed } from '../components/EventFeed';
 import { PositionCard } from '../components/PositionCard';
 import { SystemHealthPanel } from '../components/SystemHealthPanel';
 import { ActionPill, LivePulse, Metric, Panel, StatusChip } from '../components/ui';
-import { gradients, tokens } from '../theme/tokens';
+import { tokens } from '../theme/tokens';
 import { pct, signedUsd, toNum, usd } from '../utils/formatters';
 
 export function CommandDeckScreen({ data, mood, onOpenPosition, onOpenDiagnostics }) {
@@ -18,7 +17,7 @@ export function CommandDeckScreen({ data, mood, onOpenPosition, onOpenDiagnostic
 
   return (
     <View>
-      <LinearGradient colors={gradients.hero} style={styles.hero}>
+      <View style={styles.hero}>
         <View style={styles.heroTop}>
           <Text style={styles.brand}>MISSION CONTROL · COMMAND DECK</Text>
           <LivePulse online={!data.error && !data.isStale} label={data.error ? 'Degraded' : 'Streaming'} />
@@ -41,7 +40,7 @@ export function CommandDeckScreen({ data, mood, onOpenPosition, onOpenDiagnostic
         <View style={styles.actionRow}>
           <ActionPill label="System diagnostics" onPress={onOpenDiagnostics} />
         </View>
-      </LinearGradient>
+      </View>
 
       {data.error ? (
         <Panel title="Connection Warning" right={<StatusChip label="caution" tone="warn" />}>

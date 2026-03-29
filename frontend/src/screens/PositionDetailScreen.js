@@ -1,9 +1,8 @@
 import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 import { ProgressTrack } from '../components/ProgressTrack';
 import { ActionPill, Metric, Panel, StatusChip } from '../components/ui';
-import { gradients, tokens } from '../theme/tokens';
+import { tokens } from '../theme/tokens';
 import { ageLabel, getHoldSeconds, getProgressModel, pct, signedUsd, toNum, usd } from '../utils/formatters';
 
 export function PositionDetailScreen({ position, mood, onBack, onOpenDiagnostics }) {
@@ -22,7 +21,7 @@ export function PositionDetailScreen({ position, mood, onBack, onOpenDiagnostics
 
   return (
     <View>
-      <LinearGradient colors={gradients.hero} style={styles.hero}>
+      <View style={styles.hero}>
         <Text style={styles.symbol}>{position?.symbol || 'Position'}</Text>
         <Text style={[styles.detailPL, { color: up ? tokens.colors.good : tokens.colors.bad }]}>
           {signedUsd(pl)} ({pct(position?.unrealized_plpc, { ratio: true })})
@@ -32,7 +31,7 @@ export function PositionDetailScreen({ position, mood, onBack, onOpenDiagnostics
           <StatusChip label={mood?.label || 'bot'} tone={mood?.tone || 'info'} />
           <StatusChip label={`held ${ageLabel(getHoldSeconds(position))}`} tone="info" />
         </View>
-      </LinearGradient>
+      </View>
 
       <View style={styles.topActions}>
         <ActionPill label="← Back to command deck" onPress={onBack} />
