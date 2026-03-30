@@ -1,50 +1,31 @@
-# Magic Mission Control Frontend
+# Magic Frontend (Expo)
 
-A single-file Expo dashboard designed to run in Expo.dev/Snack and local Expo SDK 53 projects.
+This frontend lives in `Magic-main/frontend` and is configured for Expo SDK 53.
 
-## 1) Set your backend URL
+## Backend URL configuration
 
-In `frontend/App.js`, update:
+`App.js` uses this resolution order for the backend URL:
 
-```js
-const BASE_URL = 'https://YOUR-BACKEND-URL-HERE';
-```
+1. `process.env.EXPO_PUBLIC_BACKEND_URL`
+2. Fallback: `https://magic-lw8t.onrender.com`
 
-Replace it with your deployed backend root URL (no trailing slash required).
+Set `EXPO_PUBLIC_BACKEND_URL` in your Expo environment when you need to target a different backend.
 
-## 2) Paste into Expo.dev / Snack
+## Clean boot recovery (frontend only)
 
-1. Open https://expo.dev and create a new Snack.
-2. Replace the Snack `App.js` content with `frontend/App.js`.
-3. Ensure dependencies include:
-   - `expo`
-   - `expo-linear-gradient`
-   - `react`
-   - `react-native`
-4. Run the Snack.
-
-> Note: This app intentionally does **not** use `expo-status-bar` to avoid Snack module-resolution issues.
-
-## 3) Run locally
+Use these exact steps when Expo boot/module-resolution issues occur:
 
 ```bash
-cd frontend
+cd Magic-main/frontend
+rm -rf node_modules .expo
+rm -f package-lock.json
 npm install
-npx expo start
+npx expo install expo-linear-gradient
+npx expo start -c
 ```
 
-Then open on iOS, Android, or web from the Expo CLI options.
+## Important repo-specific notes
 
-## 4) Expected backend endpoints
-
-The frontend polls and refreshes data from:
-
-- `/health`
-- `/portfolio`
-- `/positions`
-- `/status`
-- `/metrics`
-- `/diagnostics`
-- `/system`
-
-If one endpoint fails, the UI keeps running with graceful fallbacks and connection-state updates.
+- Do **not** touch `Magic-main/backend/package-lock.json` when fixing frontend boot issues.
+- There is currently **no** `Magic-main/frontend/metro.config.js` in this repo.
+- Keep frontend entrypoint as `Magic-main/frontend/App.js`.
