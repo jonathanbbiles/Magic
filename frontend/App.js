@@ -18,7 +18,7 @@ import { LinearGradient } from 'expo-linear-gradient';
  * IMPORTANT: Replace this with your backend base URL.
  * Example: const BASE_URL = 'https://magic-api.yourdomain.com';
  */
-const BASE_URL = 'https://YOUR-BACKEND-URL-HERE';
+const BASE_URL = process.env.EXPO_PUBLIC_BACKEND_URL || 'https://magic-lw8t.onrender.com';
 
 const POLL_INTERVAL_MS = 15000;
 const REQUEST_TIMEOUT_MS = 7000;
