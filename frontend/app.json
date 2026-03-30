@@ -1,9 +1,0 @@
-{
-  "expo": {
-    "name": "Magic Mission Control",
-    "slug": "magic-mission-control",
-    "version": "1.0.0",
-    "orientation": "default",
-    "userInterfaceStyle": "dark"
-  }
-}
