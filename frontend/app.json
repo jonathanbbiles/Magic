@@ -1,0 +1,34 @@
+{
+  "expo": {
+    "name": "Magic Mission Control",
+    "slug": "magic-mission-control",
+    "version": "1.0.0",
+    "scheme": "magic",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#07070d"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#07070d"
+      }
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    },
+    "extra": {
+      "backendUrl": "https://magic-lw8t.onrender.com",
+      "apiToken": ""
+    }
+  }
+}
