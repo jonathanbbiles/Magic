@@ -1,0 +1,20 @@
+export const theme = {
+  colors: {
+    bg: '#070A12',
+    text: 'rgba(255,255,255,0.92)',
+    muted: 'rgba(255,255,255,0.65)',
+    faint: 'rgba(255,255,255,0.45)',
+    card: '#0B1220',
+    cardAlt: '#0F1730',
+    positive: '#72FFB6',
+    negative: '#FF5C8A',
+    warning: '#FFD36E',
+    border: 'rgba(255,255,255,0.10)',
+    glowPos: 'rgba(114,255,182,0.55)',
+    glowNeg: 'rgba(255,92,138,0.55)',
+    errorBg: 'rgba(255,60,90,0.18)',
+    errorText: 'rgba(255,220,230,0.95)',
+  },
+  spacing: { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 },
+  radius: { md: 14, lg: 18, xl: 24 },
+};
