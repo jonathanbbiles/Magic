@@ -110,9 +110,12 @@ function DashboardScreen() {
     load({ showSpinner: false });
   }, [load]);
 
-  const positions = Array.isArray(data?.positions) ? data.positions : [];
+  const positions = useMemo(() => (Array.isArray(data?.positions) ? data.positions : []), [data?.positions]);
   const sorted = useMemo(() => getSortedPositions(positions, sortKey), [positions, sortKey]);
-  const summary = useMemo(() => deriveSummary(data?.account, data?.meta, positions), [data, positions]);
+  const summary = useMemo(
+    () => deriveSummary(data?.account, data?.meta, positions),
+    [data?.account, data?.meta, positions]
+  );
 
   return (
     <LinearGradient colors={[colors.bgTop, colors.bgBottom]} style={styles.flex}>
