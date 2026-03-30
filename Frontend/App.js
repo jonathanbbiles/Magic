@@ -1,158 +1,209 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  ActivityIndicator,
-  FlatList,
-  RefreshControl,
   SafeAreaView,
-  StatusBar,
-  StyleSheet,
-  Text,
   View,
-} from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
-import Chip from './components/Chip';
-import CompactPositionRow from './components/CompactPositionRow';
-import { POLL_MS } from './constants/config';
-import { theme } from './constants/theme';
-import { fetchDashboard } from './services/dashboardService';
-import { distToTargetPct, pct, signedUsd, toNum, usd } from './utils/formatters';
+  Text,
+  StyleSheet,
+  Pressable,
+  ScrollView,
+  ActivityIndicator,
+} from "react-native";
+
+const BACKEND_BASE_URL = "http://192.168.1.100:3001";
+// Replace with your backend machine IP.
+// Do NOT use localhost if testing from Expo Go on a phone.
+// If using an Android emulator, localhost is usually http://10.0.2.2:3001
+// If using iOS simulator on the same Mac, localhost may work.
 
 export default function App() {
-  const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const [health, setHealth] = useState(null);
+  const [dashboard, setDashboard] = useState(null);
   const [error, setError] = useState(null);
+  const [lastChecked, setLastChecked] = useState(null);
 
-  const load = useCallback(async ({ isRefresh = false } = {}) => {
-    if (isRefresh) setRefreshing(true);
-    if (!isRefresh) setLoading(true);
+  const status = useMemo(() => {
+    if (loading) return "CHECKING";
+    if (error) return "DOWN";
+    if (health && dashboard) return "UP";
+    if (health && !dashboard) return "DEGRADED";
+    return "DOWN";
+  }, [loading, error, health, dashboard]);
+
+  const statusColor = useMemo(() => {
+    switch (status) {
+      case "UP":
+        return "#16a34a";
+      case "DEGRADED":
+        return "#d97706";
+      case "DOWN":
+        return "#dc2626";
+      default:
+        return "#2563eb";
+    }
+  }, [status]);
+
+  async function fetchJson(path) {
+    const res = await fetch(`${BACKEND_BASE_URL}${path}`);
+    const text = await res.text();
+
+    let data;
     try {
-      const payload = await fetchDashboard();
-      setDashboard(payload);
-      setError(null);
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!res.ok) {
+      throw new Error(`${path} failed with ${res.status}`);
+    }
+
+    return data;
+  }
+
+  async function runChecks() {
+    setLoading(true);
+    setError(null);
+    setHealth(null);
+    setDashboard(null);
+
+    try {
+      const healthResult = await fetchJson("/health");
+      setHealth(healthResult);
+
+      try {
+        const dashboardResult = await fetchJson("/dashboard");
+        setDashboard(dashboardResult);
+      } catch (dashboardErr) {
+        setDashboard({ error: dashboardErr.message });
+      }
+
+      setLastChecked(new Date().toLocaleString());
     } catch (err) {
-      const message = err?.message || 'Request failed';
-      const status = err?.status ? `HTTP ${err.status}` : 'HTTP ?';
-      setError(`${status}: ${message}`);
+      setError(err.message || "Unknown error");
+      setLastChecked(new Date().toLocaleString());
     } finally {
       setLoading(false);
-      setRefreshing(false);
     }
-  }, []);
+  }
 
   useEffect(() => {
-    load();
-    const timer = setInterval(() => load(), POLL_MS);
-    return () => clearInterval(timer);
-  }, [load]);
-
-  const positions = useMemo(() => {
-    const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
-
-    list.sort((a, b) => {
-      const aDist = distToTargetPct(a);
-      const bDist = distToTargetPct(b);
-      if (!Number.isFinite(aDist)) return 1;
-      if (!Number.isFinite(bDist)) return -1;
-      return aDist - bDist;
-    });
-
-    return list;
-  }, [dashboard]);
-
-  const account = dashboard?.account || {};
-  const portfolioValue = account?.portfolio_value ?? account?.equity;
-
-  const weeklyChangePct = toNum(dashboard?.meta?.weeklyChangePct);
-
-  const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
-
-  const openPLPct = useMemo(() => {
-    const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
-    if (!Number.isFinite(mv) || mv <= 0) return null;
-    return (openPL / mv) * 100;
-  }, [positions, openPL]);
+    runChecks();
+  }, []);
 
   return (
     <SafeAreaView style={styles.safe}>
-      <StatusBar barStyle="light-content" />
-      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
-        <FlatList
-          data={positions}
-          numColumns={2}
-          columnWrapperStyle={styles.gridRow}
-          keyExtractor={(item) => String(item?.symbol || 'unknown')}
-          contentContainerStyle={styles.content}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
-          }
-          ListHeaderComponent={
-            <View style={styles.headerWrap}>
-              <View style={styles.topRow}>
-                <Text style={styles.title}>🎩 Magic Money</Text>
-                <Text style={styles.titleRight}>{usd(portfolioValue)}</Text>
-              </View>
+      <ScrollView contentContainerStyle={styles.container}>
+        <Text style={styles.title}>Backend Status</Text>
+        <Text style={styles.subtitle}>{BACKEND_BASE_URL}</Text>
 
-              <View style={styles.chipsRow}>
-                <Chip value={`Weekly: ${Number.isFinite(weeklyChangePct) ? pct(weeklyChangePct) : '—'}`} />
-              </View>
+        <View style={[styles.card, { borderColor: statusColor }]}> 
+          <Text style={styles.label}>Overall Status</Text>
+          <Text style={[styles.status, { color: statusColor }]}>{status}</Text>
 
-              <View style={styles.openRow}>
-                <Text style={styles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
-              </View>
+          {loading ? (
+            <ActivityIndicator size="large" color={statusColor} style={{ marginTop: 12 }} />
+          ) : (
+            <>
+              <Text style={styles.meta}>Last checked: {lastChecked || "—"}</Text>
+              {error ? <Text style={styles.error}>Error: {error}</Text> : null}
+            </>
+          )}
+        </View>
 
-              {error ? (
-                <View style={styles.errorBanner}>
-                  <Text style={styles.errorText}>{error}</Text>
-                  <Text style={styles.errorHint}>
-                    🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
-                  </Text>
-                </View>
-              ) : null}
+        <Pressable style={styles.button} onPress={runChecks}>
+          <Text style={styles.buttonText}>Check Again</Text>
+        </Pressable>
 
-              {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
-              {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
-            </View>
-          }
-          renderItem={({ item }) => <CompactPositionRow position={item} />}
-        />
-      </LinearGradient>
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>/health response</Text>
+          <Text style={styles.code}>{health ? JSON.stringify(health, null, 2) : "No response"}</Text>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>/dashboard response</Text>
+          <Text style={styles.code}>{dashboard ? JSON.stringify(dashboard, null, 2) : "No response"}</Text>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>How to read this</Text>
+          <Text style={styles.body}>UP = /health and /dashboard both responded.</Text>
+          <Text style={styles.body}>DEGRADED = /health worked, but /dashboard did not.</Text>
+          <Text style={styles.body}>DOWN = backend could not be reached.</Text>
+        </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: theme.colors.bg },
-  screen: { flex: 1 },
-  content: { padding: theme.spacing.md, paddingBottom: 100 },
-  gridRow: { justifyContent: 'space-between', gap: 10 },
-  headerWrap: { paddingBottom: theme.spacing.md },
-  topRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
+  safe: {
+    flex: 1,
+    backgroundColor: "#0f172a",
   },
-  title: { color: theme.colors.text, fontSize: 26, fontWeight: '900', letterSpacing: 0.6 },
-  titleRight: { color: theme.colors.text, fontSize: 26, fontWeight: '900' },
-  chipsRow: {
-    flexDirection: 'row',
-    gap: theme.spacing.sm,
-    flexWrap: 'wrap',
-    marginBottom: theme.spacing.sm,
+  container: {
+    padding: 20,
+    gap: 16,
   },
-  openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
-  openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
-  errorBanner: {
-    backgroundColor: theme.colors.errorBg,
-    borderColor: '#8A2A3C',
+  title: {
+    fontSize: 28,
+    fontWeight: "700",
+    color: "#f8fafc",
+  },
+  subtitle: {
+    color: "#94a3b8",
+    marginTop: 4,
+    marginBottom: 8,
+  },
+  card: {
+    backgroundColor: "#111827",
+    borderRadius: 16,
+    padding: 16,
     borderWidth: 1,
-    borderRadius: theme.radius.md,
-    padding: theme.spacing.sm,
-    marginTop: theme.spacing.md,
+    borderColor: "#1f2937",
   },
-  errorText: { color: theme.colors.errorText, fontWeight: '900' },
-  errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
-  loader: { marginVertical: theme.spacing.md },
-  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
+  label: {
+    color: "#94a3b8",
+    fontSize: 14,
+    marginBottom: 8,
+  },
+  status: {
+    fontSize: 36,
+    fontWeight: "800",
+  },
+  meta: {
+    color: "#cbd5e1",
+    marginTop: 10,
+  },
+  error: {
+    color: "#fca5a5",
+    marginTop: 8,
+  },
+  button: {
+    backgroundColor: "#2563eb",
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  buttonText: {
+    color: "white",
+    fontWeight: "700",
+    fontSize: 16,
+  },
+  sectionTitle: {
+    color: "#f8fafc",
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 10,
+  },
+  body: {
+    color: "#cbd5e1",
+    marginBottom: 8,
+    lineHeight: 20,
+  },
+  code: {
+    color: "#93c5fd",
+    fontFamily: "monospace",
+    fontSize: 12,
+  },
 });
