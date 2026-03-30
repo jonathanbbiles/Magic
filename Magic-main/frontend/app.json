@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Magic",
+    "slug": "magic-dashboard",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#05070d"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
