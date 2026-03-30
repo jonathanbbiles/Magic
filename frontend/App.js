@@ -6,16 +6,16 @@ import {
   RefreshControl,
   SafeAreaView,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   View,
   useWindowDimensions,
 } from 'react-native';
-import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
 
 /**
- * Replace this with your backend base URL.
+ * IMPORTANT: Replace this with your backend base URL.
  * Example: const BASE_URL = 'https://magic-api.yourdomain.com';
  */
 const BASE_URL = 'https://YOUR-BACKEND-URL-HERE';
@@ -159,6 +159,7 @@ const connectionStyle = (score) => {
 const normalizePortfolio = (portfolioData, metricsData) => {
   const p = safeObject(portfolioData);
   const m = safeObject(metricsData);
+
   const totalValue =
     toNumber(p.portfolioValue, NaN) ||
     toNumber(p.equity, NaN) ||
@@ -175,9 +176,7 @@ const normalizePortfolio = (portfolioData, metricsData) => {
     toNumber(p.dayChange, NaN) ||
     toNumber(m.dayChangeDollar, 0);
 
-  const dayChangePercent =
-    toNumber(p.dayChangePercent, NaN) ||
-    toNumber(m.dayChangePercent, 0);
+  const dayChangePercent = toNumber(p.dayChangePercent, NaN) || toNumber(m.dayChangePercent, 0);
 
   const unrealizedPL =
     toNumber(p.unrealizedPL, NaN) ||
@@ -407,14 +406,14 @@ export default function App() {
     { label: 'Exit Gate', value: diagnosticsObj.exitGate ?? diagnosticsObj.exitEnabled, type: 'state' },
   ];
 
-  const bars =
-    safeArray(data.metrics?.equityHistory) ||
-    safeArray(data.metrics?.pnlHistory) ||
-    safeArray(data.portfolio?.history);
+  const equityHistory = safeArray(data.metrics?.equityHistory);
+  const pnlHistory = safeArray(data.metrics?.pnlHistory);
+  const portfolioHistory = safeArray(data.portfolio?.history);
+  const bars = equityHistory.length ? equityHistory : pnlHistory.length ? pnlHistory : portfolioHistory;
 
   return (
     <SafeAreaView style={styles.root}>
-      <StatusBar style="light" />
+      <StatusBar barStyle="light-content" />
       <LinearGradient colors={[T.colors.bg0, T.colors.bg1, T.colors.bg2]} style={StyleSheet.absoluteFill} />
 
       <ScrollView
@@ -518,6 +517,7 @@ export default function App() {
               if (row.type === 'percent') display = Number.isFinite(toNumber(raw, NaN)) ? formatPercent(toNumber(raw, 0)) : '—';
               else if (row.type === 'number') display = Number.isFinite(toNumber(raw, NaN)) ? toNumber(raw, 0).toFixed(2) : '—';
               else if (row.type === 'state') display = String(raw ?? '—');
+
               return (
                 <View key={row.label} style={styles.diagCard}>
                   <Text style={styles.diagLabel}>{row.label}</Text>
