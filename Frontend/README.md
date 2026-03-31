@@ -23,13 +23,13 @@ It then shows:
 
 Set these Expo public env vars before running:
 
-- `EXPO_PUBLIC_BACKEND_URL` (required)
+- `EXPO_PUBLIC_BACKEND_URL` (optional override; default is `https://magic-lw8t.onrender.com`)
 - `EXPO_PUBLIC_API_TOKEN` (optional, but needed when backend `API_TOKEN` is set)
 
 Examples:
 
 ```bash
-export EXPO_PUBLIC_BACKEND_URL="http://192.168.1.25:3001"
+export EXPO_PUBLIC_BACKEND_URL="https://magic-lw8t.onrender.com"
 export EXPO_PUBLIC_API_TOKEN="your_api_token"
 ```
 
@@ -56,13 +56,7 @@ Then open in Expo Go or simulator.
 
 ## Networking notes
 
-### Why `localhost` usually fails on a physical phone
-
-On a real phone, `localhost` points to the phone itself, not your backend machine. Use your backend machine's reachable host/IP instead.
-
-### Why private LAN IPs fail on cellular
-
-Private addresses (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`) are local-network-only. If your phone is on cellular and backend is on home/office LAN, the request usually cannot route unless you use VPN/tunnel/public endpoint.
+The app defaults to the deployed backend URL (`https://magic-lw8t.onrender.com`) and only uses an Expo override when explicitly provided.
 
 ## Scope clarification
 
