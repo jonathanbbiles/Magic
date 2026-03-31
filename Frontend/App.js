@@ -1,445 +1,458 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import Constants from 'expo-constants';
 import {
+  ActivityIndicator,
+  FlatList,
+  RefreshControl,
   SafeAreaView,
-  ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   View,
-  Pressable,
-  TextInput,
 } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
 
-const REQUEST_TIMEOUT_MS = 12000;
-const BACKEND_BASE_URL =
+const theme = {
+  colors: {
+    bg: '#070A12',
+    text: 'rgba(255,255,255,0.92)',
+    muted: 'rgba(255,255,255,0.65)',
+    faint: 'rgba(255,255,255,0.45)',
+    card: '#0B1220',
+    cardAlt: '#0F1730',
+    positive: '#72FFB6',
+    negative: '#FF5C8A',
+    warning: '#FFD36E',
+    border: 'rgba(255,255,255,0.10)',
+    glowPos: 'rgba(114,255,182,0.55)',
+    glowNeg: 'rgba(255,92,138,0.55)',
+    errorBg: 'rgba(255,60,90,0.18)',
+    errorText: 'rgba(255,220,230,0.95)',
+  },
+  spacing: { xs: 6, sm: 10, md: 14, lg: 18, xl: 24 },
+  radius: { md: 14, lg: 18, xl: 24 },
+};
+
+const POLL_MS = 20000;
+
+const BASE_URL =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
   'https://magic-lw8t.onrender.com';
 
-function normalizeBaseUrl(value) {
-  if (typeof value !== 'string') return '';
-  return value.trim().replace(/\/$/, '');
-}
+const API_TOKEN =
+  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
 
-function isLikelyPrivateIpUrl(url) {
-  if (!url) return false;
-  return /(https?:\/\/)?(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(url);
-}
+async function fetchDashboard() {
+  const url = `${String(BASE_URL).replace(/\/$/, '')}/dashboard`;
+  const headers = { Accept: 'application/json' };
+  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
 
-async function fetchEndpoint(baseUrl, path, options = {}) {
-  const endpointUrl = `${baseUrl}${path}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
+  const res = await fetch(url, { headers });
+  const text = await res.text();
+  let json = null;
   try {
-    const response = await fetch(endpointUrl, {
-      method: 'GET',
-      headers: options.headers || {},
-      signal: controller.signal,
-    });
-
-    const rawText = await response.text();
-    let parsed;
-
-    try {
-      parsed = rawText ? JSON.parse(rawText) : null;
-    } catch {
-      parsed = null;
-    }
-
-    return {
-      ok: response.ok,
-      status: response.status,
-      statusText: response.statusText,
-      url: endpointUrl,
-      json: parsed,
-      rawText,
-      networkError: null,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: null,
-      statusText: null,
-      url: endpointUrl,
-      json: null,
-      rawText: '',
-      networkError: error?.message || 'Network request failed',
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value, null, 2);
+    json = text ? JSON.parse(text) : null;
   } catch {
-    return String(value);
+    // ignore
   }
+
+  if (!res.ok) {
+    const err = new Error(json?.error || json?.message || text || 'Request failed');
+    err.status = res.status;
+    throw err;
+  }
+  return json;
 }
 
-function getEndpointDisplay(result) {
-  if (!result) return 'Not requested yet.';
-  if (result.networkError) {
-    return `ERROR: ${result.networkError}\nURL: ${result.url}`;
-  }
-
-  const payload = result.json ?? result.rawText;
-  return `HTTP ${result.status}${result.statusText ? ` ${result.statusText}` : ''}\nURL: ${result.url}\n\n${typeof payload === 'string' ? payload : safeStringify(payload)}`;
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function deriveSummary(healthResult, authResult, dashboardResult) {
-  if (!healthResult) {
-    return { label: 'NOT RUN', color: '#94a3b8', reachability: 'Not checked' };
+function usd(v) {
+  const n = toNum(v);
+  if (!Number.isFinite(n)) return '—';
+  return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function signedUsd(v) {
+  const n = toNum(v);
+  if (!Number.isFinite(n)) return '—';
+  const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return `${n >= 0 ? '+' : '-'}$${abs}`;
+}
+
+function pct(v) {
+  const n = toNum(v);
+  if (!Number.isFinite(n)) return '—';
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+}
+
+function minsSince(isoTs) {
+  const ms = Date.parse(String(isoTs || ''));
+  if (!Number.isFinite(ms)) return '—';
+  const mins = Math.max(0, Math.floor((Date.now() - ms) / 60000));
+  return `${mins}m`;
+}
+
+function ageLabelFromPosition(position) {
+  const heldDirect = toNum(position?.heldSeconds);
+  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
+    const mins = Math.floor(heldDirect / 60);
+    const rem = Math.floor(heldDirect % 60);
+    return `${mins}m ${rem}s`;
   }
-
-  if (healthResult.networkError) {
-    return { label: 'BACKEND DOWN', color: '#ef4444', reachability: 'Unreachable' };
+  const heldSnake = toNum(position?.held_seconds);
+  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
+    const mins = Math.floor(heldSnake / 60);
+    const rem = Math.floor(heldSnake % 60);
+    return `${mins}m ${rem}s`;
   }
-
-  const healthOk = healthResult.ok;
-  const authValue = authResult?.json?.apiTokenSet;
-
-  if (!healthOk) {
-    return { label: 'DEGRADED', color: '#f59e0b', reachability: 'Reachable' };
+  const createdMs = Date.parse(String(position?.created_at || ''));
+  if (Number.isFinite(createdMs)) {
+    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
+    const mins = Math.floor(seconds / 60);
+    const rem = Math.floor(seconds % 60);
+    return `${mins}m ${rem}s`;
   }
+  return '—';
+}
 
-  if (!authResult || authResult.networkError || authResult.status == null) {
-    return {
-      label: 'BACKEND UP / AUTH UNKNOWN',
-      color: '#f59e0b',
-      reachability: 'Reachable',
-    };
+function ageLabelShort(position) {
+  const heldDirect = toNum(position?.heldSeconds);
+  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
+    return `${Math.floor(heldDirect / 60)}m`;
   }
-
-  const dashboardNetworkFail = Boolean(dashboardResult?.networkError);
-
-  if (authValue === false) {
-    if (dashboardResult?.ok) {
-      return {
-        label: 'BACKEND UP / AUTH NOT REQUIRED',
-        color: '#22c55e',
-        reachability: 'Reachable',
-      };
-    }
-
-    if (dashboardNetworkFail) {
-      return { label: 'DEGRADED', color: '#f59e0b', reachability: 'Reachable' };
-    }
-
-    return { label: 'DEGRADED', color: '#f59e0b', reachability: 'Reachable' };
+  const heldSnake = toNum(position?.held_seconds);
+  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
+    return `${Math.floor(heldSnake / 60)}m`;
   }
-
-  if (authValue === true) {
-    if (dashboardResult?.ok) {
-      return {
-        label: 'BACKEND UP / AUTH REQUIRED / TOKEN OK',
-        color: '#22c55e',
-        reachability: 'Reachable',
-      };
-    }
-
-    if (dashboardResult?.status === 401) {
-      return {
-        label: 'BACKEND UP / AUTH REQUIRED / TOKEN MISSING OR BAD',
-        color: '#ef4444',
-        reachability: 'Reachable',
-      };
-    }
-
-    return { label: 'DEGRADED', color: '#f59e0b', reachability: 'Reachable' };
+  const createdMs = Date.parse(String(position?.created_at || ''));
+  if (Number.isFinite(createdMs)) {
+    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
+    return `${Math.floor(seconds / 60)}m`;
   }
+  return '—';
+}
 
-  return { label: 'DEGRADED', color: '#f59e0b', reachability: 'Reachable' };
+
+function distToTargetPct(position) {
+  const current = toNum(position?.current_price);
+  const sellLimit =
+    toNum(position?.sell?.activeLimit) ??
+    toNum(position?.bot?.sellOrderLimit);
+
+  if (!Number.isFinite(current) || !Number.isFinite(sellLimit) || current === 0) return null;
+  return ((sellLimit - current) / current) * 100;
+}
+
+function Chip({ value }) {
+  return (
+    <View style={headerStyles.chip}>
+      <Text style={headerStyles.chipValue}>{value}</Text>
+    </View>
+  );
+}
+
+function CompactPositionRow({ position }) {
+  const symbol = position?.symbol || '—';
+
+  const upnl = toNum(position?.unrealized_pl);
+  const upnlPctRaw = toNum(position?.unrealized_plpc);
+  const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
+  const pnlPositive = (upnl || 0) >= 0;
+
+  const dist = distToTargetPct(position);
+
+  const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
+  const pnlDollar = signedUsd(upnl);
+  const pnlPercent = pct(upnlPct);
+  const timeShort = ageLabelShort(position);
+
+  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
+
+  return (
+    <View style={[compactStyles.tile, { borderColor: glow }]}>
+      <View style={compactStyles.line1}>
+        <Text style={compactStyles.sym} numberOfLines={1} ellipsizeMode="tail">
+          {symbol}
+        </Text>
+        <Text style={compactStyles.delta} numberOfLines={1} ellipsizeMode="tail">
+          Δ🎯 {distText}
+        </Text>
+      </View>
+
+      <View style={compactStyles.line2}>
+        <Text
+          style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
+          numberOfLines={1}
+          ellipsizeMode="tail"
+        >
+          📌 {pnlDollar} ({pnlPercent})
+        </Text>
+
+        <Text style={compactStyles.timeInline} numberOfLines={1} ellipsizeMode="tail">
+          ⏱️ {timeShort}
+        </Text>
+      </View>
+    </View>
+  );
 }
 
 export default function App() {
-  const backendUrl = normalizeBaseUrl(BACKEND_BASE_URL);
-  const apiToken = (
-    (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) ||
-    Constants?.expoConfig?.extra?.EXPO_PUBLIC_API_TOKEN ||
-    Constants?.manifest2?.extra?.EXPO_PUBLIC_API_TOKEN ||
-    ''
-  ).trim();
-  const tokenPresent = Boolean(apiToken);
-  const authMode = tokenPresent ? 'Bearer + x-api-key' : 'No auth headers';
-
-  const [isRunning, setIsRunning] = useState(false);
-  const [healthResult, setHealthResult] = useState(null);
-  const [authResult, setAuthResult] = useState(null);
-  const [dashboardResult, setDashboardResult] = useState(null);
-  const [lastRunAt, setLastRunAt] = useState(null);
-
-  const runChecks = useCallback(async () => {
-    setIsRunning(true);
-
-    const health = await fetchEndpoint(backendUrl, '/health');
-    const auth = await fetchEndpoint(backendUrl, '/debug/auth');
-
-    const dashboardHeaders = tokenPresent
-      ? {
-          Authorization: `Bearer ${apiToken}`,
-          'x-api-key': apiToken,
-        }
-      : {};
-
-    const dashboard = await fetchEndpoint(backendUrl, '/dashboard', {
-      headers: dashboardHeaders,
-    });
-
-    setHealthResult(health);
-    setAuthResult(auth);
-    setDashboardResult(dashboard);
-    setLastRunAt(new Date().toISOString());
-    setIsRunning(false);
-  }, [backendUrl, tokenPresent, apiToken]);
+  const [dashboard, setDashboard] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState(null);
+  const load = useCallback(async ({ isRefresh = false } = {}) => {
+    if (isRefresh) setRefreshing(true);
+    if (!isRefresh) setLoading(true);
+    try {
+      const payload = await fetchDashboard();
+      setDashboard(payload);
+      setError(null);
+    } catch (err) {
+      const message = err?.message || 'Request failed';
+      const status = err?.status ? `HTTP ${err.status}` : 'HTTP ?';
+      setError(`${status}: ${message}`);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
-    runChecks();
-  }, [runChecks]);
+    load();
+    const timer = setInterval(() => load(), POLL_MS);
+    return () => clearInterval(timer);
+  }, [load]);
 
-  const summary = deriveSummary(healthResult, authResult, dashboardResult);
+  const positions = useMemo(() => {
+    const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
 
-  const healthStatus = healthResult
-    ? healthResult.networkError
-      ? 'Request failed'
-      : `HTTP ${healthResult.status}`
-    : 'Not checked';
+    list.sort((a, b) => {
+      const aDist = distToTargetPct(a);
+      const bDist = distToTargetPct(b);
+      if (!Number.isFinite(aDist)) return 1;
+      if (!Number.isFinite(bDist)) return -1;
+      return aDist - bDist; // closest to fill first
+    });
 
-  const authStatus = authResult
-    ? authResult.networkError
-      ? 'Request failed'
-      : `HTTP ${authResult.status} (apiTokenSet: ${String(authResult?.json?.apiTokenSet)})`
-    : 'Not checked';
+    return list;
+  }, [dashboard]);
 
-  const dashboardStatus = dashboardResult
-    ? dashboardResult.networkError
-      ? 'Request failed'
-      : `HTTP ${dashboardResult.status}`
-    : 'Not checked';
+  const account = dashboard?.account || {};
+  const portfolioValue = account?.portfolio_value ?? account?.equity;
 
-  const diagnosticsText = useMemo(() => {
-    const lines = [
-      `Timestamp: ${new Date().toISOString()}`,
-      `Backend URL: ${backendUrl}`,
-      `Token present: ${tokenPresent ? 'yes' : 'no'}`,
-      `Auth mode: ${authMode}`,
-      `Overall status: ${summary.label}`,
-      `Reachability: ${summary.reachability}`,
-      `Health status: ${healthStatus}`,
-      `Auth status: ${authStatus}`,
-      `Dashboard status: ${dashboardStatus}`,
-      '',
-      '[Raw /health]',
-      getEndpointDisplay(healthResult),
-      '',
-      '[Raw /debug/auth]',
-      getEndpointDisplay(authResult),
-      '',
-      '[Raw /dashboard]',
-      getEndpointDisplay(dashboardResult),
-    ];
+  const weeklyChangePct = toNum(dashboard?.meta?.weeklyChangePct);
 
-    return lines.join('\n');
-  }, [
-    backendUrl,
-    tokenPresent,
-    authMode,
-    summary.label,
-    summary.reachability,
-    healthStatus,
-    authStatus,
-    dashboardStatus,
-    healthResult,
-    authResult,
-    dashboardResult,
-  ]);
+  const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
 
-  const hints = useMemo(() => {
-    const hintList = [];
-
-    if (healthResult?.networkError) {
-      hintList.push('Network request failed for /health. Verify backend host, port, and device connectivity.');
-    }
-
-    if (!tokenPresent) {
-      hintList.push('No frontend token configured (EXPO_PUBLIC_API_TOKEN missing). /dashboard may return 401 when backend auth is enabled.');
-    }
-
-    if (dashboardResult?.status === 401) {
-      hintList.push('Dashboard returned 401: token is missing, expired, or does not match backend API_TOKEN.');
-    }
-
-    if (dashboardResult?.status === 403) {
-      hintList.push('Dashboard returned 403: request may be blocked by backend CORS policy or origin restrictions.');
-    }
-
-    if (healthResult?.ok && dashboardResult && !dashboardResult.ok && !dashboardResult.networkError) {
-      hintList.push('Health succeeded but dashboard failed, so backend is up but protected or degraded on /dashboard.');
-    }
-
-    if (isLikelyPrivateIpUrl(backendUrl)) {
-      hintList.push('Backend URL uses a private LAN IP. This works only when phone and backend are on the same LAN/VPN; cellular usually cannot reach it.');
-    }
-
-    if (hintList.length === 0) {
-      hintList.push('No common issues detected from the latest checks.');
-    }
-
-    return hintList;
-  }, [backendUrl, healthResult, dashboardResult, tokenPresent]);
+  const openPLPct = useMemo(() => {
+    const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
+    if (!Number.isFinite(mv) || mv <= 0) return null;
+    return (openPL / mv) * 100;
+  }, [positions, openPL]);
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>Backend Diagnostic</Text>
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Connection Summary</Text>
-          <Text style={[styles.statusLabel, { color: summary.color }]}>{summary.label}</Text>
-          <Text style={styles.row}>Backend URL: {backendUrl}</Text>
-          <Text style={styles.row}>Token present: {tokenPresent ? 'yes' : 'no'}</Text>
-          <Text style={styles.row}>Auth mode: {authMode}</Text>
-          <Text style={styles.row}>Reachability: {summary.reachability}</Text>
-          <Text style={styles.row}>Health status: {healthStatus}</Text>
-          <Text style={styles.row}>Auth status: {authStatus}</Text>
-          <Text style={styles.row}>Dashboard status: {dashboardStatus}</Text>
-          <Text style={styles.subtle}>Last run: {lastRunAt || 'not yet run'}</Text>
-        </View>
+    <SafeAreaView style={styles.safe}>
+      <StatusBar barStyle="light-content" />
+      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
+        <FlatList
+          data={positions}
+          numColumns={2}
+          columnWrapperStyle={styles.gridRow}
+          keyExtractor={(item) => String(item?.symbol || 'unknown')}
+          contentContainerStyle={styles.content}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
+          }
+          ListHeaderComponent={
+            <View style={headerStyles.wrap}>
+              <View style={headerStyles.topRow}>
+                <Text style={headerStyles.title}>🎩 Magic Money</Text>
+                <Text style={headerStyles.titleRight}>{usd(portfolioValue)}</Text>
+              </View>
 
-        <View style={styles.buttonRow}>
-          <Pressable
-            style={[styles.button, styles.primaryButton, (!backendUrl || isRunning) && styles.disabledButton]}
-            onPress={runChecks}
-            disabled={isRunning}
-          >
-            <Text style={styles.buttonText}>{isRunning ? 'Running…' : 'Run Checks'}</Text>
-          </Pressable>
-        </View>
+              <View style={headerStyles.chipsRow}>
+                <Chip value={`Weekly: ${Number.isFinite(weeklyChangePct) ? pct(weeklyChangePct) : '—'}`} />
+              </View>
 
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Endpoint Results</Text>
+              <View style={headerStyles.openRow}>
+                <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
+              </View>
 
-          <Text style={styles.endpointTitle}>/health</Text>
-          <Text style={styles.code}>{getEndpointDisplay(healthResult)}</Text>
+              {error ? (
+                <View style={styles.errorBanner}>
+                  <Text style={styles.errorText}>{error}</Text>
+                  <Text style={styles.errorHint}>
+                    🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
+                  </Text>
+                </View>
+              ) : null}
 
-          <Text style={styles.endpointTitle}>/debug/auth</Text>
-          <Text style={styles.code}>{getEndpointDisplay(authResult)}</Text>
-
-          <Text style={styles.endpointTitle}>/dashboard</Text>
-          <Text style={styles.code}>{getEndpointDisplay(dashboardResult)}</Text>
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Helpful Diagnostics</Text>
-          {hints.map((hint) => (
-            <Text key={hint} style={styles.hintLine}>{`• ${hint}`}</Text>
-          ))}
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.sectionTitle}>Copy Diagnostics</Text>
-          <Text style={styles.subtle}>
-            Clipboard helper is intentionally omitted to keep dependencies minimal. Copy from the text box below.
-          </Text>
-          <TextInput
-            style={styles.diagnosticsBox}
-            multiline
-            editable={false}
-            selectTextOnFocus
-            value={diagnosticsText}
-          />
-        </View>
-      </ScrollView>
+              {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
+              {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
+            </View>
+          }
+          renderItem={({ item }) => <CompactPositionRow position={item} />}
+        />
+      </LinearGradient>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#020617',
+  safe: { flex: 1, backgroundColor: theme.colors.bg },
+  screen: { flex: 1 },
+  content: { padding: theme.spacing.md, paddingBottom: 100 },
+  gridRow: {
+    justifyContent: 'space-between',
+    gap: 10,
   },
-  container: {
-    padding: 16,
-    gap: 12,
-  },
-  title: {
-    color: '#e2e8f0',
-    fontSize: 28,
-    fontWeight: '700',
-    marginBottom: 4,
-  },
-  card: {
-    backgroundColor: '#0f172a',
-    borderRadius: 12,
-    padding: 12,
+  errorBanner: {
+    backgroundColor: theme.colors.errorBg,
+    borderColor: '#8A2A3C',
     borderWidth: 1,
-    borderColor: '#1e293b',
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.sm,
+    marginTop: theme.spacing.md,
   },
-  sectionTitle: {
-    color: '#f8fafc',
-    fontSize: 18,
-    fontWeight: '700',
+  errorText: { color: theme.colors.errorText, fontWeight: '900' },
+  errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
+  loader: { marginVertical: theme.spacing.md },
+  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
+});
+
+const headerStyles = StyleSheet.create({
+  wrap: { paddingBottom: theme.spacing.md },
+  topRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: theme.spacing.sm,
+  },
+  title: { color: theme.colors.text, fontSize: 26, fontWeight: '900', letterSpacing: 0.6 },
+  titleRight: { color: theme.colors.text, fontSize: 26, fontWeight: '900' },
+  chipsRow: {
+    flexDirection: 'row',
+    gap: theme.spacing.sm,
+    flexWrap: 'wrap',
+    marginBottom: theme.spacing.sm,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  chipValue: { color: theme.colors.text, fontSize: 14, fontWeight: '800' },
+  openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
+  openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
+});
+
+const cardStyles = StyleSheet.create({
+  card: {
+    borderRadius: theme.radius.lg,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+    borderWidth: 1.25,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    marginBottom: theme.spacing.sm,
+  },
+  symWrap: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  symbol: { color: theme.colors.text, fontSize: 19, fontWeight: '900', letterSpacing: 0.8 },
+  qty: { color: theme.colors.muted, fontSize: 14, fontWeight: '800' },
+  pill: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+  },
+  pillText: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: theme.spacing.sm,
+    marginBottom: theme.spacing.sm,
+  },
+  stat: {
+    minWidth: '48%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 6,
+  },
+  statIcon: { color: theme.colors.muted, fontSize: 14, fontWeight: '900' },
+  statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
+  bigRow: { marginBottom: theme.spacing.sm },
+  forensicsWrap: {
+    marginTop: theme.spacing.xs,
+    paddingTop: theme.spacing.xs,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.border,
+  },
+  forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
+  forensicsDebug: { color: theme.colors.faint, fontSize: 11, marginTop: 2 },
+});
+
+
+const compactStyles = StyleSheet.create({
+  tile: {
+    flex: 1,
+    borderWidth: 1.1,
+    borderRadius: theme.radius.md,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     marginBottom: 10,
+    backgroundColor: 'rgba(255,255,255,0.04)',
+    minHeight: 0,
   },
-  statusLabel: {
-    fontSize: 20,
-    fontWeight: '800',
-    marginBottom: 8,
-  },
-  row: {
-    color: '#cbd5e1',
-    marginBottom: 5,
-  },
-  subtle: {
-    color: '#94a3b8',
-    marginTop: 8,
-  },
-  buttonRow: {
+  line1: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
     gap: 8,
   },
-  button: {
-    borderRadius: 10,
-    paddingVertical: 12,
-    alignItems: 'center',
+  line2: {
+    marginTop: 6,
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    gap: 8,
   },
-  primaryButton: {
-    backgroundColor: '#2563eb',
+  sym: {
+    flex: 1,
+    color: theme.colors.text,
+    fontSize: 15,
+    fontWeight: '900',
+    letterSpacing: 0.4,
   },
-  disabledButton: {
-    backgroundColor: '#334155',
-  },
-  buttonText: {
-    color: '#ffffff',
-    fontWeight: '700',
-  },
-  endpointTitle: {
-    color: '#e2e8f0',
-    marginTop: 10,
-    marginBottom: 6,
-    fontWeight: '700',
-  },
-  code: {
-    color: '#93c5fd',
-    fontFamily: 'monospace',
+  delta: {
+    color: theme.colors.warning,
     fontSize: 12,
+    fontWeight: '900',
   },
-  hintLine: {
-    color: '#cbd5e1',
-    marginBottom: 6,
-    lineHeight: 18,
-  },
-  diagnosticsBox: {
-    marginTop: 8,
-    minHeight: 240,
-    borderWidth: 1,
-    borderColor: '#334155',
-    borderRadius: 8,
-    padding: 10,
-    color: '#bae6fd',
-    backgroundColor: '#020617',
-    textAlignVertical: 'top',
-    fontFamily: 'monospace',
+  pnl: {
+    flex: 1,
     fontSize: 12,
+    fontWeight: '900',
+  },
+  timeInline: {
+    color: theme.colors.muted,
+    fontSize: 11,
+    fontWeight: '800',
   },
 });
