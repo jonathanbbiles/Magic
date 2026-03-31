@@ -78,6 +78,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 - Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).
 - Optional refresh repricing can cancel and replace stale exit orders when `EXIT_REFRESH_ENABLED=true` and the order age exceeds `EXIT_MAX_ORDER_AGE_MS`.
+- Live open-exit detection now uses Alpaca trading open orders (`GET /v2/orders?status=open&nested=true&direction=desc&limit=500`) as broker truth, with direct tracked order fallback via `GET /v2/orders/{order_id}` and `GET /v2/orders:by_client_order_id`.
 
 ## Notes
 
