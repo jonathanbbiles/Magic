@@ -198,6 +198,16 @@ const openOrders = [
 ];
 const normalizedOpenSells = getOpenSellOrdersForSymbol(openOrders, 'DOT/USD');
 assert.equal(normalizedOpenSells.length, 2);
+const nestedOpenSells = getOpenSellOrdersForSymbol([
+  {
+    symbol: 'SOLUSD',
+    side: 'buy',
+    status: 'new',
+    legs: [{ symbol: 'SOL/USD', side: 'sell', status: 'accepted', qty: '2.0', limit_price: '150.00', type: 'limit' }],
+  },
+], 'SOLUSD');
+assert.equal(nestedOpenSells.length, 1);
+assert.equal(nestedOpenSells[0].symbol, 'SOL/USD');
 
 const reservedSellability = computeExitSellability({
   symbol: 'DOT/USD',
@@ -244,6 +254,38 @@ assert.equal(zeroQtySellability.sellabilitySource, 'blocked_broker_available_qty
 assert.equal(zeroQtySellability.blockedReason, 'no_position_qty');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
+assert.match(
+  tradeSource,
+  /async function fetchLiveOrders\(\{ force = false \} = \{\}\)[\s\S]*fetchOrders\(\{ status: 'open', nested: true, direction: 'desc', limit: 500 \}\)/,
+);
+assert.doesNotMatch(
+  tradeSource,
+  /async function fetchLiveOrders\(\{ force = false \} = \{\}\)[\s\S]*status: 'all'[\s\S]*after:/,
+);
+assert.match(
+  tradeSource,
+  /async function fetchOrderByClientOrderId\(clientOrderId\)[\s\S]*path: 'orders:by_client_order_id'[\s\S]*client_order_id: clientOrderId/,
+);
+assert.match(
+  tradeSource,
+  /async function resolveExitSellabilityFromBrokerTruth\(\{[\s\S]*trackedSellOrderId = null,[\s\S]*trackedSellClientOrderId = null,[\s\S]*open_sell_direct_lookup_by_id[\s\S]*open_sell_direct_lookup_by_client_id[\s\S]*open_sell_adopted_from_direct_lookup[\s\S]*open_sell_not_found_after_direct_lookup/,
+);
+assert.match(
+  tradeSource,
+  /const trackedSellClientOrderId = buildTpClientOrderId\(symbol, intentRef\);[\s\S]*resolveExitSellabilityFromBrokerTruth\(\{[\s\S]*trackedSellClientOrderId/,
+);
+assert.match(
+  tradeSource,
+  /function getOpenSellOrdersForSymbol\(orders, symbol\) \{[\s\S]*expandNestedOrders/,
+);
+assert.match(
+  tradeSource,
+  /return \{\s*id: adoptedId,\s*client_order_id: bestOrder\?\.client_order_id \|\| bestOrder\?\.clientOrderId \|\| null,[\s\S]*adopted: true,\s*\};/,
+);
+assert.match(
+  tradeSource,
+  /const sellClientOrderId = sellOrder\?\.client_order_id \|\| sellOrder\?\.clientOrderId \|\| null;[\s\S]*sellClientOrderId,/,
+);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 8\);/);

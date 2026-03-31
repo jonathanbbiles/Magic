@@ -5539,6 +5539,29 @@ function normalizeOrderQty(order) {
   return Number.isFinite(num) ? num : null;
 }
 
+function normalizeBrokerOrder(order) {
+  if (!order || typeof order !== 'object') return order;
+  const rawSymbol = order.rawSymbol ?? order.symbol;
+  const normalizedSymbol = normalizeSymbol(rawSymbol);
+  const normalized = {
+    ...order,
+    rawSymbol,
+    pairSymbol: normalizedSymbol,
+    symbol: normalizedSymbol,
+  };
+  if (Array.isArray(order.legs)) {
+    normalized.legs = order.legs.map((leg) => normalizeBrokerOrder(leg));
+  }
+  return normalized;
+}
+
+function isOpenSellOrderForSymbol(order, symbol) {
+  const orderSymbol = normalizePair(order?.symbol || order?.rawSymbol);
+  const side = String(order?.side || '').toLowerCase();
+  const status = String(order?.status || '').toLowerCase();
+  return orderSymbol === normalizePair(symbol) && side === 'sell' && isOpenLikeOrderStatus(status);
+}
+
 function resolveOrderQty(order) {
   const normalizedQty = normalizeOrderQty(order);
   if (Number.isFinite(normalizedQty)) return normalizedQty;
@@ -5548,13 +5571,8 @@ function resolveOrderQty(order) {
 
 function getOpenSellOrdersForSymbol(orders, symbol) {
   const normalizedSymbol = normalizePair(symbol);
-  const list = Array.isArray(orders) ? orders : [];
-  return list.filter((order) => {
-    const orderSymbol = normalizePair(order?.symbol || order?.rawSymbol);
-    const side = String(order?.side || '').toLowerCase();
-    const status = String(order?.status || '').toLowerCase();
-    return orderSymbol === normalizedSymbol && side === 'sell' && isOpenLikeOrderStatus(status);
-  });
+  const list = expandNestedOrders(Array.isArray(orders) ? orders : []);
+  return list.filter((order) => isOpenSellOrderForSymbol(order, normalizedSymbol));
 }
 
 function computeExitSellability({
@@ -5621,10 +5639,15 @@ function computeExitSellability({
 async function resolveExitSellabilityFromBrokerTruth({
   symbol,
   openOrders = null,
+  trackedSellOrderId = null,
+  trackedSellClientOrderId = null,
   maxAttempts = 3,
   retryMs = 400,
 }) {
   const canonicalSymbol = normalizePair(symbol);
+  const trackedState = exitState.get(canonicalSymbol) || {};
+  const trackedOrderId = trackedSellOrderId || trackedState.sellOrderId || null;
+  const trackedClientOrderId = trackedSellClientOrderId || trackedState.sellClientOrderId || null;
   let currentOpenOrders = Array.isArray(openOrders) ? openOrders : null;
   let finalSellability = computeExitSellability({ symbol: canonicalSymbol, position: null, openOrders: [] });
 
@@ -5667,8 +5690,90 @@ async function resolveExitSellabilityFromBrokerTruth({
       brokerPositionQty: finalSellability.totalPositionQty,
     });
 
-    if (finalSellability.openSellCount > 0 || finalSellability.availableQty > 0 || finalSellability.totalPositionQty <= 0) {
+    const shouldAttemptDirectLookup =
+      finalSellability.openSellCount === 0 &&
+      finalSellability.totalPositionQty > 0 &&
+      Boolean(trackedOrderId || trackedClientOrderId);
+    if (
+      finalSellability.openSellCount > 0 ||
+      finalSellability.totalPositionQty <= 0 ||
+      (finalSellability.availableQty > 0 && !shouldAttemptDirectLookup)
+    ) {
       break;
+    }
+
+    let adoptedOpenSell = null;
+    if (trackedOrderId) {
+      let lookedUpById = null;
+      try {
+        lookedUpById = await fetchOrderById(trackedOrderId);
+      } catch (err) {
+        lookedUpById = null;
+      }
+      const lookupLimit = normalizeOrderLimitPrice(lookedUpById);
+      const lookupQty = resolveOrderQty(lookedUpById);
+      console.log('open_sell_direct_lookup_by_id', {
+        symbol: canonicalSymbol,
+        orderId: trackedOrderId,
+        client_order_id: String(lookedUpById?.client_order_id ?? lookedUpById?.clientOrderId ?? trackedClientOrderId ?? ''),
+        status: String(lookedUpById?.status || '').toLowerCase() || null,
+        limit_price: Number.isFinite(lookupLimit) ? lookupLimit : null,
+        qty: Number.isFinite(lookupQty) ? lookupQty : null,
+      });
+      if (isOpenSellOrderForSymbol(lookedUpById, canonicalSymbol)) {
+        adoptedOpenSell = lookedUpById;
+      }
+    }
+
+    if (!adoptedOpenSell && trackedClientOrderId) {
+      let lookedUpByClientId = null;
+      try {
+        lookedUpByClientId = await fetchOrderByClientOrderId(trackedClientOrderId);
+      } catch (err) {
+        lookedUpByClientId = null;
+      }
+      const lookupLimit = normalizeOrderLimitPrice(lookedUpByClientId);
+      const lookupQty = resolveOrderQty(lookedUpByClientId);
+      console.log('open_sell_direct_lookup_by_client_id', {
+        symbol: canonicalSymbol,
+        orderId: lookedUpByClientId?.id || lookedUpByClientId?.order_id || trackedOrderId || null,
+        client_order_id: trackedClientOrderId,
+        status: String(lookedUpByClientId?.status || '').toLowerCase() || null,
+        limit_price: Number.isFinite(lookupLimit) ? lookupLimit : null,
+        qty: Number.isFinite(lookupQty) ? lookupQty : null,
+      });
+      if (isOpenSellOrderForSymbol(lookedUpByClientId, canonicalSymbol)) {
+        adoptedOpenSell = lookedUpByClientId;
+      }
+    }
+
+    if (adoptedOpenSell) {
+      const adoptedOpenOrders = [...openList, adoptedOpenSell];
+      finalSellability = computeExitSellability({
+        symbol: canonicalSymbol,
+        position: brokerPosition,
+        openOrders: adoptedOpenOrders,
+      });
+      console.log('open_sell_adopted_from_direct_lookup', {
+        symbol: canonicalSymbol,
+        orderId: adoptedOpenSell?.id || adoptedOpenSell?.order_id || trackedOrderId || null,
+        client_order_id: String(adoptedOpenSell?.client_order_id ?? adoptedOpenSell?.clientOrderId ?? trackedClientOrderId ?? ''),
+        status: String(adoptedOpenSell?.status || '').toLowerCase() || null,
+        limit_price: normalizeOrderLimitPrice(adoptedOpenSell),
+        qty: resolveOrderQty(adoptedOpenSell),
+      });
+      break;
+    }
+
+    if (trackedOrderId || trackedClientOrderId) {
+      console.log('open_sell_not_found_after_direct_lookup', {
+        symbol: canonicalSymbol,
+        orderId: trackedOrderId || null,
+        client_order_id: trackedClientOrderId || null,
+        status: null,
+        limit_price: null,
+        qty: null,
+      });
     }
 
     if (attempt < maxAttempts) {
@@ -6751,7 +6856,30 @@ async function fetchOrderById(orderId) {
     throw err;
   }
 
-  return response;
+  return normalizeBrokerOrder(response);
+
+}
+
+async function fetchOrderByClientOrderId(clientOrderId) {
+  if (!clientOrderId) return null;
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders:by_client_order_id',
+    params: { client_order_id: clientOrderId },
+    label: 'orders_get_by_client_order_id',
+  });
+  let response;
+  try {
+    response = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ label: 'orders_by_client_order_id', url, error: err });
+    throw err;
+  }
+  return normalizeBrokerOrder(response);
 
 }
 
@@ -6947,6 +7075,7 @@ async function submitLimitSell({
   const open = openOrders || (await fetchLiveOrders({ force: true }));
   const openList = Array.isArray(open) ? open : [];
   const normalizedSymbol = normalizePair(symbol);
+  const trackedSellClientOrderId = buildTpClientOrderId(symbol, intentRef);
 
   const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
   const openSellOrders = getOpenSellOrdersForSymbol(openList, normalizedSymbol);
@@ -6970,6 +7099,7 @@ async function submitLimitSell({
   const sellability = await resolveExitSellabilityFromBrokerTruth({
     symbol: normalizedSymbol,
     openOrders: openList,
+    trackedSellClientOrderId,
     maxAttempts: 1,
   });
   console.log('exit_sellability_check', {
@@ -6999,6 +7129,7 @@ async function submitLimitSell({
   const brokerRecheckSellability = await resolveExitSellabilityFromBrokerTruth({
     symbol: normalizedSymbol,
     openOrders: null,
+    trackedSellClientOrderId,
     maxAttempts: 3,
     retryMs: 500,
   });
@@ -7039,6 +7170,47 @@ async function submitLimitSell({
     });
     return {
       id: adoptedId,
+      client_order_id: bestOrder?.client_order_id || bestOrder?.clientOrderId || null,
+      limitPrice: adoptedLimit,
+      submittedAt: bestOrder?.submitted_at || bestOrder?.submittedAt || bestOrder?.created_at || bestOrder?.createdAt,
+      adopted: true,
+    };
+  }
+  const brokerOpenSellCandidates = (Array.isArray(sellability.openSellOrders) ? sellability.openSellOrders : []).filter((order) => {
+    const type = String(order.type || order.order_type || '').toLowerCase();
+    if (type && type !== 'limit') return false;
+    if (!orderHasValidLimit(order)) return false;
+    return true;
+  });
+  if (brokerOpenSellCandidates.length) {
+    const taggedCandidates = brokerOpenSellCandidates.filter((order) => hasExitIntentOrder(order, normalizedSymbol));
+    const desiredLimit = roundedLimit;
+    const pool = taggedCandidates.length ? taggedCandidates : brokerOpenSellCandidates;
+    const bestOrder = pool.reduce((best, candidate) => {
+      const bestPrice = normalizeOrderLimitPrice(best);
+      const candidatePrice = normalizeOrderLimitPrice(candidate);
+      const bestDiff = Number.isFinite(bestPrice) ? Math.abs(bestPrice - desiredLimit) : Number.POSITIVE_INFINITY;
+      const candidateDiff = Number.isFinite(candidatePrice)
+        ? Math.abs(candidatePrice - desiredLimit)
+        : Number.POSITIVE_INFINITY;
+      return candidateDiff < bestDiff ? candidate : best;
+    }, pool[0]);
+    const adoptedId = bestOrder?.id || bestOrder?.order_id || null;
+    const adoptedLimit = normalizeOrderLimitPrice(bestOrder);
+    console.log('tp_attach_adopt_existing_sell', {
+      symbol,
+      canonicalSymbol: normalizedSymbol,
+      orderId: adoptedId,
+      status: String(bestOrder?.status || '').toLowerCase(),
+      type: String(bestOrder?.type || bestOrder?.order_type || '').toLowerCase(),
+      limitPrice: adoptedLimit,
+      matchedQty: requiredQty,
+      intentTagged: hasExitIntentOrder(bestOrder, normalizedSymbol),
+      source: 'broker_truth_direct_lookup',
+    });
+    return {
+      id: adoptedId,
+      client_order_id: bestOrder?.client_order_id || bestOrder?.clientOrderId || null,
       limitPrice: adoptedLimit,
       submittedAt: bestOrder?.submitted_at || bestOrder?.submittedAt || bestOrder?.created_at || bestOrder?.createdAt,
       adopted: true,
@@ -7538,6 +7710,7 @@ async function attachInitialExitLimit({
 
   const now = Date.now();
   const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
+  const sellClientOrderId = sellOrder?.client_order_id || sellOrder?.clientOrderId || null;
   const sellOrderLimit = normalizeOrderLimitPrice(sellOrder) ?? initialLimit;
   const sellOrderSubmittedAtRaw = sellOrder?.submittedAt || sellOrder?.submitted_at || null;
   const sellOrderSubmittedAt =
@@ -7567,6 +7740,7 @@ async function attachInitialExitLimit({
     exitFeeBps,
     entryOrderId: entryOrderId || null,
     sellOrderId,
+    sellClientOrderId,
     sellOrderSubmittedAt: Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now,
     sellOrderLimit,
     takerAttempted: false,
@@ -13048,12 +13222,7 @@ async function fetchOrders(params = {}) {
     }
 
     if (Array.isArray(response)) {
-      const normalized = response.map((order) => ({
-        ...order,
-        rawSymbol: order.symbol,
-        pairSymbol: normalizeSymbol(order.symbol),
-        symbol: normalizeSymbol(order.symbol),
-      }));
+      const normalized = response.map((order) => normalizeBrokerOrder(order));
       if (isOpenStatus) {
         openOrdersCache.data = normalized;
         openOrdersCache.tsMs = Date.now();
@@ -13083,48 +13252,26 @@ async function fetchOrders(params = {}) {
 
 async function fetchLiveOrders({ force = false } = {}) {
   const nowMs = Date.now();
+  if (force) {
+    openOrdersCache.tsMs = 0;
+    openOrdersCache.data = null;
+  }
   if (!force && liveOrdersCache.data && nowMs - liveOrdersCache.tsMs < LIVE_ORDERS_CACHE_TTL_MS) {
     return liveOrdersCache.data;
   }
   if (!force && liveOrdersCache.pending) {
     return liveOrdersCache.pending;
   }
-  const afterIso = new Date(nowMs - 15 * 60 * 1000).toISOString();
   const fetcher = async () => {
     try {
-      const response = await fetchOrders({
-        status: 'all',
-        after: afterIso,
-        direction: 'desc',
-        limit: 500,
-      });
-      const normalized = (Array.isArray(response) ? response : [])
-        .filter((order) => isOpenLikeOrderStatus(order?.status))
-        .map((order) => {
-          const rawSymbol = order.rawSymbol ?? order.symbol;
-          const normalizedSymbol = normalizeSymbol(rawSymbol);
-          return {
-            ...order,
-            rawSymbol,
-            pairSymbol: normalizedSymbol,
-            symbol: normalizedSymbol,
-          };
-        });
+      const response = await fetchOrders({ status: 'open', nested: true, direction: 'desc', limit: 500 });
+      const normalized = (Array.isArray(response) ? response : []).map((order) => normalizeBrokerOrder(order));
       liveOrdersCache.data = normalized;
       liveOrdersCache.tsMs = Date.now();
       return normalized;
     } catch (err) {
-      const fallback = await fetchOrders({ status: 'open' });
-      const normalized = (Array.isArray(fallback) ? fallback : []).map((order) => {
-        const rawSymbol = order.rawSymbol ?? order.symbol;
-        const normalizedSymbol = normalizeSymbol(rawSymbol);
-        return {
-          ...order,
-          rawSymbol,
-          pairSymbol: normalizedSymbol,
-          symbol: normalizedSymbol,
-        };
-      });
+      const fallback = await fetchOrders({ status: 'open', nested: true, direction: 'desc', limit: 500 });
+      const normalized = (Array.isArray(fallback) ? fallback : []).map((order) => normalizeBrokerOrder(order));
       liveOrdersCache.data = normalized;
       liveOrdersCache.tsMs = Date.now();
       return normalized;
@@ -13444,6 +13591,7 @@ module.exports = {
 
   fetchOrders,
   fetchOrderById,
+  fetchOrderByClientOrderId,
   replaceOrder,
 
   cancelOrder,
