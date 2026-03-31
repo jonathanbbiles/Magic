@@ -334,6 +334,13 @@ const SIZING_VOL_MIN_MULT = readNumber('SIZING_VOL_MIN_MULT', 0.25);
 const SIZING_VOL_MAX_MULT = readNumber('SIZING_VOL_MAX_MULT', 1.25);
 const SIZING_EDGE_MULT = readNumber('SIZING_EDGE_MULT', 0.50);
 const SIZING_LOSS_STREAK_MULT = readNumber('SIZING_LOSS_STREAK_MULT', 0.70);
+const KELLY_ENABLED = readEnvFlag('KELLY_ENABLED', false);
+const KELLY_FRACTION_MULT = readNumber('KELLY_FRACTION_MULT', 0.25);
+const KELLY_MAX_FRACTION = readNumber('KELLY_MAX_FRACTION', 0.05);
+const KELLY_MIN_PROB_EDGE = readNumber('KELLY_MIN_PROB_EDGE', 0.02);
+const KELLY_MIN_REWARD_RISK = readNumber('KELLY_MIN_REWARD_RISK', 1.10);
+const KELLY_USE_CONFIDENCE_MULT = readEnvFlag('KELLY_USE_CONFIDENCE_MULT', true);
+const KELLY_SHADOW_MODE = readEnvFlag('KELLY_SHADOW_MODE', true);
 const CORRELATION_GUARD_ENABLED = readEnvFlag('CORRELATION_GUARD_ENABLED', false);
 const CORRELATION_LOOKBACK_BARS = readNumber('CORRELATION_LOOKBACK_BARS', 120);
 const CORRELATION_MAX = readNumber('CORRELATION_MAX', 0.75);
@@ -3947,28 +3954,158 @@ async function prefetchBarsForUniverse(universe) {
   await prefetchEntryScanMarketData(symbols, { force: true });
 }
 
-function computeNotionalForEntry({ portfolioValueUsd, baseNotionalUsd, volatilityBps, probability, minProbToEnter, consecutiveLosses: lossCount }) {
+function computeKellyNotionalForEntry({
+  portfolioValueUsd,
+  probability,
+  minProbToEnter,
+  upsideBps,
+  downsideBps,
+  confidenceMultiplier = 1,
+}) {
+  const probabilityMissing = probability === null || probability === undefined || probability === '';
+  const pRaw = Number(probability);
+  const minP = clamp(Number(minProbToEnter) || 0, 0, 0.99);
+  const p = clamp(pRaw || 0, 0, 1);
+  const feeBps = Math.max(0, Number(FEE_BPS_ROUND_TRIP) || 0);
+  const slippageBps = Math.max(0, Number(ENTRY_SLIPPAGE_BUFFER_BPS) || 0)
+    + Math.max(0, Number(EXIT_SLIPPAGE_BUFFER_BPS) || 0)
+    + Math.max(0, Number(SLIPPAGE_BPS) || 0);
+  const totalCostBps = feeBps + slippageBps;
+  const grossUpsideBps = Number(upsideBps);
+  const grossDownsideBps = Number(downsideBps);
+  const netUpsideBps = Number.isFinite(grossUpsideBps) ? (grossUpsideBps - totalCostBps) : null;
+  const netDownsideBps = Number.isFinite(grossDownsideBps) ? (grossDownsideBps + totalCostBps) : null;
+  const probEdge = p - minP;
+
+  let fallbackReason = null;
+  let rewardRisk = null;
+  let rawKelly = null;
+  let effectiveKellyFraction = 0;
+
+  if (probabilityMissing || !Number.isFinite(pRaw)) {
+    fallbackReason = 'invalid_probability';
+  } else if (!Number.isFinite(netUpsideBps) || !Number.isFinite(netDownsideBps)) {
+    fallbackReason = 'invalid_reward_or_risk';
+  } else if (netUpsideBps <= 0 || netDownsideBps <= 0) {
+    fallbackReason = 'non_positive_net_bps';
+  } else if (probEdge < KELLY_MIN_PROB_EDGE) {
+    fallbackReason = 'below_min_prob_edge';
+  } else {
+    rewardRisk = netUpsideBps / netDownsideBps;
+    if (!Number.isFinite(rewardRisk) || rewardRisk <= 0) {
+      fallbackReason = 'invalid_reward_risk';
+    } else if (rewardRisk < KELLY_MIN_REWARD_RISK) {
+      fallbackReason = 'below_min_reward_risk';
+    } else {
+      rawKelly = p - ((1 - p) / rewardRisk);
+      if (!Number.isFinite(rawKelly)) {
+        fallbackReason = 'invalid_raw_kelly';
+      } else {
+        const kellyClamped = clamp(rawKelly, 0, Math.max(0, KELLY_MAX_FRACTION));
+        effectiveKellyFraction = kellyClamped * Math.max(0, KELLY_FRACTION_MULT);
+      }
+    }
+  }
+
+  const confidenceMult = KELLY_USE_CONFIDENCE_MULT
+    ? Math.max(0, Number(confidenceMultiplier) || 0)
+    : 1;
+  const finalKellyFraction = effectiveKellyFraction * confidenceMult;
+  const portfolioUsd = Number(portfolioValueUsd);
+  const kellyNotionalUsd = Number.isFinite(portfolioUsd) && portfolioUsd > 0
+    ? portfolioUsd * finalKellyFraction
+    : null;
+
+  return {
+    probability: Number.isFinite(pRaw) ? p : null,
+    minProbToEnter: minP,
+    upsideBps: Number.isFinite(netUpsideBps) ? netUpsideBps : null,
+    downsideBps: Number.isFinite(netDownsideBps) ? netDownsideBps : null,
+    rewardRisk,
+    rawKelly,
+    effectiveKellyFraction: finalKellyFraction,
+    kellyNotionalUsd,
+    fallbackReason,
+  };
+}
+
+function computeNotionalForEntry({
+  portfolioValueUsd,
+  baseNotionalUsd,
+  volatilityBps,
+  probability,
+  minProbToEnter,
+  consecutiveLosses: lossCount,
+  upsideBps,
+  downsideBps,
+  confidenceMultiplier = 1,
+}) {
   const base = Number(baseNotionalUsd);
   if (!Number.isFinite(base) || base <= 0) {
     return { mode: POSITION_SIZING_MODE, baseNotionalUsd: baseNotionalUsd ?? null, finalNotionalUsd: null, volMult: 1, edgeMult: 1, lossMult: 1 };
   }
-  if (POSITION_SIZING_MODE === 'fixed') {
-    return { mode: 'fixed', baseNotionalUsd: base, finalNotionalUsd: base, volMult: 1, edgeMult: 1, lossMult: 1, volatilityBps: Number(volatilityBps) || null, probability: Number(probability) || null };
-  }
-  const vol = Math.max(1e-6, Number(volatilityBps) || 0);
-  const volMultRaw = SIZING_VOL_TARGET_BPS / vol;
-  const volMult = clamp(volMultRaw, SIZING_VOL_MIN_MULT, SIZING_VOL_MAX_MULT);
   const p = clamp(Number(probability) || 0, 0, 1);
-  const minP = clamp(Number(minProbToEnter) || 0, 0, 0.99);
-  const edge = clamp((p - minP) / Math.max(1e-6, 1 - minP), 0, 1);
-  const edgeMult = 1 - SIZING_EDGE_MULT + SIZING_EDGE_MULT * edge;
-  const losses = Math.max(0, Math.floor(Number(lossCount) || 0));
-  const lossMult = Math.max(0.2, SIZING_LOSS_STREAK_MULT ** losses);
-  const riskCap = Number.isFinite(Number(portfolioValueUsd)) && portfolioValueUsd > 0
-    ? portfolioValueUsd * (RISK_PER_TRADE_BPS / 10000)
-    : Number.POSITIVE_INFINITY;
-  const finalNotionalUsd = Math.min(base * volMult * edgeMult * lossMult, riskCap);
-  return { mode: POSITION_SIZING_MODE, baseNotionalUsd: base, finalNotionalUsd, volMult, edgeMult, lossMult, volatilityBps: Number(volatilityBps) || null, probability: p };
+  const modeLabel = POSITION_SIZING_MODE === 'fixed' ? 'fixed' : POSITION_SIZING_MODE;
+  let baseSizing = null;
+  if (POSITION_SIZING_MODE === 'fixed') {
+    baseSizing = { mode: modeLabel, baseNotionalUsd: base, finalNotionalUsd: base, volMult: 1, edgeMult: 1, lossMult: 1, volatilityBps: Number(volatilityBps) || null, probability: Number(probability) || null };
+  } else {
+    const vol = Math.max(1e-6, Number(volatilityBps) || 0);
+    const volMultRaw = SIZING_VOL_TARGET_BPS / vol;
+    const volMult = clamp(volMultRaw, SIZING_VOL_MIN_MULT, SIZING_VOL_MAX_MULT);
+    const minP = clamp(Number(minProbToEnter) || 0, 0, 0.99);
+    const edge = clamp((p - minP) / Math.max(1e-6, 1 - minP), 0, 1);
+    const edgeMult = 1 - SIZING_EDGE_MULT + SIZING_EDGE_MULT * edge;
+    const losses = Math.max(0, Math.floor(Number(lossCount) || 0));
+    const lossMult = Math.max(0.2, SIZING_LOSS_STREAK_MULT ** losses);
+    const riskCap = Number.isFinite(Number(portfolioValueUsd)) && portfolioValueUsd > 0
+      ? portfolioValueUsd * (RISK_PER_TRADE_BPS / 10000)
+      : Number.POSITIVE_INFINITY;
+    const finalNotionalUsd = Math.min(base * volMult * edgeMult * lossMult, riskCap);
+    baseSizing = { mode: POSITION_SIZING_MODE, baseNotionalUsd: base, finalNotionalUsd, volMult, edgeMult, lossMult, volatilityBps: Number(volatilityBps) || null, probability: p };
+  }
+
+  if (POSITION_SIZING_MODE !== 'kelly') {
+    return baseSizing;
+  }
+  if (!KELLY_ENABLED) {
+    return { ...baseSizing, kellyEnabled: false, kellyApplied: false, kellyShadowMode: KELLY_SHADOW_MODE, kellyFallbackReason: 'kelly_disabled' };
+  }
+  const kelly = computeKellyNotionalForEntry({
+    portfolioValueUsd,
+    probability,
+    minProbToEnter,
+    upsideBps,
+    downsideBps,
+    confidenceMultiplier,
+  });
+  if (!Number.isFinite(kelly.kellyNotionalUsd) || kelly.kellyNotionalUsd <= 0 || kelly.fallbackReason) {
+    return {
+      ...baseSizing,
+      kellyEnabled: true,
+      kellyApplied: false,
+      kellyShadowMode: KELLY_SHADOW_MODE,
+      kellyFallbackReason: kelly.fallbackReason || 'kelly_notional_invalid',
+      kelly,
+    };
+  }
+  if (KELLY_SHADOW_MODE) {
+    return {
+      ...baseSizing,
+      kellyEnabled: true,
+      kellyApplied: false,
+      kellyShadowMode: true,
+      kelly,
+    };
+  }
+  return {
+    ...baseSizing,
+    finalNotionalUsd: kelly.kellyNotionalUsd,
+    kellyEnabled: true,
+    kellyApplied: true,
+    kellyShadowMode: false,
+    kelly,
+  };
 }
 
 async function getQuoteForTrading(symbol, opts = {}) {
@@ -11935,6 +12072,16 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     baseNotionalUsd: targetTradeAmount,
     context: 'entry_base_sizing',
   });
+  const confidenceMultiplierRaw = Number(options?.confidenceMeta?.confidenceMultiplier);
+  const confidenceMultiplier = CONFIDENCE_SIZING_ENABLED && Number.isFinite(confidenceMultiplierRaw)
+    ? clamp(confidenceMultiplierRaw, CONFIDENCE_MIN_MULTIPLIER, CONFIDENCE_MAX_MULTIPLIER)
+    : 1;
+  const kellyUpsideBps = Number.isFinite(Number(forensicsRecord?.config?.entryTakeProfitBps))
+    ? Number(forensicsRecord?.config?.entryTakeProfitBps)
+    : ENTRY_TAKE_PROFIT_BPS;
+  const kellyDownsideBps = Number.isFinite(Number(forensicsRecord?.stopDistanceBps))
+    ? Number(forensicsRecord?.stopDistanceBps)
+    : STOP_LOSS_BPS;
   const sizing = computeNotionalForEntry({
     portfolioValueUsd: portfolioValue,
     baseNotionalUsd,
@@ -11942,19 +12089,19 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     probability: forensicsRecord?.predictorProbability,
     minProbToEnter: MIN_PROB_TO_ENTER,
     consecutiveLosses,
+    upsideBps: kellyUpsideBps,
+    downsideBps: kellyDownsideBps,
+    confidenceMultiplier,
   });
   const externalSizeMult = Number(options?.externalSizeMult);
   const sizeMult = Number.isFinite(externalSizeMult) && externalSizeMult > 0 ? externalSizeMult : 1;
-  const confidenceMultiplierRaw = Number(options?.confidenceMeta?.confidenceMultiplier);
-  const confidenceMultiplier = CONFIDENCE_SIZING_ENABLED && Number.isFinite(confidenceMultiplierRaw)
-    ? clamp(confidenceMultiplierRaw, CONFIDENCE_MIN_MULTIPLIER, CONFIDENCE_MAX_MULTIPLIER)
-    : 1;
+  const entryConfidenceMultiplier = (sizing.mode === 'kelly' && !KELLY_USE_CONFIDENCE_MULT) ? 1 : confidenceMultiplier;
   const preConfidenceNotional = (sizing.finalNotionalUsd || baseNotionalUsd) * sizeMult;
   const { cappedNotionalUsd: amountToSpend, portfolioCapUsd } = computeCappedEntryNotional({
     symbol: normalizedSymbol,
     portfolioValue,
     buyingPower,
-    baseNotionalUsd: preConfidenceNotional * confidenceMultiplier,
+    baseNotionalUsd: preConfidenceNotional * entryConfidenceMultiplier,
     context: 'entry_final_sizing',
   });
   console.log('entry_confidence_sizing', {
@@ -11963,10 +12110,32 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     portfolioCapUsd,
     finalUsd: amountToSpend,
     confidenceScore: options?.confidenceMeta?.confidenceScore ?? null,
-    confidenceMultiplier,
+    confidenceMultiplier: entryConfidenceMultiplier,
     components: options?.confidenceMeta?.components || null,
   });
-  console.log('position_sizing', { symbol: normalizedSymbol, ...sizing, externalSizeMult: sizeMult, confidenceMultiplier, finalNotionalUsd: amountToSpend });
+  if (sizing.mode === 'kelly') {
+    const kellyLogPayload = {
+      symbol: normalizedSymbol,
+      probability: sizing?.kelly?.probability ?? sizing?.probability ?? null,
+      minProbToEnter: sizing?.kelly?.minProbToEnter ?? MIN_PROB_TO_ENTER,
+      upsideBps: sizing?.kelly?.upsideBps ?? null,
+      downsideBps: sizing?.kelly?.downsideBps ?? null,
+      rewardRisk: sizing?.kelly?.rewardRisk ?? null,
+      rawKelly: sizing?.kelly?.rawKelly ?? null,
+      effectiveKellyFraction: sizing?.kelly?.effectiveKellyFraction ?? null,
+      portfolioValueUsd: portfolioValue,
+      baseNotionalUsd,
+      kellyNotionalUsd: sizing?.kelly?.kellyNotionalUsd ?? null,
+      finalChosenNotionalUsd: amountToSpend,
+      fallbackReason: sizing?.kellyFallbackReason || sizing?.kelly?.fallbackReason || null,
+    };
+    if (sizing.kellyShadowMode) {
+      console.log('kelly_sizing_shadow', kellyLogPayload);
+    } else {
+      console.log('kelly_sizing_live', kellyLogPayload);
+    }
+  }
+  console.log('position_sizing', { symbol: normalizedSymbol, ...sizing, externalSizeMult: sizeMult, confidenceMultiplier: entryConfidenceMultiplier, finalNotionalUsd: amountToSpend });
   const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
   logBuyDecision(normalizedSymbol, amountToSpend, decision);
@@ -13326,6 +13495,8 @@ module.exports = {
   getOpenSellOrdersForSymbol,
   computeExitSellability,
   findPositionInSnapshot,
+  computeNotionalForEntry,
+  computeKellyNotionalForEntry,
   expandNestedOrders,
   isOpenLikeOrderStatus,
   getExitStateSnapshot,

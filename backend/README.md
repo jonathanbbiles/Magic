@@ -106,6 +106,13 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `SIZING_VOL_MAX_MULT=1.25`
 - `SIZING_EDGE_MULT=0.50`
 - `SIZING_LOSS_STREAK_MULT=0.70`
+- `KELLY_ENABLED=false` (must be `true` before Kelly mode can affect sizing)
+- `KELLY_FRACTION_MULT=0.25`
+- `KELLY_MAX_FRACTION=0.05`
+- `KELLY_MIN_PROB_EDGE=0.02`
+- `KELLY_MIN_REWARD_RISK=1.10`
+- `KELLY_USE_CONFIDENCE_MULT=true`
+- `KELLY_SHADOW_MODE=true` (logs hypothetical Kelly sizing while keeping live notional unchanged)
 
 - `CORRELATION_GUARD_ENABLED=false`
 - `CORRELATION_LOOKBACK_BARS=120`

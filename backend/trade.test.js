@@ -350,3 +350,172 @@ const failedDecision = guards.shouldExitFailedTrade({
   exitOnMomentumLoss: true,
 });
 assert.equal(failedDecision.shouldExit, true);
+
+const sizingFixedTrade = loadTrade({
+  POSITION_SIZING_MODE: 'fixed',
+  KELLY_ENABLED: 'true',
+});
+const fixedSizing = sizingFixedTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.6,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 140,
+  downsideBps: 70,
+  confidenceMultiplier: 1,
+});
+assert.equal(fixedSizing.finalNotionalUsd, 500);
+assert.equal(fixedSizing.mode, 'fixed');
+
+const sizingKellyDisabledTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'false',
+});
+const kellyDisabled = sizingKellyDisabledTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.6,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 140,
+  downsideBps: 70,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyDisabled.finalNotionalUsd > 0, true);
+assert.equal(kellyDisabled.kellyApplied, false);
+assert.equal(kellyDisabled.kellyFallbackReason, 'kelly_disabled');
+
+const sizingKellyShadowTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'true',
+  KELLY_SHADOW_MODE: 'true',
+});
+const kellyShadow = sizingKellyShadowTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.64,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 180,
+  downsideBps: 70,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyShadow.kellyShadowMode, true);
+assert.equal(kellyShadow.kellyApplied, false);
+assert.equal(Number.isFinite(kellyShadow.kelly?.kellyNotionalUsd), true);
+assert.equal(kellyShadow.finalNotionalUsd, 50);
+
+const sizingKellyLiveTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'true',
+  KELLY_SHADOW_MODE: 'false',
+  KELLY_FRACTION_MULT: '0.25',
+  KELLY_MAX_FRACTION: '0.01',
+});
+const kellyWeak = sizingKellyLiveTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.52,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 260,
+  downsideBps: 120,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyWeak.finalNotionalUsd, 25);
+
+const sizingKellyBoundedTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'true',
+  KELLY_SHADOW_MODE: 'false',
+  KELLY_FRACTION_MULT: '0.25',
+  KELLY_MAX_FRACTION: '0.05',
+});
+
+const kellyStrong = sizingKellyBoundedTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.9,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 400,
+  downsideBps: 60,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyStrong.finalNotionalUsd, 125);
+assert.equal(kellyStrong.kelly.effectiveKellyFraction <= 0.0125, true);
+
+const kellyMissingProb = sizingKellyLiveTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: null,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 180,
+  downsideBps: 70,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyMissingProb.kellyApplied, false);
+assert.equal(kellyMissingProb.kellyFallbackReason, 'invalid_probability');
+assert.equal(kellyMissingProb.finalNotionalUsd, 50);
+
+const kellyInvalidRisk = sizingKellyLiveTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.6,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 10,
+  downsideBps: 0,
+  confidenceMultiplier: 1,
+});
+assert.equal(kellyInvalidRisk.kellyApplied, false);
+assert.equal(kellyInvalidRisk.kellyFallbackReason !== null, true);
+
+assert.match(tradeSource, /const \{ cappedNotionalUsd: amountToSpend, portfolioCapUsd \} = computeCappedEntryNotional\(/);
+
+const kellyConfidenceOnTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'true',
+  KELLY_SHADOW_MODE: 'false',
+  KELLY_USE_CONFIDENCE_MULT: 'true',
+});
+const kellyConfidenceOn = kellyConfidenceOnTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.85,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 260,
+  downsideBps: 60,
+  confidenceMultiplier: 0.5,
+});
+const kellyConfidenceOffTrade = loadTrade({
+  POSITION_SIZING_MODE: 'kelly',
+  KELLY_ENABLED: 'true',
+  KELLY_SHADOW_MODE: 'false',
+  KELLY_USE_CONFIDENCE_MULT: 'false',
+});
+const kellyConfidenceOff = kellyConfidenceOffTrade.computeNotionalForEntry({
+  portfolioValueUsd: 10000,
+  baseNotionalUsd: 500,
+  volatilityBps: 120,
+  probability: 0.85,
+  minProbToEnter: 0.5,
+  consecutiveLosses: 0,
+  upsideBps: 260,
+  downsideBps: 60,
+  confidenceMultiplier: 0.5,
+});
+assert.equal(kellyConfidenceOn.finalNotionalUsd < kellyConfidenceOff.finalNotionalUsd, true);
+
+assert.match(tradeSource, /const buyPayload = \{[\s\S]*side: 'buy',[\s\S]*\};/);
