@@ -5449,9 +5449,14 @@ function computeExitSellability({
   } else if (hasReservedQty) {
     sellabilitySource = 'blocked_qty_reserved';
     blockedReason = 'qty_reserved';
-  } else if (qty.hasAvailableQtyField && brokerAvailableQty > 0) {
-    availableQty = brokerAvailableQty;
-    sellabilitySource = 'broker_available';
+  } else if (qty.hasAvailableQtyField) {
+    if (brokerAvailableQty > 0) {
+      availableQty = brokerAvailableQty;
+      sellabilitySource = 'broker_available';
+    } else {
+      sellabilitySource = 'blocked_broker_available_qty_zero';
+      blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
+    }
   } else if (inferredAvailableQty > 0) {
     availableQty = inferredAvailableQty;
     sellabilitySource = qty.hasAvailableQtyField ? 'inferred_from_total_qty' : 'inferred_from_position_qty';
