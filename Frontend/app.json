@@ -1,7 +1,9 @@
 {
   "expo": {
-    "name": "Backend Status Checker",
-    "slug": "backend-status-checker",
-    "version": "1.0.0"
+    "name": "Backend Diagnostic",
+    "slug": "backend-diagnostic",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark"
   }
 }

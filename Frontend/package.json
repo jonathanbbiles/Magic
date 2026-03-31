@@ -1,5 +1,5 @@
 {
-  "name": "backend-status-checker",
+  "name": "backend-diagnostic-frontend",
   "version": "1.0.0",
   "private": true,
   "main": "node_modules/expo/AppEntry.js",
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "expo": "~53.0.0",
+    "expo-constants": "~17.0.8",
     "react": "19.0.0",
     "react-native": "0.79.0"
   }
