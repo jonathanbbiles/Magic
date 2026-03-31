@@ -53,6 +53,8 @@ const {
   expandNestedOrders,
   isOpenLikeOrderStatus,
   getExitStateSnapshot,
+  getLifecycleSnapshot,
+  getSessionGovernorSummary,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -490,6 +492,11 @@ app.get('/dashboard', async (req, res) => {
     });
 
     const exitStateBySymbol = getExitStateSnapshot();
+    const lifecycleSnapshot = getLifecycleSnapshot();
+    const governorSummary = getSessionGovernorSummary();
+    const managerStatus = getTradingManagerStatus();
+    const lastError = getLastHttpError();
+    const lastQuote = getLastQuoteSnapshot();
     const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
     const latestForensicsBySymbol = {};
     Object.keys(latestBySymbolRaw || {}).forEach((key) => {
@@ -554,6 +561,10 @@ app.get('/dashboard', async (req, res) => {
           source: sellSource,
         },
         forensics: getForensicsForPositionSymbol(latestForensicsBySymbol, rawSymbol),
+        state: lifecycleSnapshot?.bySymbol?.[symbol]?.state || null,
+        targetProgressPct: Number.isFinite(expectedMovePct) ? expectedMovePct : null,
+        entryIntentAgeMs: lifecycleSnapshot?.bySymbol?.[symbol]?.createdAt ? Math.max(0, nowMs - Date.parse(lifecycleSnapshot.bySymbol[symbol].createdAt)) : null,
+        executionQuality: toFiniteNumberOrNull(latestForensicsBySymbol?.[symbol]?.executionQualityScore),
         bot: {
           requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBps),
           minNetProfitBps: toFiniteNumberOrNull(botState?.minNetProfitBps),
@@ -582,7 +593,25 @@ app.get('/dashboard', async (req, res) => {
         weeklyChangePct: toFiniteNumberOrNull(weekly?.weeklyPct),
         weekAgoEquity: toFiniteNumberOrNull(weekly?.weekAgoEquity),
         latestEquity: toFiniteNumberOrNull(weekly?.latestEquity),
+        pollAgeMs: lastQuote?.ageMs ?? null,
+        botMood: governorSummary?.coolDownActive ? 'defensive' : 'normal',
+        guardSummary: managerStatus?.sessionGovernor || null,
+        connectionState: {
+          hasLastHttpError: Boolean(lastError),
+          alpaca: getAlpacaAuthStatus(),
+        },
+        regime: managerStatus?.lifecycle?.bySymbol || null,
+        executionHealth: {
+          authoritativeCount: lifecycleSnapshot?.authoritativeCount || 0,
+          failedEntries: governorSummary?.failedEntries || 0,
+        },
       },
+      events: Object.values(lifecycleSnapshot?.bySymbol || {}).slice(-25).map((item) => ({
+        ts: item.updatedAt || item.createdAt || null,
+        symbol: item.symbol || null,
+        state: item.state || null,
+        reason: item.rejectionReason || null,
+      })),
     });
   } catch (error) {
     console.error('Dashboard fetch error:', error?.responseSnippet || error.message);

@@ -208,16 +208,119 @@ function evaluateVolCompression({
   };
 }
 
-function computeNetEdgeBps({ expectedMoveBps, feeBpsRoundTrip, entrySlippageBufferBps, exitSlippageBufferBps, adverseSpreadCostBps } = {}) {
+
+function classifyRegimeScorecard({
+  spreadBps,
+  volatilityBps,
+  quoteAgeMs,
+  quoteStability = 1,
+  directionalPersistence = 0,
+  momentumStrength = 0,
+  liquidityScore = 0,
+  imbalance = 0,
+  marketDataHealthy = true,
+  panicVolBps = 280,
+  deadVolFloorBps = 6,
+} = {}) {
+  const spread = Number.isFinite(spreadBps) ? spreadBps : Number.POSITIVE_INFINITY;
+  const vol = Number.isFinite(volatilityBps) ? volatilityBps : null;
+  const age = Number.isFinite(quoteAgeMs) ? quoteAgeMs : Number.POSITIVE_INFINITY;
+  const stability = clamp01(Number(quoteStability));
+  const drift = Number.isFinite(directionalPersistence) ? directionalPersistence : 0;
+  const momentum = clamp01(Number(momentumStrength));
+  const liquidity = clamp01(Number(liquidityScore));
+  const imbalanceAbs = Math.abs(Number.isFinite(imbalance) ? imbalance : 0);
+
+  let label = 'chop';
+  let blocked = false;
+  const reasons = [];
+
+  if (!marketDataHealthy || age > 15000) {
+    label = 'dead';
+    blocked = true;
+    reasons.push('stale_or_unhealthy_data');
+  } else if (Number.isFinite(vol) && vol >= panicVolBps && spread > 35) {
+    label = 'panic';
+    blocked = true;
+    reasons.push('panic_vol_spread');
+  } else if ((vol != null && vol <= deadVolFloorBps) || spread > 75 || liquidity < 0.2) {
+    label = 'dead';
+    blocked = true;
+    reasons.push('no_trade_liquidity_or_spread');
+  } else if (momentum >= 0.7 && drift >= 0.4 && stability >= 0.6) {
+    label = imbalanceAbs >= 0.3 ? 'breakout' : 'trend';
+  } else if (momentum < 0.35 || drift < 0.2) {
+    label = 'chop';
+  }
+
+  const regimeQuality = clamp01(
+    0.26 * stability +
+    0.2 * liquidity +
+    0.2 * momentum +
+    0.14 * clamp01((40 - Math.max(0, spread)) / 40) +
+    0.2 * clamp01((Number.isFinite(vol) ? vol : 20) / 120)
+  );
+
+  return {
+    label,
+    blocked,
+    reasons,
+    regimeScore: regimeQuality,
+    inputs: {
+      spreadBps: Number.isFinite(spreadBps) ? spreadBps : null,
+      volatilityBps: Number.isFinite(volatilityBps) ? volatilityBps : null,
+      quoteAgeMs: Number.isFinite(quoteAgeMs) ? quoteAgeMs : null,
+      quoteStability: stability,
+      directionalPersistence: drift,
+      momentumStrength: momentum,
+      liquidityScore: liquidity,
+      imbalance: Number.isFinite(imbalance) ? imbalance : null,
+    },
+  };
+}
+
+function computeExpectedNetEdgeBps({
+  expectedMoveBps,
+  fillProbability = 1,
+  feeBpsRoundTrip = 0,
+  expectedSlippageBps = 0,
+  spreadPenaltyBps = 0,
+  regimePenaltyBps = 0,
+} = {}) {
+  const move = Number(expectedMoveBps) || 0;
+  const fillProb = clamp01(fillProbability);
+  const fee = Number(feeBpsRoundTrip) || 0;
+  const slip = Number(expectedSlippageBps) || 0;
+  const spreadPenalty = Number(spreadPenaltyBps) || 0;
+  const regimePenalty = Number(regimePenaltyBps) || 0;
+  const expectedNetEdgeBps = (move * fillProb) - fee - slip - spreadPenalty - regimePenalty;
+  return {
+    expectedMoveBps: move,
+    fillProbability: fillProb,
+    feeBpsRoundTrip: fee,
+    expectedSlippageBps: slip,
+    spreadPenaltyBps: spreadPenalty,
+    regimePenaltyBps: regimePenalty,
+    expectedNetEdgeBps,
+  };
+}
+
+function computeNetEdgeBps({ expectedMoveBps, feeBpsRoundTrip, entrySlippageBufferBps, exitSlippageBufferBps, adverseSpreadCostBps, fillProbability = 1, spreadPenaltyBps = null, regimePenaltyBps = 0 } = {}) {
   const gross = Number(expectedMoveBps) || 0;
-  const net = gross
-    - (Number(feeBpsRoundTrip) || 0)
-    - (Number(entrySlippageBufferBps) || 0)
-    - (Number(exitSlippageBufferBps) || 0)
-    - (Number(adverseSpreadCostBps) || 0);
+  const slippageCost = (Number(entrySlippageBufferBps) || 0) + (Number(exitSlippageBufferBps) || 0);
+  const spreadCost = (spreadPenaltyBps != null && Number.isFinite(Number(spreadPenaltyBps))) ? Number(spreadPenaltyBps) : (Number(adverseSpreadCostBps) || 0);
+  const expected = computeExpectedNetEdgeBps({
+    expectedMoveBps: gross,
+    fillProbability,
+    feeBpsRoundTrip,
+    expectedSlippageBps: slippageCost,
+    spreadPenaltyBps: spreadCost,
+    regimePenaltyBps,
+  });
   return {
     grossEdgeBps: gross,
-    netEdgeBps: net,
+    netEdgeBps: expected.expectedNetEdgeBps,
+    ...expected,
   };
 }
 
@@ -322,6 +425,8 @@ module.exports = {
   evaluateMomentumState,
   evaluateTradeableRegime,
   evaluateVolCompression,
+  classifyRegimeScorecard,
+  computeExpectedNetEdgeBps,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,

@@ -88,6 +88,16 @@ assert.equal(
   false,
 );
 
+
+const tradeLifecycle = loadTrade({ ENGINE_V2_ENABLED: '1', ENTRY_INTENTS_ENABLED: '1' });
+assert.equal(typeof tradeLifecycle.getLifecycleSnapshot, 'function');
+assert.equal(typeof tradeLifecycle.getSessionGovernorSummary, 'function');
+const lifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(typeof lifecycleSnapshot, 'object');
+assert.equal(typeof lifecycleSnapshot.authoritativeCount, 'number');
+const governorSnapshot = tradeLifecycle.getSessionGovernorSummary();
+assert.equal(typeof governorSnapshot.coolDownActive, 'boolean');
+
 const tradeWithReprice = loadTrade({
   SELL_REPRICE_ENABLED: '1',
   EXIT_CANCELS_ENABLED: '0',
