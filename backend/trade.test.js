@@ -230,9 +230,9 @@ assert.equal(fallbackSellability.openSellCount, 0);
 assert.equal(fallbackSellability.reservedQty, 0);
 assert.equal(fallbackSellability.brokerAvailableQty, 0);
 assert.equal(fallbackSellability.inferredAvailableQty, 4.25);
-assert.equal(fallbackSellability.availableQty, 4.25);
-assert.equal(fallbackSellability.sellabilitySource, 'inferred_from_total_qty');
-assert.equal(fallbackSellability.blockedReason, null);
+assert.equal(fallbackSellability.availableQty, 0);
+assert.equal(fallbackSellability.sellabilitySource, 'blocked_broker_available_qty_zero');
+assert.equal(fallbackSellability.blockedReason, 'no_sellable_qty');
 
 const zeroQtySellability = computeExitSellability({
   symbol: 'ETH/USD',
@@ -240,7 +240,7 @@ const zeroQtySellability = computeExitSellability({
   openOrders: [],
 });
 assert.equal(zeroQtySellability.availableQty, 0);
-assert.equal(zeroQtySellability.sellabilitySource, 'blocked_no_position_qty');
+assert.equal(zeroQtySellability.sellabilitySource, 'blocked_broker_available_qty_zero');
 assert.equal(zeroQtySellability.blockedReason, 'no_position_qty');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
