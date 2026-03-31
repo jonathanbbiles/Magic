@@ -187,3 +187,49 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `ALPACA_MD_MIN_DELAY_MS=200`
 - `ALPACA_MD_MAX_RETRIES=6`
 - `ALPACA_MD_BASE_BACKOFF_MS=500`
+
+## Engine v2 lifecycle (feature-flagged, additive)
+
+When enabled, the backend runs a single authoritative lifecycle per symbol:
+`intent -> confirm -> route -> fill -> protect -> manage -> learn`.
+
+Primary implementation anchors:
+- `backend/trade.js` orchestration (`computeEntrySignal`, `runEntryScanOnce`, `submitManagedEntryBuy`, `handleBuyFill`, `manageExitStates`, `replaceOrder`).
+- `backend/modules/tradeGuards.js` scorecard regime and cost-aware edge helpers.
+- `backend/index.js` additive `/dashboard` telemetry fields.
+- `backend/modules/tradeForensics.js` execution analytics stream.
+
+### New feature flags
+- `ENGINE_V2_ENABLED`
+- `ENTRY_INTENTS_ENABLED`
+- `REGIME_ENGINE_V2_ENABLED`
+- `ADAPTIVE_ROUTING_ENABLED`
+- `EXIT_MANAGER_V2_ENABLED`
+- `SESSION_GOVERNOR_ENABLED`
+- `EXECUTION_ANALYTICS_V2_ENABLED`
+- `DASHBOARD_V2_META_ENABLED`
+- `SHADOW_INTENTS_ENABLED`
+
+### New knobs
+- `ENTRY_CONFIRMATION_SAMPLES`
+- `ENTRY_CONFIRMATION_WINDOW_MS`
+- `ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS`
+- `ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS`
+- `ROUTING_IOC_URGENCY_SCORE`
+- `ROUTING_PASSIVE_MAX_SPREAD_BPS`
+- `SESSION_GOVERNOR_FAIL_COOLDOWN_MS`
+
+### Shadow mode
+Set `SHADOW_INTENTS_ENABLED=true` with `ENGINE_V2_ENABLED=true` to run intent/confirmation telemetry without sending new live orders.
+
+### Dashboard additive fields
+`/dashboard` now includes additive metadata and events:
+- `meta.pollAgeMs`, `meta.botMood`, `meta.guardSummary`, `meta.connectionState`, `meta.regime`, `meta.executionHealth`
+- `positions[].state`, `positions[].targetProgressPct`, `positions[].entryIntentAgeMs`, `positions[].executionQuality`
+- `events[]` concise lifecycle feed
+
+### Local verification
+1. Keep live credentials untouched; toggle flags off by default.
+2. Run tests: `npm test` from `backend/`.
+3. Turn on `ENGINE_V2_ENABLED=true` + `SHADOW_INTENTS_ENABLED=true` first.
+4. Inspect `/dashboard` and `/debug/forensics/recent` before enabling live routing flags.

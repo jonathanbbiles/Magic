@@ -43,6 +43,8 @@ const {
   evaluateMomentumState,
   evaluateTradeableRegime,
   evaluateVolCompression,
+  classifyRegimeScorecard,
+  computeExpectedNetEdgeBps,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,
@@ -382,6 +384,23 @@ const CONFIDENCE_SPREAD_WEIGHT = readNumber('CONFIDENCE_SPREAD_WEIGHT', 0.20);
 const CONFIDENCE_LIQUIDITY_WEIGHT = readNumber('CONFIDENCE_LIQUIDITY_WEIGHT', 0.20);
 const CONFIDENCE_MOMENTUM_WEIGHT = readNumber('CONFIDENCE_MOMENTUM_WEIGHT', 0.15);
 const CONFIDENCE_REGIME_WEIGHT = readNumber('CONFIDENCE_REGIME_WEIGHT', 0.10);
+
+const ENGINE_V2_ENABLED = readEnvFlag('ENGINE_V2_ENABLED', false);
+const ENTRY_INTENTS_ENABLED = readEnvFlag('ENTRY_INTENTS_ENABLED', false);
+const REGIME_ENGINE_V2_ENABLED = readEnvFlag('REGIME_ENGINE_V2_ENABLED', false);
+const ADAPTIVE_ROUTING_ENABLED = readEnvFlag('ADAPTIVE_ROUTING_ENABLED', false);
+const EXIT_MANAGER_V2_ENABLED = readEnvFlag('EXIT_MANAGER_V2_ENABLED', false);
+const SESSION_GOVERNOR_ENABLED = readEnvFlag('SESSION_GOVERNOR_ENABLED', false);
+const EXECUTION_ANALYTICS_V2_ENABLED = readEnvFlag('EXECUTION_ANALYTICS_V2_ENABLED', false);
+const DASHBOARD_V2_META_ENABLED = readEnvFlag('DASHBOARD_V2_META_ENABLED', false);
+const SHADOW_INTENTS_ENABLED = readEnvFlag('SHADOW_INTENTS_ENABLED', false);
+const ENTRY_CONFIRMATION_SAMPLES = Math.max(1, Math.trunc(readNumber('ENTRY_CONFIRMATION_SAMPLES', 3)));
+const ENTRY_CONFIRMATION_WINDOW_MS = Math.max(0, readNumber('ENTRY_CONFIRMATION_WINDOW_MS', 600));
+const ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS = readNumber('ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS', 4);
+const ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS = readNumber('ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS', MIN_NET_EDGE_BPS);
+const ROUTING_IOC_URGENCY_SCORE = readNumber('ROUTING_IOC_URGENCY_SCORE', 0.72);
+const ROUTING_PASSIVE_MAX_SPREAD_BPS = readNumber('ROUTING_PASSIVE_MAX_SPREAD_BPS', 12);
+const SESSION_GOVERNOR_FAIL_COOLDOWN_MS = Math.max(1000, readNumber('SESSION_GOVERNOR_FAIL_COOLDOWN_MS', 60000));
 
 const VOLATILITY_FILTER_ENABLED = readEnvFlag('VOLATILITY_FILTER_ENABLED', false);
 const VOLATILITY_BPS_MAX = readNumber('VOLATILITY_BPS_MAX', 250);
@@ -2013,6 +2032,18 @@ async function computeEntrySignal(symbol, opts = {}) {
     allowUnknownVol: REGIME_ALLOW_UNKNOWN_VOL,
   });
 
+  const regimeScorecard = classifyRegimeScorecard({
+    spreadBps,
+    volatilityBps: volatilityContext.volatilityBps,
+    quoteAgeMs,
+    quoteStability: clamp01(1 - ((quoteAgeMs || 0) / Math.max(1, ENTRY_QUOTE_MAX_AGE_MS))),
+    directionalPersistence: Number(predictorTp?.signals?.checks?.directionalPersistence || predictorTp?.signals?.driftScore || 0),
+    momentumStrength: Number(momentumState?.strength || 0),
+    liquidityScore: Number(orderbookMeta?.liquidityScore || 0),
+    imbalance: Number(orderbookMeta?.imbalance || 0),
+    marketDataHealthy,
+  });
+
   if (!regimeDecision.entryAllowed) {
     console.log('entry_regime_gate', {
       symbol: asset.symbol,
@@ -2097,11 +2128,16 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
+  const fillProbability = clamp01((Number(predictorTp?.probability) || 0.5) * clamp01(orderbookMeta?.liquidityScore || 0.5));
+  const regimePenaltyBps = REGIME_ENGINE_V2_ENABLED && regimeScorecard?.label === 'chop' ? 8 : (regimeScorecard?.label === 'panic' ? 40 : (regimeScorecard?.label === 'dead' ? 100 : 0));
   const edge = computeNetEdgeBps({
     expectedMoveBps: predictorTp?.signals?.expectedMoveBps,
+    fillProbability,
     feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
     entrySlippageBufferBps: ENTRY_SLIPPAGE_BUFFER_BPS,
     exitSlippageBufferBps: EXIT_SLIPPAGE_BUFFER_BPS,
+    spreadPenaltyBps: spreadBps,
+    regimePenaltyBps,
     adverseSpreadCostBps: spreadBps,
   });
   console.log('entry_edge_gate', {
@@ -2117,6 +2153,20 @@ async function computeEntrySignal(symbol, opts = {}) {
     grossEdgeBps: edge.grossEdgeBps,
     netEdgeBps: edge.netEdgeBps,
   });
+
+  if (ENGINE_V2_ENABLED && edge.netEdgeBps < ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS) {
+    return {
+      entryReady: false,
+      why: 'expected_net_edge_floor',
+      meta: {
+        symbol: asset.symbol,
+        expectedNetEdgeBps: edge.netEdgeBps,
+        expectedNetEdgeFloorBps: ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS,
+        regimeScorecard,
+      },
+      record: baseRecord,
+    };
+  }
 
   const marketDataEval = evaluateEntryMarketData({
     symbol: asset.symbol,
@@ -2403,10 +2453,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       orderbookAbsorption: orderbookAbsorptionMeta,
       momentumState,
       regimeDecision,
+      regimeScorecard,
       symbolTier,
       executionMode: marketDataEval.executionMode,
       marketDataEval,
       edge,
+      expectedNetEdgeBps: edge?.expectedNetEdgeBps ?? edge?.netEdgeBps ?? null,
       confidence: { ...confidence, confidenceMultiplier: confidenceMultiplierCapped },
     },
     record: baseRecord,
@@ -2617,6 +2669,103 @@ const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
 const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
 const SIMPLE_SCALPER_RETRY_COOLDOWN_MS = 120000;
 const inFlightBySymbol = new Map();
+const entryIntentState = new Map(); // symbol -> authoritative lifecycle state
+const entryIntentsById = new Map();
+const authoritativeTradeState = new Map();
+const sessionGovernorState = {
+  coolDownUntilMs: 0,
+  failedEntries: 0,
+  recentExecutionScores: [],
+  lastReason: null,
+};
+
+function updateIntentState(symbol, patch = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  if (!normalizedSymbol) return null;
+  const current = entryIntentState.get(normalizedSymbol) || {};
+  const next = {
+    ...current,
+    ...patch,
+    symbol: normalizedSymbol,
+    updatedAt: new Date().toISOString(),
+  };
+  entryIntentState.set(normalizedSymbol, next);
+  if (next.intentId) {
+    entryIntentsById.set(next.intentId, next);
+  }
+  const active = !['completed', 'rejected', 'canceled'].includes(String(next.state || '').toLowerCase());
+  if (active) {
+    authoritativeTradeState.set(normalizedSymbol, {
+      symbol: normalizedSymbol,
+      tradeId: next.tradeId || next.intentId || null,
+      intentId: next.intentId || null,
+      state: next.state || null,
+      orderId: next.orderId || null,
+      reservedQty: Number(next.reservedQty) || 0,
+      fillQty: Number(next.fillQty) || 0,
+      exitOrderId: next.exitOrderId || null,
+      lastTs: next.updatedAt,
+    });
+  } else {
+    authoritativeTradeState.delete(normalizedSymbol);
+  }
+  return next;
+}
+
+function createEntryIntent(symbol, signal = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const intentId = randomUUID();
+  const nowIso = new Date().toISOString();
+  const intent = {
+    intentId,
+    tradeId: signal.tradeId || intentId,
+    symbol: normalizedSymbol,
+    side: 'buy',
+    state: 'intent_created',
+    createdAt: nowIso,
+    intentTs: nowIso,
+    decisionPrice: Number(signal.decisionPrice) || null,
+    expectedMoveBps: Number(signal.expectedMoveBps) || null,
+    expectedNetEdgeBps: Number(signal.expectedNetEdgeBps) || null,
+    regimeLabel: signal.regimeLabel || null,
+    regimeScore: Number.isFinite(Number(signal.regimeScore)) ? Number(signal.regimeScore) : null,
+    spreadAtIntent: Number(signal.spreadAtIntent) || null,
+    imbalanceAtIntent: Number(signal.imbalanceAtIntent) || null,
+    volatilityAtIntent: Number(signal.volatilityAtIntent) || null,
+    predictorProbability: Number(signal.predictorProbability) || null,
+    qualityScore: Number(signal.qualityScore) || null,
+    confirmationSamples: [],
+    rejectionReason: null,
+  };
+  updateIntentState(normalizedSymbol, intent);
+  return intent;
+}
+
+async function confirmEntryIntent(intent, options = {}) {
+  if (!intent || !intent.symbol) return { ok: false, reason: 'intent_missing' };
+  updateIntentState(intent.symbol, { state: 'confirming' });
+  const samples = [];
+  const baselineSpread = Number(intent.spreadAtIntent);
+  for (let i = 0; i < ENTRY_CONFIRMATION_SAMPLES; i += 1) {
+    const quote = await getQuoteForTrading(intent.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS }).catch(() => null);
+    const orderbook = await getLatestOrderbook(intent.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS }).catch(() => null);
+    const bid = Number(quote?.bid);
+    const ask = Number(quote?.ask);
+    const spreadBps = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
+    const stable = Boolean(Number.isFinite(spreadBps) && (!Number.isFinite(baselineSpread) || spreadBps <= baselineSpread + ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS));
+    const quoteAgeMs = Number.isFinite(quote?.tsMs) ? Math.max(0, Date.now() - quote.tsMs) : null;
+    const ok = stable && (quoteAgeMs == null || quoteAgeMs <= ENTRY_QUOTE_MAX_AGE_MS) && Boolean(orderbook?.ok);
+    samples.push({ ts: new Date().toISOString(), spreadBps, quoteAgeMs, stable, orderbookOk: Boolean(orderbook?.ok), ok });
+    if (i < ENTRY_CONFIRMATION_SAMPLES - 1 && ENTRY_CONFIRMATION_WINDOW_MS > 0) await sleep(Math.floor(ENTRY_CONFIRMATION_WINDOW_MS / ENTRY_CONFIRMATION_SAMPLES));
+  }
+  const failedSample = samples.find((sample) => !sample.ok);
+  if (failedSample) {
+    updateIntentState(intent.symbol, { state: 'rejected', rejectionReason: 'confirmation_failed', confirmationSamples: samples });
+    return { ok: false, reason: 'confirmation_failed', samples };
+  }
+  updateIntentState(intent.symbol, { state: 'confirmed', confirmationSamples: samples });
+  return { ok: true, samples };
+}
 
 function toJsonSafePrimitive(value) {
   if (value == null) return null;
@@ -2677,6 +2826,9 @@ function clearExitTracking(symbol, meta = null) {
   lastConfirmedPositionSeenAtBySymbol.delete(s);
   exitStateFirstSeenAtBySymbol.delete(s);
   pendingExitAttachBySymbol.delete(s);
+  if (entryIntentState.has(s)) {
+    updateIntentState(s, { state: 'completed', completedAt: new Date().toISOString() });
+  }
 
   console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
 }
@@ -7763,6 +7915,7 @@ async function attachInitialExitLimit({
     actionTaken: initialActionTaken,
   });
 
+  updateIntentState(symbol, { state: 'managing' });
   return sellOrder;
 }
 
@@ -7779,6 +7932,8 @@ async function handleBuyFill({
   entryAsk,
   entrySpreadBps,
   entryMomentumState,
+  intentId = null,
+  tradeId = null,
 
 }) {
 
@@ -7789,6 +7944,15 @@ async function handleBuyFill({
   const qtyNum = Number(qty);
 
   const notionalUsd = qtyNum * entryPriceNum;
+
+  updateIntentState(symbol, {
+    intentId: intentId || entryIntentState.get(symbol)?.intentId || null,
+    tradeId: tradeId || entryIntentState.get(symbol)?.tradeId || intentId || null,
+    state: qtyNum > 0 ? 'filled' : 'partially_filled',
+    fillQty: qtyNum,
+    orderId: entryOrderId || null,
+    decisionPrice: entryPriceNum,
+  });
 
   if (Number.isFinite(Number(desiredNetExitBps))) {
     desiredExitBpsBySymbol.set(symbol, Number(desiredNetExitBps));
@@ -7854,6 +8018,11 @@ async function handleBuyFill({
 
   if (sellOrder?.id || sellOrder?.order_id) {
     clearPendingExitAttach(symbol);
+    updateIntentState(symbol, {
+      state: 'protected',
+      exitOrderId: sellOrder?.id || sellOrder?.order_id || null,
+      reservedQty: qtyNum,
+    });
   }
 
   if (STOPS_ENABLED && STOPLOSS_ENABLED && STOPLOSS_MODE === 'atr') {
@@ -11460,6 +11629,39 @@ async function runEntryScanOnce() {
         continue;
       }
 
+      if (SESSION_GOVERNOR_ENABLED && Date.now() < sessionGovernorState.coolDownUntilMs) {
+        skipped += 1;
+        recordSkip('session_governor_cooldown', symbol, { untilMs: sessionGovernorState.coolDownUntilMs, reason: sessionGovernorState.lastReason });
+        continue;
+      }
+
+      let activeIntent = null;
+      if (ENGINE_V2_ENABLED && ENTRY_INTENTS_ENABLED) {
+        activeIntent = createEntryIntent(symbol, {
+          decisionPrice: recordBase?.refPrice,
+          expectedMoveBps: signal?.meta?.edge?.expectedMoveBps ?? signal?.meta?.edge?.grossEdgeBps,
+          expectedNetEdgeBps: signal?.meta?.expectedNetEdgeBps ?? signal?.meta?.edge?.netEdgeBps,
+          regimeLabel: signal?.meta?.regimeScorecard?.label,
+          regimeScore: signal?.meta?.regimeScorecard?.regimeScore,
+          spreadAtIntent: signal?.spreadBps,
+          imbalanceAtIntent: signal?.meta?.orderbookImbalance,
+          volatilityAtIntent: recordBase?.volatilityBps,
+          predictorProbability: recordBase?.predictorProbability,
+          qualityScore: signal?.meta?.confidence?.confidenceScore,
+        });
+        const confirmation = await confirmEntryIntent(activeIntent);
+        if (!confirmation.ok) {
+          skipped += 1;
+          recordSkip('intent_rejected', symbol, { reason: confirmation.reason });
+          if (recordBase) {
+            recordBase.decision = 'skipped';
+            recordBase.skipReason = confirmation.reason || 'intent_rejected';
+            recorder.appendRecord(recordBase);
+          }
+          continue;
+        }
+      }
+
       const volBps = Number(recordBase?.volatilityBps);
       let externalSizeMult = 1;
       if (LIQUIDITY_WINDOW_ENABLED) {
@@ -11538,15 +11740,33 @@ async function runEntryScanOnce() {
       const confidenceMeta = signal?.meta?.confidence || null;
       const signalMeta = signal?.meta || null;
       const entryOptions = { forensicsRecord: recordBase, externalSizeMult, correlationMeta: correlationBlock, confidenceMeta, signalMeta };
-      if (SIMPLE_SCALPER_ENABLED) {
+      if (ENGINE_V2_ENABLED && SHADOW_INTENTS_ENABLED && activeIntent) {
+        updateIntentState(symbol, { state: 'confirmed', routingMode: 'shadow', rejectionReason: null });
+        tradeForensics.append({
+          tsDecision: new Date().toISOString(),
+          tradeId: activeIntent.tradeId,
+          intentId: activeIntent.intentId,
+          symbol,
+          classification: 'shadow_intent',
+          lifecycleState: 'confirmed',
+          decision: { decisionPrice: activeIntent.decisionPrice, expectedNetEdgeBps: activeIntent.expectedNetEdgeBps },
+        });
+        result = { skipped: true, reason: 'shadow_intent' };
+      } else if (SIMPLE_SCALPER_ENABLED) {
         result = await placeSimpleScalperEntry(symbol, entryOptions);
       } else {
         desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
-        result = await placeMakerLimitBuyThenSell(symbol, entryOptions);
+        if (activeIntent) updateIntentState(symbol, { state: 'routing' });
+        result = await placeMakerLimitBuyThenSell(symbol, { ...entryOptions, intentId: activeIntent?.intentId || null, tradeId: activeIntent?.tradeId || null });
       }
       attempts += 1;
       if (result?.submitted) {
         placed += 1;
+        if (activeIntent) updateIntentState(symbol, { state: 'routing', orderId: result?.buy?.id || result?.orderId || null });
+        if (SESSION_GOVERNOR_ENABLED) {
+          sessionGovernorState.failedEntries = 0;
+          sessionGovernorState.lastReason = null;
+        }
         if (recordBase) {
           recordBase.decision = 'placed';
           recordBase.skipReason = null;
@@ -11556,6 +11776,19 @@ async function runEntryScanOnce() {
       }
       if (result?.skipped || result?.failed) {
         skipped += 1;
+        if (activeIntent) {
+          updateIntentState(symbol, {
+            state: result?.reason === 'shadow_intent' ? 'confirmed' : 'rejected',
+            rejectionReason: result.reason || (result.failed ? 'attempt_failed' : 'attempt_skipped'),
+          });
+        }
+        if (SESSION_GOVERNOR_ENABLED && (result?.failed || result?.reason === 'entry_not_filled')) {
+          sessionGovernorState.failedEntries += 1;
+          sessionGovernorState.lastReason = result?.reason || 'entry_failed';
+          if (sessionGovernorState.failedEntries >= 2) {
+            sessionGovernorState.coolDownUntilMs = Date.now() + SESSION_GOVERNOR_FAIL_COOLDOWN_MS;
+          }
+        }
         const reason = result.reason || (result.failed ? 'attempt_failed' : 'attempt_skipped');
         recordSkip(reason, symbol, result.meta || null);
         if (recordBase) {
@@ -12829,6 +13062,8 @@ async function submitManagedEntryBuy({
   limit_price,
   desiredNetExitBps,
   notional,
+  intentId = null,
+  tradeId = null,
 }) {
   const normalizedSymbol = normalizeSymbol(symbol);
   let bid = null;
@@ -12864,6 +13099,15 @@ async function submitManagedEntryBuy({
     context: 'managed_entry_buy',
     intent: 'entry',
   });
+  if (intentId) {
+    updateIntentState(normalizedSymbol, {
+      intentId,
+      tradeId: tradeId || intentId,
+      state: 'routing',
+      orderId: buyOrder?.id || null,
+      reservedQty: Number(qty) || 0,
+    });
+  }
   if (!buyOrder?.id) {
     return {
       ok: false,
@@ -12890,6 +13134,7 @@ async function submitManagedEntryBuy({
 
   if (lastStatus !== 'filled') {
     if (terminalStatuses.has(lastStatus)) {
+      if (intentId) updateIntentState(normalizedSymbol, { state: 'rejected', rejectionReason: 'entry_terminal' });
       return { ok: false, skipped: true, reason: 'entry_terminal', orderId: buyOrder.id, status: lastStatus };
     }
     if (Date.now() - startMs >= timeoutMs) {
@@ -12899,6 +13144,7 @@ async function submitManagedEntryBuy({
         timeoutSeconds: ENTRY_FILL_TIMEOUT_SECONDS,
       });
       await cancelOrderSafe(buyOrder.id);
+      if (intentId) updateIntentState(normalizedSymbol, { state: 'canceled', rejectionReason: 'entry_not_filled' });
       return { ok: false, skipped: true, reason: 'entry_not_filled', orderId: buyOrder.id, status: lastStatus };
     }
   }
@@ -12917,6 +13163,8 @@ async function submitManagedEntryBuy({
     entryBid: bid,
     entryAsk: ask,
     entrySpreadBps: spreadBps,
+    intentId,
+    tradeId,
   });
 
   return { ok: true, buy: filled, sell: sellOrder || null };
@@ -13129,6 +13377,8 @@ async function submitOrder(order = {}) {
       limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
       desiredNetExitBps,
       notional: useNotional ? finalNotional : undefined,
+      intentId: order.intentId || null,
+      tradeId: order.tradeId || null,
     });
   }
 
@@ -13167,18 +13417,33 @@ async function replaceOrder(orderId, payload = {}) {
     path: `orders/${orderId}`,
     label: 'orders_replace',
   });
+  let response = null;
   try {
-    const response = await requestJson({
+    response = await requestJson({
       method: 'PATCH',
       url,
       headers: alpacaJsonHeaders(),
       body: JSON.stringify(payload),
     });
-    return response;
   } catch (err) {
     logHttpError({ label: 'orders_replace', url, error: err });
     throw err;
   }
+
+  let original = null;
+  try {
+    original = await fetchOrderById(orderId);
+  } catch (_) {
+    original = null;
+  }
+  return {
+    ...response,
+    reconcile: {
+      originalOrderId: orderId,
+      originalStatus: original?.status || null,
+      replacedOrderId: response?.id || response?.order_id || null,
+    },
+  };
 }
 
 async function fetchOrders(params = {}) {
@@ -13460,11 +13725,46 @@ function getAlpacaBaseStatus() {
   };
 }
 
+
+function getLifecycleSnapshot() {
+  const bySymbol = {};
+  for (const [symbol, state] of entryIntentState.entries()) {
+    bySymbol[symbol] = { ...state };
+  }
+  return {
+    bySymbol,
+    authoritativeCount: authoritativeTradeState.size,
+  };
+}
+
+function getSessionGovernorSummary() {
+  return {
+    enabled: SESSION_GOVERNOR_ENABLED,
+    coolDownUntilMs: sessionGovernorState.coolDownUntilMs,
+    coolDownActive: Date.now() < sessionGovernorState.coolDownUntilMs,
+    failedEntries: sessionGovernorState.failedEntries,
+    lastReason: sessionGovernorState.lastReason,
+  };
+}
+
 function getTradingManagerStatus() {
   return {
     tradingEnabled: TRADING_ENABLED,
     entryManagerRunning,
     exitManagerRunning,
+    engineV2Enabled: ENGINE_V2_ENABLED,
+    featureFlags: {
+      ENTRY_INTENTS_ENABLED,
+      REGIME_ENGINE_V2_ENABLED,
+      ADAPTIVE_ROUTING_ENABLED,
+      EXIT_MANAGER_V2_ENABLED,
+      SESSION_GOVERNOR_ENABLED,
+      EXECUTION_ANALYTICS_V2_ENABLED,
+      DASHBOARD_V2_META_ENABLED,
+      SHADOW_INTENTS_ENABLED,
+    },
+    lifecycle: getLifecycleSnapshot(),
+    sessionGovernor: getSessionGovernorSummary(),
   };
 }
 
@@ -13648,6 +13948,8 @@ module.exports = {
   expandNestedOrders,
   isOpenLikeOrderStatus,
   getExitStateSnapshot,
+  getLifecycleSnapshot,
+  getSessionGovernorSummary,
   prefetchBarsForUniverse,
   runEntryScanOnce,
 

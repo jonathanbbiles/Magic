@@ -3,6 +3,8 @@ const {
   evaluateTradeableRegime,
   evaluateMomentumState,
   evaluateVolCompression,
+  classifyRegimeScorecard,
+  computeExpectedNetEdgeBps,
   computeNetEdgeBps,
   computeConfidenceScore,
   shouldExitFailedTrade,
@@ -275,5 +277,45 @@ const failedTradeNoFollowthrough = shouldExitFailedTrade({
 });
 assert.equal(failedTradeNoFollowthrough.shouldExit, true);
 assert.equal(failedTradeNoFollowthrough.reason, 'no_followthrough');
+
+
+
+const regimeTrend = classifyRegimeScorecard({
+  spreadBps: 8,
+  volatilityBps: 85,
+  quoteAgeMs: 250,
+  quoteStability: 0.9,
+  directionalPersistence: 0.7,
+  momentumStrength: 0.8,
+  liquidityScore: 0.8,
+  imbalance: 0.2,
+  marketDataHealthy: true,
+});
+assert.equal(regimeTrend.label, 'trend');
+assert.equal(regimeTrend.blocked, false);
+
+const regimePanic = classifyRegimeScorecard({
+  spreadBps: 60,
+  volatilityBps: 320,
+  quoteAgeMs: 200,
+  quoteStability: 0.4,
+  directionalPersistence: 0.1,
+  momentumStrength: 0.2,
+  liquidityScore: 0.2,
+  imbalance: 0.5,
+  marketDataHealthy: true,
+});
+assert.equal(regimePanic.label, 'panic');
+assert.equal(regimePanic.blocked, true);
+
+const expectedEdge = computeExpectedNetEdgeBps({
+  expectedMoveBps: 120,
+  fillProbability: 0.75,
+  feeBpsRoundTrip: 20,
+  expectedSlippageBps: 8,
+  spreadPenaltyBps: 6,
+  regimePenaltyBps: 5,
+});
+assert.equal(expectedEdge.expectedNetEdgeBps, 51);
 
 console.log('trade guards tests passed');

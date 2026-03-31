@@ -45,6 +45,8 @@ withEnv({}, () => {
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
   assert.equal(guardrails.entryUniverse.mode, 'dynamic');
+  assert.equal(guardrails.engineV2.enabled, false);
+  assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);
 });
 
 withEnv({ REGIME_ALLOW_UNKNOWN_VOL: 'maybe' }, () => {
@@ -113,6 +115,20 @@ withEnv({ CONFIDENCE_MIN_MULTIPLIER: '1.2', CONFIDENCE_MAX_MULTIPLIER: '0.9' }, 
 
 withEnv({ STANDDOWN_WINDOW_MIN: '0' }, () => {
   assert.throws(() => validateEnv(), /STANDDOWN_WINDOW_MIN must be a positive integer/);
+});
+
+
+
+withEnv({ ENGINE_V2_ENABLED: 'maybe' }, () => {
+  assert.throws(() => validateEnv(), /ENGINE_V2_ENABLED must be a boolean-like value/);
+});
+
+withEnv({ ENTRY_CONFIRMATION_SAMPLES: '0' }, () => {
+  assert.throws(() => validateEnv(), /ENTRY_CONFIRMATION_SAMPLES must be between 1 and 20/);
+});
+
+withEnv({ ROUTING_IOC_URGENCY_SCORE: '1.2' }, () => {
+  assert.throws(() => validateEnv(), /ROUTING_IOC_URGENCY_SCORE must be between 0 and 1/);
 });
 
 console.log('validate env tests passed');

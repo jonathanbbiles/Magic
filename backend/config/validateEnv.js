@@ -246,6 +246,22 @@ const validateEnv = () => {
     const standdownWindowMin = parseFiniteNumberEnv('STANDDOWN_WINDOW_MIN', 30);
     const standdownDurationMin = parseFiniteNumberEnv('STANDDOWN_DURATION_MIN', 20);
 
+    const engineV2Enabled = parseBooleanEnv('ENGINE_V2_ENABLED', false);
+    const entryIntentsEnabled = parseBooleanEnv('ENTRY_INTENTS_ENABLED', false);
+    const regimeEngineV2Enabled = parseBooleanEnv('REGIME_ENGINE_V2_ENABLED', false);
+    const adaptiveRoutingEnabled = parseBooleanEnv('ADAPTIVE_ROUTING_ENABLED', false);
+    const exitManagerV2Enabled = parseBooleanEnv('EXIT_MANAGER_V2_ENABLED', false);
+    const sessionGovernorEnabled = parseBooleanEnv('SESSION_GOVERNOR_ENABLED', false);
+    const executionAnalyticsV2Enabled = parseBooleanEnv('EXECUTION_ANALYTICS_V2_ENABLED', false);
+    const dashboardV2MetaEnabled = parseBooleanEnv('DASHBOARD_V2_META_ENABLED', false);
+    const shadowIntentsEnabled = parseBooleanEnv('SHADOW_INTENTS_ENABLED', false);
+    const entryConfirmationSamples = parseFiniteNumberEnv('ENTRY_CONFIRMATION_SAMPLES', 3);
+    const entryConfirmationWindowMs = parseFiniteNumberEnv('ENTRY_CONFIRMATION_WINDOW_MS', 600);
+    const entryConfirmationMaxSpreadDriftBps = parseFiniteNumberEnv('ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS', 4);
+    const entryExpectedNetEdgeFloorBps = parseFiniteNumberEnv('ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS', 5);
+    const routingIocUrgencyScore = parseFiniteNumberEnv('ROUTING_IOC_URGENCY_SCORE', 0.72);
+    const routingPassiveMaxSpreadBps = parseFiniteNumberEnv('ROUTING_PASSIVE_MAX_SPREAD_BPS', 12);
+
     assertInRange('REGIME_MAX_SPREAD_BPS', regimeMaxSpreadBps, 0, 10000);
     assertInRange('ORDERBOOK_MIN_LEVELS_PER_SIDE', orderbookMinLevelsPerSide, 1, 100);
     assertInRange('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', orderbookSparseMaxSpreadBps, 0, 10000);
@@ -324,6 +340,13 @@ const validateEnv = () => {
     assertPositiveInteger('STANDDOWN_AFTER_LOSSES', standdownAfterLosses);
     assertPositiveInteger('STANDDOWN_WINDOW_MIN', standdownWindowMin);
     assertPositiveInteger('STANDDOWN_DURATION_MIN', standdownDurationMin);
+
+    assertInRange('ENTRY_CONFIRMATION_SAMPLES', entryConfirmationSamples, 1, 20);
+    assertInRange('ENTRY_CONFIRMATION_WINDOW_MS', entryConfirmationWindowMs, 0, 10000);
+    assertInRange('ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS', entryConfirmationMaxSpreadDriftBps, 0, 1000);
+    assertInRange('ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS', entryExpectedNetEdgeFloorBps, -1000, 1000);
+    assertInRange('ROUTING_IOC_URGENCY_SCORE', routingIocUrgencyScore, 0, 1);
+    assertInRange('ROUTING_PASSIVE_MAX_SPREAD_BPS', routingPassiveMaxSpreadBps, 0, 10000);
     if (!sparseFallbackSymbols.length) {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
@@ -404,6 +427,23 @@ const validateEnv = () => {
         afterLosses: standdownAfterLosses,
         windowMin: standdownWindowMin,
         durationMin: standdownDurationMin,
+      },
+      engineV2: {
+        enabled: engineV2Enabled,
+        entryIntentsEnabled,
+        regimeEngineV2Enabled,
+        adaptiveRoutingEnabled,
+        exitManagerV2Enabled,
+        sessionGovernorEnabled,
+        executionAnalyticsV2Enabled,
+        dashboardV2MetaEnabled,
+        shadowIntentsEnabled,
+        entryConfirmationSamples,
+        entryConfirmationWindowMs,
+        entryConfirmationMaxSpreadDriftBps,
+        entryExpectedNetEdgeFloorBps,
+        routingIocUrgencyScore,
+        routingPassiveMaxSpreadBps,
       },
     });
   } catch (err) {
