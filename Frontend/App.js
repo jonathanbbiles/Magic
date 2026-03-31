@@ -11,6 +11,9 @@ import {
 } from 'react-native';
 
 const REQUEST_TIMEOUT_MS = 12000;
+const BACKEND_BASE_URL =
+  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
+  'https://magic-lw8t.onrender.com';
 
 function normalizeBaseUrl(value) {
   if (typeof value !== 'string') return '';
@@ -151,12 +154,12 @@ function deriveSummary(healthResult, authResult, dashboardResult) {
 }
 
 export default function App() {
-  const constantsExtra = Constants?.expoConfig?.extra || Constants?.manifest2?.extra || {};
-  const backendUrl = normalizeBaseUrl(
-    process.env.EXPO_PUBLIC_BACKEND_URL || constantsExtra.EXPO_PUBLIC_BACKEND_URL || ''
-  );
+  const backendUrl = normalizeBaseUrl(BACKEND_BASE_URL);
   const apiToken = (
-    process.env.EXPO_PUBLIC_API_TOKEN || constantsExtra.EXPO_PUBLIC_API_TOKEN || ''
+    (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) ||
+    Constants?.expoConfig?.extra?.EXPO_PUBLIC_API_TOKEN ||
+    Constants?.manifest2?.extra?.EXPO_PUBLIC_API_TOKEN ||
+    ''
   ).trim();
   const tokenPresent = Boolean(apiToken);
   const authMode = tokenPresent ? 'Bearer + x-api-key' : 'No auth headers';
@@ -168,8 +171,6 @@ export default function App() {
   const [lastRunAt, setLastRunAt] = useState(null);
 
   const runChecks = useCallback(async () => {
-    if (!backendUrl) return;
-
     setIsRunning(true);
 
     const health = await fetchEndpoint(backendUrl, '/health');
@@ -220,7 +221,7 @@ export default function App() {
   const diagnosticsText = useMemo(() => {
     const lines = [
       `Timestamp: ${new Date().toISOString()}`,
-      `Backend URL: ${backendUrl || '(missing EXPO_PUBLIC_BACKEND_URL)'}`,
+      `Backend URL: ${backendUrl}`,
       `Token present: ${tokenPresent ? 'yes' : 'no'}`,
       `Auth mode: ${authMode}`,
       `Overall status: ${summary.label}`,
@@ -256,11 +257,6 @@ export default function App() {
 
   const hints = useMemo(() => {
     const hintList = [];
-
-    if (!backendUrl) {
-      hintList.push('Set EXPO_PUBLIC_BACKEND_URL in your Expo environment before running checks.');
-      return hintList;
-    }
 
     if (healthResult?.networkError) {
       hintList.push('Network request failed for /health. Verify backend host, port, and device connectivity.');
@@ -300,7 +296,7 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Connection Summary</Text>
           <Text style={[styles.statusLabel, { color: summary.color }]}>{summary.label}</Text>
-          <Text style={styles.row}>Backend URL: {backendUrl || 'Missing EXPO_PUBLIC_BACKEND_URL'}</Text>
+          <Text style={styles.row}>Backend URL: {backendUrl}</Text>
           <Text style={styles.row}>Token present: {tokenPresent ? 'yes' : 'no'}</Text>
           <Text style={styles.row}>Auth mode: {authMode}</Text>
           <Text style={styles.row}>Reachability: {summary.reachability}</Text>
@@ -314,7 +310,7 @@ export default function App() {
           <Pressable
             style={[styles.button, styles.primaryButton, (!backendUrl || isRunning) && styles.disabledButton]}
             onPress={runChecks}
-            disabled={!backendUrl || isRunning}
+            disabled={isRunning}
           >
             <Text style={styles.buttonText}>{isRunning ? 'Running…' : 'Run Checks'}</Text>
           </Pressable>
