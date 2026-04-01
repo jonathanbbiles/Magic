@@ -103,7 +103,10 @@ function evaluateEntryMarketData({
       Number.isFinite(availableDepthUsdUsed) &&
       availableDepthUsdUsed >= requiredDepthUsdUsed;
 
-    const tierAllowsSparseFallback = symbolTier === 'tier1';
+    const allowByTier = sparseFallback.allowByTier || {};
+    const tierAllowsSparseFallback = Object.prototype.hasOwnProperty.call(allowByTier, symbolTier)
+      ? Boolean(allowByTier[symbolTier])
+      : symbolTier === 'tier1';
     if (
       sparseFallback.enabled &&
       tierAllowsSparseFallback &&
@@ -130,7 +133,7 @@ function evaluateEntryMarketData({
             ? 'sparse_fallback_symbol_restricted'
             : !sparseFallbackState.quoteWithinFallbackTolerance
               ? 'quote_stale'
-              : !sparseFallbackState.spreadOk
+            : !sparseFallbackState.spreadOk
                 ? 'sparse_fallback_spread_wide'
                 : !sparseFallbackState.edgeOk
                   ? 'sparse_fallback_edge_weak'

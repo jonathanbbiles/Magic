@@ -288,6 +288,14 @@ const ENTRY_PROFIT_BUFFER_BPS = readNumber('ENTRY_PROFIT_BUFFER_BPS', 5);
 const FEE_BPS_ROUND_TRIP = readNumber('FEE_BPS_ROUND_TRIP', 20);
 const ENTRY_SLIPPAGE_BUFFER_BPS = readNumber('ENTRY_SLIPPAGE_BUFFER_BPS', 10);
 const EXIT_SLIPPAGE_BUFFER_BPS = readNumber('EXIT_SLIPPAGE_BUFFER_BPS', 10);
+const ENTRY_TAKE_PROFIT_BPS_TIER1 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER1);
+const ENTRY_TAKE_PROFIT_BPS_TIER2 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER2);
+const ENTRY_STRETCH_MOVE_BPS_TIER1 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER1);
+const ENTRY_STRETCH_MOVE_BPS_TIER2 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER2);
+const ENTRY_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER1);
+const ENTRY_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER2);
+const EXIT_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER1);
+const EXIT_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER2);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
@@ -539,6 +547,9 @@ const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBAB
 const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
 const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
 const ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN = Math.max(1, Math.floor(readNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1)));
+const ORDERBOOK_SPARSE_ALLOW_TIER1 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER1', true);
+const ORDERBOOK_SPARSE_ALLOW_TIER2 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER2', false);
+const ORDERBOOK_SPARSE_ALLOW_TIER3 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER3', false);
 const MARKETDATA_DEDUPE_ENABLED = readEnvFlag('MARKETDATA_DEDUPE_ENABLED', true);
 const MARKETDATA_QUOTE_TTL_MS = Math.max(250, readNumber('MARKETDATA_QUOTE_TTL_MS', 3000));
 const MARKETDATA_ORDERBOOK_TTL_MS = Math.max(250, readNumber('MARKETDATA_ORDERBOOK_TTL_MS', 2000));
@@ -704,6 +715,7 @@ const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9
 const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
 const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000);
 const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
+const CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED = readEnvFlag('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED', false);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -980,6 +992,49 @@ function getExecutionTierPolicy() {
   };
 }
 
+const stretchClampWarnedTiers = new Set();
+
+function normalizeSymbolTier(symbolTier) {
+  return symbolTier === 'tier1' || symbolTier === 'tier2' || symbolTier === 'tier3' ? symbolTier : 'default';
+}
+
+function resolveEntryTakeProfitBps(symbolTier) {
+  const tier = normalizeSymbolTier(symbolTier);
+  if (tier === 'tier1' && Number.isFinite(ENTRY_TAKE_PROFIT_BPS_TIER1)) return ENTRY_TAKE_PROFIT_BPS_TIER1;
+  if (tier === 'tier2' && Number.isFinite(ENTRY_TAKE_PROFIT_BPS_TIER2)) return ENTRY_TAKE_PROFIT_BPS_TIER2;
+  return ENTRY_TAKE_PROFIT_BPS;
+}
+
+function resolveEntryStretchMoveBps(symbolTier, resolvedTakeProfitBps) {
+  const tier = normalizeSymbolTier(symbolTier);
+  const tpTarget = Number.isFinite(resolvedTakeProfitBps) ? resolvedTakeProfitBps : resolveEntryTakeProfitBps(symbolTier);
+  let stretchTarget = ENTRY_STRETCH_MOVE_BPS;
+  if (tier === 'tier1' && Number.isFinite(ENTRY_STRETCH_MOVE_BPS_TIER1)) stretchTarget = ENTRY_STRETCH_MOVE_BPS_TIER1;
+  if (tier === 'tier2' && Number.isFinite(ENTRY_STRETCH_MOVE_BPS_TIER2)) stretchTarget = ENTRY_STRETCH_MOVE_BPS_TIER2;
+  if (Number.isFinite(tpTarget) && Number.isFinite(stretchTarget) && stretchTarget < tpTarget) {
+    if (!stretchClampWarnedTiers.has(tier)) {
+      console.warn('entry_stretch_below_tp_clamped', { symbolTier: tier, stretchTarget, tpTarget });
+      stretchClampWarnedTiers.add(tier);
+    }
+    return tpTarget;
+  }
+  return stretchTarget;
+}
+
+function resolveEntrySlippageBufferBps(symbolTier) {
+  const tier = normalizeSymbolTier(symbolTier);
+  if (tier === 'tier1' && Number.isFinite(ENTRY_SLIPPAGE_BUFFER_BPS_TIER1)) return ENTRY_SLIPPAGE_BUFFER_BPS_TIER1;
+  if (tier === 'tier2' && Number.isFinite(ENTRY_SLIPPAGE_BUFFER_BPS_TIER2)) return ENTRY_SLIPPAGE_BUFFER_BPS_TIER2;
+  return ENTRY_SLIPPAGE_BUFFER_BPS;
+}
+
+function resolveExitSlippageBufferBps(symbolTier) {
+  const tier = normalizeSymbolTier(symbolTier);
+  if (tier === 'tier1' && Number.isFinite(EXIT_SLIPPAGE_BUFFER_BPS_TIER1)) return EXIT_SLIPPAGE_BUFFER_BPS_TIER1;
+  if (tier === 'tier2' && Number.isFinite(EXIT_SLIPPAGE_BUFFER_BPS_TIER2)) return EXIT_SLIPPAGE_BUFFER_BPS_TIER2;
+  return EXIT_SLIPPAGE_BUFFER_BPS;
+}
+
 function getEntryMarketDataPolicy() {
   return {
     maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
@@ -993,6 +1048,11 @@ function getEntryMarketDataPolicy() {
       staleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
       minProbability: ORDERBOOK_SPARSE_MIN_PROBABILITY,
       confidenceCapMultiplier: ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT,
+      allowByTier: {
+        tier1: ORDERBOOK_SPARSE_ALLOW_TIER1,
+        tier2: ORDERBOOK_SPARSE_ALLOW_TIER2,
+        tier3: ORDERBOOK_SPARSE_ALLOW_TIER3,
+      },
     },
   };
 }
@@ -1155,13 +1215,21 @@ function resolveRegimeVolatilityContext({ predictorSignals, barSeries1m, refPric
 async function computeEntrySignal(symbol, opts = {}) {
   const asset = { symbol: normalizeSymbol(symbol) };
   const entryMdContext = opts?.entryMarketDataContext || null;
-  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  const executionTierPolicy = getExecutionTierPolicy();
+  const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
+  const resolvedEntryTakeProfitBps = resolveEntryTakeProfitBps(symbolTier);
+  const resolvedEntryStretchMoveBps = resolveEntryStretchMoveBps(symbolTier, resolvedEntryTakeProfitBps);
+  const resolvedEntrySlippageBufferBps = resolveEntrySlippageBufferBps(symbolTier);
+  const resolvedExitSlippageBufferBps = resolveExitSlippageBufferBps(symbolTier);
+  const requiredEdgeBps = computeRequiredEntryEdgeBps(symbolTier);
   const configSnapshot = {
     targetMoveBps: TARGET_MOVE_BPS,
     targetHorizonMinutes: TARGET_HORIZON_MINUTES,
     minProbToEnter: MIN_PROB_TO_ENTER,
-    entryTakeProfitBps: ENTRY_TAKE_PROFIT_BPS,
-    entryStretchMoveBps: ENTRY_STRETCH_MOVE_BPS,
+    entryTakeProfitBps: resolvedEntryTakeProfitBps,
+    entryStretchMoveBps: resolvedEntryStretchMoveBps,
+    entrySlippageBufferBps: resolvedEntrySlippageBufferBps,
+    exitSlippageBufferBps: resolvedExitSlippageBufferBps,
     minProbToEnterTp: MIN_PROB_TO_ENTER_TP,
     minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
     maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
@@ -1284,8 +1352,6 @@ async function computeEntrySignal(symbol, opts = {}) {
   const weakLiquidity = Number.isFinite(spreadBps) && Number.isFinite(requiredEdgeBps)
     ? spreadBps > (requiredEdgeBps * 0.25)
     : false;
-  const executionTierPolicy = getExecutionTierPolicy();
-  const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
   console.log('entry_execution_policy_gate', {
     symbol: asset.symbol,
     symbolTier,
@@ -1795,7 +1861,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       spreadBps,
       refPrice: mid,
       marketContext: {
-        targetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+        targetMoveBps: resolvedEntryStretchMoveBps,
         horizonMinutes: TARGET_HORIZON_MINUTES,
         orderbookBandBps: ORDERBOOK_BAND_BPS,
         orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
@@ -1827,7 +1893,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       spreadBps,
       refPrice: mid,
       marketContext: {
-        targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+        targetMoveBps: resolvedEntryTakeProfitBps,
         horizonMinutes: TARGET_HORIZON_MINUTES,
         orderbookBandBps: ORDERBOOK_BAND_BPS,
         orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
@@ -1859,7 +1925,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       errorName: predictorTp?.errorName || null,
       errorMessage: predictorTp?.errorMessage || null,
       stack: predictorTp?.stack || null,
-      targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+      targetMoveBps: resolvedEntryTakeProfitBps,
       barsDebug: predictorTp?.barsDebug || null,
     });
     return {
@@ -1885,7 +1951,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       errorName: predictorStretch?.errorName || null,
       errorMessage: predictorStretch?.errorMessage || null,
       stack: predictorStretch?.stack || null,
-      targetMoveBps: ENTRY_STRETCH_MOVE_BPS,
+      targetMoveBps: resolvedEntryStretchMoveBps,
       barsDebug: predictorStretch?.barsDebug || null,
     });
   }
@@ -1945,8 +2011,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       effectiveMinProbToEnter,
       tierMinProbThresholdApplied,
       stretchProbability: predictorStretch?.probability ?? null,
-      stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
-      tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+      stretchTargetMoveBps: resolvedEntryStretchMoveBps,
+      tpTargetMoveBps: resolvedEntryTakeProfitBps,
       timeOfDay: timeOfDayMeta,
     });
     return {
@@ -1977,8 +2043,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       minProbToEnter: MIN_PROB_TO_ENTER_TP,
       stretchProbability: predictorStretch?.probability ?? null,
       minStretchProbToEnter: MIN_PROB_TO_ENTER_STRETCH,
-      stretchTargetMoveBps: ENTRY_STRETCH_MOVE_BPS,
-      tpTargetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+      stretchTargetMoveBps: resolvedEntryStretchMoveBps,
+      tpTargetMoveBps: resolvedEntryTakeProfitBps,
     });
     return {
       entryReady: false,
@@ -2075,7 +2141,8 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   const edgeRequirements = computeEntryEdgeRequirements({
     spreadBps,
-    targetMoveBps: ENTRY_TAKE_PROFIT_BPS,
+    targetMoveBps: resolvedEntryTakeProfitBps,
+    symbolTier,
   });
   if (Number.isFinite(spreadBps) && spreadBps > edgeRequirements.maxAffordableSpreadBps) {
     logEntrySkip({
@@ -2129,8 +2196,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     expectedMoveBps: predictorTp?.signals?.expectedMoveBps,
     fillProbability,
     feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-    entrySlippageBufferBps: ENTRY_SLIPPAGE_BUFFER_BPS,
-    exitSlippageBufferBps: EXIT_SLIPPAGE_BUFFER_BPS,
+    entrySlippageBufferBps: resolvedEntrySlippageBufferBps,
+    exitSlippageBufferBps: resolvedExitSlippageBufferBps,
     spreadPenaltyBps: spreadBps,
     regimePenaltyBps,
     adverseSpreadCostBps: spreadBps,
@@ -3351,8 +3418,8 @@ function logSkip(reason, details = {}) {
   console.log(`Skip — ${reason}`, details);
 }
 
-function computeRequiredEntryEdgeBps() {
-  return computeEntryEdgeRequirements().requiredEdgeBps;
+function computeRequiredEntryEdgeBps(symbolTier) {
+  return computeEntryEdgeRequirements({ symbolTier }).requiredEdgeBps;
 }
 
 function computeEntryEdgeRequirements({
@@ -3360,11 +3427,12 @@ function computeEntryEdgeRequirements({
   targetMoveBps,
   minNetEdgeBps,
   profitBufferBps,
+  symbolTier,
 } = {}) {
-  const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : ENTRY_TAKE_PROFIT_BPS;
+  const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : resolveEntryTakeProfitBps(symbolTier);
   const feeBpsRoundTripUsed = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : (Number(FEE_BPS_ROUND_TRIP) || 0);
-  const entrySlippageBpsUsed = Number(ENTRY_SLIPPAGE_BUFFER_BPS) || 0;
-  const exitSlippageBpsUsed = Number(EXIT_SLIPPAGE_BUFFER_BPS) || 0;
+  const entrySlippageBpsUsed = Number(resolveEntrySlippageBufferBps(symbolTier)) || 0;
+  const exitSlippageBpsUsed = Number(resolveExitSlippageBufferBps(symbolTier)) || 0;
   const spreadBpsUsed = Number.isFinite(spreadBps) ? Math.max(0, spreadBps) : 0;
   const minNetEdgeBpsUsed = Number.isFinite(minNetEdgeBps) ? Math.max(0, minNetEdgeBps) : Math.max(0, MIN_NET_EDGE_BPS);
   const profitBufferBpsUsed = Number.isFinite(profitBufferBps) ? Math.max(0, profitBufferBps) : Math.max(0, ENTRY_PROFIT_BUFFER_BPS);
@@ -3738,6 +3806,68 @@ function normalizeMarketDataErrorType(error) {
   return 'http_error';
 }
 
+function logMarketDataDiagnostics({
+  type,
+  method = 'GET',
+  url,
+  statusCode = null,
+  errorType = null,
+  errorName = null,
+  errorMessage = null,
+  snippet = '',
+  requestId = null,
+  urlHost = null,
+  urlPath = null,
+} = {}) {
+  try {
+    const label = getMarketDataLabel(type);
+    const parsedUrl = parseUrlMetadata(url);
+    const normalizedErrorType = String(errorType || 'http_error');
+    const diagnostics = {
+      ts: new Date().toISOString(),
+      type: String(type || '').toUpperCase() || null,
+      label,
+      method: String(method || 'GET').toUpperCase(),
+      url: parsedUrl.url || String(url || ''),
+      urlHost: urlHost || parsedUrl.urlHost || null,
+      urlPath: urlPath || parsedUrl.urlPath || null,
+      statusCode: Number.isFinite(Number(statusCode)) ? Number(statusCode) : null,
+      errorType: normalizedErrorType,
+      errorName: errorName || null,
+      errorMessage: errorMessage || null,
+      snippet: String(snippet || '').slice(0, 500),
+      requestId: requestId || null,
+    };
+    lastHttpError = diagnostics;
+    if (DEBUG_ALPACA_HTTP) {
+      console.log('alpaca_marketdata', {
+        phase: 'error',
+        ...diagnostics,
+      });
+    }
+  } catch (err) {
+    try {
+      lastHttpError = {
+        ts: new Date().toISOString(),
+        type: String(type || '').toUpperCase() || null,
+        label: getMarketDataLabel(type),
+        method: String(method || 'GET').toUpperCase(),
+        url: String(url || ''),
+        urlHost: urlHost || null,
+        urlPath: urlPath || null,
+        statusCode: Number.isFinite(Number(statusCode)) ? Number(statusCode) : null,
+        errorType: String(errorType || 'http_error'),
+        errorName: errorName || err?.name || null,
+        errorMessage: errorMessage || err?.message || 'market_data_diagnostics_failed',
+        snippet: String(snippet || '').slice(0, 500),
+        requestId: requestId || null,
+      };
+    } catch (_) {
+      // never throw from diagnostics logging
+    }
+  }
+}
+
 async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', timeoutMs = MARKET_DATA_TIMEOUT_MS }) {
   const label = getMarketDataLabel(type);
   const parsedUrl = parseUrlMetadata(url);
@@ -3835,7 +3965,6 @@ async function requestAlpacaMarketData({ type, url, symbol, method = 'GET', time
     });
 
     markMarketDataFailure(statusCode);
-    lastHttpError = error;
     const err = new Error(error?.message || 'Market data request failed');
     err.errorCode = errorType === 'parse_error' ? 'PARSE_ERROR' : errorType === 'timeout' ? 'TIMEOUT' : errorType === 'network_error' ? 'NETWORK' : 'HTTP_ERROR';
     err.errorType = errorType;
@@ -6519,7 +6648,9 @@ function pickSymbolKey(map, primaryKey) {
 }
 
 function applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs }) {
-  const effectiveMaxAgeMsFinal = isCrypto ? Math.max(effectiveMaxAgeMs, CRYPTO_QUOTE_MAX_AGE_MS) : effectiveMaxAgeMs;
+  const effectiveMaxAgeMsFinal = (isCrypto && CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED)
+    ? Math.max(effectiveMaxAgeMs, CRYPTO_QUOTE_MAX_AGE_MS)
+    : effectiveMaxAgeMs;
   if (isCrypto && effectiveMaxAgeMsFinal !== effectiveMaxAgeMs && !cryptoQuoteTtlOverrideLogged.has(symbol)) {
     console.log('crypto_quote_ttl_override', { symbol, maxAgeMs: effectiveMaxAgeMsFinal });
     cryptoQuoteTtlOverrideLogged.add(symbol);
@@ -12390,11 +12521,24 @@ async function runEntryScanOnce() {
 
       const signal = await computeEntrySignal(symbol, { prefetchedBars, fallbackBudgetState, entryMarketDataContext });
       const recordBase = signal?.record ? { ...signal.record } : null;
-      if (Number.isFinite(recordBase?.predictorProbability)) {
+      const candidateMeta = signal?.meta || {};
+      const candidateDecision = signal?.entryReady ? 'entry_ready' : 'skipped';
+      const candidateSkipReason = signal?.entryReady ? null : (resolveSkipReason(signal.why, candidateMeta) || signal?.why || null);
+      if (
+        Number.isFinite(recordBase?.predictorProbability) ||
+        Number.isFinite(candidateMeta?.edge?.netEdgeBps) ||
+        candidateDecision === 'skipped'
+      ) {
         candidateSignals.push({
           symbol,
-          probability: recordBase.predictorProbability,
-          signals: recordBase.predictorSignals,
+          probability: Number(recordBase?.predictorProbability),
+          expectedMoveBps: Number(candidateMeta?.edge?.expectedMoveBps),
+          spreadBps: Number(recordBase?.spreadBps),
+          requiredEdgeBps: Number(candidateMeta?.edge?.requiredEdgeBps),
+          netEdgeBps: Number(candidateMeta?.edge?.netEdgeBps),
+          quoteAgeMs: Number(candidateMeta?.quoteAgeMs),
+          decision: candidateDecision,
+          skipReason: candidateSkipReason,
         });
       }
       if (DEBUG_ENTRY) {
@@ -12623,12 +12767,26 @@ async function runEntryScanOnce() {
 
     const endMs = Date.now();
     const topCandidates = candidateSignals
-      .filter((candidate) => Number.isFinite(candidate.probability))
-      .sort((a, b) => b.probability - a.probability)
+      .filter((candidate) => Number.isFinite(candidate.probability) || Number.isFinite(candidate.netEdgeBps))
+      .sort((a, b) => {
+        const aNet = Number.isFinite(a.netEdgeBps) ? a.netEdgeBps : Number.NEGATIVE_INFINITY;
+        const bNet = Number.isFinite(b.netEdgeBps) ? b.netEdgeBps : Number.NEGATIVE_INFINITY;
+        if (bNet !== aNet) return bNet - aNet;
+        const aProb = Number.isFinite(a.probability) ? a.probability : Number.NEGATIVE_INFINITY;
+        const bProb = Number.isFinite(b.probability) ? b.probability : Number.NEGATIVE_INFINITY;
+        return bProb - aProb;
+      })
       .slice(0, 3)
       .map((candidate) => ({
         symbol: candidate.symbol,
-        probability: candidate.probability,
+        probability: Number.isFinite(candidate.probability) ? candidate.probability : null,
+        expectedMoveBps: Number.isFinite(candidate.expectedMoveBps) ? candidate.expectedMoveBps : null,
+        spreadBps: Number.isFinite(candidate.spreadBps) ? candidate.spreadBps : null,
+        requiredEdgeBps: Number.isFinite(candidate.requiredEdgeBps) ? candidate.requiredEdgeBps : null,
+        netEdgeBps: Number.isFinite(candidate.netEdgeBps) ? candidate.netEdgeBps : null,
+        quoteAgeMs: Number.isFinite(candidate.quoteAgeMs) ? candidate.quoteAgeMs : null,
+        decision: candidate.decision || null,
+        skipReason: candidate.skipReason || null,
       }));
     if (topCandidates.length) {
       console.log('predictor_candidates', { startMs, endMs, topCandidates });
@@ -14787,5 +14945,6 @@ module.exports = {
   prefetchBarsForUniverse,
   runEntryScanOnce,
   getLiveRuntimeTuning,
+  requestAlpacaMarketData,
 
 };
