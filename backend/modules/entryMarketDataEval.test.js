@@ -41,6 +41,8 @@ const healthyResult = evaluateEntryMarketData({
 });
 assert.equal(healthyResult.executionMode, 'normal');
 assert.equal(healthyResult.finalEntryDataEligible, true);
+assert.equal(healthyResult.sparseFallbackState?.evaluated, false);
+assert.equal(healthyResult.sparseFallbackState?.path, 'not_sparse');
 
 const sparseAllowed = evaluateEntryMarketData({
   symbol: 'BTC/USD',
@@ -140,5 +142,23 @@ const liquidityRejected = evaluateEntryMarketData({
 assert.equal(liquidityRejected.dataQualityState, 'ok');
 assert.equal(liquidityRejected.liquidityState, 'liquidity_bad');
 assert.equal(liquidityRejected.reason, 'weak_liquidity');
+
+const spreadRejected = evaluateEntryMarketData({
+  symbol: 'SOL/USD',
+  symbolTier: 'tier2',
+  spreadBps: 55,
+  quoteAgeMs: 500,
+  requiredEdgeBps: 50,
+  minNetEdgeBps: 5,
+  netEdgeBps: 8,
+  predictorProbability: 0.64,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 200,
+  orderbookMeta: { ok: true, depthState: 'ok', impactBpsBuy: 4.2 },
+  policy,
+});
+assert.equal(spreadRejected.reason, 'spread_wide');
 
 console.log('entry market data eval tests passed');

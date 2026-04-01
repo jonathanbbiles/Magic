@@ -50,17 +50,7 @@ function evaluateEntryMarketData({
   let executionMode = 'normal';
   let finalEntryDataEligible = false;
   const reasons = [];
-  const sparseFallbackState = {
-    enabled: Boolean(policy?.sparseFallback?.enabled),
-    symbolAllowed: false,
-    quoteFresh: false,
-    quoteWithinFallbackTolerance: false,
-    spreadOk: false,
-    edgeOk: false,
-    probabilityOk: false,
-    depthOk: false,
-    accepted: false,
-  };
+  let sparseFallbackState = null;
 
   const hasOrderbookMeta = Boolean(orderbookMeta && typeof orderbookMeta === 'object');
   if (!hasOrderbookMeta || depthState === 'orderbook_malformed') {
@@ -77,6 +67,19 @@ function evaluateEntryMarketData({
     reasons.push('quote_stale');
   } else if (isSparseDepthState(depthState)) {
     dataQualityState = 'orderbook_sparse';
+    sparseFallbackState = {
+      evaluated: true,
+      path: 'sparse_depth',
+      enabled: Boolean(policy?.sparseFallback?.enabled),
+      symbolAllowed: false,
+      quoteFresh: false,
+      quoteWithinFallbackTolerance: false,
+      spreadOk: false,
+      edgeOk: false,
+      probabilityOk: false,
+      depthOk: false,
+      accepted: false,
+    };
     const sparseFallback = policy?.sparseFallback || {};
     const allowedSymbol = sparseFallback.symbols?.has(normalizePair(symbol)) || false;
     const staleQuoteToleranceMs = Number.isFinite(sparseFallback.staleQuoteToleranceMs)
@@ -154,6 +157,10 @@ function evaluateEntryMarketData({
     reasons.push(weakLiquidity ? 'weak_liquidity' : 'spread_wide');
   } else {
     finalEntryDataEligible = true;
+    sparseFallbackState = {
+      evaluated: false,
+      path: 'not_sparse',
+    };
   }
 
   const confidenceMultiplierCap = executionMode === 'sparse_fallback'

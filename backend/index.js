@@ -81,6 +81,8 @@ const {
   getExitStateSnapshot,
   getLifecycleSnapshot,
   getSessionGovernorSummary,
+  getEntryDiagnosticsSnapshot,
+  getEntryRegimeStaleThresholdMs,
 } = require('./trade');
 
 const VERSION =
@@ -130,6 +132,9 @@ const runtimeStrategyConfig = {
   sparseRequireQuoteFreshMs: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS'),
   sparseStaleQuoteToleranceMs: readLiveNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS'),
   sparseMaxSpreadBps: readLiveNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS'),
+  regimeStaleThresholdMs: readLiveNumber('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS') ?? readLiveNumber('ENTRY_QUOTE_MAX_AGE_MS'),
+  engineV2Enabled: readLiveBoolean('ENGINE_V2_ENABLED'),
+  regimeEngineV2Enabled: readLiveBoolean('REGIME_ENGINE_V2_ENABLED'),
   entryTakeProfitBpsDefault: readLiveNumber('ENTRY_TAKE_PROFIT_BPS'),
   entryStretchMoveBpsDefault: readLiveNumber('ENTRY_STRETCH_MOVE_BPS'),
   entryTakeProfitBpsTier1: readLiveNumber('ENTRY_TAKE_PROFIT_BPS_TIER1'),
@@ -144,6 +149,14 @@ const runtimeStrategyConfig = {
   exitSlippageBufferBpsTier2: readLiveNumber('EXIT_SLIPPAGE_BUFFER_BPS_TIER2'),
 };
 console.log('runtime_live_strategy_config', runtimeStrategyConfig);
+console.log('runtime_entry_engine_flags', {
+  ENGINE_V2_ENABLED: runtimeStrategyConfig.engineV2Enabled,
+  REGIME_ENGINE_V2_ENABLED: runtimeStrategyConfig.regimeEngineV2Enabled,
+  ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
+  ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS_env: runtimeStrategyConfig.regimeStaleThresholdMs,
+  regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
+  ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
+});
 
 const configuredPrimary = readLiveSymbols('ENTRY_SYMBOLS_PRIMARY');
 const sparseSymbols = new Set(runtimeStrategyConfig.sparseFallbackSymbols);
@@ -596,6 +609,7 @@ app.get('/dashboard', async (req, res) => {
     const lifecycleSnapshot = getLifecycleSnapshot();
     const governorSummary = getSessionGovernorSummary();
     const managerStatus = getTradingManagerStatus();
+    const entryDiagnostics = getEntryDiagnosticsSnapshot();
     const lastError = getLastHttpError();
     const lastQuote = getLastQuoteSnapshot();
     const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
@@ -706,6 +720,11 @@ app.get('/dashboard', async (req, res) => {
           authoritativeCount: lifecycleSnapshot?.authoritativeCount || 0,
           failedEntries: governorSummary?.failedEntries || 0,
         },
+      },
+      diagnostics: {
+        entryScan: entryDiagnostics?.entryScan || null,
+        predictorCandidates: entryDiagnostics?.predictorCandidates || null,
+        skipReasonsBySymbol: entryDiagnostics?.skipReasonsBySymbol || {},
       },
       events: Object.values(lifecycleSnapshot?.bySymbol || {}).slice(-25).map((item) => ({
         ts: item.updatedAt || item.createdAt || null,

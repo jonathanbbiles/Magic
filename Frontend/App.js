@@ -270,6 +270,10 @@ export default function App() {
     if (!Number.isFinite(mv) || mv <= 0) return null;
     return (openPL / mv) * 100;
   }, [positions, openPL]);
+  const entryDiagnostics = dashboard?.diagnostics || {};
+  const entryScan = entryDiagnostics?.entryScan || null;
+  const predictorCandidates = entryDiagnostics?.predictorCandidates || null;
+  const skipReasonsBySymbol = entryDiagnostics?.skipReasonsBySymbol || {};
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -297,6 +301,22 @@ export default function App() {
 
               <View style={headerStyles.openRow}>
                 <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
+              </View>
+
+              <View style={styles.diagnosticsBlock}>
+                <Text style={styles.diagnosticsTitle}>Entry diagnostics</Text>
+                <Text style={styles.diagnosticsText}>
+                  Last scan: scanned={toNum(entryScan?.scanned) ?? '—'} placed={toNum(entryScan?.placed) ?? '—'} skipped={toNum(entryScan?.skipped) ?? '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Top skip reasons: {entryScan?.topSkipReasons ? JSON.stringify(entryScan.topSkipReasons) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Predictor candidates: {predictorCandidates?.topCandidates ? JSON.stringify(predictorCandidates.topCandidates) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Per-symbol skips: {Object.keys(skipReasonsBySymbol).length ? JSON.stringify(skipReasonsBySymbol) : '—'}
+                </Text>
               </View>
 
               {error ? (
@@ -339,6 +359,16 @@ const styles = StyleSheet.create({
   errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
   loader: { marginVertical: theme.spacing.md },
   empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
+  diagnosticsBlock: {
+    marginTop: theme.spacing.md,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.sm,
+    backgroundColor: 'rgba(255,255,255,0.03)',
+  },
+  diagnosticsTitle: { color: theme.colors.text, fontWeight: '900', marginBottom: 4 },
+  diagnosticsText: { color: theme.colors.muted, fontSize: 11, marginTop: 2 },
 });
 
 const headerStyles = StyleSheet.create({
