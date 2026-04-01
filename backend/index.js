@@ -1,8 +1,15 @@
-require('dotenv').config();
-
-const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const dotenv = require('dotenv');
+
+const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
+const dotenvPath = process.env.DOTENV_CONFIG_PATH
+  || (nodeEnv === 'production' && fs.existsSync(path.resolve(__dirname, '.env.production'))
+    ? path.resolve(__dirname, '.env.production')
+    : path.resolve(__dirname, '.env'));
+dotenv.config({ path: dotenvPath });
+
+const express = require('express');
 const { execSync } = require('child_process');
 const cors = require('cors');
 const { requireApiToken } = require('./auth');
