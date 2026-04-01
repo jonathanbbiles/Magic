@@ -38,6 +38,7 @@ Optional:
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 - `ENTRY_UNIVERSE_MODE` (`dynamic` by default; set `configured` to use `ENTRY_SYMBOLS_PRIMARY`/`ENTRY_SYMBOLS_SECONDARY`)
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; production startup fails fast unless this is explicitly `true` when using dynamic universe mode)
 - `ENTRY_SYMBOLS_PRIMARY` (manual primary universe when `ENTRY_UNIVERSE_MODE=configured`)
 - `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
@@ -202,6 +203,31 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - small prefetch chunks (`ENTRY_PREFETCH_CHUNK_SIZE=3`, still subject to hard cap of `20`)
 - sequential warmup prefetch (`PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`)
 - conservative market-data concurrency/cooldown settings and per-symbol bars fallback enabled
+- production dynamic scanning opt-out by default (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
+
+## Render deployment sync
+
+Changing `backend/.env.live.example` in git **does not** update deployed Render environment variables automatically.
+After merging, manually copy these values into Render:
+
+- `ENTRY_UNIVERSE_MODE=configured`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,UNI/USD`
+- `ENTRY_SYMBOLS_SECONDARY=`
+- `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
+- `EXECUTION_TIER3_DEFAULT=false`
+- `ENTRY_SCAN_INTERVAL_MS=12000`
+- `ENTRY_PREFETCH_CHUNK_SIZE=3`
+- `ENTRY_PREFETCH_ORDERBOOKS=false`
+- `ALPACA_MD_MAX_CONCURRENCY=1`
+- `BARS_MAX_CONCURRENT=1`
+- `BARS_PREFETCH_INTERVAL_MS=120000`
+- `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
+- `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
+- `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
+
+If production logs still show `dynamic_full_universe` after deploy, the Render environment is still wrong.
 
 ## Engine v2 lifecycle (feature-flagged, additive)
 

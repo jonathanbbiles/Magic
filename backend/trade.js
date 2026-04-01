@@ -540,10 +540,17 @@ const ENTRY_SYMBOLS_SECONDARY = String(process.env.ENTRY_SYMBOLS_SECONDARY || ''
 const ENTRY_SYMBOLS_INCLUDE_SECONDARY = readEnvFlag('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
 const ENTRY_UNIVERSE_MODE_RAW = String(process.env.ENTRY_UNIVERSE_MODE || 'dynamic').trim().toLowerCase();
 const ENTRY_UNIVERSE_MODE = ENTRY_UNIVERSE_MODE_RAW === 'configured' ? 'configured' : 'dynamic';
+const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
+const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = readEnvFlag('ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION', false);
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
 const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
 const EXECUTION_TIER3_DEFAULT = readEnvFlag('EXECUTION_TIER3_DEFAULT', true);
+if (NODE_ENV === 'production' && ENTRY_UNIVERSE_MODE !== 'configured' && !ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION) {
+  throw new Error(
+    'Production startup blocked: ENTRY_UNIVERSE_MODE must be configured unless ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true explicitly opts in to dynamic scanning.'
+  );
+}
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
@@ -564,9 +571,38 @@ const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
 
 let printedConfigOnce = false;
+function buildLiveCriticalConfigSummary() {
+  const configuredUniverse = buildEntryUniverse({
+    primaryRaw: ENTRY_SYMBOLS_PRIMARY,
+    secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
+    includeSecondary: ENTRY_SYMBOLS_INCLUDE_SECONDARY,
+  });
+  return {
+    nodeEnv: NODE_ENV,
+    entryUniverseMode: ENTRY_UNIVERSE_MODE,
+    allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+    configuredPrimaryCount: configuredUniverse.primaryCount,
+    configuredSecondaryCount: configuredUniverse.secondaryCount,
+    entrySymbolsPrimarySample: configuredUniverse.primary.slice(0, 6),
+    entrySymbolsSecondarySample: configuredUniverse.secondary.slice(0, 6),
+    entryScanIntervalMs: ENTRY_SCAN_INTERVAL_MS,
+    entryPrefetchChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
+    entryPrefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+    predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
+    barsPrefetchIntervalMs: BARS_PREFETCH_INTERVAL_MS,
+    allowPerSymbolBarsFallback: ALLOW_PER_SYMBOL_BARS_FALLBACK,
+    marketdataRateLimitCooldownMs: MARKETDATA_RATE_LIMIT_COOLDOWN_MS,
+    executionTier3Default: EXECUTION_TIER3_DEFAULT,
+  };
+}
+
 function printConfigOnce() {
   if (printedConfigOnce) return;
   printedConfigOnce = true;
+  console.log('runtime_live_critical_config', {
+    stage: 'startup',
+    ...buildLiveCriticalConfigSummary(),
+  });
   console.log('runtime_config_effective', {
     MAX_CONCURRENT_POSITIONS,
     maxConcurrentPositionsEnabled: Number.isFinite(getEffectiveMaxConcurrentPositions()) && getEffectiveMaxConcurrentPositions() !== Number.POSITIVE_INFINITY,
@@ -586,6 +622,7 @@ function printConfigOnce() {
     tradePortfolioPctEffective: TRADE_PORTFOLIO_PCT,
     maxPortfolioAllocationPerTradePct: MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT,
     entryUniverseMode: ENTRY_UNIVERSE_MODE,
+    allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
   });
   console.log('runtime_config', {
@@ -12129,13 +12166,16 @@ async function runEntryScanOnce() {
     });
     let universe = [];
     let universeMode = 'dynamic_full_universe';
+    let universeModeReason = 'dynamic_default';
     let dynamicUniverseStats = getSupportedCryptoPairsSnapshot().stats || null;
     if (autoScanSymbols.length) {
       universe = autoScanSymbols;
       universeMode = 'auto_scan_override';
+      universeModeReason = 'AUTO_SCAN_SYMBOLS_override';
     } else if (ENTRY_UNIVERSE_MODE === 'configured') {
       universe = configuredUniverse.scanSymbols;
       universeMode = 'configured_primary_secondary';
+      universeModeReason = 'configured_env_requested';
     } else if (SIMPLE_SCALPER_ENABLED) {
       await loadSupportedCryptoPairs();
       const snapshot = getSupportedCryptoPairsSnapshot();
@@ -12144,6 +12184,7 @@ async function runEntryScanOnce() {
       if (!universe.length) {
         universe = configuredUniverse.scanSymbols;
         universeMode = 'configured_fallback';
+        universeModeReason = 'dynamic_empty_fallback_configured';
       }
     } else {
       await loadSupportedCryptoPairs();
@@ -12153,10 +12194,12 @@ async function runEntryScanOnce() {
       if (!universe.length) {
         universe = configuredUniverse.scanSymbols;
         universeMode = 'configured_fallback';
+        universeModeReason = 'dynamic_empty_fallback_configured';
       }
       if (!universe.length) {
         universe = CRYPTO_CORE_TRACKED;
         universeMode = 'core_tracked_fallback';
+        universeModeReason = 'dynamic_and_configured_empty_fallback_core';
       }
     }
     if (ENTRY_UNIVERSE_MODE === 'configured' && !universe.length) {
@@ -12167,21 +12210,48 @@ async function runEntryScanOnce() {
         dynamicUniverseStats = snapshot.stats || dynamicUniverseStats;
         universe = snapshot.pairs;
         universeMode = 'dynamic_fallback';
+        universeModeReason = 'configured_empty_fallback_dynamic';
       }
     }
     const scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
     console.log('entry_universe_selection', {
-      universeMode,
+      envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+      effectiveUniverseMode: universeMode,
+      universeModeReason,
       overrideActive: universeIsOverride,
       configuredOverrideActive: ENTRY_UNIVERSE_MODE === 'configured',
-      tradableCryptoSymbolsFetched: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       acceptedSymbols: scanSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
-      sampleSymbols: scanSymbols.slice(0, 10),
+      configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
+      configuredSecondarySample: configuredUniverse.secondary.slice(0, 6),
+      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+      nodeEnv: NODE_ENV,
     });
+    if (
+      ENTRY_UNIVERSE_MODE === 'configured' &&
+      !['configured_primary_secondary', 'configured_fallback'].includes(universeMode)
+    ) {
+      console.warn('entry_universe_mode_mismatch', {
+        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+        effectiveUniverseMode: universeMode,
+        reason: universeModeReason,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        configuredSecondaryCount: configuredUniverse.secondaryCount,
+      });
+    }
+    if (NODE_ENV === 'production' && ENTRY_UNIVERSE_MODE !== 'configured' && ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION) {
+      console.warn('entry_universe_dynamic_production_opt_in', {
+        nodeEnv: NODE_ENV,
+        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+        effectiveUniverseMode: universeMode,
+        allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+      });
+    }
     const universeSize = scanSymbols.length;
     const isDynamicMode = universeMode.startsWith('dynamic');
     const primarySymbolsCount = isDynamicMode ? universeSize : configuredUniverse.primaryCount;
@@ -12700,6 +12770,10 @@ function startEntryManager() {
       console.error('entry_manager_failed', err?.message || err);
     });
   }, ENTRY_SCAN_INTERVAL_MS);
+  console.log('runtime_live_critical_config', {
+    stage: 'entry_manager_start',
+    ...buildLiveCriticalConfigSummary(),
+  });
   console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS, predictorWarmupEnabled: PREDICTOR_WARMUP_ENABLED, predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, predictorWarmupLogEveryMs: PREDICTOR_WARMUP_LOG_EVERY_MS });
 }
 
