@@ -480,10 +480,27 @@ function shouldCountSparseFallbackReject({ marketDataEval }) {
   );
 }
 
+function shouldCountSparseRetryFailureReject({ reason, sparseRetryDetails }) {
+  if (!sparseRetryDetails) return false;
+  if (sparseRetryDetails?.providerQuoteStaleAfterRefresh) return true;
+  if (!reason) return false;
+  return [
+    'provider_quote_stale_after_refresh',
+    'quote_stale',
+    'ob_depth_insufficient',
+  ].includes(reason) || String(reason).startsWith('sparse_fallback_');
+}
+
+function resolveEntrySkipReason(reason, meta) {
+  if (reason === 'orderbook_unavailable' && meta?.obReason) return meta.obReason;
+  if (reason === 'orderbook_liquidity_gate' && meta?.reason) return meta.reason;
+  if (reason === 'predictor_unavailable' && meta?.dataQualityReason) return meta.dataQualityReason;
+  return reason || 'signal_skip';
+}
+
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
   const requiredEdgeBps = Number(
     candidateMeta?.requiredEdgeBps
-    ?? candidateMeta?.edge?.requiredEdgeBps
     ?? recordBase?.requiredEdgeBps
   );
   const expectedMoveBps = Number(
@@ -1427,6 +1444,16 @@ async function computeEntrySignal(symbol, opts = {}) {
   let quoteSource = quote?.source || null;
   let quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
   let sparseRetryDetails = null;
+  let sparseRejectCounted = false;
+  const maybeCountSparseReject = ({ reason, marketDataEval = null }) => {
+    const shouldCount = shouldCountSparseFallbackReject({ marketDataEval }) ||
+      shouldCountSparseRetryFailureReject({ reason, sparseRetryDetails });
+    if (shouldCount && !sparseRejectCounted) {
+      if (entryMdContext) entryMdContext.stats.sparseFallbackRejects += 1;
+      sparseRejectCounted = true;
+    }
+    return shouldCount;
+  };
 
   if (!obResult) {
     obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
@@ -1910,16 +1937,35 @@ async function computeEntrySignal(symbol, opts = {}) {
       ]);
       if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
         if (predictorInputGateBeforeFallback.missing.length) {
+          const resolvedReason = sparseRetryDetails?.providerQuoteStaleAfterRefresh
+            ? 'provider_quote_stale_after_refresh'
+            : 'bars_fetch_failed';
+          maybeCountSparseReject({ reason: resolvedReason });
           return {
             entryReady: false,
-            why: 'predictor_unavailable',
+            why: resolvedReason === 'provider_quote_stale_after_refresh'
+              ? 'provider_quote_stale_after_refresh'
+              : 'predictor_unavailable',
             meta: {
               symbol: asset.symbol,
-              reason: 'bars_fetch_failed',
+              reason: resolvedReason,
               blockTrades: warmupGate.blockTrades,
               lengths: warmupGate.lengths,
               thresholds: predictorMinBarsThresholds,
               missing: predictorInputGateBeforeFallback.missing,
+              spreadBps,
+              requiredEdgeBps,
+              netEdgeBps: null,
+              regimeScorecard: null,
+              regimePenaltyBps: null,
+              quoteAgeMs,
+              quoteTsMs,
+              quoteReceivedAtMs,
+              dataQualityReason: resolvedReason === 'provider_quote_stale_after_refresh'
+                ? resolvedReason
+                : null,
+              sparseRetry: sparseRetryDetails,
+              ...orderbookMeta,
             },
             record: baseRecord,
           };
@@ -1967,16 +2013,35 @@ async function computeEntrySignal(symbol, opts = {}) {
         record: baseRecord,
       };
     }
+    const resolvedReason = sparseRetryDetails?.providerQuoteStaleAfterRefresh
+      ? 'provider_quote_stale_after_refresh'
+      : 'predictor_missing_bars';
+    maybeCountSparseReject({ reason: resolvedReason });
     return {
       entryReady: false,
-      why: 'predictor_unavailable',
+      why: resolvedReason === 'provider_quote_stale_after_refresh'
+        ? 'provider_quote_stale_after_refresh'
+        : 'predictor_unavailable',
       meta: {
         symbol: asset.symbol,
-        reason: 'predictor_missing_bars',
+        reason: resolvedReason,
         blockTrades: Boolean(PREDICTOR_WARMUP_BLOCK_TRADES),
         lengths: predictorInputGate.lengths,
         thresholds: predictorInputGate.thresholds,
         missing: predictorInputGate.missing,
+        spreadBps,
+        requiredEdgeBps,
+        netEdgeBps: null,
+        regimeScorecard: null,
+        regimePenaltyBps: null,
+        quoteAgeMs,
+        quoteTsMs,
+        quoteReceivedAtMs,
+        dataQualityReason: resolvedReason === 'provider_quote_stale_after_refresh'
+          ? resolvedReason
+          : null,
+        sparseRetry: sparseRetryDetails,
+        ...orderbookMeta,
       },
       record: baseRecord,
     };
@@ -2452,8 +2517,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     reason: marketDataEval.reason || dataQualityReason,
   });
   if (marketDataEval.dataQualityState !== 'ok') {
-    if (shouldCountSparseFallbackReject({ marketDataEval })) {
-      if (entryMdContext) entryMdContext.stats.sparseFallbackRejects += 1;
+    if (maybeCountSparseReject({ reason: marketDataEval.reason || dataQualityReason, marketDataEval })) {
       console.log('entry_sparse_fallback_reject', {
         symbol: asset.symbol,
         symbolTier,
@@ -12770,11 +12834,7 @@ async function runEntryScanOnce() {
       skipSamples.set(normalizedReason, existing);
     };
 
-    const resolveSkipReason = (reason, meta) => {
-      if (reason === 'orderbook_unavailable' && meta?.obReason) return meta.obReason;
-      if (reason === 'orderbook_liquidity_gate' && meta?.reason) return meta.reason;
-      return reason || 'signal_skip';
-    };
+    const resolveSkipReason = (reason, meta) => resolveEntrySkipReason(reason, meta);
 
     let prefetchedBars = null;
     const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
@@ -15310,6 +15370,8 @@ module.exports = {
   requestAlpacaMarketData,
   resolveRegimePenaltyBps,
   shouldCountSparseFallbackReject,
+  shouldCountSparseRetryFailureReject,
+  resolveEntrySkipReason,
   buildPredictorCandidateSignal,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {

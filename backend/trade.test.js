@@ -371,6 +371,19 @@ const staleSparseEval = evaluateEntryMarketData({
 });
 assert.equal(staleSparseEval.reason, 'provider_quote_stale_after_refresh');
 assert.equal(tradeEntryBasis.shouldCountSparseFallbackReject({ marketDataEval: staleSparseEval }), true);
+assert.equal(
+  tradeEntryBasis.shouldCountSparseRetryFailureReject({
+    reason: 'provider_quote_stale_after_refresh',
+    sparseRetryDetails: { providerQuoteStaleAfterRefresh: true },
+  }),
+  true,
+);
+assert.equal(
+  tradeEntryBasis.resolveEntrySkipReason('predictor_unavailable', {
+    dataQualityReason: 'provider_quote_stale_after_refresh',
+  }),
+  'provider_quote_stale_after_refresh',
+);
 
 const predictorCandidate = tradeEntryBasis.buildPredictorCandidateSignal({
   symbol: 'BTC/USD',
@@ -380,6 +393,23 @@ const predictorCandidate = tradeEntryBasis.buildPredictorCandidateSignal({
   candidateSkipReason: 'test_skip',
 });
 assert.equal(predictorCandidate.requiredEdgeBps, 42);
+const predictorCandidateRequiredEdgeFallback = tradeEntryBasis.buildPredictorCandidateSignal({
+  symbol: 'ETH/USD',
+  recordBase: { predictorProbability: 0.64, spreadBps: 7, requiredEdgeBps: 27 },
+  candidateMeta: {
+    edge: { requiredEdgeBps: 99, netEdgeBps: 11 },
+    quoteAgeMs: 500,
+    quoteTsMs: 111,
+    quoteReceivedAtMs: 112,
+    sparseRetry: { providerQuoteStaleAfterRefresh: true },
+    dataQualityReason: 'provider_quote_stale_after_refresh',
+  },
+  candidateDecision: 'skipped',
+  candidateSkipReason: 'predictor_unavailable',
+});
+assert.equal(predictorCandidateRequiredEdgeFallback.requiredEdgeBps, 27);
+assert.equal(predictorCandidateRequiredEdgeFallback.dataQualityReason, 'provider_quote_stale_after_refresh');
+assert.deepEqual(predictorCandidateRequiredEdgeFallback.sparseRetry, { providerQuoteStaleAfterRefresh: true });
 
 async function runSparseQuoteRefreshToleranceTest() {
   const calls = [];
@@ -871,8 +901,8 @@ assert.match(tradeSource, /const ENTRY_PROFIT_BUFFER_BPS = readNumber\('ENTRY_PR
 assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 0\);/);
 assert.match(tradeSource, /const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0\.10;/);
 assert.match(tradeSource, /const TRADE_PORTFOLIO_PCT = Math\.max\(0, Math\.min\(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW\)\);/);
-assert.match(tradeSource, /why: 'predictor_unavailable'/);
-assert.match(tradeSource, /reason: 'predictor_missing_bars'/);
+assert.match(tradeSource, /why: resolvedReason === 'provider_quote_stale_after_refresh'/);
+assert.match(tradeSource, /'predictor_missing_bars'/);
 assert.match(tradeSource, /console\.log\('predictor_warmup_info',/);
 assert.match(tradeSource, /function computeCappedEntryNotional\(/);
 assert.match(tradeSource, /function computeEntryEdgeRequirements\(/);
