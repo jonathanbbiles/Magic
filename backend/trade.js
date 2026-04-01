@@ -546,7 +546,7 @@ const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_S
 const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBABILITY', 0.60);
 const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
 const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
-const ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN = Math.max(1, Math.floor(readNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1)));
+const ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN = Math.max(1, Math.floor(readNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 4)));
 const ORDERBOOK_SPARSE_ALLOW_TIER1 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER1', true);
 const ORDERBOOK_SPARSE_ALLOW_TIER2 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER2', false);
 const ORDERBOOK_SPARSE_ALLOW_TIER3 = readEnvFlag('ORDERBOOK_SPARSE_ALLOW_TIER3', false);
@@ -2116,6 +2116,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     liquidityScore: Number(orderbookMeta?.liquidityScore || 0),
     imbalance: Number(orderbookMeta?.imbalance || 0),
     marketDataHealthy,
+    quoteStaleMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
   });
 
   if (!regimeDecision.entryAllowed) {
@@ -2204,7 +2205,10 @@ async function computeEntrySignal(symbol, opts = {}) {
   }
 
   const fillProbability = clamp01((Number(predictorTp?.probability) || 0.5) * clamp01(orderbookMeta?.liquidityScore || 0.5));
-  const regimePenaltyBps = REGIME_ENGINE_V2_ENABLED && regimeScorecard?.label === 'chop' ? 8 : (regimeScorecard?.label === 'panic' ? 40 : (regimeScorecard?.label === 'dead' ? 100 : 0));
+  const regimePenaltyBps = resolveRegimePenaltyBps({
+    regimeEngineEnabled: REGIME_ENGINE_V2_ENABLED,
+    regimeLabel: regimeScorecard?.label,
+  });
   const edge = computeNetEdgeBps({
     expectedMoveBps: predictorTp?.signals?.expectedMoveBps,
     fillProbability,
@@ -6658,6 +6662,15 @@ function isProfitableExit(entryPrice, exitPrice, feeBpsRoundTrip, profitBufferBp
   return netBps >= computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
 }
 
+function resolveRegimePenaltyBps({ regimeEngineEnabled, regimeLabel } = {}) {
+  if (!regimeEngineEnabled) return 0;
+
+  if (regimeLabel === 'chop') return 8;
+  if (regimeLabel === 'panic') return 40;
+  if (regimeLabel === 'dead') return 100;
+  return 0;
+}
+
 function pickSymbolKey(map, primaryKey) {
   if (!map || !primaryKey) return null;
   if (map[primaryKey]) return primaryKey;
@@ -6769,7 +6782,10 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     const fromCache = {
       bid: cached.bid,
       ask: cached.ask,
+      mid: Number.isFinite(cached.mid) ? cached.mid : null,
       tsMs: cachedTsMs,
+      receivedAtMs: Number.isFinite(cached.receivedAtMs) ? cached.receivedAtMs : null,
+      source: cached.source || 'cache',
     };
     quotePassCache.set(symbol, { passId: marketDataPassId, quote: fromCache });
     return fromCache;
@@ -6819,7 +6835,10 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     const fallbackQuote = {
       bid: fallback.bid,
       ask: fallback.ask,
+      mid: Number.isFinite(fallback.mid) ? fallback.mid : null,
       tsMs: fallback.tsMs,
+      receivedAtMs: Number.isFinite(fallback.receivedAtMs) ? fallback.receivedAtMs : null,
+      source: fallback.source || 'trade_fallback',
     };
     quotePassCache.set(symbol, { passId: marketDataPassId, quote: fallbackQuote });
     return fallbackQuote;
@@ -14971,5 +14990,17 @@ module.exports = {
   runEntryScanOnce,
   getLiveRuntimeTuning,
   requestAlpacaMarketData,
+  resolveRegimePenaltyBps,
+
+  __setQuoteCacheEntryForTests: (symbol, quote) => {
+    quoteCache.set(normalizeSymbol(symbol), quote);
+  },
+  __setQuotePassCacheEntryForTests: (symbol, quote, passId = marketDataPassId) => {
+    quotePassCache.set(normalizeSymbol(symbol), { passId, quote });
+  },
+  __clearQuoteCachesForTests: () => {
+    quoteCache.clear();
+    quotePassCache.clear();
+  },
 
 };

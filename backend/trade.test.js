@@ -620,6 +620,52 @@ const staleTradePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
 });
 assert.notEqual(staleTradePricePlan.selectedLimit, staleTradePricePlan.tpLimit);
 
+
+async function runRegimeAndQuoteCacheRegression() {
+  const tradeRegimePenaltyDisabled = loadTrade({ REGIME_ENGINE_V2_ENABLED: '0' });
+  assert.equal(tradeRegimePenaltyDisabled.resolveRegimePenaltyBps({ regimeEngineEnabled: false, regimeLabel: 'panic' }), 0);
+  assert.equal(tradeRegimePenaltyDisabled.resolveRegimePenaltyBps({ regimeEngineEnabled: false, regimeLabel: 'dead' }), 0);
+
+  const tradeRegimePenaltyEnabled = loadTrade({ REGIME_ENGINE_V2_ENABLED: '1' });
+  assert.equal(tradeRegimePenaltyEnabled.resolveRegimePenaltyBps({ regimeEngineEnabled: true, regimeLabel: 'chop' }), 8);
+  assert.equal(tradeRegimePenaltyEnabled.resolveRegimePenaltyBps({ regimeEngineEnabled: true, regimeLabel: 'panic' }), 40);
+  assert.equal(tradeRegimePenaltyEnabled.resolveRegimePenaltyBps({ regimeEngineEnabled: true, regimeLabel: 'dead' }), 100);
+
+  const tradeQuoteCache = loadTrade();
+  tradeQuoteCache.__clearQuoteCachesForTests();
+  tradeQuoteCache.__setQuoteCacheEntryForTests('BTC/USD', {
+    bid: 100,
+    ask: 101,
+    mid: 100.5,
+    tsMs: Date.now(),
+    receivedAtMs: Date.now() - 50,
+    source: 'cache_seed',
+  });
+  const cachedQuote = await tradeQuoteCache.getLatestQuote('BTC/USD', { maxAgeMs: 60_000 });
+  assert.equal(cachedQuote.source, 'cache_seed');
+  assert.equal(Number.isFinite(cachedQuote.receivedAtMs), true);
+  assert.equal(cachedQuote.mid, 100.5);
+
+  tradeQuoteCache.__setQuotePassCacheEntryForTests('ETH/USD', {
+    bid: 200,
+    ask: 201,
+    mid: 200.5,
+    tsMs: Date.now(),
+    receivedAtMs: Date.now() - 25,
+    source: 'pass_cache_seed',
+  });
+  const passCachedQuote = await tradeQuoteCache.getLatestQuote('ETH/USD', { maxAgeMs: 60_000 });
+  assert.equal(passCachedQuote.source, 'pass_cache_seed');
+  assert.equal(Number.isFinite(passCachedQuote.receivedAtMs), true);
+  assert.equal(passCachedQuote.mid, 200.5);
+  tradeQuoteCache.__clearQuoteCachesForTests();
+}
+
+runRegimeAndQuoteCacheRegression().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
+
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.ok(tradeSource.includes("telemetrySchemaVersion: 2"));
 assert.ok(tradeSource.includes("sortMode: 'net_edge_then_probability'"));
