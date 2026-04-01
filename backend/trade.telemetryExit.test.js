@@ -27,5 +27,7 @@ assert.ok(!source.includes("console.log('entry_candidates'"));
 assert.ok(source.includes('requestedSymbols'));
 assert.ok(source.includes('signalReadyCount'));
 assert.ok(source.includes('signalBlockedByWarmupCount'));
+assert.ok(source.includes("reason: 'no_trustworthy_desired_target'"));
+assert.ok(source.includes('canExitProfitably = Number.isFinite(bid) && bid >= (state.profitabilityFloorPrice ?? state.trueBreakevenPrice ?? targetPrice)'));
 
 console.log('trade telemetry/exit tests passed');

@@ -1,4 +1,6 @@
 const assert = require('assert/strict');
+const fs = require('fs');
+const path = require('path');
 const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 const { getRuntimeConfigSummary } = require('./runtimeConfig');
 
@@ -22,6 +24,11 @@ withEnv({}, () => {
   assert.equal(tuning.entryScanIntervalMs, summary.entryScanIntervalMs);
   assert.equal(tuning.entryPrefetchChunkSize, summary.entryPrefetchChunkSize);
   assert.equal(tuning.predictorWarmupPrefetchConcurrency, summary.predictorWarmupPrefetchConcurrency);
+
+  const tradeSource = fs.readFileSync(path.resolve(__dirname, '..', 'trade.js'), 'utf8');
+  assert.ok(tradeSource.includes('const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;'));
+  assert.ok(tradeSource.includes('const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;'));
+  assert.ok(tradeSource.includes('const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, runtimeLiveConfig.marketdataRateLimitCooldownMs);'));
 });
 
 console.log('live defaults tests passed');
