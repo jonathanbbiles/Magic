@@ -293,7 +293,7 @@ assert.equal(fallbackSellability.brokerAvailableQty, 0);
 assert.equal(fallbackSellability.inferredAvailableQty, 4.25);
 assert.equal(fallbackSellability.availableQty, 0);
 assert.equal(fallbackSellability.sellabilitySource, 'blocked_broker_available_qty_zero');
-assert.equal(fallbackSellability.blockedReason, 'no_sellable_qty');
+assert.equal(fallbackSellability.blockedReason, 'broker_qty_not_yet_released');
 
 const zeroQtySellability = computeExitSellability({
   symbol: 'ETH/USD',
@@ -302,7 +302,37 @@ const zeroQtySellability = computeExitSellability({
 });
 assert.equal(zeroQtySellability.availableQty, 0);
 assert.equal(zeroQtySellability.sellabilitySource, 'blocked_broker_available_qty_zero');
-assert.equal(zeroQtySellability.blockedReason, 'no_position_qty');
+assert.equal(zeroQtySellability.blockedReason, 'true_no_position_qty');
+
+const visibilityGraceSellability = computeExitSellability({
+  symbol: 'SOL/USD',
+  position: { symbol: 'SOLUSD', qty: '2', qty_available: '0' },
+  openOrders: [],
+  trackedState: {
+    exitVisibilityState: 'replace_pending_visibility',
+    exitVisibilityDeadlineAt: Date.now() + 2000,
+    lastKnownReservedSellQty: 2,
+  },
+});
+assert.equal(visibilityGraceSellability.sellabilitySource, 'blocked_replace_pending_visibility');
+assert.equal(visibilityGraceSellability.blockedReason, 'replace_pending_visibility');
+
+const staleTimeStopRefresh = tradeEntryBasis.shouldRefreshExitOrder({
+  mode: 'material',
+  existingOrderAgeMs: 1000,
+  awayBps: 0.5,
+  currentLimit: 100.2,
+  nextLimit: 100.21,
+  tickSize: 0.01,
+  refreshCooldownActive: false,
+  quoteAgeMs: 1000,
+  heldMs: 500000,
+  staleTradeMs: 900000,
+  thesisBroken: false,
+  timeStopTriggered: true,
+});
+assert.equal(staleTimeStopRefresh.ok, true);
+assert.equal(staleTimeStopRefresh.why, 'time_stop');
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(
@@ -316,6 +346,10 @@ assert.doesNotMatch(
 assert.match(
   tradeSource,
   /async function fetchOrderByClientOrderId\(clientOrderId\)[\s\S]*path: 'orders:by_client_order_id'[\s\S]*client_order_id: clientOrderId/,
+);
+assert.match(
+  tradeSource,
+  /statusCode === 404 && options\.expectedNotFound[\s\S]*tracked_sell_lookup_not_found_expected/,
 );
 assert.match(
   tradeSource,
@@ -377,6 +411,10 @@ assert.match(tradeSource, /reason: orderbookMeta\.reason,[\s\S]*depthState: orde
 assert.match(tradeSource, /actionTaken = 'defer_no_sellable_qty';/);
 assert.match(tradeSource, /sellabilitySource: sellability\.sellabilitySource,/);
 assert.match(tradeSource, /console\.log\('sellability_resolved',/);
+assert.match(tradeSource, /replace_visibility_grace_started/);
+assert.match(tradeSource, /replace_visibility_grace_resolved/);
+assert.match(tradeSource, /tracked_sell_identity_updated/);
+assert.match(tradeSource, /stale_exit_override_triggered/);
 assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);
 assert.match(tradeSource, /console\.log\('tp_attach_submitted',/);
 assert.match(tradeSource, /console\.log\('entry_universe_selection', \{/);
