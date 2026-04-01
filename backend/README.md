@@ -78,7 +78,10 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 - Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).
 - Optional refresh repricing can cancel and replace stale exit orders when `EXIT_REFRESH_ENABLED=true` and the order age exceeds `EXIT_MAX_ORDER_AGE_MS`.
+- In `EXIT_REFRESH_MODE=material`, stale-thesis protection now forces refresh when a trade is beyond failed-trade age and below entry, even if `away_bps_small` would normally hold the GTC exit.
 - Live open-exit detection now uses Alpaca trading open orders (`GET /v2/orders?status=open&nested=true&direction=desc&limit=500`) as broker truth, with direct tracked order fallback via `GET /v2/orders/{order_id}` and `GET /v2/orders:by_client_order_id`.
+- Entry/exit manager startup is idempotent; repeated bootstrap calls do not register duplicate manager intervals.
+- Entry intent confirmation now fails closed while market-data is degraded and enforces directional persistence + orderbook health before routing.
 
 ## Notes
 

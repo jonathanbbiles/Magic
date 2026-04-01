@@ -2734,6 +2734,11 @@ function createEntryIntent(symbol, signal = {}) {
     volatilityAtIntent: Number(signal.volatilityAtIntent) || null,
     predictorProbability: Number(signal.predictorProbability) || null,
     qualityScore: Number(signal.qualityScore) || null,
+    directionalPersistence: Number(signal.directionalPersistence) || null,
+    momentumStrength: Number(signal.momentumStrength) || null,
+    orderbookLiquidityScore: Number(signal.orderbookLiquidityScore) || null,
+    orderbookDepthUsd: Number(signal.orderbookDepthUsd) || null,
+    marketDataDegraded: Boolean(signal.marketDataDegraded),
     confirmationSamples: [],
     rejectionReason: null,
   };
@@ -2743,9 +2748,27 @@ function createEntryIntent(symbol, signal = {}) {
 
 async function confirmEntryIntent(intent, options = {}) {
   if (!intent || !intent.symbol) return { ok: false, reason: 'intent_missing' };
+  if (dataDegradedUntil > Date.now()) {
+    updateIntentState(intent.symbol, { state: 'rejected', rejectionReason: 'market_data_degraded' });
+    return { ok: false, reason: 'market_data_degraded' };
+  }
   updateIntentState(intent.symbol, { state: 'confirming' });
   const samples = [];
   const baselineSpread = Number(intent.spreadAtIntent);
+  const minDirectionalPersistence = Number.isFinite(Number(options.minDirectionalPersistence))
+    ? Number(options.minDirectionalPersistence)
+    : 0.2;
+  const minLiquidityScore = Number.isFinite(Number(options.minLiquidityScore))
+    ? Number(options.minLiquidityScore)
+    : ORDERBOOK_LIQUIDITY_SCORE_MIN;
+  if (Number.isFinite(intent.directionalPersistence) && intent.directionalPersistence < minDirectionalPersistence) {
+    updateIntentState(intent.symbol, { state: 'rejected', rejectionReason: 'weak_directional_persistence' });
+    return { ok: false, reason: 'weak_directional_persistence' };
+  }
+  if (Number.isFinite(intent.orderbookLiquidityScore) && intent.orderbookLiquidityScore < minLiquidityScore) {
+    updateIntentState(intent.symbol, { state: 'rejected', rejectionReason: 'orderbook_health_bad' });
+    return { ok: false, reason: 'orderbook_health_bad' };
+  }
   for (let i = 0; i < ENTRY_CONFIRMATION_SAMPLES; i += 1) {
     const quote = await getQuoteForTrading(intent.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS }).catch(() => null);
     const orderbook = await getLatestOrderbook(intent.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS }).catch(() => null);
@@ -2754,8 +2777,27 @@ async function confirmEntryIntent(intent, options = {}) {
     const spreadBps = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
     const stable = Boolean(Number.isFinite(spreadBps) && (!Number.isFinite(baselineSpread) || spreadBps <= baselineSpread + ENTRY_CONFIRMATION_MAX_SPREAD_DRIFT_BPS));
     const quoteAgeMs = Number.isFinite(quote?.tsMs) ? Math.max(0, Date.now() - quote.tsMs) : null;
-    const ok = stable && (quoteAgeMs == null || quoteAgeMs <= ENTRY_QUOTE_MAX_AGE_MS) && Boolean(orderbook?.ok);
-    samples.push({ ts: new Date().toISOString(), spreadBps, quoteAgeMs, stable, orderbookOk: Boolean(orderbook?.ok), ok });
+    const orderbookMeta = orderbook?.ok
+      ? computeOrderbookMetrics(orderbook.orderbook, { bid, ask }, {
+        bandBps: ORDERBOOK_BAND_BPS,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+        impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
+      })
+      : null;
+    const orderbookHealthy = Boolean(orderbook?.ok && orderbookMeta?.ok && orderbookMeta.liquidityScore >= minLiquidityScore);
+    const ok = stable && (quoteAgeMs == null || quoteAgeMs <= ENTRY_QUOTE_MAX_AGE_MS) && orderbookHealthy;
+    samples.push({
+      ts: new Date().toISOString(),
+      spreadBps,
+      quoteAgeMs,
+      stable,
+      orderbookOk: Boolean(orderbook?.ok),
+      orderbookHealthy,
+      liquidityScore: Number(orderbookMeta?.liquidityScore) || null,
+      ok,
+    });
     if (i < ENTRY_CONFIRMATION_SAMPLES - 1 && ENTRY_CONFIRMATION_WINDOW_MS > 0) await sleep(Math.floor(ENTRY_CONFIRMATION_WINDOW_MS / ENTRY_CONFIRMATION_SAMPLES));
   }
   const failedSample = samples.find((sample) => !sample.ok);
@@ -2892,6 +2934,19 @@ function hasPendingExitAttach(symbol) {
   return ageMs >= 0 && ageMs <= POST_FILL_POSITION_SETTLE_MS;
 }
 
+function resolveAuthoritativeEntryTimeMs({ stateEntryTime, pendingFilledAtMs, intentCreatedAt, fallbackMs = Date.now() } = {}) {
+  const candidates = [
+    Number(stateEntryTime),
+    Number(pendingFilledAtMs),
+    intentCreatedAt ? Date.parse(intentCreatedAt) : null,
+    Number(fallbackMs),
+  ].filter((value) => Number.isFinite(value) && value > 0);
+  if (!candidates.length) {
+    return Date.now();
+  }
+  return Math.min(...candidates);
+}
+
 function hasOpenSellForSymbol(openOrders, symbol, requiredQty = null) {
   const matches = getOpenSellOrdersForSymbol(openOrders, symbol);
   if (!matches.length) return false;
@@ -3003,6 +3058,8 @@ const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let exitManagerRunning = false;
 let exitRepairIntervalId = null;
+let exitManagerIntervalId = null;
+let exitRepairBootstrapTimeoutId = null;
 let exitRepairRunning = false;
 let lastExitRepairAtMs = 0;
 const positionsSnapshot = {
@@ -3150,6 +3207,7 @@ const positionsListCache = {
 };
 let entryManagerRunning = false;
 let entryScanRunning = false;
+let entryManagerIntervalId = null;
 const openPositionsCache = {
   tsMs: 0,
   data: null,
@@ -4403,10 +4461,19 @@ function shouldRefreshExitOrder({
   tickSize,
   refreshCooldownActive,
   quoteAgeMs,
+  heldMs,
+  staleTradeMs,
+  thesisBroken = false,
 }) {
   if (!EXIT_REFRESH_ENABLED) return { ok: false, why: 'disabled' };
-  if (refreshCooldownActive) return { ok: false, why: 'cooldown' };
+  if (refreshCooldownActive && !thesisBroken) return { ok: false, why: 'cooldown' };
   if (!Number.isFinite(existingOrderAgeMs)) return { ok: false, why: 'no_age' };
+  const staleThresholdMs = Number.isFinite(staleTradeMs) && staleTradeMs > 0 ? staleTradeMs : EXIT_MAX_ORDER_AGE_MS;
+  if ((Number.isFinite(heldMs) && heldMs >= staleThresholdMs) || thesisBroken) {
+    if (existingOrderAgeMs >= EXIT_REFRESH_MIN_ORDER_AGE_MS || thesisBroken) {
+      return { ok: true, why: thesisBroken ? 'thesis_break' : 'stale_trade' };
+    }
+  }
 
   if (mode === 'age') {
     return existingOrderAgeMs > EXIT_MAX_ORDER_AGE_MS ? { ok: true, why: 'age' } : { ok: false, why: 'age_not_met' };
@@ -7861,6 +7928,14 @@ async function attachInitialExitLimit({
   });
 
   const now = Date.now();
+  const pendingAttach = pendingExitAttachBySymbol.get(symbol) || null;
+  const intentState = entryIntentState.get(symbol) || null;
+  const authoritativeEntryTimeMs = resolveAuthoritativeEntryTimeMs({
+    stateEntryTime: exitState.get(symbol)?.entryTime,
+    pendingFilledAtMs: pendingAttach?.filledAtMs,
+    intentCreatedAt: intentState?.createdAt,
+    fallbackMs: now,
+  });
   const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
   const sellClientOrderId = sellOrder?.client_order_id || sellOrder?.clientOrderId || null;
   const sellOrderLimit = normalizeOrderLimitPrice(sellOrder) ?? initialLimit;
@@ -7876,7 +7951,7 @@ async function attachInitialExitLimit({
     entryPriceUsed,
     maxFillPrice: Number.isFinite(maxFill) ? maxFill : null,
     actualEntryFillPrice,
-    entryTime: now,
+    entryTime: authoritativeEntryTimeMs,
     notionalUsd,
     minNetProfitBps,
     targetPrice,
@@ -8489,6 +8564,8 @@ async function repairOrphanExits() {
       const adoptedSubmittedAt = Number.isFinite(adoptedSubmittedAtParsed) ? adoptedSubmittedAtParsed : Date.now();
       const now = Date.now();
       const trackedState = exitState.get(symbol) || {};
+      const pendingAttach = pendingExitAttachBySymbol.get(symbol) || null;
+      const intentState = entryIntentState.get(symbol) || null;
       const entrySpreadBpsUsed = Number.isFinite(Number(trackedState.entrySpreadBpsUsed))
         ? Number(trackedState.entrySpreadBpsUsed)
         : 0;
@@ -8500,7 +8577,12 @@ async function repairOrphanExits() {
         entryPrice: entryBasisValue,
         effectiveEntryPrice: entryBasisValue,
         entryBasisType,
-        entryTime: Number.isFinite(Number(trackedState.entryTime)) ? Number(trackedState.entryTime) : now,
+        entryTime: resolveAuthoritativeEntryTimeMs({
+          stateEntryTime: trackedState.entryTime,
+          pendingFilledAtMs: pendingAttach?.filledAtMs,
+          intentCreatedAt: intentState?.createdAt,
+          fallbackMs: adoptedSubmittedAt,
+        }),
         notionalUsd,
         minNetProfitBps,
         targetPrice,
@@ -9215,6 +9297,13 @@ async function manageExitStates() {
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
         const quoteAgeMs = Number.isFinite(state.lastQuoteTsMs) ? Math.max(0, now - state.lastQuoteTsMs) : null;
+        const failedTradeStale = Number.isFinite(heldSeconds) && heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
+        const thesisBrokenForRefresh =
+          failedTradeStale &&
+          Number.isFinite(bid) &&
+          Number.isFinite(entryBasisValue) &&
+          entryBasisValue > 0 &&
+          bid < entryBasisValue;
         const exitRefreshDecision = shouldRefreshExitOrder({
           mode: EXIT_REFRESH_MODE,
           existingOrderAgeMs,
@@ -9224,6 +9313,9 @@ async function manageExitStates() {
           tickSize,
           refreshCooldownActive,
           quoteAgeMs,
+          heldMs,
+          staleTradeMs: FAILED_TRADE_MAX_AGE_SEC * 1000,
+          thesisBroken: thesisBrokenForRefresh,
         });
         const exitScanBase = {
           entryPriceUsed,
@@ -11648,6 +11740,11 @@ async function runEntryScanOnce() {
           volatilityAtIntent: recordBase?.volatilityBps,
           predictorProbability: recordBase?.predictorProbability,
           qualityScore: signal?.meta?.confidence?.confidenceScore,
+          directionalPersistence: signal?.meta?.directionalPersistence,
+          momentumStrength: signal?.meta?.momentumStrength,
+          orderbookLiquidityScore: signal?.meta?.orderbookLiquidityScore ?? signal?.meta?.liquidityScore,
+          orderbookDepthUsd: signal?.meta?.orderbookDepthUsd ?? signal?.meta?.actualDepthUsd,
+          marketDataDegraded: Boolean(signal?.meta?.marketDataDegraded),
         });
         const confirmation = await confirmEntryIntent(activeIntent);
         if (!confirmation.ok) {
@@ -11881,7 +11978,7 @@ function startExitManager() {
           console.error('exit_repair_scheduler_failed', err?.message || err);
         });
       }, EXIT_REPAIR_INTERVAL_MS);
-      setTimeout(() => {
+      exitRepairBootstrapTimeoutId = setTimeout(() => {
         repairOrphanExitsSafe().catch((err) => {
           console.error('exit_repair_scheduler_failed', err?.message || err);
         });
@@ -11894,15 +11991,14 @@ function startExitManager() {
   if (SIMPLE_SCALPER_ENABLED) {
     return;
   }
-
-  setInterval(() => {
-
+  if (exitManagerIntervalId) {
+    console.log('exit_manager_start_skipped', { reason: 'already_started', intervalSeconds: REPRICE_EVERY_SECONDS });
+    return;
+  }
+  exitManagerIntervalId = setInterval(() => {
     manageExitStates().catch((err) => {
-
       console.error('exit_manager_failed', err?.message || err);
-
     });
-
   }, REPRICE_EVERY_SECONDS * 1000);
 
   console.log('exit_manager_started', { intervalSeconds: REPRICE_EVERY_SECONDS });
@@ -11915,7 +12011,10 @@ function startExitManager() {
 }
 
 function startEntryManager() {
-  if (entryManagerRunning) return;
+  if (entryManagerRunning || entryManagerIntervalId) {
+    console.log('entry_manager_start_skipped', { reason: 'already_started' });
+    return;
+  }
   entryManagerRunning = true;
   if (PREDICTOR_WARMUP_ENABLED) {
     setTimeout(async () => {
@@ -11940,7 +12039,7 @@ function startEntryManager() {
       }
     }, 0);
   }
-  setInterval(() => {
+  entryManagerIntervalId = setInterval(() => {
     runEntryScanOnce().catch((err) => {
       console.error('entry_manager_failed', err?.message || err);
     });
@@ -13752,6 +13851,9 @@ function getTradingManagerStatus() {
     tradingEnabled: TRADING_ENABLED,
     entryManagerRunning,
     exitManagerRunning,
+    entryManagerIntervalActive: Boolean(entryManagerIntervalId),
+    exitManagerIntervalActive: Boolean(exitManagerIntervalId),
+    exitRepairIntervalActive: Boolean(exitRepairIntervalId),
     engineV2Enabled: ENGINE_V2_ENABLED,
     featureFlags: {
       ENTRY_INTENTS_ENABLED,
@@ -13766,6 +13868,19 @@ function getTradingManagerStatus() {
     lifecycle: getLifecycleSnapshot(),
     sessionGovernor: getSessionGovernorSummary(),
   };
+}
+
+function __resetManagerIntervalsForTests() {
+  if (entryManagerIntervalId) clearInterval(entryManagerIntervalId);
+  if (exitManagerIntervalId) clearInterval(exitManagerIntervalId);
+  if (exitRepairIntervalId) clearInterval(exitRepairIntervalId);
+  if (exitRepairBootstrapTimeoutId) clearTimeout(exitRepairBootstrapTimeoutId);
+  entryManagerIntervalId = null;
+  exitManagerIntervalId = null;
+  exitRepairIntervalId = null;
+  exitRepairBootstrapTimeoutId = null;
+  entryManagerRunning = false;
+  exitManagerRunning = false;
 }
 
 function getLastHttpError() {
@@ -13938,6 +14053,7 @@ module.exports = {
   computeTargetSellPrice,
   resolveEntryBasis,
   computeAwayBps,
+  shouldRefreshExitOrder,
   getBrokerPositionLookupKeys,
   extractBrokerPositionQty,
   getOpenSellOrdersForSymbol,
@@ -13950,6 +14066,9 @@ module.exports = {
   getExitStateSnapshot,
   getLifecycleSnapshot,
   getSessionGovernorSummary,
+  createEntryIntent,
+  confirmEntryIntent,
+  __resetManagerIntervalsForTests,
   prefetchBarsForUniverse,
   runEntryScanOnce,
 
