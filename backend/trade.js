@@ -4574,12 +4574,16 @@ function shouldRefreshExitOrder({
   staleTradeMs,
   thesisBroken = false,
   timeStopTriggered = false,
+  basisConfidence = 'broker',
 }) {
   if (!EXIT_REFRESH_ENABLED) return { ok: false, why: 'disabled' };
   const staleThresholdMs = Number.isFinite(staleTradeMs) && staleTradeMs > 0 ? staleTradeMs : EXIT_MAX_ORDER_AGE_MS;
   const staleTradeTriggered = Number.isFinite(heldMs) && heldMs >= staleThresholdMs;
   const defensiveOverrideRequested = thesisBroken || timeStopTriggered || staleTradeTriggered;
   if (refreshCooldownActive && !defensiveOverrideRequested) return { ok: false, why: 'cooldown' };
+  if (basisConfidence === 'fallback' && !defensiveOverrideRequested) {
+    return { ok: false, why: 'low_confidence_basis' };
+  }
   if (!Number.isFinite(existingOrderAgeMs)) return { ok: false, why: 'no_age' };
   if (thesisBroken || timeStopTriggered || staleTradeTriggered) {
     if (thesisBroken || timeStopTriggered || existingOrderAgeMs >= EXIT_REFRESH_MIN_ORDER_AGE_MS) {
@@ -4612,6 +4616,71 @@ function shouldRefreshExitOrder({
     if (ticksDiff < EXIT_REFRESH_MIN_ABS_TICKS) return { ok: false, why: 'tick_diff_small' };
   }
   return { ok: true, why: 'material' };
+}
+
+function buildExitDecisionContext({
+  symbol,
+  bid,
+  ask,
+  tickSize,
+  tpLimit,
+  entryBasisValue,
+  heldSeconds,
+  tacticDecision,
+  currentLimit,
+  mode,
+  existingOrderAgeMs,
+  refreshCooldownActive,
+  quoteAgeMs,
+  heldMs,
+  staleTradeMs,
+  thesisBrokenForRefresh = false,
+  timeStopTriggered = false,
+  basisConfidence = 'broker',
+}) {
+  const pricePlan = buildForcedExitPricePlan({
+    symbol,
+    bid,
+    ask,
+    tickSize,
+    tpLimit,
+    entryPrice: entryBasisValue,
+    heldSeconds,
+    tacticDecision,
+  });
+  const desiredLimit = pricePlan?.selectedLimit ?? null;
+  const finalLimit = tacticDecision === 'take_profit_hold'
+    ? applyMakerGuard(desiredLimit, bid, tickSize)
+    : desiredLimit;
+  const marketToExitBps_from_entry =
+    Number.isFinite(finalLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
+      ? ((finalLimit - entryBasisValue) / entryBasisValue) * 10000
+      : null;
+  const awayBps = computeAwayBps(currentLimit, finalLimit);
+  const exitRefreshDecision = shouldRefreshExitOrder({
+    mode,
+    existingOrderAgeMs,
+    awayBps,
+    currentLimit,
+    nextLimit: finalLimit,
+    tickSize,
+    refreshCooldownActive,
+    quoteAgeMs,
+    heldMs,
+    staleTradeMs,
+    thesisBroken: thesisBrokenForRefresh,
+    timeStopTriggered,
+    basisConfidence,
+  });
+
+  return {
+    pricePlan,
+    desiredLimit,
+    finalLimit,
+    marketToExitBps_from_entry,
+    awayBps,
+    exitRefreshDecision,
+  };
 }
 
 function chooseExitTactic({
@@ -9511,6 +9580,12 @@ async function manageExitStates() {
 
         let actionTaken = 'none';
         let reasonCode = 'hold';
+        let desiredLimit = null;
+        let finalLimit = null;
+        let marketToExitBps_from_entry = null;
+        let awayBps = null;
+        let exitRefreshDecision = { ok: false, why: 'uninitialized' };
+        let pricePlan = null;
         let spreadBps =
           Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
         const entryFeeBps = Number.isFinite(state.entryFeeBps)
@@ -9531,6 +9606,7 @@ async function manageExitStates() {
           avgEntryPrice,
           fallbackEntryPrice: state.entryPrice,
         });
+        const basisConfidence = entryBasisType === 'alpaca_avg_entry' ? 'broker' : 'fallback';
         const entryBasisValue = Number.isFinite(entryBasis) ? entryBasis : state.entryPrice;
         if (!(Number.isFinite(avgEntryPrice) && avgEntryPrice > 0)) {
           console.warn('alpaca_avg_entry_missing_fallback', {
@@ -9616,39 +9692,33 @@ async function manageExitStates() {
           staleTradeTriggered: failedTradeStale,
           maxHoldForced: false,
         });
-        const pricePlan = buildForcedExitPricePlan({
+        ({
+          pricePlan,
+          desiredLimit,
+          finalLimit,
+          marketToExitBps_from_entry,
+          awayBps,
+          exitRefreshDecision,
+        } = buildExitDecisionContext({
           symbol,
           bid,
           ask,
           tickSize,
           tpLimit,
-          entryPrice: entryBasisValue,
+          entryBasisValue,
           heldSeconds,
           tacticDecision,
-        });
-        const desiredLimit = pricePlan.selectedLimit;
-        const finalLimit = tacticDecision === 'take_profit_hold'
-          ? applyMakerGuard(desiredLimit, bid, tickSize)
-          : desiredLimit;
-        const marketToExitBps_from_entry =
-          Number.isFinite(finalLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
-            ? ((finalLimit - entryBasisValue) / entryBasisValue) * 10000
-            : null;
-        const awayBps = computeAwayBps(currentLimit, finalLimit);
-        const exitRefreshDecision = shouldRefreshExitOrder({
           mode: EXIT_REFRESH_MODE,
           existingOrderAgeMs,
-          awayBps,
           currentLimit,
-          nextLimit: finalLimit,
-          tickSize,
           refreshCooldownActive,
           quoteAgeMs,
           heldMs,
           staleTradeMs: FAILED_TRADE_MAX_AGE_SEC * 1000,
-          thesisBroken: thesisBrokenForRefresh,
+          thesisBrokenForRefresh,
           timeStopTriggered,
-        });
+          basisConfidence,
+        }));
         if (exitRefreshDecision?.override) {
           console.log('stale_exit_override_triggered', {
             symbol,
@@ -9658,10 +9728,19 @@ async function manageExitStates() {
             awayBps,
           });
         }
+        if (exitRefreshDecision?.why === 'low_confidence_basis') {
+          console.log('exit_refresh_low_confidence_basis', {
+            symbol,
+            entryBasisType,
+            basisConfidence,
+            action: 'retain_existing_or_defer_refresh',
+          });
+        }
         const exitScanBase = {
           entryPriceUsed,
           avgEntryPriceRaw: avgEntryPriceRaw ?? null,
           entryBasisType,
+          basisConfidence,
           entryBasisValue,
           bookAsk: ask,
           bookBid: bid,
@@ -14580,6 +14659,7 @@ module.exports = {
   resolveEntryBasis,
   computeAwayBps,
   shouldRefreshExitOrder,
+  buildExitDecisionContext,
   chooseExitTactic,
   buildForcedExitPricePlan,
   getBrokerPositionLookupKeys,
