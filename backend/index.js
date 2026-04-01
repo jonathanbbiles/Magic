@@ -1138,6 +1138,7 @@ app.get('/market/stocks/bars', async (req, res) => {
  
 
 const port = process.env.PORT || 3000;
+let bootstrapTradingStarted = false;
 
 function withTimeout(promise, ms, label) {
   let t;
@@ -1148,6 +1149,11 @@ function withTimeout(promise, ms, label) {
 }
 
 async function bootstrapTrading() {
+  if (bootstrapTradingStarted) {
+    console.log('bootstrap_skip_duplicate_start');
+    return;
+  }
+  bootstrapTradingStarted = true;
   console.log('bootstrap_start');
   logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
