@@ -41,6 +41,8 @@ Optional:
 - `ENTRY_SYMBOLS_PRIMARY` (manual primary universe when `ENTRY_UNIVERSE_MODE=configured`)
 - `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
+- `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
+- `ENTRY_PREFETCH_ORDERBOOKS` (default `false`; when `true`, prefetch also batches orderbooks instead of quote+bars only)
 - `AUTO_SCAN_SYMBOLS` (optional hard override universe; when set it overrides both dynamic and configured modes)
 - `SUPPORTED_CRYPTO_PAIRS_REFRESH_MS` (default `3600000`, refresh interval for Alpaca tradable crypto asset universe cache)
 
@@ -169,7 +171,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `PREDICTOR_MIN_BARS_15M=20`
 - `PREDICTOR_WARMUP_BLOCK_TRADES=false`
 - `PREDICTOR_WARMUP_LOG_EVERY_MS=60000`
-- `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=4`
+- `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1` (sequential/low-pressure by default)
 - `ORDERBOOK_ABSORPTION_ENABLED=false`
 - `REGIME_MIN_VOL_BPS_TIER1=4`
 - `REGIME_MIN_VOL_BPS_TIER2=8`
@@ -184,12 +186,22 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS=15000` (bounded sparse-fallback tolerance for tier1 quote staleness)
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
-- `PER_SCAN_BARS_FALLBACK_BUDGET=2`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
 - `ALPACA_BARS_USE_TIME_RANGE=true`
 - `ALPACA_MD_MAX_CONCURRENCY=2`
 - `ALPACA_MD_MIN_DELAY_MS=200`
 - `ALPACA_MD_MAX_RETRIES=6`
 - `ALPACA_MD_BASE_BACKOFF_MS=500`
+
+## Live example profile (intentionally conservative)
+
+`backend/.env.live.example` is intentionally narrow to reduce Alpaca market-data rate-limit pressure in live trading:
+- configured universe (`ENTRY_UNIVERSE_MODE=configured`) with only `BTC/USD, ETH/USD, SOL/USD, LINK/USD, AVAX/USD, UNI/USD`
+- no secondary universe expansion
+- slower scans (`ENTRY_SCAN_INTERVAL_MS=12000`)
+- small prefetch chunks (`ENTRY_PREFETCH_CHUNK_SIZE=3`, still subject to hard cap of `20`)
+- sequential warmup prefetch (`PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`)
+- conservative market-data concurrency/cooldown settings and per-symbol bars fallback enabled
 
 ## Engine v2 lifecycle (feature-flagged, additive)
 
