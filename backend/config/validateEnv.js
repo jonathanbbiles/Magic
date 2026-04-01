@@ -211,9 +211,11 @@ const validateEnv = () => {
     const orderbookSparseRequireStrongerEdgeBps = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
     const orderbookSparseRequireQuoteFreshMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
     const orderbookSparseStaleQuoteToleranceMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);
+    const entryQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_QUOTE_MAX_AGE_MS', 120000);
+    const entryRegimeStaleQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', entryQuoteMaxAgeMs);
     const orderbookSparseConfirmRetry = parseBooleanEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
     const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
-    const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
+    const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD,AVAX/USD,LINK/USD');
     const executionTier1Symbols = parseSymbolListEnv('EXECUTION_TIER1_SYMBOLS', 'BTC/USD,ETH/USD');
     const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
     const runtimeConfig = getRuntimeConfig(process.env);
@@ -224,7 +226,7 @@ const validateEnv = () => {
     const marketdataBarsTtlMs = parseFiniteNumberEnv('MARKETDATA_BARS_TTL_MS', 10000);
     const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', runtimeConfig.marketdataRateLimitCooldownMs);
     const runtimeSummary = getRuntimeConfigSummary(process.env);
-    const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1);
+    const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 4);
 
     const failedTradeMaxAgeSec = parseFiniteNumberEnv('FAILED_TRADE_MAX_AGE_SEC', 90);
     const failedTradeMinProgressPct = parseFiniteNumberEnv('FAILED_TRADE_MIN_PROGRESS_PCT', 0.10);
@@ -265,6 +267,7 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', orderbookSparseRequireStrongerEdgeBps, 0, 10000);
     assertInRange('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', orderbookSparseRequireQuoteFreshMs, 0, 3600000);
     assertInRange('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', orderbookSparseStaleQuoteToleranceMs, 0, 3600000);
+    assertInRange('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', entryRegimeStaleQuoteMaxAgeMs, 0, 3600000);
     assertInRange('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', orderbookSparseConfirmRetryMs, 0, 10000);
     assertInRange('MARKETDATA_QUOTE_TTL_MS', marketdataQuoteTtlMs, 1, 600000);
     assertInRange('MARKETDATA_ORDERBOOK_TTL_MS', marketdataOrderbookTtlMs, 1, 600000);
@@ -371,6 +374,7 @@ const validateEnv = () => {
         requireStrongerEdgeBps: orderbookSparseRequireStrongerEdgeBps,
         requireQuoteFreshMs: orderbookSparseRequireQuoteFreshMs,
         staleQuoteToleranceMs: orderbookSparseStaleQuoteToleranceMs,
+        entryRegimeStaleQuoteMaxAgeMs,
         confirmRetry: orderbookSparseConfirmRetry,
         confirmRetryMs: orderbookSparseConfirmRetryMs,
         symbols: sparseFallbackSymbols,

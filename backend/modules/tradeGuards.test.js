@@ -40,6 +40,17 @@ const badRegime = evaluateTradeableRegime({
 assert.equal(badRegime.entryAllowed, false);
 assert.ok(badRegime.reasons.includes('spread_too_wide'));
 
+const staleScorecard = classifyRegimeScorecard({
+  spreadBps: 12,
+  volatilityBps: 80,
+  quoteAgeMs: 20001,
+  quoteStaleMs: 20000,
+  marketDataHealthy: true,
+});
+assert.equal(staleScorecard.blocked, true);
+assert.equal(staleScorecard.label, 'dead');
+assert.ok(staleScorecard.reasons.includes('stale_quote'));
+
 const lowVolNowAllowedRegime = evaluateTradeableRegime({
   spreadBps: 12,
   weakLiquidity: false,

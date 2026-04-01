@@ -236,10 +236,14 @@ function classifyRegimeScorecard({
   let blocked = false;
   const reasons = [];
 
-  if (!marketDataHealthy || age > quoteStaleMs) {
+  if (age > quoteStaleMs) {
     label = 'dead';
     blocked = true;
-    reasons.push('stale_or_unhealthy_data');
+    reasons.push('stale_quote');
+  } else if (!marketDataHealthy) {
+    label = 'dead';
+    blocked = true;
+    reasons.push('unhealthy_market_data');
   } else if (Number.isFinite(vol) && vol >= panicVolBps && spread > 35) {
     label = 'panic';
     blocked = true;
