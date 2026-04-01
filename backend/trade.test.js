@@ -36,6 +36,7 @@ function loadTrade(overrides = {}) {
 
 const { isInsufficientBalanceError, isInsufficientSellableQtyError } = loadTrade();
 
+
 assert.equal(
   isInsufficientBalanceError({
     statusCode: 403,
@@ -570,6 +571,7 @@ assert.match(
   tradeSource,
   /const sellClientOrderId = sellOrder\?\.client_order_id \|\| sellOrder\?\.clientOrderId \|\| null;[\s\S]*sellClientOrderId,/,
 );
+assert.match(tradeSource, /const clamp01 = \(x\) => clamp\(Number\(x\), 0, 1\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 8\);/);

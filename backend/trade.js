@@ -862,6 +862,7 @@ const ORIGINAL_TOKENS = [
 const CRYPTO_CORE_TRACKED = ORIGINAL_TOKENS.filter((sym) => !String(sym).includes('USD/USD'));
 
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const clamp01 = (x) => clamp(Number(x), 0, 1);
 const LA_TIMEZONE = 'America/Los_Angeles';
 const laHourFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: LA_TIMEZONE });
 const DEFAULT_TIME_OF_DAY_PROFILE = Array.from({ length: 24 }, () => 1);
