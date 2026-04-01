@@ -1,6 +1,7 @@
 const assert = require('assert/strict');
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 const { getRuntimeConfigSummary } = require('./runtimeConfig');
 
@@ -30,5 +31,14 @@ withEnv({}, () => {
   assert.ok(tradeSource.includes('const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;'));
   assert.ok(tradeSource.includes('const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, runtimeLiveConfig.marketdataRateLimitCooldownMs);'));
 });
+
+assert.throws(
+  () => execFileSync('node', [path.resolve(__dirname, '..', 'scripts', 'check_runtime_env.js')], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, ENTRY_TAKE_PROFIT_BPS: '71' },
+    stdio: 'pipe',
+  }),
+  /runtime_env_check_failed/,
+);
 
 console.log('live defaults tests passed');
