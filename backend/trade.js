@@ -53,6 +53,7 @@ const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets } = require('./modules/entryUniversePolicy');
+const { getRuntimeConfigSummary } = require('./config/runtimeConfig');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -546,11 +547,6 @@ const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_
 const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
 const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
 const EXECUTION_TIER3_DEFAULT = readEnvFlag('EXECUTION_TIER3_DEFAULT', true);
-if (NODE_ENV === 'production' && ENTRY_UNIVERSE_MODE !== 'configured' && !ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION) {
-  throw new Error(
-    'Production startup blocked: ENTRY_UNIVERSE_MODE must be configured unless ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true explicitly opts in to dynamic scanning.'
-  );
-}
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
@@ -570,39 +566,7 @@ const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
 
-let printedConfigOnce = false;
-function buildLiveCriticalConfigSummary() {
-  const configuredUniverse = buildEntryUniverse({
-    primaryRaw: ENTRY_SYMBOLS_PRIMARY,
-    secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
-    includeSecondary: ENTRY_SYMBOLS_INCLUDE_SECONDARY,
-  });
-  return {
-    nodeEnv: NODE_ENV,
-    entryUniverseMode: ENTRY_UNIVERSE_MODE,
-    allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
-    configuredPrimaryCount: configuredUniverse.primaryCount,
-    configuredSecondaryCount: configuredUniverse.secondaryCount,
-    entrySymbolsPrimarySample: configuredUniverse.primary.slice(0, 6),
-    entrySymbolsSecondarySample: configuredUniverse.secondary.slice(0, 6),
-    entryScanIntervalMs: ENTRY_SCAN_INTERVAL_MS,
-    entryPrefetchChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
-    entryPrefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
-    predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
-    barsPrefetchIntervalMs: BARS_PREFETCH_INTERVAL_MS,
-    allowPerSymbolBarsFallback: ALLOW_PER_SYMBOL_BARS_FALLBACK,
-    marketdataRateLimitCooldownMs: MARKETDATA_RATE_LIMIT_COOLDOWN_MS,
-    executionTier3Default: EXECUTION_TIER3_DEFAULT,
-  };
-}
-
-function printConfigOnce() {
-  if (printedConfigOnce) return;
-  printedConfigOnce = true;
-  console.log('runtime_live_critical_config', {
-    stage: 'startup',
-    ...buildLiveCriticalConfigSummary(),
-  });
+function logRuntimeConfigEffective() {
   console.log('runtime_config_effective', {
     MAX_CONCURRENT_POSITIONS,
     maxConcurrentPositionsEnabled: Number.isFinite(getEffectiveMaxConcurrentPositions()) && getEffectiveMaxConcurrentPositions() !== Number.POSITIVE_INFINITY,
@@ -624,27 +588,6 @@ function printConfigOnce() {
     entryUniverseMode: ENTRY_UNIVERSE_MODE,
     allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
-  });
-  console.log('runtime_config', {
-    MIN_PROB_TO_ENTER,
-    EV_GUARD_ENABLED,
-    EV_MIN_BPS,
-    EV_BUFFER_BPS,
-    TARGET_PROFIT_BPS,
-    STOP_LOSS_BPS,
-    ENTRY_BUFFER_BPS,
-    MIN_NET_EDGE_BPS,
-    ENTRY_PROFIT_BUFFER_BPS,
-    REQUIRED_EDGE_BPS,
-    FEE_BPS_MAKER,
-    FEE_BPS_TAKER,
-    feeBpsRoundTrip: feeBpsRoundTrip(),
-    SLIPPAGE_BPS,
-    ENTRY_MAX_SLIPPAGE_BPS,
-    ENTRY_PRICE_MODE,
-    ENTRY_IOC_LIMIT,
-    ENTRY_POST_ONLY,
-    TAKER_EXIT_ON_TOUCH,
   });
 }
 
@@ -12075,7 +12018,6 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
 async function runEntryScanOnce() {
   beginMarketDataPass();
-  printConfigOnce();
   if (entryScanRunning) return;
   entryScanRunning = true;
   try {
@@ -12770,10 +12712,8 @@ function startEntryManager() {
       console.error('entry_manager_failed', err?.message || err);
     });
   }, ENTRY_SCAN_INTERVAL_MS);
-  console.log('runtime_live_critical_config', {
-    stage: 'entry_manager_start',
-    ...buildLiveCriticalConfigSummary(),
-  });
+  logRuntimeConfigEffective();
+  console.log('entry_manager_runtime_config', { stage: 'entry_manager_start', ...getRuntimeConfigSummary() });
   console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS, predictorWarmupEnabled: PREDICTOR_WARMUP_ENABLED, predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, predictorWarmupLogEveryMs: PREDICTOR_WARMUP_LOG_EVERY_MS });
 }
 

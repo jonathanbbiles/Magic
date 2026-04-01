@@ -1,0 +1,140 @@
+const { normalizePair } = require('../symbolUtils');
+
+const BOOLEAN_TRUE = new Set(['true', '1', 'yes', 'y', 'on']);
+const BOOLEAN_FALSE = new Set(['false', '0', 'no', 'n', 'off']);
+
+const parseBoolean = (value, fallback = false) => {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw) return fallback;
+  if (BOOLEAN_TRUE.has(raw)) return true;
+  if (BOOLEAN_FALSE.has(raw)) return false;
+  throw new Error(`Expected boolean-like value but received "${value}"`);
+};
+
+const parsePositiveInt = (value, fallback) => {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Expected positive integer but received "${value}"`);
+  }
+  return Math.floor(parsed);
+};
+
+const parseSymbols = (raw) =>
+  String(raw ?? '')
+    .split(',')
+    .map((symbol) => normalizePair(symbol))
+    .filter(Boolean);
+
+const dedupeSymbols = (symbols) => Array.from(new Set(symbols));
+
+const remediationText =
+  'Remediation: either set ENTRY_UNIVERSE_MODE=configured and populate ENTRY_SYMBOLS_PRIMARY OR explicitly set ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true';
+
+const buildFailureDetails = (summary) => ({
+  nodeEnv: summary.nodeEnv,
+  entryUniverseModeRaw: summary.entryUniverseModeRaw,
+  entryUniverseModeEffective: summary.entryUniverseModeEffective,
+  allowDynamicUniverseInProduction: summary.allowDynamicUniverseInProduction,
+  configuredPrimaryCount: summary.configuredPrimaryCount,
+  configuredSecondaryCount: summary.configuredSecondaryCount,
+  configuredPrimarySample: summary.configuredPrimarySample,
+  configuredSecondarySample: summary.configuredSecondarySample,
+});
+
+function getRuntimeConfig(env = process.env) {
+  const nodeEnv = String(env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
+  const entryUniverseModeRaw = String(env.ENTRY_UNIVERSE_MODE ?? '').trim().toLowerCase();
+  const entryUniverseModeEffective = entryUniverseModeRaw === 'configured' ? 'configured' : 'dynamic';
+  const allowDynamicUniverseInProduction = parseBoolean(env.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, false);
+
+  const configuredPrimarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_PRIMARY));
+  const configuredSecondarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_SECONDARY)).filter(
+    (symbol) => !configuredPrimarySymbols.includes(symbol)
+  );
+
+  return {
+    nodeEnv,
+    entryUniverseModeRaw,
+    entryUniverseModeEffective,
+    allowDynamicUniverseInProduction,
+    entrySymbolsPrimaryRaw: String(env.ENTRY_SYMBOLS_PRIMARY ?? ''),
+    entrySymbolsSecondaryRaw: String(env.ENTRY_SYMBOLS_SECONDARY ?? ''),
+    entrySymbolsIncludeSecondary: parseBoolean(env.ENTRY_SYMBOLS_INCLUDE_SECONDARY, false),
+    executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, true),
+    entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, 10000),
+    entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, 5),
+    entryPrefetchOrderbooks: parseBoolean(env.ENTRY_PREFETCH_ORDERBOOKS, false),
+    alpacaMdMaxConcurrency: parsePositiveInt(env.ALPACA_MD_MAX_CONCURRENCY, 2),
+    barsMaxConcurrent: parsePositiveInt(env.BARS_MAX_CONCURRENT, 2),
+    barsPrefetchIntervalMs: parsePositiveInt(env.BARS_PREFETCH_INTERVAL_MS, 60000),
+    allowPerSymbolBarsFallback: parseBoolean(env.ALLOW_PER_SYMBOL_BARS_FALLBACK, false),
+    predictorWarmupFallbackBudgetPerScan: parsePositiveInt(env.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, 2),
+    predictorWarmupPrefetchConcurrency: parsePositiveInt(env.PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, 2),
+    marketdataRateLimitCooldownMs: parsePositiveInt(env.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, 5000),
+    configuredPrimarySymbols,
+    configuredSecondarySymbols,
+  };
+}
+
+function getRuntimeConfigSummary(env = process.env) {
+  const config = getRuntimeConfig(env);
+  return {
+    nodeEnv: config.nodeEnv,
+    entryUniverseModeRaw: config.entryUniverseModeRaw,
+    entryUniverseModeEffective: config.entryUniverseModeEffective,
+    allowDynamicUniverseInProduction: config.allowDynamicUniverseInProduction,
+    configuredPrimaryCount: config.configuredPrimarySymbols.length,
+    configuredSecondaryCount: config.configuredSecondarySymbols.length,
+    configuredPrimarySample: config.configuredPrimarySymbols.slice(0, 6),
+    configuredSecondarySample: config.configuredSecondarySymbols.slice(0, 6),
+    entryScanIntervalMs: config.entryScanIntervalMs,
+    entryPrefetchChunkSize: config.entryPrefetchChunkSize,
+    entryPrefetchOrderbooks: config.entryPrefetchOrderbooks,
+    alpacaMdMaxConcurrency: config.alpacaMdMaxConcurrency,
+    barsMaxConcurrent: config.barsMaxConcurrent,
+    barsPrefetchIntervalMs: config.barsPrefetchIntervalMs,
+    allowPerSymbolBarsFallback: config.allowPerSymbolBarsFallback,
+    predictorWarmupFallbackBudgetPerScan: config.predictorWarmupFallbackBudgetPerScan,
+    predictorWarmupPrefetchConcurrency: config.predictorWarmupPrefetchConcurrency,
+    marketdataRateLimitCooldownMs: config.marketdataRateLimitCooldownMs,
+    executionTier3Default: config.executionTier3Default,
+  };
+}
+
+function validateRuntimeConfig(env = process.env, options = {}) {
+  const logger = options.logger || console;
+  const summary = getRuntimeConfigSummary(env);
+
+  if (summary.entryUniverseModeEffective === 'configured' && summary.configuredPrimaryCount === 0) {
+    const reason = 'Configured universe mode requires at least one primary symbol.';
+    const details = buildFailureDetails(summary);
+    logger.error('runtime_config_validation_failed', { ...summary, reason, remediation: remediationText });
+    const err = new Error(`${reason} ${JSON.stringify(details)} ${remediationText}`);
+    err.details = details;
+    throw err;
+  }
+
+  if (
+    summary.nodeEnv === 'production' &&
+    summary.entryUniverseModeEffective === 'dynamic' &&
+    !summary.allowDynamicUniverseInProduction
+  ) {
+    const reason = 'Production startup blocked because effective universe mode is dynamic without explicit opt-in.';
+    const details = buildFailureDetails(summary);
+    logger.error('runtime_config_validation_failed', { ...summary, reason, remediation: remediationText });
+    const err = new Error(`${reason} ${JSON.stringify(details)} ${remediationText}`);
+    err.details = details;
+    throw err;
+  }
+
+  return { ok: true, summary };
+}
+
+module.exports = {
+  getRuntimeConfig,
+  getRuntimeConfigSummary,
+  validateRuntimeConfig,
+  remediationText,
+};

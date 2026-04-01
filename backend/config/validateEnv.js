@@ -1,6 +1,7 @@
 const path = require('path');
 const recorder = require('../modules/recorder');
 const { normalizePair } = require('../symbolUtils');
+const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
 
 const maskSecret = (value) => {
   const raw = String(value || '');
@@ -221,14 +222,8 @@ const validateEnv = () => {
     const marketdataOrderbookTtlMs = parseFiniteNumberEnv('MARKETDATA_ORDERBOOK_TTL_MS', 2000);
     const marketdataBarsTtlMs = parseFiniteNumberEnv('MARKETDATA_BARS_TTL_MS', 10000);
     const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000);
-    const entryUniverseModeRaw = String(process.env.ENTRY_UNIVERSE_MODE || 'dynamic').trim().toLowerCase();
-    const entryUniverseMode = entryUniverseModeRaw === 'configured' ? 'configured' : 'dynamic';
-    const nodeEnv = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
-    const allowDynamicUniverseInProduction = parseBooleanEnv('ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION', false);
-    const entrySymbolsPrimary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_PRIMARY', ''));
-    const entrySymbolsSecondary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_SECONDARY', ''))
-      .filter((symbol) => !entrySymbolsPrimary.includes(symbol));
-    const entrySymbolsIncludeSecondary = parseBooleanEnv('ENTRY_SYMBOLS_INCLUDE_SECONDARY', false);
+    const runtimeConfig = getRuntimeConfig(process.env);
+    const runtimeSummary = getRuntimeConfigSummary(process.env);
     const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1);
 
     const failedTradeMaxAgeSec = parseFiniteNumberEnv('FAILED_TRADE_MAX_AGE_SEC', 90);
@@ -352,14 +347,7 @@ const validateEnv = () => {
     if (!sparseFallbackSymbols.length) {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
-    if (entryUniverseMode === 'configured' && !entrySymbolsPrimary.length) {
-      throw new Error('ENTRY_SYMBOLS_PRIMARY must include at least one symbol when ENTRY_UNIVERSE_MODE=configured.');
-    }
-    if (nodeEnv === 'production' && entryUniverseMode !== 'configured' && !allowDynamicUniverseInProduction) {
-      throw new Error(
-        'ENTRY_UNIVERSE_MODE must be "configured" in production unless ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true explicitly opts in to broad dynamic scanning.'
-      );
-    }
+    validateRuntimeConfig(process.env);
     if (!executionTier1Symbols.length) {
       throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
     }
@@ -393,12 +381,13 @@ const validateEnv = () => {
         tier3Default: executionTier3Default,
       },
       entryUniverse: {
-        nodeEnv,
-        mode: entryUniverseMode,
-        allowDynamicUniverseInProduction,
-        primarySymbols: entrySymbolsPrimary,
-        secondarySymbols: entrySymbolsSecondary,
-        includeSecondary: entrySymbolsIncludeSecondary,
+        nodeEnv: runtimeSummary.nodeEnv,
+        modeRaw: runtimeSummary.entryUniverseModeRaw,
+        modeEffective: runtimeSummary.entryUniverseModeEffective,
+        allowDynamicUniverseInProduction: runtimeSummary.allowDynamicUniverseInProduction,
+        primarySymbols: runtimeConfig.configuredPrimarySymbols,
+        secondarySymbols: runtimeConfig.configuredSecondarySymbols,
+        includeSecondary: runtimeConfig.entrySymbolsIncludeSecondary,
       },
       marketDataCoordinator: {
         dedupeEnabled: marketdataDedupeEnabled,
