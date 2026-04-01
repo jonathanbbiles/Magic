@@ -316,6 +316,18 @@ const visibilityGraceSellability = computeExitSellability({
 });
 assert.equal(visibilityGraceSellability.sellabilitySource, 'blocked_replace_pending_visibility');
 assert.equal(visibilityGraceSellability.blockedReason, 'replace_pending_visibility');
+const attachVisibilitySellability = computeExitSellability({
+  symbol: 'SOL/USD',
+  position: { symbol: 'SOLUSD', qty: '2', qty_available: '0' },
+  openOrders: [],
+  trackedState: {
+    exitVisibilityState: 'attach_pending_visibility',
+    exitVisibilityDeadlineAt: Date.now() + 2000,
+    lastKnownReservedSellQty: 2,
+  },
+});
+assert.equal(attachVisibilitySellability.sellabilitySource, 'blocked_attach_pending_visibility');
+assert.equal(attachVisibilitySellability.blockedReason, 'attach_pending_visibility');
 
 const staleTimeStopRefresh = tradeEntryBasis.shouldRefreshExitOrder({
   mode: 'material',
@@ -365,7 +377,7 @@ assert.match(
 );
 assert.match(
   tradeSource,
-  /return \{\s*id: adoptedId,\s*client_order_id: bestOrder\?\.client_order_id \|\| bestOrder\?\.clientOrderId \|\| null,[\s\S]*adopted: true,\s*\};/,
+  /return \{\s*id: adoptedId,\s*client_order_id: bestOrder\?\.client_order_id \|\| bestOrder\?\.clientOrderId \|\| null,[\s\S]*adopted: true,[\s\S]*\};/,
 );
 assert.match(
   tradeSource,
@@ -413,6 +425,11 @@ assert.match(tradeSource, /sellabilitySource: sellability\.sellabilitySource,/);
 assert.match(tradeSource, /console\.log\('sellability_resolved',/);
 assert.match(tradeSource, /replace_visibility_grace_started/);
 assert.match(tradeSource, /replace_visibility_grace_resolved/);
+assert.match(tradeSource, /attach_visibility_grace_started/);
+assert.match(tradeSource, /attach_visibility_grace_resolved/);
+assert.match(tradeSource, /open_sell_adopted_from_broker_truth/);
+assert.match(tradeSource, /open_sell_known_but_not_yet_hydrated/);
+assert.match(tradeSource, /exit_attach_block_cause_changed/);
 assert.match(tradeSource, /tracked_sell_identity_updated/);
 assert.match(tradeSource, /stale_exit_override_triggered/);
 assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);
