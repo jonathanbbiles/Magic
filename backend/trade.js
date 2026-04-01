@@ -484,6 +484,10 @@ const EXIT_FORCE_EXIT_MODE_RAW = String(process.env.EXIT_FORCE_EXIT_MODE || 'ioc
 const EXIT_FORCE_EXIT_MODE = ['ioc_limit', 'market'].includes(EXIT_FORCE_EXIT_MODE_RAW)
   ? EXIT_FORCE_EXIT_MODE_RAW
   : 'ioc_limit';
+const EXIT_DEFENSIVE_IOC_SPREAD_BPS_MAX = readNumber('EXIT_DEFENSIVE_IOC_SPREAD_BPS_MAX', 18);
+const EXIT_DEFENSIVE_IOC_MIN_HOLD_SEC = readNumber('EXIT_DEFENSIVE_IOC_MIN_HOLD_SEC', 60);
+const EXIT_DEFENSIVE_SLIPPAGE_CAP_BPS = readNumber('EXIT_DEFENSIVE_SLIPPAGE_CAP_BPS', 25);
+const EXIT_DEFENSIVE_ALLOW_MARKET_FALLBACK = readEnvFlag('EXIT_DEFENSIVE_ALLOW_MARKET_FALLBACK', false);
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const ENTRY_INTENT_TTL_MS = readNumber('ENTRY_INTENT_TTL_MS', 45000);
 const ENTRY_BUY_TIF = String(process.env.ENTRY_BUY_TIF || 'ioc').trim().toLowerCase();
@@ -4607,6 +4611,65 @@ function shouldRefreshExitOrder({
     if (ticksDiff < EXIT_REFRESH_MIN_ABS_TICKS) return { ok: false, why: 'tick_diff_small' };
   }
   return { ok: true, why: 'material' };
+}
+
+function chooseExitTactic({
+  thesisBroken = false,
+  timeStopTriggered = false,
+  staleTradeTriggered = false,
+  maxHoldForced = false,
+} = {}) {
+  if (maxHoldForced) return 'max_hold_forced_exit';
+  if (thesisBroken) return 'thesis_break_exit';
+  if (timeStopTriggered) return 'time_stop_exit';
+  if (staleTradeTriggered) return 'stale_trade_exit';
+  return 'take_profit_hold';
+}
+
+function buildForcedExitPricePlan({
+  symbol,
+  bid,
+  ask,
+  tickSize,
+  tpLimit,
+  entryPrice,
+  heldSeconds,
+  tacticDecision,
+}) {
+  const spreadBps = Number.isFinite(bid) && Number.isFinite(ask) && bid > 0
+    ? ((ask - bid) / bid) * 10000
+    : null;
+  const safeTick = Number.isFinite(tickSize) && tickSize > 0 ? tickSize : getTickSize({ symbol, price: ask || bid || entryPrice });
+  const iocLimit = Number.isFinite(bid)
+    ? roundDownToTick(bid * (1 - (EXIT_DEFENSIVE_SLIPPAGE_CAP_BPS / 10000)), safeTick)
+    : null;
+  const aggressiveLimit = Number.isFinite(bid) && Number.isFinite(ask)
+    ? roundDownToTick(Math.max(bid, ask - safeTick), safeTick)
+    : (Number.isFinite(bid) ? roundDownToTick(bid, safeTick) : null);
+  const urgencyHigh =
+    tacticDecision === 'thesis_break_exit' ||
+    (Number.isFinite(heldSeconds) && heldSeconds >= EXIT_DEFENSIVE_IOC_MIN_HOLD_SEC);
+  const thinBook = Number.isFinite(spreadBps) ? spreadBps >= EXIT_DEFENSIVE_IOC_SPREAD_BPS_MAX : false;
+  const preferIoc = urgencyHigh || thinBook;
+  const defensiveExitLimit = preferIoc ? (iocLimit ?? aggressiveLimit) : (aggressiveLimit ?? iocLimit);
+  const forcedExitLimit = defensiveExitLimit;
+  const selectedLimit = tacticDecision === 'take_profit_hold'
+    ? tpLimit
+    : (Number.isFinite(forcedExitLimit) ? forcedExitLimit : tpLimit);
+  const route = tacticDecision === 'take_profit_hold'
+    ? 'gtc_limit'
+    : (preferIoc ? 'ioc_limit' : 'aggressive_limit');
+
+  return {
+    spreadBps,
+    tpLimit,
+    defensiveExitLimit,
+    forcedExitLimit,
+    selectedLimit,
+    route,
+    preferIoc,
+    allowMarketFallback: EXIT_DEFENSIVE_ALLOW_MARKET_FALLBACK,
+  };
 }
 
 function applyMakerGuard(limitPrice, bid, tickSize) {
@@ -9516,10 +9579,9 @@ async function manageExitStates() {
         state.breakevenPrice = breakevenPrice;
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
         const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
-        const desiredLimit = Number.isFinite(targetPrice)
+        const tpLimit = Number.isFinite(targetPrice)
           ? targetPrice
           : computeTargetSellPrice(entryBasisValue, requiredExitBpsFinal, tickSize);
-        const finalLimit = applyMakerGuard(desiredLimit, bid, tickSize);
         const marketToExitBps_from_entry =
           Number.isFinite(desiredLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
             ? ((desiredLimit - entryBasisValue) / entryBasisValue) * 10000
@@ -9552,6 +9614,26 @@ async function manageExitStates() {
           Number.isFinite(entryBasisValue) &&
           entryBasisValue > 0 &&
           bid < entryBasisValue;
+        const tacticDecision = chooseExitTactic({
+          thesisBroken: thesisBrokenForRefresh,
+          timeStopTriggered,
+          staleTradeTriggered: failedTradeStale,
+          maxHoldForced: false,
+        });
+        const pricePlan = buildForcedExitPricePlan({
+          symbol,
+          bid,
+          ask,
+          tickSize,
+          tpLimit,
+          entryPrice: entryBasisValue,
+          heldSeconds,
+          tacticDecision,
+        });
+        const desiredLimit = pricePlan.selectedLimit;
+        const finalLimit = tacticDecision === 'take_profit_hold'
+          ? applyMakerGuard(desiredLimit, bid, tickSize)
+          : desiredLimit;
         const exitRefreshDecision = shouldRefreshExitOrder({
           mode: EXIT_REFRESH_MODE,
           existingOrderAgeMs,
@@ -9591,6 +9673,11 @@ async function manageExitStates() {
           desiredLimit,
           marketToExitBps_from_entry,
           exitRefreshDecision: { ...exitRefreshDecision, mode: EXIT_REFRESH_MODE },
+          tacticDecision,
+          tpLimit,
+          defensiveExitLimit: pricePlan.defensiveExitLimit,
+          forcedExitLimit: pricePlan.forcedExitLimit,
+          exitRoute: pricePlan.route,
         };
 
         const tradeGate = shouldSkipTradeActionBecauseTradingOff({ symbol, context: 'exit_manager' }, { intent: 'exit' });
@@ -9900,7 +9987,53 @@ async function manageExitStates() {
         }
 
         if (openSellCount > 0) {
+          const existingAtDesired =
+            Number.isFinite(currentLimit) && Number.isFinite(finalLimit)
+              ? Math.abs(currentLimit - finalLimit) <= (tickSize || 0.00000001)
+              : false;
           if (refreshOrder && exitRefreshDecision.ok) {
+            if (existingAtDesired) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'open_sell_exists_at_tactic_price';
+              const decisionPath = 'exit_refresh_reprice';
+              logExitDecision({
+                symbol,
+                heldSeconds,
+                entryPrice: state.entryPrice,
+                targetPrice,
+                bid,
+                ask,
+                minNetProfitBps,
+                actionTaken,
+              });
+              console.log('exit_scan', {
+                symbol,
+                heldQty: state.qty,
+                ...exitScanBase,
+                existingOrderAgeMs,
+                feeBpsRoundTrip,
+                profitBufferBps,
+                minNetProfitBps,
+                targetPrice,
+                breakevenPrice,
+                desiredLimit,
+                finalLimit,
+                currentLimit,
+                awayBps,
+                decisionPath,
+                lastRepriceAgeMs: Number.isFinite(lastCancelReplaceAt.get(symbol))
+                  ? now - lastCancelReplaceAt.get(symbol)
+                  : null,
+                lastCancelReplaceAt: lastCancelReplaceAt.get(symbol) || null,
+                actionTaken,
+                action: 'hold',
+                reasonCode,
+                iocRequestedQty: null,
+                iocFilledQty: null,
+                iocFallbackReason: null,
+              });
+              continue;
+            }
             const oldOrderId = refreshOrder?.id || refreshOrder?.order_id || null;
             lastExitRefreshAt.set(symbol, now);
             const canceled = oldOrderId ? await cancelOrderSafe(oldOrderId) : false;
@@ -9935,7 +10068,7 @@ async function manageExitStates() {
                 });
                 resolveReplaceVisibilityGrace(state, { symbol, reason: 'replacement_submitted' });
                 actionTaken = 'exit_refresh_reprice';
-                reasonCode = 'exit_refresh_reprice';
+                reasonCode = tacticDecision;
                 lastActionAt.set(symbol, now);
                 console.log('exit_refresh_reprice', {
                   symbol,
@@ -9954,6 +10087,8 @@ async function manageExitStates() {
               reasonCode = 'exit_refresh_cancel_failed';
             }
             const decisionPath = 'exit_refresh_reprice';
+            const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || null;
+            const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
             logExitDecision({
               symbol,
               heldSeconds,
@@ -9987,8 +10122,8 @@ async function manageExitStates() {
               currentLimit,
               awayBps,
               decisionPath,
-              lastRepriceAgeMs,
-              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              lastRepriceAgeMs: loggedLastRepriceAgeMs,
+              lastCancelReplaceAt: loggedLastCancelReplaceAt,
               actionTaken,
             action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
@@ -10060,6 +10195,8 @@ async function manageExitStates() {
               actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice'
                 ? 'cancel_replace'
                 : 'hold_existing_order';
+            const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || null;
+            const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
             logExitDecision({
               symbol,
               heldSeconds,
@@ -10093,8 +10230,8 @@ async function manageExitStates() {
               currentLimit,
               awayBps,
               decisionPath,
-              lastRepriceAgeMs,
-              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              lastRepriceAgeMs: loggedLastRepriceAgeMs,
+              lastCancelReplaceAt: loggedLastCancelReplaceAt,
               actionTaken,
             action: actionTaken === 'reprice_cancel_replace' || actionTaken === 'exit_refresh_reprice' ? 'cancel_replace' : 'hold',
               reasonCode,
@@ -10171,16 +10308,29 @@ async function manageExitStates() {
             updateSellabilityBlockCause(state, symbol, state.exitVisibilityState, { source: 'grace_active' });
             continue;
           }
-          const replacement = await submitLimitSell({
-            symbol,
-            qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
-            limitPrice: finalLimit,
-            reason: 'place_gtc_tp',
-            intentRef: state.entryOrderId || getOrderIntentBucket(),
-            openOrders: symbolOrders,
-            availableQtyOverride,
-            allowSellBelowMin: false,
-          });
+          const plannedQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty;
+          let replacement = null;
+          if (tacticDecision !== 'take_profit_hold' && pricePlan.route === 'ioc_limit' && Number.isFinite(finalLimit)) {
+            replacement = await submitIocLimitSell({
+              symbol,
+              qty: plannedQty,
+              limitPrice: finalLimit,
+              reason: tacticDecision,
+              allowSellBelowMin: false,
+            });
+            replacement = replacement?.order || replacement;
+          } else {
+            replacement = await submitLimitSell({
+              symbol,
+              qty: plannedQty,
+              limitPrice: finalLimit,
+              reason: tacticDecision === 'take_profit_hold' ? 'place_gtc_tp' : tacticDecision,
+              intentRef: state.entryOrderId || getOrderIntentBucket(),
+              openOrders: symbolOrders,
+              availableQtyOverride,
+              allowSellBelowMin: false,
+            });
+          }
           if (!replacement?.skipped && replacement?.id) {
             updateTrackedSellIdentity(state, {
               symbol,
@@ -14426,6 +14576,8 @@ module.exports = {
   resolveEntryBasis,
   computeAwayBps,
   shouldRefreshExitOrder,
+  chooseExitTactic,
+  buildForcedExitPricePlan,
   getBrokerPositionLookupKeys,
   extractBrokerPositionQty,
   getOpenSellOrdersForSymbol,

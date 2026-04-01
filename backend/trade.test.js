@@ -346,6 +346,49 @@ const staleTimeStopRefresh = tradeEntryBasis.shouldRefreshExitOrder({
 assert.equal(staleTimeStopRefresh.ok, true);
 assert.equal(staleTimeStopRefresh.why, 'time_stop');
 
+assert.equal(
+  tradeEntryBasis.chooseExitTactic({
+    thesisBroken: true,
+    timeStopTriggered: false,
+    staleTradeTriggered: true,
+    maxHoldForced: false,
+  }),
+  'thesis_break_exit',
+);
+assert.equal(
+  tradeEntryBasis.chooseExitTactic({
+    thesisBroken: false,
+    timeStopTriggered: true,
+    staleTradeTriggered: false,
+    maxHoldForced: false,
+  }),
+  'time_stop_exit',
+);
+const defensivePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
+  symbol: 'BTC/USD',
+  bid: 90,
+  ask: 90.2,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryPrice: 100,
+  heldSeconds: 120,
+  tacticDecision: 'thesis_break_exit',
+});
+assert.equal(defensivePricePlan.route, 'ioc_limit');
+assert.notEqual(defensivePricePlan.selectedLimit, defensivePricePlan.tpLimit);
+assert.ok(defensivePricePlan.selectedLimit < defensivePricePlan.tpLimit);
+const holdPricePlan = tradeEntryBasis.buildForcedExitPricePlan({
+  symbol: 'BTC/USD',
+  bid: 100,
+  ask: 100.1,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryPrice: 100,
+  heldSeconds: 30,
+  tacticDecision: 'take_profit_hold',
+});
+assert.equal(holdPricePlan.selectedLimit, holdPricePlan.tpLimit);
+
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.match(
   tradeSource,
@@ -432,6 +475,11 @@ assert.match(tradeSource, /open_sell_known_but_not_yet_hydrated/);
 assert.match(tradeSource, /exit_attach_block_cause_changed/);
 assert.match(tradeSource, /tracked_sell_identity_updated/);
 assert.match(tradeSource, /stale_exit_override_triggered/);
+assert.match(tradeSource, /tacticDecision,/);
+assert.match(tradeSource, /open_sell_exists_at_tactic_price/);
+assert.match(tradeSource, /reasonCode = tacticDecision;/);
+assert.match(tradeSource, /lastRepriceAgeMs: loggedLastRepriceAgeMs/);
+assert.match(tradeSource, /lastCancelReplaceAt: loggedLastCancelReplaceAt/);
 assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);
 assert.match(tradeSource, /console\.log\('tp_attach_submitted',/);
 assert.match(tradeSource, /console\.log\('entry_universe_selection', \{/);
