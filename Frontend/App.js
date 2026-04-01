@@ -44,7 +44,10 @@ const API_TOKEN =
 async function fetchDashboard() {
   const url = `${String(BASE_URL).replace(/\/$/, '')}/dashboard`;
   const headers = { Accept: 'application/json' };
-  if (API_TOKEN) headers.Authorization = `Bearer ${API_TOKEN}`;
+  if (API_TOKEN) {
+    headers.Authorization = `Bearer ${API_TOKEN}`;
+    headers['x-api-key'] = API_TOKEN;
+  }
 
   const res = await fetch(url, { headers });
   const text = await res.text();

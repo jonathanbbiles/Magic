@@ -424,6 +424,7 @@ const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
 const chunkSizeEnv = Number(process.env.ENTRY_PREFETCH_CHUNK_SIZE);
 const ENTRY_PREFETCH_CHUNK_SIZE =
   Number.isFinite(chunkSizeEnv) ? Math.max(1, chunkSizeEnv) : 3;
+const ENTRY_PREFETCH_ORDERBOOKS = readEnvFlag('ENTRY_PREFETCH_ORDERBOOKS', false);
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
@@ -436,7 +437,7 @@ const PREDICTOR_MIN_BARS_5M = readNumber('PREDICTOR_MIN_BARS_5M', 30);
 const PREDICTOR_MIN_BARS_15M = readNumber('PREDICTOR_MIN_BARS_15M', 20);
 const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', false);
 const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS', 60000);
-const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 4));
+const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, readNumber('PREDICTOR_WARMUP_PREFETCH_CONCURRENCY', 1));
 const BARS_PREFETCH_INTERVAL_MS = readNumber('BARS_PREFETCH_INTERVAL_MS', 60000);
 const ALLOW_PER_SYMBOL_BARS_FALLBACK = readEnvFlag('ALLOW_PER_SYMBOL_BARS_FALLBACK', false);
 const PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN = Math.max(0, readNumber('PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN', 2));
@@ -11914,6 +11915,30 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     };
   }
 
+  const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
+  if (!opts.force) {
+    const cooldownBlockedEndpoints = [];
+    if (cooldownSnapshot.quote) cooldownBlockedEndpoints.push('quote');
+    if (cooldownSnapshot.bars) cooldownBlockedEndpoints.push('bars');
+    if (ENTRY_PREFETCH_ORDERBOOKS && cooldownSnapshot.orderbook) cooldownBlockedEndpoints.push('orderbook');
+    if (cooldownBlockedEndpoints.length > 0) {
+      console.warn('entry_scan_prefetch_skipped', {
+        reason: 'endpoint_cooldown',
+        blockedEndpoints: cooldownBlockedEndpoints,
+        cooldownSnapshot,
+        prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+      });
+      return {
+        ok: true,
+        skipped: 'endpoint_cooldown',
+        skippedEndpoints: cooldownBlockedEndpoints,
+        cooldownSnapshot,
+        prefetchedBars: lastPrefetchedBars,
+        prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+      };
+    }
+  }
+
   lastBarsPrefetchMs = nowMs;
   const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
   const chunks = chunkArray(symbols, chunkSize);
@@ -11927,51 +11952,71 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     '15m': getBarsFetchRange({ timeframe: '15Min', limit: warmupLimits['15m'] }),
   };
 
-  for (const chunkSymbols of chunks) {
-    try {
-      const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
-      const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
-      const bars1mResp = await fetchCryptoBarsWarmupPaged({
-        symbols: chunkSymbols,
-        perSymbolLimit: warmupLimits['1m'],
-        timeframe: '1Min',
-        start: ranges['1m'].start,
-        end: ranges['1m'].end,
-      });
-      const bars5mResp = await fetchCryptoBarsWarmupPaged({
-        symbols: chunkSymbols,
-        perSymbolLimit: warmupLimits['5m'],
-        timeframe: '5Min',
-        start: ranges['5m'].start,
-        end: ranges['5m'].end,
-      });
-      const bars15mResp = await fetchCryptoBarsWarmupPaged({
-        symbols: chunkSymbols,
-        perSymbolLimit: warmupLimits['15m'],
-        timeframe: '15Min',
-        start: ranges['15m'].start,
-        end: ranges['15m'].end,
-      });
+  const warmupPrefetchConcurrency = Math.max(
+    1,
+    Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, chunks.length || 1),
+  );
+  const processChunk = async (chunkSymbols) => {
+    const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
+    const orderbooksResp = ENTRY_PREFETCH_ORDERBOOKS
+      ? await fetchCryptoOrderbooks({ symbols: chunkSymbols })
+      : null;
+    const bars1mResp = await fetchCryptoBarsWarmupPaged({
+      symbols: chunkSymbols,
+      perSymbolLimit: warmupLimits['1m'],
+      timeframe: '1Min',
+      start: ranges['1m'].start,
+      end: ranges['1m'].end,
+    });
+    const bars5mResp = await fetchCryptoBarsWarmupPaged({
+      symbols: chunkSymbols,
+      perSymbolLimit: warmupLimits['5m'],
+      timeframe: '5Min',
+      start: ranges['5m'].start,
+      end: ranges['5m'].end,
+    });
+    const bars15mResp = await fetchCryptoBarsWarmupPaged({
+      symbols: chunkSymbols,
+      perSymbolLimit: warmupLimits['15m'],
+      timeframe: '15Min',
+      start: ranges['15m'].start,
+      end: ranges['15m'].end,
+    });
 
-      warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+    warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+    if (ENTRY_PREFETCH_ORDERBOOKS && orderbooksResp) {
       warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
-
-      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars1mResp).entries()) {
-        bars1mBySymbol.set(symbol, series);
-      }
-      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars5mResp).entries()) {
-        bars5mBySymbol.set(symbol, series);
-      }
-      for (const [symbol, series] of buildBarsMapFromBatch(chunkSymbols, bars15mResp).entries()) {
-        bars15mBySymbol.set(symbol, series);
-      }
-    } catch (err) {
-      console.warn('entry_scan_prefetch_failed', {
-        errorName: err?.name || null,
-        errorMessage: err?.message || String(err),
-      });
-      return { ok: false, error: err?.message || String(err) };
     }
+
+    return {
+      bars1m: buildBarsMapFromBatch(chunkSymbols, bars1mResp),
+      bars5m: buildBarsMapFromBatch(chunkSymbols, bars5mResp),
+      bars15m: buildBarsMapFromBatch(chunkSymbols, bars15mResp),
+    };
+  };
+
+  try {
+    for (let i = 0; i < chunks.length; i += warmupPrefetchConcurrency) {
+      const batch = chunks.slice(i, i + warmupPrefetchConcurrency);
+      const batchResults = await Promise.all(batch.map((chunkSymbols) => processChunk(chunkSymbols)));
+      for (const result of batchResults) {
+        for (const [symbol, series] of result.bars1m.entries()) {
+          bars1mBySymbol.set(symbol, series);
+        }
+        for (const [symbol, series] of result.bars5m.entries()) {
+          bars5mBySymbol.set(symbol, series);
+        }
+        for (const [symbol, series] of result.bars15m.entries()) {
+          bars15mBySymbol.set(symbol, series);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('entry_scan_prefetch_failed', {
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+    });
+    return { ok: false, error: err?.message || String(err) };
   }
 
   lastPrefetchedBars = {
@@ -11983,6 +12028,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   return {
     ok: true,
     prefetchedBars: lastPrefetchedBars,
+    prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+    warmupPrefetchConcurrency,
+    chunkSize,
+    chunkSizeCap: 20,
+    orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'enabled' : 'skipped_env_disabled',
   };
 }
 

@@ -4,20 +4,7 @@ This frontend is a minimal Expo diagnostic app used to verify backend reachabili
 
 ## What this app does
 
-The app runs three checks against your existing backend:
-
-1. `GET /health` (public)
-2. `GET /debug/auth` (public)
-3. `GET /dashboard` (with token headers if configured)
-
-It then shows:
-
-- active backend URL
-- whether frontend token is present
-- which auth mode was used
-- summary status for reachability/auth/dashboard
-- raw endpoint responses (JSON when possible, text fallback otherwise)
-- plain-English diagnostics for common failure modes
+The app polls `GET /dashboard` and renders account + position diagnostics.
 
 ## Environment variables
 
@@ -46,13 +33,11 @@ Then open in Expo Go or simulator.
 
 ## Endpoint usage details
 
-- `/health` is called without auth headers.
-- `/debug/auth` is called without auth headers.
-- `/dashboard` is always called:
-  - If `EXPO_PUBLIC_API_TOKEN` exists, frontend sends both:
-    - `Authorization: Bearer <token>`
-    - `x-api-key: <token>`
-  - If token is missing, request is still sent without token to show real backend response.
+- `/dashboard` is always called.
+- If `EXPO_PUBLIC_API_TOKEN` exists, frontend sends both:
+  - `Authorization: Bearer <token>`
+  - `x-api-key: <token>`
+- If token is missing, request is still sent without token.
 
 ## Networking notes
 
