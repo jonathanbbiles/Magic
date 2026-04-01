@@ -200,6 +200,22 @@ const staleRefresh = tradeEntryBasis.shouldRefreshExitOrder({
 });
 assert.equal(staleRefresh.ok, true);
 assert.equal(staleRefresh.why, 'thesis_break');
+const staleRefreshWithCooldown = tradeEntryBasis.shouldRefreshExitOrder({
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  awayBps: 1,
+  currentLimit: 100.2,
+  nextLimit: 99.5,
+  tickSize: 0.01,
+  refreshCooldownActive: true,
+  quoteAgeMs: 2000,
+  heldMs: 500000,
+  staleTradeMs: 90000,
+  thesisBroken: false,
+  timeStopTriggered: true,
+});
+assert.equal(staleRefreshWithCooldown.ok, true);
+assert.equal(staleRefreshWithCooldown.why, 'time_stop');
 
 const fallbackEntry = resolveEntryBasis({ avgEntryPrice: 0, fallbackEntryPrice: 101 });
 assert.equal(fallbackEntry.entryBasisType, 'fallback_local');
@@ -364,6 +380,24 @@ assert.equal(
   }),
   'time_stop_exit',
 );
+assert.equal(
+  tradeEntryBasis.chooseExitTactic({
+    thesisBroken: false,
+    timeStopTriggered: false,
+    staleTradeTriggered: true,
+    maxHoldForced: false,
+  }),
+  'stale_trade_exit',
+);
+assert.equal(
+  tradeEntryBasis.chooseExitTactic({
+    thesisBroken: true,
+    timeStopTriggered: true,
+    staleTradeTriggered: true,
+    maxHoldForced: true,
+  }),
+  'max_hold_forced_exit',
+);
 const defensivePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
   symbol: 'BTC/USD',
   bid: 90,
@@ -388,8 +422,36 @@ const holdPricePlan = tradeEntryBasis.buildForcedExitPricePlan({
   tacticDecision: 'take_profit_hold',
 });
 assert.equal(holdPricePlan.selectedLimit, holdPricePlan.tpLimit);
+const staleTradePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
+  symbol: 'BTC/USD',
+  bid: 89.7,
+  ask: 90.1,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryPrice: 100,
+  heldSeconds: 800,
+  tacticDecision: 'stale_trade_exit',
+});
+assert.notEqual(staleTradePricePlan.selectedLimit, staleTradePricePlan.tpLimit);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
+const tpLimitIndex = tradeSource.indexOf('const tpLimit =');
+const tacticDecisionIndex = tradeSource.indexOf('const tacticDecision = chooseExitTactic');
+const pricePlanIndex = tradeSource.indexOf('const pricePlan = buildForcedExitPricePlan');
+const desiredLimitIndex = tradeSource.indexOf('const desiredLimit = pricePlan.selectedLimit');
+const finalLimitIndex = tradeSource.indexOf('const finalLimit = tacticDecision');
+const marketToExitBpsIndex = tradeSource.indexOf('const marketToExitBps_from_entry =');
+const awayBpsIndex = tradeSource.indexOf('const awayBps = computeAwayBps(currentLimit, finalLimit)');
+const exitRefreshDecisionIndex = tradeSource.indexOf('const exitRefreshDecision = shouldRefreshExitOrder');
+const exitScanBaseIndex = tradeSource.indexOf('const exitScanBase = {');
+assert.ok(tpLimitIndex < tacticDecisionIndex);
+assert.ok(tacticDecisionIndex < pricePlanIndex);
+assert.ok(pricePlanIndex < desiredLimitIndex);
+assert.ok(desiredLimitIndex < finalLimitIndex);
+assert.ok(finalLimitIndex < marketToExitBpsIndex);
+assert.ok(marketToExitBpsIndex < awayBpsIndex);
+assert.ok(awayBpsIndex < exitRefreshDecisionIndex);
+assert.ok(exitRefreshDecisionIndex < exitScanBaseIndex);
 assert.match(
   tradeSource,
   /async function fetchLiveOrders\(\{ force = false \} = \{\}\)[\s\S]*fetchOrders\(\{ status: 'open', nested: true, direction: 'desc', limit: 500 \}\)/,
@@ -478,6 +540,7 @@ assert.match(tradeSource, /stale_exit_override_triggered/);
 assert.match(tradeSource, /tacticDecision,/);
 assert.match(tradeSource, /open_sell_exists_at_tactic_price/);
 assert.match(tradeSource, /reasonCode = tacticDecision;/);
+assert.match(tradeSource, /actionTaken =\s*tacticDecision !== 'take_profit_hold' && pricePlan\.route === 'ioc_limit'[\s\S]*'defensive_exit_ioc_submitted'/);
 assert.match(tradeSource, /lastRepriceAgeMs: loggedLastRepriceAgeMs/);
 assert.match(tradeSource, /lastCancelReplaceAt: loggedLastCancelReplaceAt/);
 assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);

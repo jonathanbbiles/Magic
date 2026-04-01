@@ -4576,10 +4576,11 @@ function shouldRefreshExitOrder({
   timeStopTriggered = false,
 }) {
   if (!EXIT_REFRESH_ENABLED) return { ok: false, why: 'disabled' };
-  if (refreshCooldownActive && !thesisBroken) return { ok: false, why: 'cooldown' };
-  if (!Number.isFinite(existingOrderAgeMs)) return { ok: false, why: 'no_age' };
   const staleThresholdMs = Number.isFinite(staleTradeMs) && staleTradeMs > 0 ? staleTradeMs : EXIT_MAX_ORDER_AGE_MS;
   const staleTradeTriggered = Number.isFinite(heldMs) && heldMs >= staleThresholdMs;
+  const defensiveOverrideRequested = thesisBroken || timeStopTriggered || staleTradeTriggered;
+  if (refreshCooldownActive && !defensiveOverrideRequested) return { ok: false, why: 'cooldown' };
+  if (!Number.isFinite(existingOrderAgeMs)) return { ok: false, why: 'no_age' };
   if (thesisBroken || timeStopTriggered || staleTradeTriggered) {
     if (thesisBroken || timeStopTriggered || existingOrderAgeMs >= EXIT_REFRESH_MIN_ORDER_AGE_MS) {
       return {
@@ -9582,10 +9583,6 @@ async function manageExitStates() {
         const tpLimit = Number.isFinite(targetPrice)
           ? targetPrice
           : computeTargetSellPrice(entryBasisValue, requiredExitBpsFinal, tickSize);
-        const marketToExitBps_from_entry =
-          Number.isFinite(desiredLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
-            ? ((desiredLimit - entryBasisValue) / entryBasisValue) * 10000
-            : null;
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
         const hasOpenSell = openSellOrders.length > 0 || Boolean(state.sellOrderId);
@@ -9601,7 +9598,6 @@ async function manageExitStates() {
           existingOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
           currentLimit = normalizeOrderLimitPrice(refreshOrder) ?? state.sellOrderLimit;
         }
-        const awayBps = computeAwayBps(currentLimit, desiredLimit);
         const lastRefreshAtMs = lastExitRefreshAt.get(symbol) || null;
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
@@ -9634,6 +9630,11 @@ async function manageExitStates() {
         const finalLimit = tacticDecision === 'take_profit_hold'
           ? applyMakerGuard(desiredLimit, bid, tickSize)
           : desiredLimit;
+        const marketToExitBps_from_entry =
+          Number.isFinite(finalLimit) && Number.isFinite(entryBasisValue) && entryBasisValue > 0
+            ? ((finalLimit - entryBasisValue) / entryBasisValue) * 10000
+            : null;
+        const awayBps = computeAwayBps(currentLimit, finalLimit);
         const exitRefreshDecision = shouldRefreshExitOrder({
           mode: EXIT_REFRESH_MODE,
           existingOrderAgeMs,
@@ -10344,8 +10345,11 @@ async function manageExitStates() {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement?.reason || 'open_sell_exists';
             } else {
-              actionTaken = 'place_gtc_tp';
-              reasonCode = 'place_gtc_tp';
+              actionTaken =
+                tacticDecision !== 'take_profit_hold' && pricePlan.route === 'ioc_limit'
+                  ? 'defensive_exit_ioc_submitted'
+                  : 'place_gtc_tp';
+              reasonCode = tacticDecision === 'take_profit_hold' ? 'place_gtc_tp' : tacticDecision;
             }
             lastActionAt.set(symbol, now);
           } else {
