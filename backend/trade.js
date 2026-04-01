@@ -708,6 +708,7 @@ const RISK_COOLDOWN_MS = readNumber('RISK_COOLDOWN_MS', 1800000);
 
 const EXIT_REFRESH_COOLDOWN_MS = 30000;
 const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
+const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
 const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000);
 const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
@@ -2875,6 +2876,105 @@ function clearExitTracking(symbol, meta = null) {
   console.log('exit_tracking_cleared', { symbol: s, ...before, meta });
 }
 
+function updateTrackedSellIdentity(state, {
+  symbol,
+  order = null,
+  orderId = null,
+  clientOrderId = null,
+  submittedAtMs = null,
+  limitPrice = null,
+  source = 'unknown',
+}) {
+  if (!state || typeof state !== 'object') return;
+  const resolvedOrderId = orderId || order?.id || order?.order_id || null;
+  const resolvedClientOrderId =
+    clientOrderId ||
+    order?.client_order_id ||
+    order?.clientOrderId ||
+    null;
+  const submittedAtRaw =
+    submittedAtMs ??
+    order?.submittedAt ??
+    order?.submitted_at ??
+    order?.createdAt ??
+    order?.created_at ??
+    null;
+  const parsedSubmittedAt = typeof submittedAtRaw === 'string' ? Date.parse(submittedAtRaw) : Number(submittedAtRaw);
+  const shouldClearIdentity = !resolvedOrderId && !resolvedClientOrderId && submittedAtMs === null;
+  const resolvedSubmittedAt = shouldClearIdentity ? null : (Number.isFinite(parsedSubmittedAt) ? parsedSubmittedAt : Date.now());
+  const resolvedLimitPrice = Number.isFinite(Number(limitPrice))
+    ? Number(limitPrice)
+    : (shouldClearIdentity ? null : (normalizeOrderLimitPrice(order) ?? state.sellOrderLimit ?? null));
+
+  state.sellOrderId = resolvedOrderId;
+  state.sellClientOrderId = resolvedClientOrderId;
+  state.sellOrderSubmittedAt = resolvedSubmittedAt;
+  state.sellOrderLimit = resolvedLimitPrice;
+
+  const sellQty = resolveOrderQty(order);
+  if (Number.isFinite(sellQty) && sellQty > 0) {
+    state.lastKnownReservedSellQty = sellQty;
+  }
+
+  console.log('tracked_sell_identity_updated', {
+    symbol,
+    source,
+    sellOrderId: state.sellOrderId || null,
+    sellClientOrderId: state.sellClientOrderId || null,
+    sellOrderSubmittedAt: state.sellOrderSubmittedAt || null,
+    sellOrderLimit: Number.isFinite(state.sellOrderLimit) ? state.sellOrderLimit : null,
+    lastKnownReservedSellQty: Number.isFinite(state.lastKnownReservedSellQty) ? state.lastKnownReservedSellQty : null,
+  });
+}
+
+function startReplaceVisibilityGrace(state, { symbol, visibilityState, reason, nowMs = Date.now() }) {
+  if (!state || typeof state !== 'object') return;
+  state.exitVisibilityState = visibilityState;
+  state.exitVisibilityStartedAt = nowMs;
+  state.exitVisibilityDeadlineAt = nowMs + EXIT_REPLACE_VISIBILITY_GRACE_MS;
+  if (!Number.isFinite(state.lastKnownReservedSellQty) || state.lastKnownReservedSellQty <= 0) {
+    const fallbackQty = Number(state.qty);
+    if (Number.isFinite(fallbackQty) && fallbackQty > 0) {
+      state.lastKnownReservedSellQty = fallbackQty;
+    }
+  }
+  console.log('replace_visibility_grace_started', {
+    symbol,
+    visibilityState,
+    reason: reason || null,
+    deadlineAt: state.exitVisibilityDeadlineAt,
+    graceMs: EXIT_REPLACE_VISIBILITY_GRACE_MS,
+    reservedQtyHint: state.lastKnownReservedSellQty || null,
+  });
+}
+
+function resolveReplaceVisibilityGrace(state, { symbol, reason, nowMs = Date.now() }) {
+  if (!state || typeof state !== 'object') return;
+  const wasState = state.exitVisibilityState || null;
+  if (!wasState) return;
+  state.exitVisibilityState = null;
+  state.exitVisibilityStartedAt = null;
+  state.exitVisibilityDeadlineAt = null;
+  console.log('replace_visibility_grace_resolved', {
+    symbol,
+    previousVisibilityState: wasState,
+    reason: reason || null,
+    resolvedAt: nowMs,
+  });
+}
+
+function updateSellabilityBlockCause(state, symbol, cause, context = {}) {
+  if (!state || typeof state !== 'object') return;
+  const nextCause = cause || null;
+  if (state.sellabilityBlockCause === nextCause) return;
+  state.sellabilityBlockCause = nextCause;
+  console.log('sellability_block_cause_changed', {
+    symbol,
+    cause: nextCause,
+    ...context,
+  });
+}
+
 // Only call this on hard broker evidence, not cache/snapshot membership.
 function markPositionConfirmed(symbol, tsMs = Date.now()) {
   const normalized = normalizeSymbolInternal(symbol);
@@ -4464,14 +4564,20 @@ function shouldRefreshExitOrder({
   heldMs,
   staleTradeMs,
   thesisBroken = false,
+  timeStopTriggered = false,
 }) {
   if (!EXIT_REFRESH_ENABLED) return { ok: false, why: 'disabled' };
   if (refreshCooldownActive && !thesisBroken) return { ok: false, why: 'cooldown' };
   if (!Number.isFinite(existingOrderAgeMs)) return { ok: false, why: 'no_age' };
   const staleThresholdMs = Number.isFinite(staleTradeMs) && staleTradeMs > 0 ? staleTradeMs : EXIT_MAX_ORDER_AGE_MS;
-  if ((Number.isFinite(heldMs) && heldMs >= staleThresholdMs) || thesisBroken) {
-    if (existingOrderAgeMs >= EXIT_REFRESH_MIN_ORDER_AGE_MS || thesisBroken) {
-      return { ok: true, why: thesisBroken ? 'thesis_break' : 'stale_trade' };
+  const staleTradeTriggered = Number.isFinite(heldMs) && heldMs >= staleThresholdMs;
+  if (thesisBroken || timeStopTriggered || staleTradeTriggered) {
+    if (thesisBroken || timeStopTriggered || existingOrderAgeMs >= EXIT_REFRESH_MIN_ORDER_AGE_MS) {
+      return {
+        ok: true,
+        why: thesisBroken ? 'thesis_break' : (timeStopTriggered ? 'time_stop' : 'stale_trade'),
+        override: true,
+      };
     }
   }
 
@@ -5798,6 +5904,7 @@ function computeExitSellability({
   symbol,
   position = null,
   openOrders = [],
+  trackedState = null,
 }) {
   const canonicalSymbol = normalizePair(symbol);
   const openSellOrders = getOpenSellOrdersForSymbol(openOrders, canonicalSymbol);
@@ -5813,6 +5920,14 @@ function computeExitSellability({
   const inferredAvailableQty = Math.max(0, totalPositionQty - reservedQty);
   const hasOpenSell = openSellCount > 0 || openSellQty > 0;
   const hasReservedQty = reservedQty > 0;
+  const visibilityState = trackedState?.exitVisibilityState || null;
+  const visibilityDeadlineAt = Number(trackedState?.exitVisibilityDeadlineAt);
+  const visibilityActive = Boolean(
+    visibilityState &&
+    Number.isFinite(visibilityDeadlineAt) &&
+    visibilityDeadlineAt > Date.now(),
+  );
+  const reservedQtyHint = Number(trackedState?.lastKnownReservedSellQty);
   let availableQty = 0;
   let sellabilitySource = 'blocked_no_position_qty';
   let blockedReason = null;
@@ -5820,6 +5935,9 @@ function computeExitSellability({
   if (hasOpenSell) {
     sellabilitySource = 'blocked_open_sell_exists';
     blockedReason = 'open_sell_exists';
+  } else if (visibilityActive) {
+    sellabilitySource = 'blocked_replace_pending_visibility';
+    blockedReason = visibilityState;
   } else if (hasReservedQty) {
     sellabilitySource = 'blocked_qty_reserved';
     blockedReason = 'qty_reserved';
@@ -5829,13 +5947,13 @@ function computeExitSellability({
       sellabilitySource = 'broker_available';
     } else {
       sellabilitySource = 'blocked_broker_available_qty_zero';
-      blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
+      blockedReason = totalPositionQty > 0 ? 'broker_qty_not_yet_released' : 'true_no_position_qty';
     }
   } else if (inferredAvailableQty > 0) {
     availableQty = inferredAvailableQty;
     sellabilitySource = qty.hasAvailableQtyField ? 'inferred_from_total_qty' : 'inferred_from_position_qty';
   } else {
-    blockedReason = totalPositionQty > 0 ? 'no_sellable_qty' : 'no_position_qty';
+    blockedReason = totalPositionQty > 0 ? 'true_no_sellable_qty' : 'true_no_position_qty';
   }
   const sellableQty = Math.max(0, availableQty);
   return {
@@ -5850,6 +5968,10 @@ function computeExitSellability({
     openSellCount,
     openSellOrders,
     hasAvailableQtyField: qty.hasAvailableQtyField,
+    visibilityActive,
+    visibilityState,
+    visibilityDeadlineAt: Number.isFinite(visibilityDeadlineAt) ? visibilityDeadlineAt : null,
+    reservedQtyHint: Number.isFinite(reservedQtyHint) ? Math.max(0, reservedQtyHint) : 0,
     sellabilitySource,
     blockedReason,
   };
@@ -5891,6 +6013,7 @@ async function resolveExitSellabilityFromBrokerTruth({
       symbol: canonicalSymbol,
       position: brokerPosition,
       openOrders: openList,
+      trackedState,
     });
 
     console.log('broker_truth_position_found', {
@@ -5947,7 +6070,7 @@ async function resolveExitSellabilityFromBrokerTruth({
     if (!adoptedOpenSell && trackedClientOrderId) {
       let lookedUpByClientId = null;
       try {
-        lookedUpByClientId = await fetchOrderByClientOrderId(trackedClientOrderId);
+        lookedUpByClientId = await fetchOrderByClientOrderId(trackedClientOrderId, { expectedNotFound: true, symbol: canonicalSymbol });
       } catch (err) {
         lookedUpByClientId = null;
       }
@@ -5972,6 +6095,7 @@ async function resolveExitSellabilityFromBrokerTruth({
         symbol: canonicalSymbol,
         position: brokerPosition,
         openOrders: adoptedOpenOrders,
+        trackedState,
       });
       console.log('open_sell_adopted_from_direct_lookup', {
         symbol: canonicalSymbol,
@@ -6001,12 +6125,17 @@ async function resolveExitSellabilityFromBrokerTruth({
     }
   }
 
+  if (finalSellability.visibilityActive && finalSellability.openSellCount > 0) {
+    resolveReplaceVisibilityGrace(trackedState, { symbol: canonicalSymbol, reason: 'open_sell_visible_again' });
+  }
+
   console.log('sellability_resolved', {
     symbol: canonicalSymbol,
     brokerPositionQty: finalSellability.totalPositionQty,
     brokerAvailableQty: finalSellability.brokerAvailableQty,
     openSellQty: finalSellability.openSellQty,
     reservedQty: finalSellability.reservedQty,
+    visibilityState: finalSellability.visibilityState,
     finalSellableQty: finalSellability.availableQty,
     blockedReason: finalSellability.blockedReason,
   });
@@ -7080,6 +7209,7 @@ async function fetchOrderById(orderId) {
 }
 
 async function fetchOrderByClientOrderId(clientOrderId) {
+  const options = arguments[1] && typeof arguments[1] === 'object' ? arguments[1] : {};
   if (!clientOrderId) return null;
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
@@ -7095,6 +7225,14 @@ async function fetchOrderByClientOrderId(clientOrderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
+    const statusCode = err?.statusCode ?? err?.status ?? null;
+    if (statusCode === 404 && options.expectedNotFound) {
+      console.log('tracked_sell_lookup_not_found_expected', {
+        symbol: options.symbol || null,
+        client_order_id: clientOrderId,
+      });
+      return null;
+    }
     logHttpError({ label: 'orders_by_client_order_id', url, error: err });
     throw err;
   }
@@ -7294,6 +7432,7 @@ async function submitLimitSell({
   const open = openOrders || (await fetchLiveOrders({ force: true }));
   const openList = Array.isArray(open) ? open : [];
   const normalizedSymbol = normalizePair(symbol);
+  const trackedState = exitState.get(normalizedSymbol) || null;
   const trackedSellClientOrderId = buildTpClientOrderId(symbol, intentRef);
 
   const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
@@ -7319,6 +7458,7 @@ async function submitLimitSell({
     symbol: normalizedSymbol,
     openOrders: openList,
     trackedSellClientOrderId,
+    trackedSellOrderId: trackedState?.sellOrderId || null,
     maxAttempts: 1,
   });
   console.log('exit_sellability_check', {
@@ -7349,6 +7489,7 @@ async function submitLimitSell({
     symbol: normalizedSymbol,
     openOrders: null,
     trackedSellClientOrderId,
+    trackedSellOrderId: trackedState?.sellOrderId || null,
     maxAttempts: 3,
     retryMs: 500,
   });
@@ -7436,9 +7577,15 @@ async function submitLimitSell({
     };
   }
   if (!(availableQty > 0)) {
-    const deferReason = brokerRecheckSellability.blockedReason === 'no_position_qty'
-      ? 'no_position_qty'
-      : 'qty_reserved_or_unavailable';
+    const reasonMap = {
+      open_sell_exists: 'open_sell_exists',
+      replace_pending_visibility: 'replace_pending_visibility',
+      reattach_pending_visibility: 'reattach_pending_visibility',
+      broker_qty_not_yet_released: 'broker_qty_not_yet_released',
+      true_no_position_qty: 'no_position_qty',
+      true_no_sellable_qty: 'qty_reserved_or_unavailable',
+    };
+    const deferReason = reasonMap[brokerRecheckSellability.blockedReason] || 'qty_reserved_or_unavailable';
     console.log('tp_attach_deferred', {
       symbol,
       canonicalSymbol: normalizedSymbol,
@@ -7943,7 +8090,7 @@ async function attachInitialExitLimit({
   const sellOrderSubmittedAt =
     typeof sellOrderSubmittedAtRaw === 'string' ? Date.parse(sellOrderSubmittedAtRaw) : sellOrderSubmittedAtRaw;
 
-  exitState.set(symbol, {
+  const newState = {
     symbol,
     qty: qtyNum,
     entryPrice: entryPriceBasis,
@@ -7972,6 +8119,16 @@ async function attachInitialExitLimit({
     sellOrderLimit,
     takerAttempted: false,
     entryMomentumState: entryMomentumState || null,
+  };
+  exitState.set(symbol, newState);
+  updateTrackedSellIdentity(newState, {
+    symbol,
+    order: sellOrder,
+    orderId: sellOrderId,
+    clientOrderId: sellClientOrderId,
+    submittedAtMs: Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now,
+    limitPrice: sellOrderLimit,
+    source: 'attach_initial_exit_limit',
   });
 
   const initialActionTaken =
@@ -8961,9 +9118,14 @@ async function manageExitStates() {
         const submittedAt = submittedAtRaw ? Date.parse(submittedAtRaw) : null;
         const submittedAtMs = Number.isFinite(submittedAt) ? submittedAt : Date.now();
         const limitPrice = normalizeOrderLimitPrice(chosen);
-        state.sellOrderId = adoptedOrderId;
-        state.sellOrderSubmittedAt = submittedAtMs;
-        state.sellOrderLimit = limitPrice;
+        updateTrackedSellIdentity(state, {
+          symbol,
+          order: chosen,
+          orderId: adoptedOrderId,
+          submittedAtMs,
+          limitPrice,
+          source: 'adopt_open_orders_on_restart',
+        });
         console.log('adopt_existing_sell_on_restart', {
           symbol,
           orderId: adoptedOrderId,
@@ -9298,6 +9460,7 @@ async function manageExitStates() {
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
         const quoteAgeMs = Number.isFinite(state.lastQuoteTsMs) ? Math.max(0, now - state.lastQuoteTsMs) : null;
         const failedTradeStale = Number.isFinite(heldSeconds) && heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
+        const timeStopTriggered = Number.isFinite(EXIT_MAX_HOLD_SECONDS) && EXIT_MAX_HOLD_SECONDS > 0 && heldSeconds >= EXIT_MAX_HOLD_SECONDS;
         const thesisBrokenForRefresh =
           failedTradeStale &&
           Number.isFinite(bid) &&
@@ -9316,7 +9479,17 @@ async function manageExitStates() {
           heldMs,
           staleTradeMs: FAILED_TRADE_MAX_AGE_SEC * 1000,
           thesisBroken: thesisBrokenForRefresh,
+          timeStopTriggered,
         });
+        if (exitRefreshDecision?.override) {
+          console.log('stale_exit_override_triggered', {
+            symbol,
+            reason: exitRefreshDecision.why,
+            heldMs,
+            existingOrderAgeMs,
+            awayBps,
+          });
+        }
         const exitScanBase = {
           entryPriceUsed,
           avgEntryPriceRaw: avgEntryPriceRaw ?? null,
@@ -9648,6 +9821,12 @@ async function manageExitStates() {
             const canceled = oldOrderId ? await cancelOrderSafe(oldOrderId) : false;
             if (canceled) {
               lastCancelReplaceAt.set(symbol, now);
+              startReplaceVisibilityGrace(state, {
+                symbol,
+                visibilityState: 'replace_pending_visibility',
+                reason: 'exit_refresh_reprice',
+                nowMs: now,
+              });
               const refreshedOpenOrders = oldOrderId
                 ? symbolOrders.filter((order) => (order?.id || order?.order_id) !== oldOrderId)
                 : symbolOrders;
@@ -9662,9 +9841,14 @@ async function manageExitStates() {
                 allowSellBelowMin: false,
               });
               if (!replacement?.skipped && replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
+                updateTrackedSellIdentity(state, {
+                  symbol,
+                  order: replacement,
+                  orderId: replacement.id,
+                  limitPrice: normalizeOrderLimitPrice(replacement) ?? finalLimit,
+                  source: 'exit_refresh_reprice_replacement',
+                });
+                resolveReplaceVisibilityGrace(state, { symbol, reason: 'replacement_submitted' });
                 actionTaken = 'exit_refresh_reprice';
                 reasonCode = 'exit_refresh_reprice';
                 lastActionAt.set(symbol, now);
@@ -9748,6 +9932,14 @@ async function manageExitStates() {
                 orderId: state.sellOrderId || refreshOrder?.id || refreshOrder?.order_id,
                 reason: awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : (EXIT_REFRESH_MODE === 'age' ? 'reprice_ttl' : 'reprice_away'),
               });
+              if (canceled) {
+                startReplaceVisibilityGrace(state, {
+                  symbol,
+                  visibilityState: 'replace_pending_visibility',
+                  reason: awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : 'reprice_ttl',
+                  nowMs: now,
+                });
+              }
               const replacement = await submitLimitSell({
                 symbol,
                 qty: state.qty,
@@ -9757,9 +9949,14 @@ async function manageExitStates() {
                 postOnly: EXIT_POST_ONLY,
               });
               if (!replacement?.skipped && replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
+                updateTrackedSellIdentity(state, {
+                  symbol,
+                  order: replacement,
+                  orderId: replacement.id,
+                  limitPrice: normalizeOrderLimitPrice(replacement) ?? finalLimit,
+                  source: 'reprice_cancel_replace',
+                });
+                resolveReplaceVisibilityGrace(state, { symbol, reason: 'replacement_submitted' });
                 actionTaken = 'reprice_cancel_replace';
                 reasonCode = awayBps >= REPRICE_IF_AWAY_BPS ? 'reprice_away' : (EXIT_REFRESH_MODE === 'age' ? 'reprice_ttl' : 'reprice_away');
                 lastActionAt.set(symbol, now);
@@ -9871,6 +10068,24 @@ async function manageExitStates() {
         }
 
         if (openSellCount === 0) {
+          if (!state.exitVisibilityState && state.sellOrderId) {
+            startReplaceVisibilityGrace(state, {
+              symbol,
+              visibilityState: 'reattach_pending_visibility',
+              reason: 'tracked_sell_missing_from_open_orders',
+              nowMs: now,
+            });
+          }
+          const graceActive =
+            Boolean(state.exitVisibilityState) &&
+            Number.isFinite(state.exitVisibilityDeadlineAt) &&
+            state.exitVisibilityDeadlineAt > now;
+          if (graceActive) {
+            actionTaken = 'hold_existing_order';
+            reasonCode = state.exitVisibilityState;
+            updateSellabilityBlockCause(state, symbol, state.exitVisibilityState, { source: 'grace_active' });
+            continue;
+          }
           const replacement = await submitLimitSell({
             symbol,
             qty: Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty,
@@ -9882,19 +10097,27 @@ async function manageExitStates() {
             allowSellBelowMin: false,
           });
           if (!replacement?.skipped && replacement?.id) {
-            state.sellOrderId = replacement.id;
-            state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
+            updateTrackedSellIdentity(state, {
+              symbol,
+              order: replacement,
+              orderId: replacement.id,
+              limitPrice: normalizeOrderLimitPrice(replacement) ?? finalLimit,
+              source: 'place_gtc_tp',
+            });
+            resolveReplaceVisibilityGrace(state, { symbol, reason: 'replacement_submitted' });
             actionTaken = 'place_gtc_tp';
             reasonCode = 'place_gtc_tp';
             lastActionAt.set(symbol, now);
           } else {
             if (
-              (replacement?.reason === 'qty_reserved_or_unavailable' || replacement?.reason === 'awaiting_broker_sellable_qty')
+              (replacement?.reason === 'qty_reserved_or_unavailable' ||
+                replacement?.reason === 'awaiting_broker_sellable_qty' ||
+                replacement?.reason === 'replace_pending_visibility')
               && openSellCount === 0
             ) {
               actionTaken = 'defer_no_sellable_qty';
               reasonCode = 'defer_no_sellable_qty';
+              updateSellabilityBlockCause(state, symbol, replacement?.reason || 'unknown', { source: 'submit_limit_sell' });
             } else {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
@@ -10051,9 +10274,13 @@ async function manageExitStates() {
               allowSellBelowMin: false,
             });
             if (!replacement?.skipped && replacement?.id) {
-              state.sellOrderId = replacement.id;
-              state.sellOrderSubmittedAt = Date.now();
-              state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? conservativeLimit;
+              updateTrackedSellIdentity(state, {
+                symbol,
+                order: replacement,
+                orderId: replacement.id,
+                limitPrice: normalizeOrderLimitPrice(replacement) ?? conservativeLimit,
+                source: 'stale_quote_fallback',
+              });
               actionTaken = 'placed_stale_fallback';
               reasonCode = 'stale_quote_fallback';
               lastActionAt.set(symbol, now);
@@ -10164,14 +10391,17 @@ async function manageExitStates() {
         }
         if (!state.sellOrderId && openSellOrders.length === 1) {
           const onlyOrder = openSellOrders[0];
-          state.sellOrderId = onlyOrder?.id || onlyOrder?.order_id || null;
           const limitPrice = normalizeOrderLimitPrice(onlyOrder);
-          state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
           const orderAgeMs = getOrderAgeMs(onlyOrder);
           const normalizedOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
-          if (!state.sellOrderSubmittedAt && Number.isFinite(normalizedOrderAgeMs)) {
-            state.sellOrderSubmittedAt = now - normalizedOrderAgeMs;
-          }
+          updateTrackedSellIdentity(state, {
+            symbol,
+            order: onlyOrder,
+            submittedAtMs: Number.isFinite(normalizedOrderAgeMs) ? now - normalizedOrderAgeMs : null,
+            limitPrice,
+            source: 'single_open_sell_discovery',
+          });
+          resolveReplaceVisibilityGrace(state, { symbol, reason: 'open_sell_discovered' });
         }
         if (openSellOrders.length > 1) {
           const desiredForSelect = Number.isFinite(desiredLimit) ? desiredLimit : state.sellOrderLimit;
@@ -10194,14 +10424,18 @@ async function manageExitStates() {
             count: openSellOrders.length,
           });
           if (keepId) {
-            state.sellOrderId = keepId;
             const limitPrice = normalizeOrderLimitPrice(keepOrder);
-            state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
             const keepOrderAgeMs = getOrderAgeMs(keepOrder);
             const normalizedKeepOrderAgeMs = Number.isFinite(keepOrderAgeMs) ? Math.max(0, keepOrderAgeMs) : null;
-            state.sellOrderSubmittedAt =
-              state.sellOrderSubmittedAt ||
-              (Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null);
+            updateTrackedSellIdentity(state, {
+              symbol,
+              order: keepOrder,
+              orderId: keepId,
+              submittedAtMs: Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null,
+              limitPrice,
+              source: 'multiple_open_sell_select',
+            });
+            resolveReplaceVisibilityGrace(state, { symbol, reason: 'open_sell_discovered' });
           }
         }
 
@@ -10217,9 +10451,14 @@ async function manageExitStates() {
             allowSellBelowMin: false,
           });
           if (!replacement?.skipped && replacement?.id) {
-            state.sellOrderId = replacement.id;
-            state.sellOrderSubmittedAt = Date.now();
-            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? finalLimit;
+            updateTrackedSellIdentity(state, {
+              symbol,
+              order: replacement,
+              orderId: replacement.id,
+              limitPrice: normalizeOrderLimitPrice(replacement) ?? finalLimit,
+              source: 'missing_sell_order_recreate',
+            });
+            resolveReplaceVisibilityGrace(state, { symbol, reason: 'replacement_submitted' });
             actionTaken = 'recreate_limit_sell';
             reasonCode = 'missing_sell_order';
             lastActionAt.set(symbol, now);
@@ -10592,8 +10831,12 @@ async function manageExitStates() {
             }),
           });
           if (oco?.id || oco?.order_id) {
-            state.sellOrderId = oco.id || oco.order_id;
-            state.sellOrderSubmittedAt = Date.now();
+            updateTrackedSellIdentity(state, {
+              symbol,
+              order: oco,
+              orderId: oco.id || oco.order_id,
+              source: 'timeout_exit_oco',
+            });
           }
           actionTaken = oco?.id || oco?.order_id ? 'oco_exit_attached' : 'timeout_exit_hold';
           reasonCode = oco?.id || oco?.order_id ? 'timeout_exit_oco' : 'timeout_exit_not_profitable';
@@ -10839,9 +11082,14 @@ async function manageExitStates() {
             post_only: order.post_only ?? null,
             note: 'Bot cancel is hard-disabled; terminal status is broker-side or external.',
           });
-          state.sellOrderId = null;
-          state.sellOrderSubmittedAt = null;
-          state.sellOrderLimit = null;
+          updateTrackedSellIdentity(state, {
+            symbol,
+            orderId: null,
+            clientOrderId: null,
+            submittedAtMs: null,
+            limitPrice: null,
+            source: 'terminal_sell_order_reset',
+          });
         }
 
         if (!state.sellOrderId) {
@@ -10854,9 +11102,13 @@ async function manageExitStates() {
                 postOnly: EXIT_POST_ONLY,
               });
               if (!replacement?.skipped && replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = finalLimit;
+                updateTrackedSellIdentity(state, {
+                  symbol,
+                  order: replacement,
+                  orderId: replacement.id,
+                  limitPrice: finalLimit,
+                  source: 'missing_sell_order_recreate',
+                });
                 actionTaken = 'recreate_limit_sell';
                 reasonCode = 'maker_post_only';
                 decisionPath = 'maker_post_only';
@@ -10917,9 +11169,13 @@ async function manageExitStates() {
                 postOnly: EXIT_POST_ONLY,
               });
               if (replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = finalLimit;
+                updateTrackedSellIdentity(state, {
+                  symbol,
+                  order: replacement,
+                  orderId: replacement.id,
+                  limitPrice: finalLimit,
+                  source: 'reprice_ttl',
+                });
                 actionTaken = 'reprice_cancel_replace';
                 reasonCode = 'reprice_ttl';
                 decisionPath = 'reprice_ttl';
@@ -10955,9 +11211,13 @@ async function manageExitStates() {
                 postOnly: EXIT_POST_ONLY,
               });
               if (replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = finalLimit;
+                updateTrackedSellIdentity(state, {
+                  symbol,
+                  order: replacement,
+                  orderId: replacement.id,
+                  limitPrice: finalLimit,
+                  source: 'reprice_away',
+                });
                 actionTaken = 'reprice_cancel_replace';
                 reasonCode = 'reprice_away';
                 decisionPath = 'reprice_away';
@@ -11014,9 +11274,14 @@ async function manageExitStates() {
               post_only: order.post_only ?? null,
               note: 'Bot cancel is hard-disabled; terminal status is broker-side or external.',
             });
-            state.sellOrderId = null;
-            state.sellOrderSubmittedAt = null;
-            state.sellOrderLimit = null;
+            updateTrackedSellIdentity(state, {
+              symbol,
+              orderId: null,
+              clientOrderId: null,
+              submittedAtMs: null,
+              limitPrice: null,
+              source: 'terminal_sell_order_reset',
+            });
           }
           if (order && order.status === 'filled') {
             exitState.delete(symbol);
@@ -11057,9 +11322,13 @@ async function manageExitStates() {
                   postOnly: EXIT_POST_ONLY,
                 });
                 if (replacement?.id) {
-                  state.sellOrderId = replacement.id;
-                  state.sellOrderSubmittedAt = Date.now();
-                  state.sellOrderLimit = desiredLimit;
+                  updateTrackedSellIdentity(state, {
+                    symbol,
+                    order: replacement,
+                    orderId: replacement.id,
+                    limitPrice: desiredLimit,
+                    source: 'reprice_ttl',
+                  });
                   actionTaken = 'reprice_cancel_replace';
                   reasonCode = 'reprice_ttl';
                   decisionPath = 'reprice_ttl';
@@ -11092,9 +11361,13 @@ async function manageExitStates() {
                   postOnly: EXIT_POST_ONLY,
                 });
                 if (replacement?.id) {
-                  state.sellOrderId = replacement.id;
-                  state.sellOrderSubmittedAt = Date.now();
-                  state.sellOrderLimit = desiredLimit;
+                  updateTrackedSellIdentity(state, {
+                    symbol,
+                    order: replacement,
+                    orderId: replacement.id,
+                    limitPrice: desiredLimit,
+                    source: 'reprice_away',
+                  });
                   actionTaken = 'reprice_cancel_replace';
                   reasonCode = 'reprice_away';
                   decisionPath = 'reprice_away';
