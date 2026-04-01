@@ -1,4 +1,5 @@
 const { normalizePair } = require('../symbolUtils');
+const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 
 const BOOLEAN_TRUE = new Set(['true', '1', 'yes', 'y', 'on']);
 const BOOLEAN_FALSE = new Set(['false', '0', 'no', 'n', 'off']);
@@ -45,12 +46,12 @@ const buildFailureDetails = (summary) => ({
 
 function getRuntimeConfig(env = process.env) {
   const nodeEnv = String(env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
-  const entryUniverseModeRaw = String(env.ENTRY_UNIVERSE_MODE ?? '').trim().toLowerCase();
+  const entryUniverseModeRaw = String(env.ENTRY_UNIVERSE_MODE ?? LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE).trim().toLowerCase();
   const entryUniverseModeEffective = entryUniverseModeRaw === 'configured' ? 'configured' : 'dynamic';
-  const allowDynamicUniverseInProduction = parseBoolean(env.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, false);
+  const allowDynamicUniverseInProduction = parseBoolean(env.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, parseBoolean(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, false));
 
-  const configuredPrimarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_PRIMARY));
-  const configuredSecondarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_SECONDARY)).filter(
+  const configuredPrimarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_PRIMARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY));
+  const configuredSecondarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_SECONDARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_SECONDARY)).filter(
     (symbol) => !configuredPrimarySymbols.includes(symbol)
   );
 
@@ -59,20 +60,20 @@ function getRuntimeConfig(env = process.env) {
     entryUniverseModeRaw,
     entryUniverseModeEffective,
     allowDynamicUniverseInProduction,
-    entrySymbolsPrimaryRaw: String(env.ENTRY_SYMBOLS_PRIMARY ?? ''),
-    entrySymbolsSecondaryRaw: String(env.ENTRY_SYMBOLS_SECONDARY ?? ''),
-    entrySymbolsIncludeSecondary: parseBoolean(env.ENTRY_SYMBOLS_INCLUDE_SECONDARY, false),
-    executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, true),
-    entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, 10000),
-    entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, 5),
-    entryPrefetchOrderbooks: parseBoolean(env.ENTRY_PREFETCH_ORDERBOOKS, false),
-    alpacaMdMaxConcurrency: parsePositiveInt(env.ALPACA_MD_MAX_CONCURRENCY, 2),
-    barsMaxConcurrent: parsePositiveInt(env.BARS_MAX_CONCURRENT, 2),
-    barsPrefetchIntervalMs: parsePositiveInt(env.BARS_PREFETCH_INTERVAL_MS, 60000),
-    allowPerSymbolBarsFallback: parseBoolean(env.ALLOW_PER_SYMBOL_BARS_FALLBACK, false),
-    predictorWarmupFallbackBudgetPerScan: parsePositiveInt(env.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, 2),
-    predictorWarmupPrefetchConcurrency: parsePositiveInt(env.PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, 2),
-    marketdataRateLimitCooldownMs: parsePositiveInt(env.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, 5000),
+    entrySymbolsPrimaryRaw: String(env.ENTRY_SYMBOLS_PRIMARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY),
+    entrySymbolsSecondaryRaw: String(env.ENTRY_SYMBOLS_SECONDARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_SECONDARY),
+    entrySymbolsIncludeSecondary: parseBoolean(env.ENTRY_SYMBOLS_INCLUDE_SECONDARY, parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_INCLUDE_SECONDARY, false)),
+    executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
+    entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS, 10000)),
+    entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE, 5)),
+    entryPrefetchOrderbooks: parseBoolean(env.ENTRY_PREFETCH_ORDERBOOKS, parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_ORDERBOOKS, false)),
+    alpacaMdMaxConcurrency: parsePositiveInt(env.ALPACA_MD_MAX_CONCURRENCY, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ALPACA_MD_MAX_CONCURRENCY, 2)),
+    barsMaxConcurrent: parsePositiveInt(env.BARS_MAX_CONCURRENT, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.BARS_MAX_CONCURRENT, 2)),
+    barsPrefetchIntervalMs: parsePositiveInt(env.BARS_PREFETCH_INTERVAL_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.BARS_PREFETCH_INTERVAL_MS, 60000)),
+    allowPerSymbolBarsFallback: parseBoolean(env.ALLOW_PER_SYMBOL_BARS_FALLBACK, parseBoolean(LIVE_CRITICAL_DEFAULTS.ALLOW_PER_SYMBOL_BARS_FALLBACK, false)),
+    predictorWarmupFallbackBudgetPerScan: parsePositiveInt(env.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, 2)),
+    predictorWarmupPrefetchConcurrency: parsePositiveInt(env.PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, 2)),
+    marketdataRateLimitCooldownMs: parsePositiveInt(env.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, 5000)),
     configuredPrimarySymbols,
     configuredSecondarySymbols,
   };

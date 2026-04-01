@@ -1,17 +1,18 @@
 const fs = require('fs');
-const path = require('path');
+const { resolveStoragePaths, logOnce } = require('./storagePaths');
 
-const DATASET_DIR = process.env.DATASET_DIR || './data';
-const DATASET_FORMAT = process.env.DATASET_FORMAT || 'jsonl';
 const RECENT_LIMIT = Number(process.env.PREDICTOR_RECENT_LIMIT || 2000);
 const RECORDER_ENABLED = String(process.env.RECORDER_ENABLED || 'true').toLowerCase() !== 'false';
 
-const datasetPath = path.resolve(DATASET_DIR, `predictor.${DATASET_FORMAT}`);
+const storage = resolveStoragePaths();
+const datasetPath = storage.paths.recorderFile || null;
 const recent = [];
 
 function ensureDir() {
-  const dir = path.dirname(datasetPath);
+  if (!datasetPath) return false;
+  const dir = require('path').dirname(datasetPath);
   fs.mkdirSync(dir, { recursive: true });
+  return true;
 }
 
 function appendRecord(record) {
@@ -19,7 +20,7 @@ function appendRecord(record) {
     return;
   }
   try {
-    ensureDir();
+    if (!ensureDir()) return;
     const line = `${JSON.stringify(record)}\n`;
     fs.appendFileSync(datasetPath, line, 'utf8');
     recent.push(record);
@@ -27,7 +28,7 @@ function appendRecord(record) {
       recent.shift();
     }
   } catch (err) {
-    console.warn('predictor_record_append_failed', { error: err?.message || String(err) });
+    logOnce('warn', 'predictor_record_append_failed', 'predictor_record_append_failed', { datasetPath, error: err?.message || String(err) });
   }
 }
 

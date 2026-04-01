@@ -1,9 +1,11 @@
+const { getRuntimeConfig } = require('../config/runtimeConfig');
 function readNumber(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
 }
 
-const ALPACA_MD_MAX_CONCURRENCY = Math.max(1, readNumber('ALPACA_MD_MAX_CONCURRENCY', 2));
+const runtimeConfig = getRuntimeConfig(process.env);
+const ALPACA_MD_MAX_CONCURRENCY = Math.max(1, runtimeConfig.alpacaMdMaxConcurrency);
 const ALPACA_MD_MIN_DELAY_MS = Math.max(0, readNumber('ALPACA_MD_MIN_DELAY_MS', 250));
 const ALPACA_MD_MAX_RETRIES = Math.max(0, readNumber('ALPACA_MD_MAX_RETRIES', 6));
 const ALPACA_MD_BASE_BACKOFF_MS = Math.max(1, readNumber('ALPACA_MD_BASE_BACKOFF_MS', 500));

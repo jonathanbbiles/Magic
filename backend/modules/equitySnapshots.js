@@ -1,13 +1,14 @@
 const fs = require('fs');
 const path = require('path');
+const { resolveStoragePaths, logOnce } = require('./storagePaths');
 
-const SNAPSHOTS_DIR = String(process.env.SNAPSHOTS_DIR || './data').trim() || './data';
 const RING_BUFFER_SIZE = 5000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const WEEK_TOLERANCE_MS = 12 * 60 * 60 * 1000;
 
-const dirPath = path.resolve(SNAPSHOTS_DIR);
-const filePath = path.join(dirPath, 'equity_snapshots.jsonl');
+const storage = resolveStoragePaths();
+const filePath = storage.paths.equitySnapshotsFile || null;
+const dirPath = filePath ? path.dirname(filePath) : null;
 
 const recentSnapshots = [];
 
@@ -32,10 +33,12 @@ function toTimestampMs(value) {
 }
 
 function ensureFileReady() {
+  if (!filePath || !dirPath) return false;
   fs.mkdirSync(dirPath, { recursive: true });
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, '', { encoding: 'utf8' });
   }
+  return true;
 }
 
 function pushRecent(snapshot) {
@@ -47,7 +50,7 @@ function pushRecent(snapshot) {
 
 function hydrateRecentFromDisk() {
   try {
-    ensureFileReady();
+    if (!ensureFileReady()) return;
     const content = fs.readFileSync(filePath, { encoding: 'utf8' });
     const lines = content.split('\n').filter(Boolean);
     const start = Math.max(0, lines.length - RING_BUFFER_SIZE);
@@ -55,19 +58,14 @@ function hydrateRecentFromDisk() {
       try {
         const item = JSON.parse(lines[i]);
         const tsMs = toTimestampMs(item?.tsMs) || toTimestampMs(item?.ts);
-        if (!Number.isFinite(tsMs)) {
-          continue;
-        }
-        pushRecent({
-          ...item,
-          tsMs,
-        });
-      } catch (err) {
+        if (!Number.isFinite(tsMs)) continue;
+        pushRecent({ ...item, tsMs });
+      } catch (_) {
         // ignore malformed historical lines
       }
     }
   } catch (err) {
-    console.warn('equity_snapshot_hydrate_failed', { error: err?.message || err });
+    logOnce('warn', 'equity_snapshot_hydrate_failed', 'equity_snapshot_hydrate_failed', { filePath, error: err?.message || err });
   }
 }
 
@@ -75,10 +73,7 @@ function appendSnapshot(input) {
   const tsMs = toTimestampMs(input?.ts) || Date.now();
   const equity = toFiniteNumber(input?.equity);
   const portfolioValue = toFiniteNumber(input?.portfolio_value);
-
-  if (!Number.isFinite(equity) && !Number.isFinite(portfolioValue)) {
-    return null;
-  }
+  if (!Number.isFinite(equity) && !Number.isFinite(portfolioValue)) return null;
 
   const snapshot = {
     type: 'equity_snapshot',
@@ -89,75 +84,40 @@ function appendSnapshot(input) {
   };
 
   try {
-    ensureFileReady();
+    if (!ensureFileReady()) return snapshot;
     fs.appendFileSync(filePath, `${JSON.stringify(snapshot)}\n`, { encoding: 'utf8' });
     pushRecent(snapshot);
   } catch (err) {
-    console.warn('equity_snapshot_write_failed', { error: err?.message || err });
+    logOnce('warn', 'equity_snapshot_write_failed', 'equity_snapshot_write_failed', { filePath, error: err?.message || err });
   }
-
   return snapshot;
 }
 
-function getNearestAtOrBefore(tsMs) {
-  const targetMs = toFiniteNumber(tsMs);
-  if (!Number.isFinite(targetMs)) {
-    return null;
-  }
-  for (let i = recentSnapshots.length - 1; i >= 0; i -= 1) {
-    const item = recentSnapshots[i];
-    if (Number.isFinite(item?.tsMs) && item.tsMs <= targetMs) {
-      return item;
-    }
-  }
-  return null;
-}
+function getNearestAtOrBefore(tsMs) { const targetMs = toFiniteNumber(tsMs); if (!Number.isFinite(targetMs)) return null; for (let i = recentSnapshots.length - 1; i >= 0; i -= 1) { const item = recentSnapshots[i]; if (Number.isFinite(item?.tsMs) && item.tsMs <= targetMs) return item; } return null; }
 
 function getWeeklyChangePct(latestEquity, nowMs = Date.now()) {
   const latest = toFiniteNumber(latestEquity);
   const nowTs = toFiniteNumber(nowMs);
-  if (!Number.isFinite(latest) || !Number.isFinite(nowTs)) {
-    return null;
-  }
-
+  if (!Number.isFinite(latest) || !Number.isFinite(nowTs)) return null;
   const targetTs = nowTs - WEEK_MS;
   let closest = null;
   let minDiff = Number.POSITIVE_INFINITY;
-
   for (let i = recentSnapshots.length - 1; i >= 0; i -= 1) {
     const item = recentSnapshots[i];
     const itemTs = toFiniteNumber(item?.tsMs);
     const itemEquity = toFiniteNumber(item?.equity) ?? toFiniteNumber(item?.portfolio_value);
-    if (!Number.isFinite(itemTs) || !Number.isFinite(itemEquity) || itemEquity === 0) {
-      continue;
-    }
+    if (!Number.isFinite(itemTs) || !Number.isFinite(itemEquity) || itemEquity === 0) continue;
     const diff = Math.abs(itemTs - targetTs);
     if (diff <= WEEK_TOLERANCE_MS && diff < minDiff) {
       minDiff = diff;
-      closest = {
-        snapshot: item,
-        equity: itemEquity,
-      };
+      closest = { snapshot: item, equity: itemEquity };
     }
   }
-
-  if (!closest) {
-    return null;
-  }
-
+  if (!closest) return null;
   const weeklyPct = ((latest - closest.equity) / closest.equity) * 100;
-  return {
-    weeklyPct,
-    weekAgoEquity: closest.equity,
-    latestEquity: latest,
-    weekAgoSnapshotTs: closest.snapshot.ts,
-  };
+  return { weeklyPct, weekAgoEquity: closest.equity, latestEquity: latest, weekAgoSnapshotTs: closest.snapshot.ts };
 }
 
 hydrateRecentFromDisk();
 
-module.exports = {
-  appendSnapshot,
-  getNearestAtOrBefore,
-  getWeeklyChangePct,
-};
+module.exports = { appendSnapshot, getNearestAtOrBefore, getWeeklyChangePct };
