@@ -1376,10 +1376,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     symbolTier,
     sparseFallbackEnabled: ORDERBOOK_SPARSE_FALLBACK_ENABLED,
   });
-  const quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
-  const quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
-  const quoteSource = quote?.source || null;
-  const quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
+  let quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+  let quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+  let quoteSource = quote?.source || null;
+  let quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
 
   if (!obResult) {
     obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
@@ -1449,6 +1449,13 @@ async function computeEntrySignal(symbol, opts = {}) {
     if (ORDERBOOK_SPARSE_CONFIRM_RETRY_MS > 0) {
       await sleep(ORDERBOOK_SPARSE_CONFIRM_RETRY_MS);
     }
+    const shouldForceQuoteRefreshForSparseRetry =
+      (orderbookMeta?.depthState === 'orderbook_sparse' || sparseByLevelCount) &&
+      Number.isFinite(quoteAgeMs) &&
+      quoteAgeMs > ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS;
+    const priorQuoteAgeMs = quoteAgeMs;
+    const priorQuoteSource = quoteSource;
+    const priorOrderbookSource = obResult?.source || null;
     const obRetrySnapshot = entryMdContext
       ? await getOrFetchSymbolMarketData({
         context: entryMdContext,
@@ -1458,13 +1465,28 @@ async function computeEntrySignal(symbol, opts = {}) {
         fetchOrderbook: getLatestOrderbook,
         quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        forceQuoteRefresh: shouldForceQuoteRefreshForSparseRetry,
         forceOrderbookRefresh: true,
       })
       : null;
-    const obRetry = entryMdContext ? obRetrySnapshot?.orderbook : await getLatestOrderbook(asset.symbol, {
-      maxAgeMs: ORDERBOOK_MAX_AGE_MS,
-      bypassCache: true,
-    });
+    const quoteRetry = entryMdContext
+      ? (obRetrySnapshot?.quote || null)
+      : (shouldForceQuoteRefreshForSparseRetry
+        ? await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS, forceRefresh: true, bypassCache: true }).catch(() => null)
+        : quote);
+    if (quoteRetry && shouldForceQuoteRefreshForSparseRetry) {
+      quote = quoteRetry;
+      quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+      quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+      quoteSource = quote?.source || null;
+      quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+    }
+    const obRetry = entryMdContext
+      ? obRetrySnapshot?.orderbook
+      : await getLatestOrderbook(asset.symbol, {
+        maxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        bypassCache: true,
+      });
     if (obRetry?.ok) {
       obResult = obRetry;
       orderbookMeta = buildOrderbookMeta(obResult);
@@ -1472,7 +1494,20 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbol: asset.symbol,
         symbolTier,
         action: 'confirm_retry',
-        retrySource: obRetry.source || null,
+        retrySource: {
+          quote: quote?.source || null,
+          quoteBefore: priorQuoteSource,
+          orderbook: obRetry.source || null,
+          orderbookBefore: priorOrderbookSource,
+        },
+        refresh: {
+          quoteForced: shouldForceQuoteRefreshForSparseRetry,
+          orderbookForced: true,
+        },
+        quoteAgeMs: {
+          before: priorQuoteAgeMs,
+          after: quoteAgeMs,
+        },
         depthState: orderbookMeta.depthState,
         levelsConsideredPerSide: orderbookMeta.levelsConsideredPerSide,
       });
@@ -2345,6 +2380,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   });
   if (marketDataEval.dataQualityState !== 'ok') {
     if (marketDataEval.depthState === 'orderbook_sparse') {
+      if (entryMdContext) entryMdContext.stats.sparseFallbackRejects += 1;
       console.log('entry_sparse_fallback_reject', {
         symbol: asset.symbol,
         symbolTier,
@@ -2369,7 +2405,20 @@ async function computeEntrySignal(symbol, opts = {}) {
     return {
       entryReady: false,
       why: marketDataEval.reason || 'data_quality_bad',
-      meta: { symbol: asset.symbol, symbolTier, spreadBps, quoteAgeMs, ...orderbookMeta, marketDataEval },
+      meta: {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        quoteAgeMs,
+        quoteSource,
+        quoteTsMs,
+        quoteReceivedAtMs,
+        edge,
+        regimeScorecard,
+        regimePenaltyBps,
+        marketDataEval,
+        ...orderbookMeta,
+      },
       record: baseRecord,
     };
   }
@@ -2416,6 +2465,11 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbol: asset.symbol,
         symbolTier,
         spreadBps,
+        quoteAgeMs,
+        regimeScorecard,
+        regimePenaltyBps,
+        marketDataEval,
+        edge,
         targetMoveBps: edgeRequirements.targetMoveBps,
         feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
         slippageBps: edgeRequirements.slippageBps,
@@ -4117,6 +4171,26 @@ function logQuoteTimestampDebug({ symbol, rawTs, source }) {
 function formatLoggedAgeSeconds(ageMs) {
   if (!Number.isFinite(ageMs)) return null;
   return Math.min(Math.round(ageMs / 1000), MAX_LOGGED_QUOTE_AGE_SECONDS);
+}
+
+function buildStaleQuoteLogMeta({
+  symbol,
+  source = null,
+  tsMs = null,
+  receivedAtMs = null,
+  effectiveMaxAgeMs = null,
+  ageMs = null,
+  lastSeenAgeMs = null,
+} = {}) {
+  return {
+    symbol,
+    source: source || null,
+    tsMs: Number.isFinite(tsMs) ? tsMs : null,
+    receivedAtMs: Number.isFinite(receivedAtMs) ? receivedAtMs : null,
+    effectiveMaxAgeMs: Number.isFinite(effectiveMaxAgeMs) ? effectiveMaxAgeMs : null,
+    ageSeconds: formatLoggedAgeSeconds(ageMs),
+    lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAgeMs),
+  };
 }
 
 async function withExpensiveMarketDataLimit(fn, dedupeKey = null) {
@@ -6795,11 +6869,25 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
     logQuoteAgeWarning({ symbol, ageMs: rawAgeMs, source: 'trade_fallback', tsMs });
   }
   if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
+    logSkip('stale_quote', buildStaleQuoteLogMeta({
+      symbol,
+      source: 'trade_fallback',
+      tsMs,
+      receivedAtMs: nowMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      ageMs: rawAgeMs,
+    }));
     return null;
   }
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
+    logSkip('stale_quote', buildStaleQuoteLogMeta({
+      symbol,
+      source: 'trade_fallback',
+      tsMs,
+      receivedAtMs: nowMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      ageMs,
+    }));
     return null;
   }
 
@@ -6817,12 +6905,13 @@ async function getLatestQuote(rawSymbol, opts = {}) {
 
   const symbol = normalizeSymbol(rawSymbol);
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const forceRefresh = Boolean(opts.forceRefresh || opts.bypassCache);
   const isCrypto = isCryptoSymbol(symbol);
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
 
   const nowMs = Date.now();
   const passCached = quotePassCache.get(symbol);
-  if (passCached?.passId === marketDataPassId && passCached?.quote) {
+  if (!forceRefresh && passCached?.passId === marketDataPassId && passCached?.quote) {
     return passCached.quote;
   }
   const cached = quoteCache.get(symbol);
@@ -6834,7 +6923,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   if (Number.isFinite(cachedAgeMsRaw)) {
     logQuoteAgeWarning({ symbol, ageMs: cachedAgeMsRaw, source: cached?.source || 'cache', tsMs: cachedTsMs });
   }
-  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMsFinal) {
+  if (!forceRefresh && Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMsFinal) {
     recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'cache' });
     const fromCache = {
       bid: cached.bid,
@@ -6932,7 +7021,14 @@ async function getLatestQuote(rawSymbol, opts = {}) {
       const lastSeenAge = Number.isFinite(cachedAgeMs)
         ? cachedAgeMs
         : cachedAgeMsRaw;
-      logSkip('stale_quote', { symbol, lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAge) });
+      logSkip('stale_quote', buildStaleQuoteLogMeta({
+        symbol,
+        source: cached?.source || 'cache',
+        tsMs: cachedTsMs,
+        receivedAtMs: cached?.receivedAtMs,
+        effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+        lastSeenAgeMs: lastSeenAge,
+      }));
       recordQuoteFailure(symbol, 'stale_quote');
     } else {
       logSkip('no_quote', { symbol, reason });
@@ -6967,7 +7063,14 @@ async function getLatestQuote(rawSymbol, opts = {}) {
       const lastSeenAge = Number.isFinite(cachedAgeMs)
         ? cachedAgeMs
         : cachedAgeMsRaw;
-      logSkip('stale_quote', { symbol, lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAge) });
+      logSkip('stale_quote', buildStaleQuoteLogMeta({
+        symbol,
+        source: cached?.source || 'cache',
+        tsMs: cachedTsMs,
+        receivedAtMs: cached?.receivedAtMs,
+        effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+        lastSeenAgeMs: lastSeenAge,
+      }));
     } else {
       logSkip('no_quote', { symbol, reason: 'invalid_bid_ask' });
     }
@@ -6992,7 +7095,14 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     if (fallbackQuote) {
       return fallbackQuote;
     }
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
+    logSkip('stale_quote', buildStaleQuoteLogMeta({
+      symbol,
+      source: 'alpaca',
+      tsMs,
+      receivedAtMs: nowMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      ageMs: rawAgeMs,
+    }));
     recordLastQuoteAt(symbol, { tsMs: null, source: 'stale', reason: 'absurd_age' });
     recordQuoteFailure(symbol, 'stale_quote');
     throw new Error(`Quote age absurd for ${symbol}`);
@@ -7003,7 +7113,14 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     if (fallbackQuote) {
       return fallbackQuote;
     }
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
+    logSkip('stale_quote', buildStaleQuoteLogMeta({
+      symbol,
+      source: 'alpaca',
+      tsMs,
+      receivedAtMs: nowMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      ageMs,
+    }));
     recordLastQuoteAt(symbol, { tsMs, source: 'stale', reason: 'stale_quote' });
     recordQuoteFailure(symbol, 'stale_quote');
     throw new Error(`Quote stale for ${symbol}`);

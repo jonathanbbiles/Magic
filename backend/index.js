@@ -130,6 +130,7 @@ const runtimeStrategyConfig = {
   sparseAllowTier2: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER2'),
   sparseAllowTier3: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER3'),
   sparseRequireQuoteFreshMs: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS'),
+  sparseRequireStrongerEdgeBps: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS'),
   sparseStaleQuoteToleranceMs: readLiveNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS'),
   sparseMaxSpreadBps: readLiveNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS'),
   regimeStaleThresholdMs: readLiveNumber('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS') ?? readLiveNumber('ENTRY_QUOTE_MAX_AGE_MS'),
@@ -155,6 +156,7 @@ console.log('runtime_entry_engine_flags', {
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS_env: runtimeStrategyConfig.regimeStaleThresholdMs,
   regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
+  ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS: runtimeStrategyConfig.sparseRequireStrongerEdgeBps,
   ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
 });
 

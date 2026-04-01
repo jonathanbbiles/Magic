@@ -60,6 +60,22 @@ const {
   });
   assert.equal(orderbookCalls, 1, 'per-scan symbol context should avoid duplicate orderbook fetches');
 
+  let forcedQuoteCalls = 0;
+  await getOrFetchSymbolMarketData({
+    context,
+    coordinator,
+    symbol: 'BTC/USD',
+    fetchQuote: async () => {
+      forcedQuoteCalls += 1;
+      return { bid: 12, ask: 13, tsMs: Date.now(), source: 'forced' };
+    },
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 12, bestAsk: 13, bids: [{ p: 12, s: 1 }], asks: [{ p: 13, s: 1 }] } }),
+    quoteMaxAgeMs: 120000,
+    orderbookMaxAgeMs: 10000,
+    forceQuoteRefresh: true,
+  });
+  assert.equal(forcedQuoteCalls, 1, 'forceQuoteRefresh should bypass per-scan quote reuse');
+
   let rateLimitedCalls = 0;
   const cooldownCoordinator = createRequestCoordinator({ quoteTtlMs: 1, rateLimitCooldownMs: 50 });
   const rl = await cooldownCoordinator.get({

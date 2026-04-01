@@ -165,18 +165,20 @@ async function getOrFetchSymbolMarketData({
   quoteMaxAgeMs,
   orderbookMaxAgeMs,
   barsWarmup,
+  forceQuoteRefresh = false,
   forceOrderbookRefresh = false,
 }) {
   const normalizedSymbol = normalizePair(symbol);
   const existing = context.symbolData.get(normalizedSymbol) || {};
   const result = { ...existing };
 
-  if (!result.quote) {
+  if (!result.quote || forceQuoteRefresh) {
     const quoteResult = await coordinator.get({
       endpoint: 'quote',
       key: normalizedSymbol,
+      forceRefresh: forceQuoteRefresh,
       allowStaleOnRateLimit: true,
-      fetcher: () => fetchQuote(normalizedSymbol, { maxAgeMs: quoteMaxAgeMs }),
+      fetcher: () => fetchQuote(normalizedSymbol, { maxAgeMs: quoteMaxAgeMs, forceRefresh: forceQuoteRefresh, bypassCache: forceQuoteRefresh }),
     });
     result.quoteResult = quoteResult;
     if (quoteResult.ok) result.quote = quoteResult.value;
