@@ -221,6 +221,7 @@ function classifyRegimeScorecard({
   marketDataHealthy = true,
   panicVolBps = 280,
   deadVolFloorBps = 6,
+  quoteStaleMs = 15000,
 } = {}) {
   const spread = Number.isFinite(spreadBps) ? spreadBps : Number.POSITIVE_INFINITY;
   const vol = Number.isFinite(volatilityBps) ? volatilityBps : null;
@@ -235,7 +236,7 @@ function classifyRegimeScorecard({
   let blocked = false;
   const reasons = [];
 
-  if (!marketDataHealthy || age > 15000) {
+  if (!marketDataHealthy || age > quoteStaleMs) {
     label = 'dead';
     blocked = true;
     reasons.push('stale_or_unhealthy_data');

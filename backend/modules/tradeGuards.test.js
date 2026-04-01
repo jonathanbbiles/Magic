@@ -308,6 +308,34 @@ const regimePanic = classifyRegimeScorecard({
 assert.equal(regimePanic.label, 'panic');
 assert.equal(regimePanic.blocked, true);
 
+
+const defaultStaleRegime = classifyRegimeScorecard({
+  spreadBps: 10,
+  volatilityBps: 50,
+  quoteAgeMs: 16000,
+  quoteStability: 0.8,
+  directionalPersistence: 0.5,
+  momentumStrength: 0.7,
+  liquidityScore: 0.7,
+  marketDataHealthy: true,
+});
+assert.equal(defaultStaleRegime.label, 'dead');
+assert.equal(defaultStaleRegime.blocked, true);
+
+const relaxedStaleRegime = classifyRegimeScorecard({
+  spreadBps: 10,
+  volatilityBps: 50,
+  quoteAgeMs: 16000,
+  quoteStability: 0.8,
+  directionalPersistence: 0.5,
+  momentumStrength: 0.7,
+  liquidityScore: 0.7,
+  marketDataHealthy: true,
+  quoteStaleMs: 20000,
+});
+assert.notEqual(relaxedStaleRegime.label, 'dead');
+assert.equal(relaxedStaleRegime.blocked, false);
+
 const expectedEdge = computeExpectedNetEdgeBps({
   expectedMoveBps: 120,
   fillProbability: 0.75,
