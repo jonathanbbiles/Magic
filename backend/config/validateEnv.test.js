@@ -36,7 +36,8 @@ withEnv({}, () => {
   assert.equal(guardrails.regime.orderbookMinLevelsPerSide, 2);
   assert.equal(guardrails.sparseFallback.maxSpreadBps, 12);
   assert.equal(guardrails.sparseFallback.entryRegimeStaleQuoteMaxAgeMs, 120000);
-  assert.deepEqual(guardrails.sparseFallback.symbols, ['BTC/USD', 'ETH/USD', 'AVAX/USD', 'LINK/USD']);
+  assert.deepEqual(guardrails.sparseFallback.symbols, ['BTC/USD', 'ETH/USD']);
+  assert.equal(guardrails.marketDataCoordinator.sparseConfirmMaxPerScan, 2);
   assert.equal(guardrails.volCompression.minRatio, 0.60);
   assert.equal(guardrails.regime.minVolBps, 15);
   assert.equal(guardrails.regime.minVolBpsTier1, 4);

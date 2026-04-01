@@ -3,6 +3,13 @@ const fs = require('fs');
 const path = require('path');
 
 const tradeModulePath = require.resolve('./trade');
+const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
+const { evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
+const {
+  createRequestCoordinator,
+  buildEntryMarketDataContext,
+  getOrFetchSymbolMarketData,
+} = require('./modules/entryMarketDataContext');
 
 function withEnv(overrides, callback) {
   const previous = {};
@@ -283,6 +290,130 @@ const snapshot = {
 assert.equal(findPositionInSnapshot(snapshot, 'DOT/USD')?.position?.symbol, 'DOT/USD');
 assert.equal(findPositionInSnapshot(snapshot, 'dotusd')?.position?.symbol, 'DOT/USD');
 
+const sparseOrderbookMeta = computeOrderbookMetrics(
+  {
+    asks: [{ p: 101, s: 2 }],
+    bids: [{ p: 99, s: 2 }],
+  },
+  { ask: 101, bid: 99 },
+  {
+    bandBps: 200,
+    minDepthUsd: 500,
+    maxImpactBps: 100,
+    impactNotionalUsd: 50,
+    imbalanceBiasScale: 0.04,
+    minLevelsPerSide: 2,
+  },
+);
+assert.equal(sparseOrderbookMeta.depthState, 'orderbook_sparse');
+assert.equal(Number.isFinite(sparseOrderbookMeta.sparseAvailableDepthUsd), true);
+assert.equal(sparseOrderbookMeta.actualDepthUsd, null);
+const sparseEval = evaluateEntryMarketData({
+  symbol: 'BTC/USD',
+  symbolTier: 'tier1',
+  spreadBps: 5,
+  quoteAgeMs: 1000,
+  requiredEdgeBps: 10,
+  netEdgeBps: 300,
+  minNetEdgeBps: 5,
+  predictorProbability: 0.8,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: sparseOrderbookMeta.sparseAvailableDepthUsd,
+  orderbookMeta: sparseOrderbookMeta,
+  policy: {
+    quoteMaxAgeMs: 120000,
+    maxSpreadBpsToEnter: 20,
+    sparseFallback: {
+      enabled: true,
+      symbols: new Set(['BTC/USD']),
+      maxSpreadBps: 10,
+      requireStrongerEdgeBps: 240,
+      requireQuoteFreshMs: 5000,
+      staleQuoteToleranceMs: 15000,
+      minProbability: 0.6,
+      allowByTier: { tier1: true },
+    },
+  },
+});
+assert.equal(sparseEval.sparseFallbackState.depthOk, true);
+
+const staleSparseEval = evaluateEntryMarketData({
+  symbol: 'BTC/USD',
+  symbolTier: 'tier1',
+  spreadBps: 5,
+  quoteAgeMs: 30000,
+  requiredEdgeBps: 10,
+  netEdgeBps: 300,
+  minNetEdgeBps: 5,
+  predictorProbability: 0.8,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 0,
+  orderbookMeta: { depthState: 'orderbook_sparse', actualDepthUsd: null },
+  policy: {
+    quoteMaxAgeMs: 120000,
+    maxSpreadBpsToEnter: 20,
+    sparseFallback: {
+      enabled: true,
+      symbols: new Set(['BTC/USD']),
+      maxSpreadBps: 10,
+      requireStrongerEdgeBps: 240,
+      requireQuoteFreshMs: 5000,
+      staleQuoteToleranceMs: 15000,
+      minProbability: 0.6,
+      allowByTier: { tier1: true },
+    },
+  },
+  dataQualityReason: 'provider_quote_stale_after_refresh',
+});
+assert.equal(staleSparseEval.reason, 'provider_quote_stale_after_refresh');
+assert.equal(tradeEntryBasis.shouldCountSparseFallbackReject({ marketDataEval: staleSparseEval }), true);
+
+const predictorCandidate = tradeEntryBasis.buildPredictorCandidateSignal({
+  symbol: 'BTC/USD',
+  recordBase: { predictorProbability: 0.7, spreadBps: 6 },
+  candidateMeta: { requiredEdgeBps: 42, edge: { netEdgeBps: 10 }, quoteAgeMs: 1000 },
+  candidateDecision: 'skipped',
+  candidateSkipReason: 'test_skip',
+});
+assert.equal(predictorCandidate.requiredEdgeBps, 42);
+
+async function runSparseQuoteRefreshToleranceTest() {
+  const calls = [];
+  const coordinator = createRequestCoordinator({ dedupeEnabled: true, quoteTtlMs: 3000 });
+  const context = buildEntryMarketDataContext();
+  await getOrFetchSymbolMarketData({
+    context,
+    coordinator,
+    symbol: 'BTC/USD',
+    fetchQuote: async (_symbol, opts) => {
+      calls.push(opts.maxAgeMs);
+      return { tsMs: Date.now(), bid: 1, ask: 2, receivedAtMs: Date.now() };
+    },
+    fetchOrderbook: async () => ({ ok: true, orderbook: { asks: [], bids: [] } }),
+    quoteMaxAgeMs: 120000,
+    orderbookMaxAgeMs: 1000,
+    forceQuoteRefresh: true,
+  });
+  await getOrFetchSymbolMarketData({
+    context,
+    coordinator,
+    symbol: 'BTC/USD',
+    fetchQuote: async (_symbol, opts) => {
+      calls.push(opts.maxAgeMs);
+      return { tsMs: Date.now(), bid: 1, ask: 2, receivedAtMs: Date.now() };
+    },
+    fetchOrderbook: async () => ({ ok: true, orderbook: { asks: [], bids: [] } }),
+    quoteMaxAgeMs: 15000,
+    orderbookMaxAgeMs: 1000,
+    forceQuoteRefresh: true,
+  });
+  assert.deepEqual(calls, [120000, 15000]);
+}
+
 async function runMarketDataDiagnosticsRegression() {
   const httpModule = require('./modules/http');
   const originalRequestJson = httpModule.requestJson;
@@ -341,7 +472,10 @@ async function runMarketDataDiagnosticsRegression() {
   }
 }
 
-runMarketDataDiagnosticsRegression().catch((err) => {
+Promise.resolve()
+  .then(() => runSparseQuoteRefreshToleranceTest())
+  .then(() => runMarketDataDiagnosticsRegression())
+  .catch((err) => {
   console.error(err);
   process.exitCode = 1;
 });

@@ -39,6 +39,7 @@ function evaluateEntryMarketData({
   availableDepthUsd,
   orderbookMeta,
   policy,
+  dataQualityReason = null,
 }) {
   const depthState = orderbookMeta?.depthState || 'orderbook_malformed';
   const spreadState = Number.isFinite(spreadBps)
@@ -135,7 +136,7 @@ function evaluateEntryMarketData({
           : !allowedSymbol
             ? 'sparse_fallback_symbol_restricted'
             : !sparseFallbackState.quoteWithinFallbackTolerance
-              ? 'quote_stale'
+              ? (dataQualityReason || 'quote_stale')
             : !sparseFallbackState.spreadOk
                 ? 'sparse_fallback_spread_wide'
                 : !sparseFallbackState.edgeOk

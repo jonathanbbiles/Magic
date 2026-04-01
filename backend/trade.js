@@ -472,6 +472,52 @@ function getEntryRegimeStaleThresholdMs() {
   return ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS;
 }
 
+function shouldCountSparseFallbackReject({ marketDataEval }) {
+  return Boolean(
+    marketDataEval?.depthState === 'orderbook_sparse' &&
+    marketDataEval?.sparseFallbackState?.evaluated &&
+    marketDataEval?.sparseFallbackState?.accepted === false,
+  );
+}
+
+function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
+  const requiredEdgeBps = Number(
+    candidateMeta?.requiredEdgeBps
+    ?? candidateMeta?.edge?.requiredEdgeBps
+    ?? recordBase?.requiredEdgeBps
+  );
+  const expectedMoveBps = Number(
+    candidateMeta?.expectedMoveBps
+    ?? candidateMeta?.edge?.expectedMoveBps
+  );
+  const netEdgeBps = Number(
+    candidateMeta?.netEdgeBps
+    ?? candidateMeta?.edge?.netEdgeBps
+  );
+  const fillProbability = Number(
+    candidateMeta?.fillProbability
+    ?? candidateMeta?.edge?.fillProbability
+  );
+  return {
+    symbol,
+    probability: Number(recordBase?.predictorProbability),
+    expectedMoveBps,
+    spreadBps: Number(candidateMeta?.spreadBps ?? recordBase?.spreadBps),
+    requiredEdgeBps,
+    netEdgeBps,
+    quoteAgeMs: Number(candidateMeta?.quoteAgeMs),
+    regimeLabel: candidateMeta?.regimeScorecard?.label || null,
+    regimePenaltyBps: Number(candidateMeta?.regimePenaltyBps),
+    fillProbability,
+    quoteTsMs: Number(candidateMeta?.quoteTsMs),
+    quoteReceivedAtMs: Number(candidateMeta?.quoteReceivedAtMs),
+    dataQualityReason: candidateMeta?.dataQualityReason || null,
+    sparseRetry: candidateMeta?.sparseRetry || null,
+    decision: candidateDecision,
+    skipReason: candidateSkipReason,
+  };
+}
+
 // 1) Time-of-day conditioning
 const TIME_OF_DAY_ENABLED = readFlag('TIME_OF_DAY_ENABLED', false);
 const TIME_OF_DAY_PROFILE_JSON = String(process.env.TIME_OF_DAY_PROFILE_JSON || '').trim();
@@ -1380,6 +1426,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   let quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
   let quoteSource = quote?.source || null;
   let quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
+  let sparseRetryDetails = null;
 
   if (!obResult) {
     obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
@@ -1463,7 +1510,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbol: asset.symbol,
         fetchQuote: getQuoteForTrading,
         fetchOrderbook: getLatestOrderbook,
-        quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        quoteMaxAgeMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
         forceQuoteRefresh: shouldForceQuoteRefreshForSparseRetry,
         forceOrderbookRefresh: true,
@@ -1472,8 +1519,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     const quoteRetry = entryMdContext
       ? (obRetrySnapshot?.quote || null)
       : (shouldForceQuoteRefreshForSparseRetry
-        ? await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS, forceRefresh: true, bypassCache: true }).catch(() => null)
+        ? await getQuoteForTrading(asset.symbol, { maxAgeMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS, forceRefresh: true, bypassCache: true }).catch(() => null)
         : quote);
+    const priorQuoteTsMs = quoteTsMs;
+    const priorQuoteReceivedAtMs = quoteReceivedAtMs;
     if (quoteRetry && shouldForceQuoteRefreshForSparseRetry) {
       quote = quoteRetry;
       quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
@@ -1481,6 +1530,29 @@ async function computeEntrySignal(symbol, opts = {}) {
       quoteSource = quote?.source || null;
       quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
     }
+    sparseRetryDetails = {
+      quoteMaxAgeMsUsed: shouldForceQuoteRefreshForSparseRetry
+        ? ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS
+        : ENTRY_QUOTE_MAX_AGE_MS,
+      sparseStaleToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+      quoteTsMs: { before: priorQuoteTsMs, after: quoteTsMs },
+      quoteReceivedAtMs: { before: priorQuoteReceivedAtMs, after: quoteReceivedAtMs },
+      quoteAgeMs: { before: priorQuoteAgeMs, after: quoteAgeMs },
+      retrySource: {
+        quote: quote?.source || null,
+        quoteBefore: priorQuoteSource,
+        orderbook: null,
+        orderbookBefore: priorOrderbookSource,
+      },
+      refresh: {
+        quoteForced: shouldForceQuoteRefreshForSparseRetry,
+        orderbookForced: true,
+      },
+      providerQuoteStaleAfterRefresh:
+        Boolean(shouldForceQuoteRefreshForSparseRetry) &&
+        Number.isFinite(quoteAgeMs) &&
+        quoteAgeMs > ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+    };
     const obRetry = entryMdContext
       ? obRetrySnapshot?.orderbook
       : await getLatestOrderbook(asset.symbol, {
@@ -1490,32 +1562,24 @@ async function computeEntrySignal(symbol, opts = {}) {
     if (obRetry?.ok) {
       obResult = obRetry;
       orderbookMeta = buildOrderbookMeta(obResult);
+      sparseRetryDetails.retrySource.orderbook = obRetry.source || null;
       console.log('entry_sparse_fallback_eval', {
         symbol: asset.symbol,
         symbolTier,
         action: 'confirm_retry',
-        retrySource: {
-          quote: quote?.source || null,
-          quoteBefore: priorQuoteSource,
-          orderbook: obRetry.source || null,
-          orderbookBefore: priorOrderbookSource,
-        },
-        refresh: {
-          quoteForced: shouldForceQuoteRefreshForSparseRetry,
-          orderbookForced: true,
-        },
-        quoteAgeMs: {
-          before: priorQuoteAgeMs,
-          after: quoteAgeMs,
-        },
+        quoteMaxAgeMsUsed: sparseRetryDetails.quoteMaxAgeMsUsed,
+        sparseStaleToleranceMs: sparseRetryDetails.sparseStaleToleranceMs,
+        quoteTsMs: sparseRetryDetails.quoteTsMs,
+        quoteReceivedAtMs: sparseRetryDetails.quoteReceivedAtMs,
+        quoteAgeMs: sparseRetryDetails.quoteAgeMs,
+        retrySource: sparseRetryDetails.retrySource,
+        refresh: sparseRetryDetails.refresh,
+        providerQuoteStaleAfterRefresh: sparseRetryDetails.providerQuoteStaleAfterRefresh,
         depthState: orderbookMeta.depthState,
         levelsConsideredPerSide: orderbookMeta.levelsConsideredPerSide,
       });
-    } else if (entryMdContext) {
-      entryMdContext.stats.sparseFallbackRejects += 1;
     }
   } else if (shouldConfirmSparse && entryMdContext) {
-    entryMdContext.stats.sparseFallbackRejects += 1;
     const confirmAttemptsUsed = entryMdContext?.sparseConfirmAttempts?.size || 0;
     const confirmAttemptsBudget = ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN;
     let retryBlockedReason = 'endpoint_cooldown_active';
@@ -2333,6 +2397,11 @@ async function computeEntrySignal(symbol, opts = {}) {
       record: baseRecord,
     };
   }
+  const providerQuoteStaleAfterRefresh = Boolean(sparseRetryDetails?.providerQuoteStaleAfterRefresh);
+  const dataQualityReason = providerQuoteStaleAfterRefresh ? 'provider_quote_stale_after_refresh' : null;
+  const availableDepthUsdForEval = orderbookMeta?.depthState === 'ok'
+    ? orderbookMeta.actualDepthUsd
+    : orderbookMeta.sparseAvailableDepthUsd;
 
   const marketDataEval = evaluateEntryMarketData({
     symbol: asset.symbol,
@@ -2346,9 +2415,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     weakLiquidity,
     cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
     requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    availableDepthUsd: orderbookMeta.actualDepthUsd,
+    availableDepthUsd: availableDepthUsdForEval,
     orderbookMeta,
     policy: getEntryMarketDataPolicy(),
+    dataQualityReason,
   });
   console.log('entry_marketdata_eval', {
     symbol: asset.symbol,
@@ -2361,6 +2431,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     bidDepthUsd: orderbookMeta.bidDepthUsd,
     askDepthUsd: orderbookMeta.askDepthUsd,
     actualDepthUsd: orderbookMeta.actualDepthUsd,
+    sparseAvailableDepthUsd: orderbookMeta.sparseAvailableDepthUsd,
     impactBps: orderbookMeta.impactBpsBuy,
     spreadBps,
     spreadPressureProxy,
@@ -2374,12 +2445,14 @@ async function computeEntrySignal(symbol, opts = {}) {
     sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
     sparseStaleToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
     sparseFallback: marketDataEval.sparseFallbackState,
+    sparseRetry: sparseRetryDetails,
+    dataQualityReason,
     cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
     requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    reason: marketDataEval.reason,
+    reason: marketDataEval.reason || dataQualityReason,
   });
   if (marketDataEval.dataQualityState !== 'ok') {
-    if (marketDataEval.depthState === 'orderbook_sparse') {
+    if (shouldCountSparseFallbackReject({ marketDataEval })) {
       if (entryMdContext) entryMdContext.stats.sparseFallbackRejects += 1;
       console.log('entry_sparse_fallback_reject', {
         symbol: asset.symbol,
@@ -2389,9 +2462,11 @@ async function computeEntrySignal(symbol, opts = {}) {
         netEdgeBps: edge.netEdgeBps,
         quoteAgeMs,
         requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-        availableDepthUsd: orderbookMeta.actualDepthUsd,
+        availableDepthUsd: availableDepthUsdForEval,
         cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
         sparseFallback: marketDataEval.sparseFallbackState,
+        sparseRetry: sparseRetryDetails,
+        dataQualityReason: dataQualityReason || marketDataEval.reason,
         reason: marketDataEval.reason,
       });
     }
@@ -2410,6 +2485,11 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbolTier,
         spreadBps,
         quoteAgeMs,
+        expectedMoveBps: edge?.expectedMoveBps ?? null,
+        requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+        netEdgeBps: edge?.netEdgeBps ?? null,
+        fillProbability,
+        regimeLabel: regimeScorecard?.label || null,
         quoteSource,
         quoteTsMs,
         quoteReceivedAtMs,
@@ -2417,6 +2497,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         regimeScorecard,
         regimePenaltyBps,
         marketDataEval,
+        dataQualityReason: dataQualityReason || marketDataEval.reason,
+        sparseRetry: sparseRetryDetails,
         ...orderbookMeta,
       },
       record: baseRecord,
@@ -2435,7 +2517,26 @@ async function computeEntrySignal(symbol, opts = {}) {
     return {
       entryReady: false,
       why: marketDataEval.reason || 'entry_liquidity_gate',
-      meta: { symbol: asset.symbol, symbolTier, spreadBps, weakLiquidity, spreadPressureProxy, ...orderbookMeta, marketDataEval },
+      meta: {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        weakLiquidity,
+        spreadPressureProxy,
+        quoteAgeMs,
+        quoteTsMs,
+        quoteReceivedAtMs,
+        expectedMoveBps: edge?.expectedMoveBps ?? null,
+        requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+        netEdgeBps: edge?.netEdgeBps ?? null,
+        fillProbability,
+        regimeLabel: regimeScorecard?.label || null,
+        regimePenaltyBps,
+        dataQualityReason: marketDataEval.reason || null,
+        sparseRetry: sparseRetryDetails,
+        ...orderbookMeta,
+        marketDataEval,
+      },
       record: baseRecord,
     };
   }
@@ -2450,7 +2551,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       netEdgeBps: edge.netEdgeBps,
       quoteAgeMs,
       requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-      availableDepthUsd: orderbookMeta.actualDepthUsd,
+      availableDepthUsd: availableDepthUsdForEval,
       cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
       confidenceCap: marketDataEval.confidenceMultiplierCap,
       sparseFallback: marketDataEval.sparseFallbackState,
@@ -2466,10 +2567,14 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbolTier,
         spreadBps,
         quoteAgeMs,
+        quoteTsMs,
+        quoteReceivedAtMs,
         regimeScorecard,
         regimePenaltyBps,
+        regimeLabel: regimeScorecard?.label || null,
         marketDataEval,
         edge,
+        fillProbability,
         targetMoveBps: edgeRequirements.targetMoveBps,
         feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
         slippageBps: edgeRequirements.slippageBps,
@@ -2656,6 +2761,15 @@ async function computeEntrySignal(symbol, opts = {}) {
       edge,
       expectedNetEdgeBps: edge?.expectedNetEdgeBps ?? edge?.netEdgeBps ?? null,
       confidence: { ...confidence, confidenceMultiplier: confidenceMultiplierCapped },
+      expectedMoveBps: edge?.expectedMoveBps ?? null,
+      requiredEdgeBps: edgeRequirements.requiredEdgeBps,
+      netEdgeBps: edge?.netEdgeBps ?? null,
+      fillProbability,
+      quoteAgeMs,
+      quoteTsMs,
+      quoteReceivedAtMs,
+      regimeLabel: regimeScorecard?.label || null,
+      sparseRetry: sparseRetryDetails,
     },
     record: baseRecord,
   };
@@ -12741,19 +12855,13 @@ async function runEntryScanOnce() {
         Number.isFinite(candidateMeta?.edge?.netEdgeBps) ||
         candidateDecision === 'skipped'
       ) {
-        candidateSignals.push({
+        candidateSignals.push(buildPredictorCandidateSignal({
           symbol,
-          probability: Number(recordBase?.predictorProbability),
-          expectedMoveBps: Number(candidateMeta?.edge?.expectedMoveBps),
-          spreadBps: Number(recordBase?.spreadBps),
-          requiredEdgeBps: Number(candidateMeta?.edge?.requiredEdgeBps),
-          netEdgeBps: Number(candidateMeta?.edge?.netEdgeBps),
-          quoteAgeMs: Number(candidateMeta?.quoteAgeMs),
-          regimeLabel: candidateMeta?.regimeScorecard?.label || null,
-          regimePenaltyBps: Number(candidateMeta?.regimePenaltyBps),
-          decision: candidateDecision,
-          skipReason: candidateSkipReason,
-        });
+          recordBase,
+          candidateMeta,
+          candidateDecision,
+          candidateSkipReason,
+        }));
       }
       if (DEBUG_ENTRY) {
         console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
@@ -13001,6 +13109,11 @@ async function runEntryScanOnce() {
         quoteAgeMs: Number.isFinite(candidate.quoteAgeMs) ? candidate.quoteAgeMs : null,
         regimeLabel: candidate.regimeLabel || null,
         regimePenaltyBps: Number.isFinite(candidate.regimePenaltyBps) ? candidate.regimePenaltyBps : null,
+        fillProbability: Number.isFinite(candidate.fillProbability) ? candidate.fillProbability : null,
+        quoteTsMs: Number.isFinite(candidate.quoteTsMs) ? candidate.quoteTsMs : null,
+        quoteReceivedAtMs: Number.isFinite(candidate.quoteReceivedAtMs) ? candidate.quoteReceivedAtMs : null,
+        dataQualityReason: candidate.dataQualityReason || null,
+        sparseRetry: candidate.sparseRetry || null,
         decision: candidate.decision || null,
         skipReason: candidate.skipReason || null,
       }));
@@ -13028,6 +13141,12 @@ async function runEntryScanOnce() {
           quoteAgeMs: Number.isFinite(candidate.quoteAgeMs) ? candidate.quoteAgeMs : null,
           regimeLabel: candidate.regimeLabel || null,
           regimePenaltyBps: Number.isFinite(candidate.regimePenaltyBps) ? candidate.regimePenaltyBps : null,
+          requiredEdgeBps: Number.isFinite(candidate.requiredEdgeBps) ? candidate.requiredEdgeBps : null,
+          netEdgeBps: Number.isFinite(candidate.netEdgeBps) ? candidate.netEdgeBps : null,
+          quoteTsMs: Number.isFinite(candidate.quoteTsMs) ? candidate.quoteTsMs : null,
+          quoteReceivedAtMs: Number.isFinite(candidate.quoteReceivedAtMs) ? candidate.quoteReceivedAtMs : null,
+          dataQualityReason: candidate.dataQualityReason || null,
+          sparseRetry: candidate.sparseRetry || null,
         });
         return acc;
       }, {});
@@ -15190,6 +15309,8 @@ module.exports = {
   getEntryRegimeStaleThresholdMs,
   requestAlpacaMarketData,
   resolveRegimePenaltyBps,
+  shouldCountSparseFallbackReject,
+  buildPredictorCandidateSignal,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
     quoteCache.set(normalizeSymbol(symbol), quote);
