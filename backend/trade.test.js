@@ -98,6 +98,24 @@ assert.equal(typeof lifecycleSnapshot.authoritativeCount, 'number');
 const governorSnapshot = tradeLifecycle.getSessionGovernorSummary();
 assert.equal(typeof governorSnapshot.coolDownActive, 'boolean');
 
+const tradeManagers = loadTrade({ TRADING_ENABLED: '0' });
+tradeManagers.__resetManagerIntervalsForTests();
+const managerStatusBefore = tradeManagers.getTradingManagerStatus();
+assert.equal(managerStatusBefore.entryManagerIntervalActive, false);
+assert.equal(managerStatusBefore.exitManagerIntervalActive, false);
+tradeManagers.startEntryManager();
+tradeManagers.startEntryManager();
+tradeManagers.startExitManager();
+tradeManagers.startExitManager();
+const managerStatusAfter = tradeManagers.getTradingManagerStatus();
+assert.equal(managerStatusAfter.entryManagerIntervalActive, true);
+assert.equal(managerStatusAfter.exitRepairIntervalActive, true);
+assert.equal(managerStatusAfter.exitManagerIntervalActive, true);
+tradeManagers.__resetManagerIntervalsForTests();
+const managerStatusReset = tradeManagers.getTradingManagerStatus();
+assert.equal(managerStatusReset.entryManagerIntervalActive, false);
+assert.equal(managerStatusReset.exitManagerIntervalActive, false);
+
 const tradeWithReprice = loadTrade({
   SELL_REPRICE_ENABLED: '1',
   EXIT_CANCELS_ENABLED: '0',
@@ -167,10 +185,33 @@ assert.equal(desiredLimit, 100.5);
 
 const desiredLimitFromEntry = computeTargetSellPrice(100, 75, 0.01);
 assert.equal(desiredLimitFromEntry, 100.75);
+const staleRefresh = tradeEntryBasis.shouldRefreshExitOrder({
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  awayBps: 1,
+  currentLimit: 100.2,
+  nextLimit: 100.21,
+  tickSize: 0.01,
+  refreshCooldownActive: false,
+  quoteAgeMs: 2000,
+  heldMs: 120000,
+  staleTradeMs: 90000,
+  thesisBroken: true,
+});
+assert.equal(staleRefresh.ok, true);
+assert.equal(staleRefresh.why, 'thesis_break');
 
 const fallbackEntry = resolveEntryBasis({ avgEntryPrice: 0, fallbackEntryPrice: 101 });
 assert.equal(fallbackEntry.entryBasisType, 'fallback_local');
 assert.equal(fallbackEntry.entryBasis, 101);
+
+const weakIntent = tradeLifecycle.createEntryIntent('SOL/USD', {
+  decisionPrice: 120,
+  spreadAtIntent: 8,
+  directionalPersistence: 0.05,
+  orderbookLiquidityScore: 0.9,
+});
+assert.equal(weakIntent.directionalPersistence, 0.05);
 
 assert.equal(computeAwayBps(110, 100), 1000);
 assert.equal(computeAwayBps(90, 100), 1000);
