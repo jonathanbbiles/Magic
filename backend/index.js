@@ -16,6 +16,7 @@ const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 const validateEnv = require('./config/validateEnv');
 const { getRuntimeConfigSummary } = require('./config/runtimeConfig');
+const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { preflightStoragePaths, resolveStoragePaths, logOnce } = require('./modules/storagePaths');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
 
@@ -87,6 +88,81 @@ const VERSION =
   process.env.RENDER_GIT_COMMIT ||
   process.env.COMMIT_SHA ||
   'dev';
+
+function readLiveNumber(key) {
+  const raw = process.env[key] ?? LIVE_CRITICAL_DEFAULTS[key];
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readLiveBoolean(key) {
+  const raw = String(process.env[key] ?? LIVE_CRITICAL_DEFAULTS[key] ?? '').trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(raw);
+}
+
+function readLiveSymbols(key) {
+  return String(process.env[key] ?? LIVE_CRITICAL_DEFAULTS[key] ?? '')
+    .split(',')
+    .map((symbol) => normalizePair(symbol))
+    .filter(Boolean);
+}
+
+function resolvePrimarySymbolTier(symbol) {
+  const normalized = normalizePair(symbol);
+  const tier1 = readLiveSymbols('EXECUTION_TIER1_SYMBOLS');
+  const tier2 = readLiveSymbols('EXECUTION_TIER2_SYMBOLS');
+  if (tier1.includes(normalized)) return 'tier1';
+  if (tier2.includes(normalized)) return 'tier2';
+  return 'tier3';
+}
+
+const runtimeStrategyConfig = {
+  version: VERSION,
+  commit: process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || process.env.GIT_COMMIT || null,
+  telemetrySchemaVersion: 2,
+  entryQuoteMaxAgeMs: readLiveNumber('ENTRY_QUOTE_MAX_AGE_MS'),
+  cryptoQuoteMaxAgeOverrideEnabled: readLiveBoolean('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED'),
+  sparseFallbackEnabled: readLiveBoolean('ORDERBOOK_SPARSE_FALLBACK_ENABLED'),
+  sparseFallbackSymbols: readLiveSymbols('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS'),
+  sparseAllowTier1: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER1'),
+  sparseAllowTier2: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER2'),
+  sparseAllowTier3: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER3'),
+  sparseRequireQuoteFreshMs: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS'),
+  sparseStaleQuoteToleranceMs: readLiveNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS'),
+  sparseMaxSpreadBps: readLiveNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS'),
+  entryTakeProfitBpsDefault: readLiveNumber('ENTRY_TAKE_PROFIT_BPS'),
+  entryStretchMoveBpsDefault: readLiveNumber('ENTRY_STRETCH_MOVE_BPS'),
+  entryTakeProfitBpsTier1: readLiveNumber('ENTRY_TAKE_PROFIT_BPS_TIER1'),
+  entryTakeProfitBpsTier2: readLiveNumber('ENTRY_TAKE_PROFIT_BPS_TIER2'),
+  entryStretchMoveBpsTier1: readLiveNumber('ENTRY_STRETCH_MOVE_BPS_TIER1'),
+  entryStretchMoveBpsTier2: readLiveNumber('ENTRY_STRETCH_MOVE_BPS_TIER2'),
+  entrySlippageBufferBpsDefault: readLiveNumber('ENTRY_SLIPPAGE_BUFFER_BPS'),
+  exitSlippageBufferBpsDefault: readLiveNumber('EXIT_SLIPPAGE_BUFFER_BPS'),
+  entrySlippageBufferBpsTier1: readLiveNumber('ENTRY_SLIPPAGE_BUFFER_BPS_TIER1'),
+  entrySlippageBufferBpsTier2: readLiveNumber('ENTRY_SLIPPAGE_BUFFER_BPS_TIER2'),
+  exitSlippageBufferBpsTier1: readLiveNumber('EXIT_SLIPPAGE_BUFFER_BPS_TIER1'),
+  exitSlippageBufferBpsTier2: readLiveNumber('EXIT_SLIPPAGE_BUFFER_BPS_TIER2'),
+};
+console.log('runtime_live_strategy_config', runtimeStrategyConfig);
+
+const configuredPrimary = readLiveSymbols('ENTRY_SYMBOLS_PRIMARY');
+const sparseSymbols = new Set(runtimeStrategyConfig.sparseFallbackSymbols);
+for (const symbol of configuredPrimary) {
+  const symbolTier = resolvePrimarySymbolTier(symbol);
+  const sparseAllowedByTier =
+    symbolTier === 'tier1' ? runtimeStrategyConfig.sparseAllowTier1
+      : symbolTier === 'tier2' ? runtimeStrategyConfig.sparseAllowTier2
+        : runtimeStrategyConfig.sparseAllowTier3;
+  const sparseSymbolListed = sparseSymbols.has(symbol);
+  if ((symbolTier === 'tier2' || symbolTier === 'tier3') && !sparseAllowedByTier && !sparseSymbolListed) {
+    console.warn('universe_symbol_policy_mismatch', {
+      symbol,
+      symbolTier,
+      sparseAllowedByTier,
+      sparseSymbolListed,
+    });
+  }
+}
 
 
 function maskConfigValue(key, value) {

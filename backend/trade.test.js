@@ -621,6 +621,13 @@ const staleTradePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
 assert.notEqual(staleTradePricePlan.selectedLimit, staleTradePricePlan.tpLimit);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
+assert.ok(tradeSource.includes("telemetrySchemaVersion: 2"));
+assert.ok(tradeSource.includes("sortMode: 'net_edge_then_probability'"));
+assert.ok(tradeSource.includes("quoteSource,"));
+assert.ok(tradeSource.includes("quoteReceivedAtMs,"));
+assert.ok(tradeSource.includes("sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS"));
+assert.ok(tradeSource.includes("retryBlockedReason = 'confirm_budget_exhausted'"));
+assert.ok(tradeSource.includes("retryBlockedReason = 'endpoint_cooldown_active'"));
 assert.match(
   tradeSource,
   /async function fetchLiveOrders\(\{ force = false \} = \{\}\)[\s\S]*fetchOrders\(\{ status: 'open', nested: true, direction: 'desc', limit: 500 \}\)/,

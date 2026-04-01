@@ -1357,7 +1357,10 @@ async function computeEntrySignal(symbol, opts = {}) {
     symbolTier,
     sparseFallbackEnabled: ORDERBOOK_SPARSE_FALLBACK_ENABLED,
   });
-  const quoteAgeMs = Number.isFinite(quote.tsMs) ? Math.max(0, nowMs - quote.tsMs) : null;
+  const quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+  const quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+  const quoteSource = quote?.source || null;
+  const quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
 
   if (!obResult) {
     obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
@@ -1456,11 +1459,21 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   } else if (shouldConfirmSparse && entryMdContext) {
     entryMdContext.stats.sparseFallbackRejects += 1;
+    const confirmAttemptsUsed = entryMdContext?.sparseConfirmAttempts?.size || 0;
+    const confirmAttemptsBudget = ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN;
+    let retryBlockedReason = 'endpoint_cooldown_active';
+    if (sparseConfirmAlreadyAttempted) {
+      retryBlockedReason = 'already_attempted_this_scan';
+    } else if (confirmAttemptsUsed >= confirmAttemptsBudget) {
+      retryBlockedReason = 'confirm_budget_exhausted';
+    }
     console.log('entry_sparse_fallback_eval', {
       symbol: asset.symbol,
       symbolTier,
       action: 'retry_blocked',
-      reason: sparseConfirmAlreadyAttempted ? 'already_attempted' : 'cooldown_active',
+      reason: retryBlockedReason,
+      confirmAttemptsUsed,
+      confirmAttemptsBudget,
     });
   }
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
@@ -2261,7 +2274,13 @@ async function computeEntrySignal(symbol, opts = {}) {
     spreadBps,
     probability: predictorTp?.probability ?? null,
     confidenceCap: marketDataEval.confidenceMultiplierCap,
+    quoteSource,
+    quoteTsMs,
+    quoteReceivedAtMs,
     quoteAgeMs,
+    entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+    sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+    sparseStaleToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
     sparseFallback: marketDataEval.sparseFallbackState,
     cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
     requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
@@ -12789,7 +12808,13 @@ async function runEntryScanOnce() {
         skipReason: candidate.skipReason || null,
       }));
     if (topCandidates.length) {
-      console.log('predictor_candidates', { startMs, endMs, topCandidates });
+      console.log('predictor_candidates', {
+        telemetrySchemaVersion: 2,
+        sortMode: 'net_edge_then_probability',
+        startMs,
+        endMs,
+        topCandidates,
+      });
     }
     console.log('entry_scan', {
       startMs,
