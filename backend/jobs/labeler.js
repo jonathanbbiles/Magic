@@ -1,18 +1,18 @@
 const fs = require('fs');
 const path = require('path');
+const { resolveStoragePaths, logOnce } = require('../modules/storagePaths');
 const { fetchCryptoBars } = require('../trade');
 const { normalizePair } = require('../symbolUtils');
 
-const DATASET_DIR = process.env.DATASET_DIR || './data';
-const DATASET_FORMAT = process.env.DATASET_FORMAT || 'jsonl';
 const TARGET_MOVE_BPS = Number(process.env.TARGET_MOVE_BPS || 100);
 const TARGET_HORIZON_MINUTES = Number(process.env.TARGET_HORIZON_MINUTES || 30);
 const LABELER_INTERVAL_MS = Number(process.env.LABELER_INTERVAL_MS || 300000);
 const LABELER_MAX_RECORDS = Number(process.env.LABELER_MAX_RECORDS || 200);
 const LABELER_SLEEP_MS = Number(process.env.LABELER_SLEEP_MS || 200);
 
-const predictorPath = path.resolve(DATASET_DIR, `predictor.${DATASET_FORMAT}`);
-const labelsPath = path.resolve(DATASET_DIR, 'labeled.jsonl');
+const storage = resolveStoragePaths();
+const predictorPath = storage.paths.recorderFile || null;
+const labelsPath = storage.paths.labelerFile || null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -54,10 +54,11 @@ function keyForRecord(record) {
 
 function appendLabel(record) {
   try {
+    if (!labelsPath) return;
     fs.mkdirSync(path.dirname(labelsPath), { recursive: true });
     fs.appendFileSync(labelsPath, `${JSON.stringify(record)}\n`, 'utf8');
   } catch (err) {
-    console.warn('labeler_append_failed', { error: err?.message || String(err) });
+    logOnce('warn', 'labeler_append_failed', 'labeler_append_failed', { labelsPath, error: err?.message || String(err) });
   }
 }
 
@@ -201,6 +202,7 @@ async function labelRecord(record) {
 }
 
 async function runLabelerOnce() {
+  if (!predictorPath || !labelsPath) return;
   const predictorLines = readLastLines(predictorPath, LABELER_MAX_RECORDS * 4);
   const predictorRecords = parseJsonLines(predictorLines);
   if (!predictorRecords.length) return;

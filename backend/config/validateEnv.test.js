@@ -44,7 +44,7 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
-  assert.equal(guardrails.entryUniverse.modeEffective, 'dynamic');
+  assert.equal(guardrails.entryUniverse.modeEffective, 'configured');
   assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, false);
   assert.equal(guardrails.engineV2.enabled, false);
   assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);

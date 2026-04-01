@@ -10,7 +10,9 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 
 ## Production environment source of truth
 
-- `backend/.env.production` is the canonical production profile in git.
+- `backend/.env.production` is the single canonical production config model for all live-critical defaults.
+- `backend/.env.live.example` must mirror those live-critical keys exactly and is only an example for operators.
+- `backend/config/liveDefaults.js` defines the same canonical live-critical defaults used by runtime parsing, checks, and engine fallbacks.
 - Start production with `npm run start:production` so the backend loads `backend/.env.production` before boot.
 - On managed hosts (Render/Fly/etc.), copy these same values into the platform environment because checked-in env files are not auto-synced.
 

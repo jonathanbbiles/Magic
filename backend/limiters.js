@@ -1,3 +1,4 @@
+const { getRuntimeConfig } = require('./config/runtimeConfig');
 function createLimiter(name, maxConcurrent, minTimeMs = 0) {
   let activeCount = 0;
   const queue = [];
@@ -57,10 +58,8 @@ const QUOTE_MIN_TIME_MS = (() => {
 })();
 
 // BARS limiter (market-data bars endpoint is the one hitting 429 most often)
-const BARS_MAX_CONCURRENT = (() => {
-  const value = Number(process.env.BARS_MAX_CONCURRENT);
-  return Number.isFinite(value) && value > 0 ? value : 2;
-})();
+const runtimeConfig = getRuntimeConfig(process.env);
+const BARS_MAX_CONCURRENT = Math.max(1, runtimeConfig.barsMaxConcurrent);
 
 const BARS_MIN_TIME_MS = (() => {
   const value = Number(process.env.BARS_MIN_TIME_MS);

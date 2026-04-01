@@ -216,13 +216,13 @@ const validateEnv = () => {
     const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
     const executionTier1Symbols = parseSymbolListEnv('EXECUTION_TIER1_SYMBOLS', 'BTC/USD,ETH/USD');
     const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
-    const executionTier3Default = parseBooleanEnv('EXECUTION_TIER3_DEFAULT', true);
+    const runtimeConfig = getRuntimeConfig(process.env);
+    const executionTier3Default = parseBooleanEnv('EXECUTION_TIER3_DEFAULT', runtimeConfig.executionTier3Default);
     const marketdataDedupeEnabled = parseBooleanEnv('MARKETDATA_DEDUPE_ENABLED', true);
     const marketdataQuoteTtlMs = parseFiniteNumberEnv('MARKETDATA_QUOTE_TTL_MS', 3000);
     const marketdataOrderbookTtlMs = parseFiniteNumberEnv('MARKETDATA_ORDERBOOK_TTL_MS', 2000);
     const marketdataBarsTtlMs = parseFiniteNumberEnv('MARKETDATA_BARS_TTL_MS', 10000);
-    const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000);
-    const runtimeConfig = getRuntimeConfig(process.env);
+    const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', runtimeConfig.marketdataRateLimitCooldownMs);
     const runtimeSummary = getRuntimeConfigSummary(process.env);
     const orderbookSparseConfirmMaxPerScan = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN', 1);
 

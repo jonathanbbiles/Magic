@@ -16,6 +16,7 @@ const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 const validateEnv = require('./config/validateEnv');
 const { getRuntimeConfigSummary } = require('./config/runtimeConfig');
+const { preflightStoragePaths, resolveStoragePaths, logOnce } = require('./modules/storagePaths');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
 
 const { getLimiterStatus } = require('./limiters');
@@ -27,6 +28,7 @@ const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
 validateEnv();
+const storagePaths = preflightStoragePaths();
 const runtimeConfigSummary = getRuntimeConfigSummary();
 console.log('runtime_live_critical_config', {
   stage: 'startup',
@@ -115,11 +117,11 @@ function writeRunSnapshot() {
   const snapshot = { ts: new Date().toISOString(), gitCommit: resolveGitCommit(), config };
   console.log('app_boot', snapshot);
   try {
-    const out = path.resolve('./data/run_snapshot.json');
+    const out = resolveStoragePaths().paths.runSnapshotFile || path.resolve('./data/run_snapshot.json');
     fs.mkdirSync(path.dirname(out), { recursive: true });
     fs.writeFileSync(out, JSON.stringify(snapshot, null, 2));
   } catch (err) {
-    console.warn('run_snapshot_write_failed', { error: err?.message || err });
+    logOnce('warn', 'run_snapshot_write_failed', 'run_snapshot_write_failed', { error: err?.message || err });
   }
 }
 

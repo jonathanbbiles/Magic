@@ -1,31 +1,34 @@
 const fs = require('fs');
 const path = require('path');
+const { resolveStoragePaths, logOnce } = require('./storagePaths');
 
-const FORENSICS_DIR = String(process.env.FORENSICS_DIR || './data').trim() || './data';
 const FORENSICS_RECENT_LIMIT = Number(process.env.FORENSICS_RECENT_LIMIT || 2000);
 const RECENT_LIMIT = Number.isFinite(FORENSICS_RECENT_LIMIT) && FORENSICS_RECENT_LIMIT > 0
   ? Math.floor(FORENSICS_RECENT_LIMIT)
   : 2000;
 
-const dirPath = path.resolve(FORENSICS_DIR);
-const filePath = path.join(dirPath, 'trade_forensics.jsonl');
+const storage = resolveStoragePaths();
+const filePath = storage.paths.tradeForensicsFile || null;
+const dirPath = filePath ? path.dirname(filePath) : null;
 
 const recentRecords = [];
 const latestTradeIdBySymbol = new Map();
 
 function ensureFileReady() {
+  if (!filePath || !dirPath) return false;
   fs.mkdirSync(dirPath, { recursive: true });
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, '', { encoding: 'utf8' });
   }
+  return true;
 }
 
 function appendLine(payload) {
   try {
-    ensureFileReady();
+    if (!ensureFileReady()) return;
     fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`, { encoding: 'utf8' });
   } catch (err) {
-    console.warn('trade_forensics_write_failed', { error: err?.message || err });
+    logOnce('warn', 'trade_forensics_write_failed', 'trade_forensics_write_failed', { filePath, error: err?.message || err });
   }
 }
 
