@@ -8,6 +8,12 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 2. Create a `.env` file with your Alpaca API keys and API token.
 3. `npm start`
 
+## Production environment source of truth
+
+- `backend/.env.production` is the canonical production profile in git.
+- Start production with `npm run start:production` so the backend loads `backend/.env.production` before boot.
+- On managed hosts (Render/Fly/etc.), copy these same values into the platform environment because checked-in env files are not auto-synced.
+
 ## Node 22 requirement
 
 - Run locally with Node 22: `nvm use` in the backend directory.
@@ -18,10 +24,10 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 Required:
 - `ALPACA_API_KEY`
 - `ALPACA_SECRET_KEY`
-- `TRADE_BASE` (or `ALPACA_API_BASE` for legacy configs)
+- `TRADE_BASE` (required live trading base URL; or `ALPACA_API_BASE` for legacy configs)
 
 Recommended:
-- `API_TOKEN` (shared token used by the frontend; include it as `Authorization: Bearer <token>` or `x-api-key`.)
+- `API_TOKEN` (required for non-public routes in production; include it as `Authorization: Bearer <token>` or `x-api-key`.)
 
 Optional:
 - `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
@@ -37,9 +43,9 @@ Optional:
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
-- `ENTRY_UNIVERSE_MODE` (`dynamic` by default; set `configured` to use `ENTRY_SYMBOLS_PRIMARY`/`ENTRY_SYMBOLS_SECONDARY`)
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; production startup fails fast unless this is explicitly `true` when using dynamic universe mode)
-- `ENTRY_SYMBOLS_PRIMARY` (manual primary universe when `ENTRY_UNIVERSE_MODE=configured`)
+- `ENTRY_UNIVERSE_MODE` (`dynamic` scans Alpaca tradable pairs at runtime; `configured` uses only symbols you provide via `ENTRY_SYMBOLS_PRIMARY` and optional `ENTRY_SYMBOLS_SECONDARY`)
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; production must use configured mode unless you explicitly set this to `true`)
+- `ENTRY_SYMBOLS_PRIMARY` (required when `ENTRY_UNIVERSE_MODE=configured`; provide at least one symbol such as `BTC/USD`)
 - `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
 - `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
@@ -194,10 +200,25 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `ALPACA_MD_MAX_RETRIES=6`
 - `ALPACA_MD_BASE_BACKOFF_MS=500`
 
+## Entry universe modes (dynamic vs configured)
+
+- **dynamic**: backend discovers tradable symbols from Alpaca at runtime, then filters by internal policy.
+- **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY` (plus optional `ENTRY_SYMBOLS_SECONDARY`).
+
+Production safety rule:
+- Set `ENTRY_UNIVERSE_MODE=configured` and provide at least one symbol in `ENTRY_SYMBOLS_PRIMARY`, **or**
+- explicitly opt into dynamic production behavior with `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`.
+
+For stable live deployments, also set:
+- `TRADE_BASE=https://api.alpaca.markets`
+- `DATA_BASE=https://data.alpaca.markets`
+- `API_TOKEN=<long random token>`
+- `DATASET_DIR` to a persistent mount (example: `/mnt/data`)
+
 ## Live example profile (intentionally conservative)
 
 `backend/.env.live.example` is intentionally narrow to reduce Alpaca market-data rate-limit pressure in live trading:
-- configured universe (`ENTRY_UNIVERSE_MODE=configured`) with only `BTC/USD, ETH/USD, SOL/USD, LINK/USD, AVAX/USD, UNI/USD`
+- configured universe (`ENTRY_UNIVERSE_MODE=configured`) with only `BTC/USD, ETH/USD, AVAX/USD, LINK/USD`
 - no secondary universe expansion
 - slower scans (`ENTRY_SCAN_INTERVAL_MS=12000`)
 - small prefetch chunks (`ENTRY_PREFETCH_CHUNK_SIZE=3`, still subject to hard cap of `20`)
@@ -211,7 +232,7 @@ Changing `backend/.env.live.example` in git **does not** update deployed Render 
 After merging, manually copy these values into Render:
 
 - `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,UNI/USD`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,AVAX/USD,LINK/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `EXECUTION_TIER3_DEFAULT=false`
@@ -234,7 +255,7 @@ If production logs still show `dynamic_full_universe` after deploy, the Render e
 Intended live non-secret env values:
 
 - `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,UNI/USD`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,AVAX/USD,LINK/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `EXECUTION_TIER3_DEFAULT=false`
