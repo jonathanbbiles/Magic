@@ -223,6 +223,8 @@ const validateEnv = () => {
     const marketdataRateLimitCooldownMs = parseFiniteNumberEnv('MARKETDATA_RATE_LIMIT_COOLDOWN_MS', 5000);
     const entryUniverseModeRaw = String(process.env.ENTRY_UNIVERSE_MODE || 'dynamic').trim().toLowerCase();
     const entryUniverseMode = entryUniverseModeRaw === 'configured' ? 'configured' : 'dynamic';
+    const nodeEnv = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
+    const allowDynamicUniverseInProduction = parseBooleanEnv('ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION', false);
     const entrySymbolsPrimary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_PRIMARY', ''));
     const entrySymbolsSecondary = dedupeSymbols(parseSymbolListEnv('ENTRY_SYMBOLS_SECONDARY', ''))
       .filter((symbol) => !entrySymbolsPrimary.includes(symbol));
@@ -353,6 +355,11 @@ const validateEnv = () => {
     if (entryUniverseMode === 'configured' && !entrySymbolsPrimary.length) {
       throw new Error('ENTRY_SYMBOLS_PRIMARY must include at least one symbol when ENTRY_UNIVERSE_MODE=configured.');
     }
+    if (nodeEnv === 'production' && entryUniverseMode !== 'configured' && !allowDynamicUniverseInProduction) {
+      throw new Error(
+        'ENTRY_UNIVERSE_MODE must be "configured" in production unless ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true explicitly opts in to broad dynamic scanning.'
+      );
+    }
     if (!executionTier1Symbols.length) {
       throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
     }
@@ -386,7 +393,9 @@ const validateEnv = () => {
         tier3Default: executionTier3Default,
       },
       entryUniverse: {
+        nodeEnv,
         mode: entryUniverseMode,
+        allowDynamicUniverseInProduction,
         primarySymbols: entrySymbolsPrimary,
         secondarySymbols: entrySymbolsSecondary,
         includeSecondary: entrySymbolsIncludeSecondary,
