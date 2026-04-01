@@ -30,7 +30,10 @@ withEnv({}, () => {
   assert.ok(tradeSource.includes('const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;'));
   assert.ok(tradeSource.includes('const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;'));
   assert.ok(tradeSource.includes('const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, runtimeLiveConfig.marketdataRateLimitCooldownMs);'));
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY, 'BTC/USD,ETH/USD');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY, '');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, 'false');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_FALLBACK_SYMBOLS, 'BTC/USD,ETH/USD');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS, '240');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER1, 'true');
