@@ -169,6 +169,7 @@ const {
   resolveEntryBasis,
   computeTargetSellPrice,
   computeAwayBps,
+  buildExitDecisionContext,
   getBrokerPositionLookupKeys,
   extractBrokerPositionQty,
   getOpenSellOrdersForSymbol,
@@ -361,6 +362,104 @@ const staleTimeStopRefresh = tradeEntryBasis.shouldRefreshExitOrder({
 });
 assert.equal(staleTimeStopRefresh.ok, true);
 assert.equal(staleTimeStopRefresh.why, 'time_stop');
+const lowConfidenceRefresh = tradeEntryBasis.shouldRefreshExitOrder({
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  awayBps: 25,
+  currentLimit: 100.2,
+  nextLimit: 99.8,
+  tickSize: 0.01,
+  refreshCooldownActive: false,
+  quoteAgeMs: 1000,
+  heldMs: 1000,
+  staleTradeMs: 900000,
+  thesisBroken: false,
+  timeStopTriggered: false,
+  basisConfidence: 'fallback',
+});
+assert.equal(lowConfidenceRefresh.ok, false);
+assert.equal(lowConfidenceRefresh.why, 'low_confidence_basis');
+const lowConfidenceWithOverride = tradeEntryBasis.shouldRefreshExitOrder({
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  awayBps: 25,
+  currentLimit: 100.2,
+  nextLimit: 99.8,
+  tickSize: 0.01,
+  refreshCooldownActive: false,
+  quoteAgeMs: 1000,
+  heldMs: 1000,
+  staleTradeMs: 900000,
+  thesisBroken: true,
+  timeStopTriggered: false,
+  basisConfidence: 'fallback',
+});
+assert.equal(lowConfidenceWithOverride.ok, true);
+assert.equal(lowConfidenceWithOverride.why, 'thesis_break');
+assert.doesNotThrow(() => buildExitDecisionContext({
+  symbol: 'BTC/USD',
+  bid: 100,
+  ask: 100.1,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryBasisValue: 100,
+  heldSeconds: 30,
+  tacticDecision: 'take_profit_hold',
+  currentLimit: 100.8,
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  refreshCooldownActive: false,
+  quoteAgeMs: 2000,
+  heldMs: 120000,
+  staleTradeMs: 90000,
+  thesisBrokenForRefresh: false,
+  timeStopTriggered: false,
+  basisConfidence: 'broker',
+}));
+const brokerDecisionContext = buildExitDecisionContext({
+  symbol: 'BTC/USD',
+  bid: 100,
+  ask: 100.1,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryBasisValue: 100,
+  heldSeconds: 30,
+  tacticDecision: 'take_profit_hold',
+  currentLimit: 100.8,
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  refreshCooldownActive: false,
+  quoteAgeMs: 2000,
+  heldMs: 120000,
+  staleTradeMs: 90000,
+  thesisBrokenForRefresh: false,
+  timeStopTriggered: false,
+  basisConfidence: 'broker',
+});
+assert.equal(Number.isFinite(brokerDecisionContext.desiredLimit), true);
+assert.equal(brokerDecisionContext.exitRefreshDecision.ok, true);
+const fallbackDecisionContext = buildExitDecisionContext({
+  symbol: 'BTC/USD',
+  bid: 100,
+  ask: 100.1,
+  tickSize: 0.01,
+  tpLimit: 101.5,
+  entryBasisValue: 100,
+  heldSeconds: 30,
+  tacticDecision: 'take_profit_hold',
+  currentLimit: 100.8,
+  mode: 'material',
+  existingOrderAgeMs: 600000,
+  refreshCooldownActive: false,
+  quoteAgeMs: 2000,
+  heldMs: 1000,
+  staleTradeMs: 90000,
+  thesisBrokenForRefresh: false,
+  timeStopTriggered: false,
+  basisConfidence: 'fallback',
+});
+assert.equal(fallbackDecisionContext.exitRefreshDecision.ok, false);
+assert.equal(fallbackDecisionContext.exitRefreshDecision.why, 'low_confidence_basis');
 
 assert.equal(
   tradeEntryBasis.chooseExitTactic({
@@ -435,23 +534,6 @@ const staleTradePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
 assert.notEqual(staleTradePricePlan.selectedLimit, staleTradePricePlan.tpLimit);
 
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
-const tpLimitIndex = tradeSource.indexOf('const tpLimit =');
-const tacticDecisionIndex = tradeSource.indexOf('const tacticDecision = chooseExitTactic');
-const pricePlanIndex = tradeSource.indexOf('const pricePlan = buildForcedExitPricePlan');
-const desiredLimitIndex = tradeSource.indexOf('const desiredLimit = pricePlan.selectedLimit');
-const finalLimitIndex = tradeSource.indexOf('const finalLimit = tacticDecision');
-const marketToExitBpsIndex = tradeSource.indexOf('const marketToExitBps_from_entry =');
-const awayBpsIndex = tradeSource.indexOf('const awayBps = computeAwayBps(currentLimit, finalLimit)');
-const exitRefreshDecisionIndex = tradeSource.indexOf('const exitRefreshDecision = shouldRefreshExitOrder');
-const exitScanBaseIndex = tradeSource.indexOf('const exitScanBase = {');
-assert.ok(tpLimitIndex < tacticDecisionIndex);
-assert.ok(tacticDecisionIndex < pricePlanIndex);
-assert.ok(pricePlanIndex < desiredLimitIndex);
-assert.ok(desiredLimitIndex < finalLimitIndex);
-assert.ok(finalLimitIndex < marketToExitBpsIndex);
-assert.ok(marketToExitBpsIndex < awayBpsIndex);
-assert.ok(awayBpsIndex < exitRefreshDecisionIndex);
-assert.ok(exitRefreshDecisionIndex < exitScanBaseIndex);
 assert.match(
   tradeSource,
   /async function fetchLiveOrders\(\{ force = false \} = \{\}\)[\s\S]*fetchOrders\(\{ status: 'open', nested: true, direction: 'desc', limit: 500 \}\)/,
