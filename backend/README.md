@@ -229,6 +229,39 @@ After merging, manually copy these values into Render:
 
 If production logs still show `dynamic_full_universe` after deploy, the Render environment is still wrong.
 
+## Runtime preflight and Render deploy checklist
+
+Intended live non-secret env values:
+
+- `ENTRY_UNIVERSE_MODE=configured`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,UNI/USD`
+- `ENTRY_SYMBOLS_SECONDARY=`
+- `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
+- `EXECUTION_TIER3_DEFAULT=false`
+- `ENTRY_SCAN_INTERVAL_MS=12000`
+- `ENTRY_PREFETCH_CHUNK_SIZE=3`
+- `ENTRY_PREFETCH_ORDERBOOKS=false`
+- `ALPACA_MD_MAX_CONCURRENCY=1`
+- `BARS_MAX_CONCURRENT=1`
+- `BARS_PREFETCH_INTERVAL_MS=120000`
+- `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
+- `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
+- `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
+
+Run these before deploy:
+
+- `npm test`
+- `npm run smoke`
+- `npm run check:runtime-env`
+- `npm run preflight`
+
+Important notes:
+
+- Repo env example files do **not** automatically update the real Render service environment.
+- After deploy, `/debug/runtime-config` (with API token auth) is the first place to verify effective live runtime config.
+
 ## Engine v2 lifecycle (feature-flagged, additive)
 
 When enabled, the backend runs a single authoritative lifecycle per symbol:

@@ -17,9 +17,9 @@ const clearAlpacaEnv = () => {
   });
 };
 
-const requestJson = (port, path) =>
+const requestJson = (port, path, headers = {}) =>
   new Promise((resolve, reject) => {
-    const req = http.get({ hostname: '127.0.0.1', port, path }, (res) => {
+    const req = http.get({ hostname: '127.0.0.1', port, path, headers }, (res) => {
       let body = '';
       res.on('data', (chunk) => {
         body += chunk;
@@ -28,7 +28,7 @@ const requestJson = (port, path) =>
         let payload = null;
         try {
           payload = JSON.parse(body);
-        } catch (err) {
+        } catch (_) {
           payload = null;
         }
         resolve({ status: res.statusCode, payload });
@@ -37,29 +37,35 @@ const requestJson = (port, path) =>
     req.on('error', reject);
   });
 
-const waitForHealth = async (port) => {
-  const attempts = 20;
-  for (let i = 0; i < attempts; i += 1) {
+const formatFailure = (message, childState) => {
+  const lines = [message];
+  if (childState.exitCode !== null || childState.signal !== null) {
+    lines.push(`childExitCode=${childState.exitCode} childSignal=${childState.signal}`);
+  }
+  lines.push(`--- child stdout ---\n${childState.stdout || '(empty)'}`);
+  lines.push(`--- child stderr ---\n${childState.stderr || '(empty)'}`);
+  return lines.join('\n');
+};
+
+const waitForHealth = async (port, childState) => {
+  const deadlineMs = Date.now() + 12000;
+  while (Date.now() < deadlineMs) {
+    if (childState.exitCode !== null || childState.signal !== null) {
+      throw new Error(formatFailure('Server exited before /health became ready.', childState));
+    }
     try {
       const res = await requestJson(port, '/health');
       if (res.status === 200 && res.payload?.ok) return res;
-    } catch (err) {
-      // ignore until retries exhausted
+    } catch (_) {
+      // retry until timeout
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error('Server did not respond to /health');
+  throw new Error(formatFailure('Server did not respond to /health within 12 seconds.', childState));
 };
 
 (async () => {
   clearAlpacaEnv();
-  try {
-    delete require.cache[require.resolve('./trade')];
-    require('./trade');
-  } catch (err) {
-    console.error('trade_require_failed', err);
-    process.exit(1);
-  }
 
   const port = 3105;
   const env = { ...process.env, PORT: String(port), API_TOKEN: 'test-token' };
@@ -73,15 +79,28 @@ const waitForHealth = async (port) => {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
+  const childState = { stdout: '', stderr: '', exitCode: null, signal: null };
+  child.stdout.on('data', (chunk) => {
+    childState.stdout += chunk.toString();
+  });
+  child.stderr.on('data', (chunk) => {
+    childState.stderr += chunk.toString();
+  });
+  child.on('exit', (code, signal) => {
+    childState.exitCode = code;
+    childState.signal = signal;
+  });
+
   try {
-    await waitForHealth(port);
-    const status = await requestJson(port, '/debug/status');
+    await waitForHealth(port, childState);
+    const status = await requestJson(port, '/debug/status', { 'x-api-token': 'test-token' });
     if (status.status !== 200 || !status.payload?.ok) {
-      throw new Error('Expected /debug/status to return ok:true');
+      throw new Error(formatFailure('Expected /debug/status to return ok:true.', childState));
     }
     console.log('startup_test_ok');
   } catch (err) {
-    console.error('startup_test_failed', err);
+    console.error('startup_test_failed');
+    console.error(err?.message || err);
     process.exitCode = 1;
   } finally {
     child.kill();

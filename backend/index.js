@@ -8,7 +8,23 @@ const cors = require('cors');
 const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 const validateEnv = require('./config/validateEnv');
+const { getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
+
+const { getLimiterStatus } = require('./limiters');
+const { getFailureSnapshot } = require('./symbolFailures');
+const { normalizePair } = require('./symbolUtils');
+const recorder = require('./modules/recorder');
+const tradeForensics = require('./modules/tradeForensics');
+const equitySnapshots = require('./modules/equitySnapshots');
+const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
+
+validateEnv();
+const runtimeConfigSummary = getRuntimeConfigSummary();
+console.log('runtime_live_critical_config', {
+  stage: 'startup',
+  ...runtimeConfigSummary,
+});
 
 const {
   placeMakerLimitBuyThenSell,
@@ -56,15 +72,6 @@ const {
   getLifecycleSnapshot,
   getSessionGovernorSummary,
 } = require('./trade');
-const { getLimiterStatus } = require('./limiters');
-const { getFailureSnapshot } = require('./symbolFailures');
-const { normalizePair } = require('./symbolUtils');
-const recorder = require('./modules/recorder');
-const tradeForensics = require('./modules/tradeForensics');
-const equitySnapshots = require('./modules/equitySnapshots');
-const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
-
-validateEnv();
 
 const VERSION =
   process.env.VERSION ||
@@ -384,6 +391,15 @@ app.get('/debug/auth', (req, res) => {
     apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
     version: VERSION,
     serverTime: new Date().toISOString(),
+  });
+});
+
+app.get('/debug/runtime-config', (req, res) => {
+  res.json({
+    ok: true,
+    version: VERSION,
+    commit: resolveGitCommit(),
+    runtimeConfig: getRuntimeConfigSummary(),
   });
 });
 
