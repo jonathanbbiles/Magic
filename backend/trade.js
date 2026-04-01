@@ -637,6 +637,7 @@ const ENTRY_UNIVERSE_MODE_RAW = String(runtimeLiveConfig.entryUniverseModeRaw ||
 const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
+const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
 const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
@@ -681,8 +682,18 @@ function logRuntimeConfigEffective() {
     maxPortfolioAllocationPerTradePct: MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT,
     entryUniverseMode: ENTRY_UNIVERSE_MODE,
     allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+    entrySymbolsPrimary: ENTRY_SYMBOLS_PRIMARY,
+    entrySymbolsSecondary: ENTRY_SYMBOLS_SECONDARY,
+    entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
   });
+}
+
+const ENTRY_UNIVERSE_STABLE_SYMBOLS = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
+
+function applyEntryUniverseStableFilter(symbols = [], { excludeStables = false } = {}) {
+  if (!excludeStables) return symbols.slice();
+  return symbols.filter((sym) => !ENTRY_UNIVERSE_STABLE_SYMBOLS.has(sym));
 }
 
 function getEffectiveMaxConcurrentPositions() {
@@ -12658,7 +12669,6 @@ async function runEntryScanOnce() {
       tradingHaltedReason = null;
     }
 
-    const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
     const configuredUniverse = buildEntryUniverse({
       primaryRaw: ENTRY_SYMBOLS_PRIMARY,
       secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
@@ -12713,9 +12723,12 @@ async function runEntryScanOnce() {
         universeModeReason = 'configured_empty_fallback_dynamic';
       }
     }
-    const scanSymbols = universe
+    const normalizedUniverse = universe
       .map((sym) => normalizeSymbol(sym))
-      .filter((sym) => sym && !stableSymbols.has(sym));
+      .filter(Boolean);
+    const scanSymbols = applyEntryUniverseStableFilter(normalizedUniverse, {
+      excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+    });
     console.log('entry_universe_selection', {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
       effectiveUniverseMode: universeMode,
@@ -12724,6 +12737,8 @@ async function runEntryScanOnce() {
       configuredOverrideActive: ENTRY_UNIVERSE_MODE === 'configured',
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       acceptedSymbols: scanSymbols.length,
+      entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+      stableSymbolsExcludedCount: normalizedUniverse.length - scanSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
@@ -15320,6 +15335,7 @@ module.exports = {
   loadSupportedCryptoPairs,
   getSupportedCryptoPairsSnapshot,
   filterSupportedCryptoSymbols,
+  applyEntryUniverseStableFilter,
   scanOrphanPositions,
   repairOrphanExits,
 

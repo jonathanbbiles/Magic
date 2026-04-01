@@ -46,10 +46,11 @@ Optional:
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 - `ENTRY_UNIVERSE_MODE` (`dynamic` scans Alpaca tradable pairs at runtime; `configured` uses only symbols you provide via `ENTRY_SYMBOLS_PRIMARY` and optional `ENTRY_SYMBOLS_SECONDARY`)
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; production must use configured mode unless you explicitly set this to `true`)
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (set `true` in production to run the full dynamic Alpaca tradable crypto universe)
 - `ENTRY_SYMBOLS_PRIMARY` (required when `ENTRY_UNIVERSE_MODE=configured`; provide at least one symbol such as `BTC/USD`)
 - `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `false`; when `true`, excludes `USDC/USD`, `USDT/USD`, `BUSD/USD`, `DAI/USD` from scan symbols)
 - `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
 - `ENTRY_PREFETCH_ORDERBOOKS` (default `false`; when `true`, prefetch also batches orderbooks instead of quote+bars only)
 - `AUTO_SCAN_SYMBOLS` (optional hard override universe; when set it overrides both dynamic and configured modes)
@@ -204,12 +205,12 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 ## Entry universe modes (dynamic vs configured)
 
-- **dynamic**: backend discovers tradable symbols from Alpaca at runtime, then filters by internal policy.
+- **dynamic**: backend discovers tradable symbols from Alpaca assets at runtime (`dynamic_full_universe`). This is the intended live/production mode.
 - **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY` (plus optional `ENTRY_SYMBOLS_SECONDARY`).
 
 Production safety rule:
-- Set `ENTRY_UNIVERSE_MODE=configured` and provide at least one symbol in `ENTRY_SYMBOLS_PRIMARY`, **or**
-- explicitly opt into dynamic production behavior with `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`.
+- Keep `ENTRY_UNIVERSE_MODE=dynamic` **and** `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true` for full live universe scanning, or
+- set `ENTRY_UNIVERSE_MODE=configured` with at least one `ENTRY_SYMBOLS_PRIMARY` symbol only when intentionally narrowing scope.
 
 For stable live deployments, also set:
 - `TRADE_BASE=https://api.alpaca.markets`
@@ -217,26 +218,25 @@ For stable live deployments, also set:
 - `API_TOKEN=<long random token>`
 - `DATASET_DIR` to a persistent mount (example: `/mnt/data`)
 
-## Live example profile (intentionally conservative)
+## Live example profile
 
-`backend/.env.live.example` is intentionally narrow to reduce Alpaca market-data rate-limit pressure in live trading:
-- configured universe (`ENTRY_UNIVERSE_MODE=configured`) with only `BTC/USD, ETH/USD, AVAX/USD, LINK/USD`
-- no secondary universe expansion
-- slower scans (`ENTRY_SCAN_INTERVAL_MS=12000`)
-- small prefetch chunks (`ENTRY_PREFETCH_CHUNK_SIZE=3`, still subject to hard cap of `20`)
-- sequential warmup prefetch (`PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`)
-- conservative market-data concurrency/cooldown settings and per-symbol bars fallback enabled
-- production dynamic scanning opt-out by default (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
+`backend/.env.live.example` now reflects production intent:
+- dynamic full Alpaca tradable crypto universe (`ENTRY_UNIVERSE_MODE=dynamic`)
+- explicit production opt-in for dynamic universe (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`)
+- optional stablecoin exclusion is disabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=false`)
+- no configured primary/secondary pinning by default (`ENTRY_SYMBOLS_PRIMARY=` and `ENTRY_SYMBOLS_SECONDARY=`)
+- conservative scan cadence/prefetch/rate-limit settings remain unchanged
 
 ## Render deployment sync
 
 Changing `backend/.env.live.example` in git **does not** update deployed Render environment variables automatically.
 After merging, manually copy these values into Render:
 
-- `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,AVAX/USD,LINK/USD`
+- `ENTRY_UNIVERSE_MODE=dynamic`
+- `ENTRY_SYMBOLS_PRIMARY=`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
 - `EXECUTION_TIER3_DEFAULT=false`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
@@ -248,18 +248,19 @@ After merging, manually copy these values into Render:
 - `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
 
-If production logs still show `dynamic_full_universe` after deploy, the Render environment is still wrong.
+If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
 
 ## Runtime preflight and Render deploy checklist
 
 Intended live non-secret env values:
 
-- `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,AVAX/USD,LINK/USD`
+- `ENTRY_UNIVERSE_MODE=dynamic`
+- `ENTRY_SYMBOLS_PRIMARY=`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
 - `EXECUTION_TIER3_DEFAULT=false`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
@@ -271,7 +272,7 @@ Intended live non-secret env values:
 - `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
 
 Run these before deploy:
 

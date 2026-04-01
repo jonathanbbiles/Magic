@@ -63,6 +63,10 @@ function getRuntimeConfig(env = process.env) {
     entrySymbolsPrimaryRaw: String(env.ENTRY_SYMBOLS_PRIMARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY),
     entrySymbolsSecondaryRaw: String(env.ENTRY_SYMBOLS_SECONDARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_SECONDARY),
     entrySymbolsIncludeSecondary: parseBoolean(env.ENTRY_SYMBOLS_INCLUDE_SECONDARY, parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_INCLUDE_SECONDARY, false)),
+    entryUniverseExcludeStables: parseBoolean(
+      env.ENTRY_UNIVERSE_EXCLUDE_STABLES,
+      parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, false),
+    ),
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
     entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS, 10000)),
     entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE, 5)),
@@ -90,6 +94,7 @@ function getRuntimeConfigSummary(env = process.env) {
     configuredSecondaryCount: config.configuredSecondarySymbols.length,
     configuredPrimarySample: config.configuredPrimarySymbols.slice(0, 6),
     configuredSecondarySample: config.configuredSecondarySymbols.slice(0, 6),
+    entryUniverseExcludeStables: config.entryUniverseExcludeStables,
     entryScanIntervalMs: config.entryScanIntervalMs,
     entryPrefetchChunkSize: config.entryPrefetchChunkSize,
     entryPrefetchOrderbooks: config.entryPrefetchOrderbooks,

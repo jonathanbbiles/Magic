@@ -151,7 +151,11 @@ const runtimeStrategyConfig = {
 };
 console.log('runtime_live_strategy_config', runtimeStrategyConfig);
 console.log('runtime_entry_engine_flags', {
+  ENTRY_UNIVERSE_MODE: String(process.env.ENTRY_UNIVERSE_MODE || '').trim().toLowerCase() || null,
+  ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: readLiveBoolean('ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION'),
   ENTRY_SYMBOLS_PRIMARY: readLiveSymbols('ENTRY_SYMBOLS_PRIMARY'),
+  ENTRY_SYMBOLS_SECONDARY: readLiveSymbols('ENTRY_SYMBOLS_SECONDARY'),
+  ENTRY_UNIVERSE_EXCLUDE_STABLES: readLiveBoolean('ENTRY_UNIVERSE_EXCLUDE_STABLES'),
   ENGINE_V2_ENABLED: runtimeStrategyConfig.engineV2Enabled,
   REGIME_ENGINE_V2_ENABLED: runtimeStrategyConfig.regimeEngineV2Enabled,
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,

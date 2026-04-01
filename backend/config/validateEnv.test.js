@@ -47,8 +47,8 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
-  assert.equal(guardrails.entryUniverse.modeEffective, 'configured');
-  assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, false);
+  assert.equal(guardrails.entryUniverse.modeEffective, 'dynamic');
+  assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, true);
   assert.equal(guardrails.engineV2.enabled, false);
   assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);
 });
@@ -93,14 +93,14 @@ withEnv({ ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: '' }, () => 
   assert.throws(() => validateEnv(), /Configured universe mode requires at least one primary symbol/);
 });
 
-withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: '' }, () => {
+withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'false' }, () => {
   assert.throws(
     () => validateEnv(),
     /Production startup blocked because effective universe mode is dynamic without explicit opt-in/
   );
 });
 
-withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: '', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: '' }, () => {
+withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: '', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'false' }, () => {
   assert.throws(
     () => validateEnv(),
     /entryUniverseModeRaw\":\"\".*entryUniverseModeEffective\":\"dynamic/

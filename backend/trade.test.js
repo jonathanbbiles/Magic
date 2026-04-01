@@ -1019,6 +1019,22 @@ const fixedSizing = sizingFixedTrade.computeNotionalForEntry({
 assert.equal(fixedSizing.finalNotionalUsd, 500);
 assert.equal(fixedSizing.mode, 'fixed');
 
+const universeDefaultTrade = loadTrade({
+  ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false',
+});
+assert.deepEqual(
+  universeDefaultTrade.applyEntryUniverseStableFilter(['BTC/USD', 'USDC/USD', 'ETH/USD'], { excludeStables: false }),
+  ['BTC/USD', 'USDC/USD', 'ETH/USD'],
+);
+
+const universeFilteredTrade = loadTrade({
+  ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true',
+});
+assert.deepEqual(
+  universeFilteredTrade.applyEntryUniverseStableFilter(['BTC/USD', 'USDC/USD', 'ETH/USD'], { excludeStables: true }),
+  ['BTC/USD', 'ETH/USD'],
+);
+
 const sizingKellyDisabledTrade = loadTrade({
   POSITION_SIZING_MODE: 'kelly',
   KELLY_ENABLED: 'false',

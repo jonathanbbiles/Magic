@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
+const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
 
 const BASE_ENV = {
   NODE_ENV: 'production',
@@ -39,10 +39,21 @@ withEnv({ ENTRY_UNIVERSE_MODE: '', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'false'
 
 withEnv({ ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'true' }, () => {
   assert.doesNotThrow(() => validateRuntimeConfig());
+  const cfg = getRuntimeConfig();
+  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
+  assert.equal(cfg.allowDynamicUniverseInProduction, true);
 });
 
 withEnv({ ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: '   ' }, () => {
   assert.throws(() => validateRuntimeConfig(), /requires at least one primary symbol/);
+});
+
+withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false' }, () => {
+  assert.equal(getRuntimeConfig().entryUniverseExcludeStables, false);
+});
+
+withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true' }, () => {
+  assert.equal(getRuntimeConfig().entryUniverseExcludeStables, true);
 });
 
 console.log('runtime config tests passed');
