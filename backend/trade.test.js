@@ -258,6 +258,7 @@ assert.equal(computeAwayBps(110, 100), 1000);
 assert.equal(computeAwayBps(90, 100), 1000);
 
 assert.deepEqual(getBrokerPositionLookupKeys('dotusd'), ['DOT/USD', 'DOTUSD']);
+
 assert.deepEqual(getBrokerPositionLookupKeys('DOT/USD'), ['DOT/USD', 'DOTUSD']);
 
 const qtyEvidence = extractBrokerPositionQty({ symbol: 'DOTUSD', qty: '12.5', qty_available: '0' });
@@ -669,6 +670,9 @@ runRegimeAndQuoteCacheRegression().catch((err) => {
 const tradeSource = fs.readFileSync(path.join(__dirname, 'trade.js'), 'utf8');
 assert.ok(tradeSource.includes("telemetrySchemaVersion: 2"));
 assert.ok(tradeSource.includes("sortMode: 'net_edge_then_probability'"));
+assert.ok(tradeSource.includes('forceQuoteRefresh: shouldForceQuoteRefreshForSparseRetry'));
+assert.ok(tradeSource.includes("if (entryMdContext) entryMdContext.stats.sparseFallbackRejects += 1;"));
+assert.ok(tradeSource.includes('buildStaleQuoteLogMeta'));
 assert.ok(tradeSource.includes("quoteSource,"));
 assert.ok(tradeSource.includes("quoteReceivedAtMs,"));
 assert.ok(tradeSource.includes("sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS"));
