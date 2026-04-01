@@ -171,8 +171,16 @@ async function getOrFetchSymbolMarketData({
   const normalizedSymbol = normalizePair(symbol);
   const existing = context.symbolData.get(normalizedSymbol) || {};
   const result = { ...existing };
+  const nowMs = Date.now();
+  const existingQuoteTsMs = Number(result?.quote?.tsMs);
+  const existingQuoteAgeMs = Number.isFinite(existingQuoteTsMs)
+    ? Math.max(0, nowMs - existingQuoteTsMs)
+    : null;
+  const shouldRefreshForQuoteAge =
+    Number.isFinite(quoteMaxAgeMs) &&
+    (!Number.isFinite(existingQuoteAgeMs) || existingQuoteAgeMs > quoteMaxAgeMs);
 
-  if (!result.quote || forceQuoteRefresh) {
+  if (!result.quote || forceQuoteRefresh || shouldRefreshForQuoteAge) {
     const quoteResult = await coordinator.get({
       endpoint: 'quote',
       key: normalizedSymbol,

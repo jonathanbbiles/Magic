@@ -151,6 +151,7 @@ const runtimeStrategyConfig = {
 };
 console.log('runtime_live_strategy_config', runtimeStrategyConfig);
 console.log('runtime_entry_engine_flags', {
+  ENTRY_SYMBOLS_PRIMARY: readLiveSymbols('ENTRY_SYMBOLS_PRIMARY'),
   ENGINE_V2_ENABLED: runtimeStrategyConfig.engineV2Enabled,
   REGIME_ENGINE_V2_ENABLED: runtimeStrategyConfig.regimeEngineV2Enabled,
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
@@ -158,6 +159,9 @@ console.log('runtime_entry_engine_flags', {
   regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
   ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS: runtimeStrategyConfig.sparseRequireStrongerEdgeBps,
   ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
+  ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN: readLiveNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN'),
+  ORDERBOOK_SPARSE_FALLBACK_SYMBOLS: readLiveSymbols('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS'),
+  MAX_CONCURRENT_POSITIONS: readLiveNumber('MAX_CONCURRENT_POSITIONS'),
 });
 
 const configuredPrimary = readLiveSymbols('ENTRY_SYMBOLS_PRIMARY');

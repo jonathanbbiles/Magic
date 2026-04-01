@@ -274,6 +274,11 @@ export default function App() {
   const entryScan = entryDiagnostics?.entryScan || null;
   const predictorCandidates = entryDiagnostics?.predictorCandidates || null;
   const skipReasonsBySymbol = entryDiagnostics?.skipReasonsBySymbol || {};
+  const topCandidate = Array.isArray(predictorCandidates?.topCandidates) ? predictorCandidates.topCandidates[0] : null;
+  const firstSkipSymbol = Object.keys(skipReasonsBySymbol)[0] || null;
+  const firstSkip = firstSkipSymbol && Array.isArray(skipReasonsBySymbol[firstSkipSymbol])
+    ? skipReasonsBySymbol[firstSkipSymbol][0]
+    : null;
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -315,7 +320,36 @@ export default function App() {
                   Predictor candidates: {predictorCandidates?.topCandidates ? JSON.stringify(predictorCandidates.topCandidates) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
+                  Top candidate detail: {topCandidate ? JSON.stringify({
+                    symbol: topCandidate.symbol,
+                    requiredEdgeBps: topCandidate.requiredEdgeBps,
+                    netEdgeBps: topCandidate.netEdgeBps,
+                    quoteAgeMs: topCandidate.quoteAgeMs,
+                    quoteTsMs: topCandidate.quoteTsMs,
+                    quoteReceivedAtMs: topCandidate.quoteReceivedAtMs,
+                    regimeLabel: topCandidate.regimeLabel,
+                    regimePenaltyBps: topCandidate.regimePenaltyBps,
+                    dataQualityReason: topCandidate.dataQualityReason,
+                    sparseRetry: topCandidate.sparseRetry,
+                  }) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
                   Per-symbol skips: {Object.keys(skipReasonsBySymbol).length ? JSON.stringify(skipReasonsBySymbol) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  First skip detail: {firstSkip ? JSON.stringify({
+                    symbol: firstSkipSymbol,
+                    reason: firstSkip.reason,
+                    requiredEdgeBps: firstSkip.requiredEdgeBps,
+                    netEdgeBps: firstSkip.netEdgeBps,
+                    quoteAgeMs: firstSkip.quoteAgeMs,
+                    quoteTsMs: firstSkip.quoteTsMs,
+                    quoteReceivedAtMs: firstSkip.quoteReceivedAtMs,
+                    regimeLabel: firstSkip.regimeLabel,
+                    regimePenaltyBps: firstSkip.regimePenaltyBps,
+                    dataQualityReason: firstSkip.dataQualityReason,
+                    sparseRetry: firstSkip.sparseRetry,
+                  }) : '—'}
                 </Text>
               </View>
 
