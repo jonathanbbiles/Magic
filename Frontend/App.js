@@ -40,6 +40,7 @@ const BASE_URL =
 
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
+const DASHBOARD_FETCH_TIMEOUT_MS = 9000;
 
 async function fetchDashboard() {
   const url = `${String(BASE_URL).replace(/\/$/, '')}/dashboard`;
@@ -49,7 +50,21 @@ async function fetchDashboard() {
     headers['x-api-key'] = API_TOKEN;
   }
 
-  const res = await fetch(url, { headers });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DASHBOARD_FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { headers, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      const timeoutErr = new Error(`Request timed out after ${Math.round(DASHBOARD_FETCH_TIMEOUT_MS / 1000)}s`);
+      timeoutErr.status = 408;
+      throw timeoutErr;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const text = await res.text();
   let json = null;
   try {

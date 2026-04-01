@@ -17,6 +17,7 @@ function parseEnvFile(filePath) {
 
 const canonicalFile = path.resolve(__dirname, '..', '.env.production');
 const canonical = parseEnvFile(canonicalFile);
+const runtimeEnvFallback = parseEnvFile(canonicalFile);
 const missingKeys = [];
 const mismatchedKeys = [];
 const canonicalMismatches = [];
@@ -26,7 +27,8 @@ for (const key of LIVE_CRITICAL_KEYS) {
     canonicalMismatches.push({ key, expectedDefault: LIVE_CRITICAL_DEFAULTS[key], productionValue: canonical[key] ?? '' });
   }
   const expected = canonical[key] ?? LIVE_CRITICAL_DEFAULTS[key] ?? '';
-  const actual = String(process.env[key] ?? '').trim();
+  const envValue = String(process.env[key] ?? '').trim();
+  const actual = envValue || String(runtimeEnvFallback[key] ?? '').trim();
   if (!actual && expected !== '') {
     missingKeys.push(key);
     continue;

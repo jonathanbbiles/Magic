@@ -27,6 +27,29 @@ function withEnv(overrides, callback) {
   }
 }
 
+async function withEnvAsync(overrides, callback) {
+  const previous = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    previous[key] = process.env[key];
+    if (value === null || value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 function loadTrade(overrides = {}) {
   return withEnv(overrides, () => {
     delete require.cache[tradeModulePath];
@@ -258,6 +281,69 @@ const snapshot = {
 };
 assert.equal(findPositionInSnapshot(snapshot, 'DOT/USD')?.position?.symbol, 'DOT/USD');
 assert.equal(findPositionInSnapshot(snapshot, 'dotusd')?.position?.symbol, 'DOT/USD');
+
+async function runMarketDataDiagnosticsRegression() {
+  const httpModule = require('./modules/http');
+  const originalRequestJson = httpModule.requestJson;
+  const originalLogHttpError = httpModule.logHttpError;
+  httpModule.requestJson = async () => {
+    const err = new Error('rate limited');
+    err.statusCode = 429;
+    err.responseText = '{"message":"rate limit"}';
+    throw err;
+  };
+  httpModule.logHttpError = () => {};
+  try {
+    const tradeWithMdErrors = loadTrade({
+      APCA_API_KEY_ID: 'test-key',
+      APCA_API_SECRET_KEY: 'test-secret',
+      MARKET_DATA_FAILURE_LIMIT: '1',
+      MARKET_DATA_COOLDOWN_MS: '60000',
+      DEBUG_ALPACA_HTTP: '0',
+      DEBUG_ALPACA_HTTP_OK: '0',
+    });
+    await withEnvAsync({ APCA_API_KEY_ID: 'test-key', APCA_API_SECRET_KEY: 'test-secret' }, async () => {
+      await assert.rejects(
+        tradeWithMdErrors.requestAlpacaMarketData({
+          type: 'QUOTE',
+          url: 'https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC/USD',
+          symbol: 'BTC/USD',
+        }),
+        (err) => err && err.errorCode === 'HTTP_ERROR',
+      );
+    });
+    const firstError = tradeWithMdErrors.getLastHttpError();
+    assert.equal(typeof firstError, 'object');
+    assert.equal(firstError.label, 'quotes');
+    assert.equal(firstError.errorType, 'http_error');
+    assert.equal(Number.isFinite(firstError.statusCode), true);
+    assert.equal(typeof firstError.urlPath, 'string');
+    assert.equal(typeof firstError.requestId, 'string');
+
+    await withEnvAsync({ APCA_API_KEY_ID: 'test-key', APCA_API_SECRET_KEY: 'test-secret' }, async () => {
+      await assert.rejects(
+        tradeWithMdErrors.requestAlpacaMarketData({
+          type: 'QUOTE',
+          url: 'https://data.alpaca.markets/v1beta3/crypto/us/latest/quotes?symbols=BTC/USD',
+          symbol: 'BTC/USD',
+        }),
+        (err) => err && err.errorCode === 'COOLDOWN',
+      );
+    });
+    const cooldownError = tradeWithMdErrors.getLastHttpError();
+    assert.equal(typeof cooldownError, 'object');
+    assert.equal(cooldownError.errorMessage, 'Market data cooldown active');
+    assert.equal(cooldownError.label, 'quotes');
+  } finally {
+    httpModule.requestJson = originalRequestJson;
+    httpModule.logHttpError = originalLogHttpError;
+  }
+}
+
+runMarketDataDiagnosticsRegression().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
 
 const openOrders = [
   { symbol: 'DOTUSD', side: 'sell', status: 'new', qty: '4.0', type: 'limit', limit_price: '8.15' },
