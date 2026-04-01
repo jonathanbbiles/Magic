@@ -14,9 +14,9 @@
     "start:production": "DOTENV_CONFIG_PATH=.env.production NODE_ENV=production node index.js"
   },
   "dependencies": {
-    "axios": "^1.6.8",
+    "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
-    "express": "^4.18.2"
+    "express": "^4.22.1"
   }
 }
