@@ -109,10 +109,12 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
 - `GET /dashboard` now exposes runtime-truth diagnostics in `meta.universe`, `meta.predictorWarmup`, and `meta.truth` (dynamic universe active flag, accepted symbol count/sample, fallback state/reason, warmup progress, top skip reasons, open positions, and active sell-limit count).
 - `GET /dashboard` meta now also exposes explicit engine/entry-loop proof fields: `engineState`, `entryManagerStarted`, `lastEntryScanAt`, `lastEntryScanSummary`, `lastSuccessfulAction`, `lastExecutionFailure`, and skip-category counters for stale quotes/market/data/rate-limit/concurrency-risk.
+- `GET /dashboard` truth diagnostics now include live mid-scan heartbeat (`currentEntryScanProgress`) so active scans are visible before end-of-scan summary emission.
 - `/dashboard` diagnostics explicitly separate market rejection vs stale/data rejection vs insufficient bars vs rate-limit suppression vs execution failures.
 - Entry scanning is cache-first: rolling in-memory quote/orderbook/bar caches are reused between scans, broad warmup is now bounded seeding, and per-symbol bars fallback is budgeted/cooldown-gated under rate pressure.
 - Alpaca **live** execution/account/orders/positions behavior remains unchanged; dynamic full-universe scanning remains unchanged.
 - Entry quote freshness is unified under runtime config (no hidden entry-path fallback literals), stale-data protection remains active, and market-condition rejections remain distinct from data-quality rejections.
+- Quote freshness policy names are explicit in diagnostics/logs: `normalEntryQuoteMaxAgeMs`, `sparseQuoteFreshMs`, and `sparseStaleToleranceMs`.
 
 ## Bulletproof upgrade env vars
 

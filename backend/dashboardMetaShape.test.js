@@ -30,10 +30,13 @@ const source = fs.readFileSync(path.resolve(__dirname, 'index.js'), 'utf8');
   'entryManagerStarted',
   'lastEntryScanAt',
   'lastEntryScanSummary',
+  'currentEntryScanProgress',
   'lastSuccessfulAction',
   'lastExecutionFailure',
   'staleQuoteSkipCount',
   'marketRejectionCount',
+  'staleDataRejectionCount',
+  'staleCooldownSuppressionCount',
   'warmupBlockedCount',
   'concurrencyRiskGuardCount',
 ].forEach((token) => {
