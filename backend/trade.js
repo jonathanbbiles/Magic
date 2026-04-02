@@ -265,6 +265,7 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 );
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
+const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', false);
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -4925,7 +4926,7 @@ function computeNotionalForEntry({
 }
 
 async function getQuoteForTrading(symbol, opts = {}) {
-  if (!readEnvFlag('SECONDARY_QUOTE_ENABLED', false)) {
+  if (!SECONDARY_QUOTE_ENABLED) {
     return getLatestQuote(symbol, opts);
   }
   const best = await quoteRouter.getBestQuote(symbol, opts);
