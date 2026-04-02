@@ -13,6 +13,15 @@ const ALPACA_MD_BASE_BACKOFF_MS = Math.max(1, readNumber('ALPACA_MD_BASE_BACKOFF
 let active = 0;
 let lastStartMs = 0;
 const queue = [];
+const RATE_TYPES = ['BARS', 'QUOTE', 'ORDERBOOK'];
+const ratePressureByType = new Map(RATE_TYPES.map((type) => [type, {
+  active: false,
+  untilMs: 0,
+  retryInMs: 0,
+  lastStatusCode: null,
+  lastEndpoint: null,
+  updatedAtMs: 0,
+}]));
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -68,6 +77,68 @@ function drainQueue() {
   }, waitMs);
 }
 
+function setRatePressure(type, { retryInMs = 0, statusCode = null, endpointLabel = null } = {}) {
+  const normalizedType = RATE_TYPES.includes(String(type || '').toUpperCase())
+    ? String(type || '').toUpperCase()
+    : 'BARS';
+  const waitMs = Math.max(ALPACA_MD_BASE_BACKOFF_MS, Number(retryInMs) || 0);
+  const untilMs = Date.now() + waitMs;
+  ratePressureByType.set(normalizedType, {
+    active: true,
+    untilMs,
+    retryInMs: waitMs,
+    lastStatusCode: statusCode,
+    lastEndpoint: endpointLabel || null,
+    updatedAtMs: Date.now(),
+  });
+}
+
+function clearExpiredRatePressure() {
+  const nowMs = Date.now();
+  for (const [type, state] of ratePressureByType.entries()) {
+    if (!state?.active) continue;
+    if (Number(state.untilMs) <= nowMs) {
+      ratePressureByType.set(type, {
+        ...state,
+        active: false,
+        retryInMs: 0,
+      });
+    }
+  }
+}
+
+function getRatePressureState() {
+  clearExpiredRatePressure();
+  const nowMs = Date.now();
+  const byType = {};
+  for (const [type, state] of ratePressureByType.entries()) {
+    byType[type] = {
+      active: Boolean(state?.active && state.untilMs > nowMs),
+      untilMs: state?.untilMs || 0,
+      remainingMs: state?.untilMs > nowMs ? state.untilMs - nowMs : 0,
+      retryInMs: state?.retryInMs || 0,
+      lastStatusCode: state?.lastStatusCode ?? null,
+      lastEndpoint: state?.lastEndpoint ?? null,
+      updatedAtMs: state?.updatedAtMs || 0,
+    };
+  }
+  const activeTypes = Object.entries(byType)
+    .filter(([, state]) => state.active)
+    .map(([type]) => type);
+  return {
+    active: activeTypes.length > 0,
+    activeTypes,
+    byType,
+  };
+}
+
+function isUnderRatePressure(type = null) {
+  const state = getRatePressureState();
+  if (!type) return state.active;
+  const normalizedType = String(type || '').toUpperCase();
+  return Boolean(state.byType?.[normalizedType]?.active);
+}
+
 function schedule(task) {
   return new Promise((resolve, reject) => {
     queue.push({ task, resolve, reject });
@@ -86,6 +157,7 @@ async function withAlpacaMdLimit(fn, { endpointLabel = 'unknown', type = 'BARS' 
         const headers = error?.responseHeaders || {};
         const rate = parseRateLimitHeaders(headers);
         const retryInMs = attempt < ALPACA_MD_MAX_RETRIES ? retryDelayMs(attempt, headers) : null;
+        setRatePressure(type, { retryInMs, statusCode, endpointLabel });
         console.warn('marketdata_rate_limit', {
           type,
           endpoint: endpointLabel,
@@ -106,4 +178,6 @@ async function withAlpacaMdLimit(fn, { endpointLabel = 'unknown', type = 'BARS' 
 
 module.exports = {
   withAlpacaMdLimit,
+  getRatePressureState,
+  isUnderRatePressure,
 };

@@ -158,6 +158,7 @@ function resolveBarsSeries(prefetchedBars, symbol, timeframeKey) {
 async function getOrFetchSymbolMarketData({
   context,
   coordinator,
+  marketDataCache = null,
   symbol,
   fetchQuote,
   fetchOrderbook,
@@ -167,6 +168,8 @@ async function getOrFetchSymbolMarketData({
   barsWarmup,
   forceQuoteRefresh = false,
   forceOrderbookRefresh = false,
+  includeOrderbook = true,
+  fallbackPolicy = null,
 }) {
   const normalizedSymbol = normalizePair(symbol);
   const existing = context.symbolData.get(normalizedSymbol) || {};
@@ -181,6 +184,13 @@ async function getOrFetchSymbolMarketData({
     (!Number.isFinite(existingQuoteAgeMs) || existingQuoteAgeMs > quoteMaxAgeMs);
 
   if (!result.quote || forceQuoteRefresh || shouldRefreshForQuoteAge) {
+    const cachedQuote = !forceQuoteRefresh && marketDataCache?.getQuote
+      ? marketDataCache.getQuote(normalizedSymbol)
+      : null;
+    if (cachedQuote?.ok && cachedQuote?.fresh) {
+      result.quoteResult = { ok: true, state: 'cache_layer', value: cachedQuote.value, ageMs: cachedQuote.ageMs };
+      result.quote = cachedQuote.value;
+    } else {
     const quoteResult = await coordinator.get({
       endpoint: 'quote',
       key: normalizedSymbol,
@@ -189,10 +199,23 @@ async function getOrFetchSymbolMarketData({
       fetcher: () => fetchQuote(normalizedSymbol, { maxAgeMs: quoteMaxAgeMs, forceRefresh: forceQuoteRefresh, bypassCache: forceQuoteRefresh }),
     });
     result.quoteResult = quoteResult;
-    if (quoteResult.ok) result.quote = quoteResult.value;
+      if (quoteResult.ok) {
+        result.quote = quoteResult.value;
+        if (marketDataCache?.upsertQuote) {
+          marketDataCache.upsertQuote(normalizedSymbol, quoteResult.value, quoteResult.value?.tsMs || Date.now());
+        }
+      }
+    }
   }
 
-  if (!result.orderbook || forceOrderbookRefresh) {
+  if (includeOrderbook && (!result.orderbook || forceOrderbookRefresh)) {
+    const cachedOrderbook = !forceOrderbookRefresh && marketDataCache?.getOrderbook
+      ? marketDataCache.getOrderbook(normalizedSymbol)
+      : null;
+    if (cachedOrderbook?.ok && cachedOrderbook?.fresh) {
+      result.orderbookResult = { ok: true, state: 'cache_layer', value: cachedOrderbook.value, ageMs: cachedOrderbook.ageMs };
+      result.orderbook = cachedOrderbook.value;
+    } else {
     const orderbookResult = await coordinator.get({
       endpoint: 'orderbook',
       key: normalizedSymbol,
@@ -201,7 +224,13 @@ async function getOrFetchSymbolMarketData({
       fetcher: () => fetchOrderbook(normalizedSymbol, { maxAgeMs: orderbookMaxAgeMs, bypassCache: forceOrderbookRefresh }),
     });
     result.orderbookResult = orderbookResult;
-    if (orderbookResult.ok) result.orderbook = orderbookResult.value;
+      if (orderbookResult.ok) {
+        result.orderbook = orderbookResult.value;
+        if (marketDataCache?.upsertOrderbook && orderbookResult.value?.orderbook) {
+          marketDataCache.upsertOrderbook(normalizedSymbol, orderbookResult.value, orderbookResult.value?.tsMs || Date.now());
+        }
+      }
+    }
   }
 
   if (!result.bars) {
@@ -215,6 +244,13 @@ async function getOrFetchSymbolMarketData({
       barsResult.fifteenMin = pre15m;
       barsResult.state = 'reused_recent';
     } else if (fetchBars && barsWarmup) {
+      const shouldSuppressFallback = Boolean(fallbackPolicy?.suppress);
+      if (shouldSuppressFallback) {
+        barsResult.oneMin = [];
+        barsResult.fiveMin = [];
+        barsResult.fifteenMin = [];
+        barsResult.state = fallbackPolicy.reason || 'fallback_suppressed';
+      } else {
       const [one, five, fifteen] = await Promise.all([
         coordinator.get({ endpoint: 'bars', key: `${normalizedSymbol}:1m:${barsWarmup['1m']}`, fetcher: () => fetchBars(normalizedSymbol, '1Min', barsWarmup['1m']) }),
         coordinator.get({ endpoint: 'bars', key: `${normalizedSymbol}:5m:${barsWarmup['5m']}`, fetcher: () => fetchBars(normalizedSymbol, '5Min', barsWarmup['5m']) }),
@@ -224,6 +260,12 @@ async function getOrFetchSymbolMarketData({
       barsResult.fiveMin = five.ok ? five.value : [];
       barsResult.fifteenMin = fifteen.ok ? fifteen.value : [];
       barsResult.state = one.ok && five.ok && fifteen.ok ? 'fresh' : 'stale_unusable';
+        if (marketDataCache?.upsertBars && barsResult.state === 'fresh') {
+          marketDataCache.upsertBars(normalizedSymbol, '1m', barsResult.oneMin);
+          marketDataCache.upsertBars(normalizedSymbol, '5m', barsResult.fiveMin);
+          marketDataCache.upsertBars(normalizedSymbol, '15m', barsResult.fifteenMin);
+        }
+      }
     } else {
       barsResult.oneMin = [];
       barsResult.fiveMin = [];
@@ -238,7 +280,7 @@ async function getOrFetchSymbolMarketData({
   for (const response of [result.quoteResult, result.orderbookResult]) {
     if (!response) continue;
     if (response.state === 'fresh') context.stats.freshFetches += 1;
-    if (response.state === 'reused_recent' || response.state === 'rate_limited') context.stats.cacheHits += 1;
+    if (response.state === 'reused_recent' || response.state === 'rate_limited' || response.state === 'cache_layer') context.stats.cacheHits += 1;
     if (response.state === 'rate_limited') context.stats.rateLimited += 1;
     if (response.state === 'cooldown_active') context.stats.cooldownBlocked += 1;
   }
