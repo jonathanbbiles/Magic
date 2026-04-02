@@ -923,7 +923,7 @@ assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNu
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4\);/);
 assert.match(tradeSource, /const MIN_NET_EDGE_BPS = readNumber\('MIN_NET_EDGE_BPS', 5\);/);
 assert.match(tradeSource, /const ENTRY_PROFIT_BUFFER_BPS = readNumber\('ENTRY_PROFIT_BUFFER_BPS', 5\);/);
-assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 0\);/);
+assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 3\);/);
 assert.match(tradeSource, /const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0\.10;/);
 assert.match(tradeSource, /const TRADE_PORTFOLIO_PCT = Math\.max\(0, Math\.min\(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW\)\);/);
 assert.match(tradeSource, /why: resolvedReason === 'provider_quote_stale_after_refresh'/);

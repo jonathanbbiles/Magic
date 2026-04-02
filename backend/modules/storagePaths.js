@@ -45,6 +45,7 @@ function resolveStoragePaths() {
     recorderFile: path.join(writableRoot, `predictor.${process.env.DATASET_FORMAT || 'jsonl'}`),
     labelerFile: path.join(writableRoot, 'labeled.jsonl'),
     tradeForensicsFile: path.join(writableRoot, 'trade_forensics.jsonl'),
+    closedTradeStatsFile: path.join(writableRoot, 'closed_trade_stats.jsonl'),
     equitySnapshotsFile: path.join(writableRoot, 'equity_snapshots.jsonl'),
     runSnapshotFile: path.join(writableRoot, 'run_snapshot.json'),
     riskKillSwitchFile: path.resolve(String(process.env.RISK_KILL_SWITCH_FILE || path.join(writableRoot, 'KILL_SWITCH')).trim()),
