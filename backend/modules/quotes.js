@@ -1,18 +1,11 @@
 const { httpJson } = require('../httpClient');
+const { readEnvFlag } = require('./envFlags');
 
 const lastFetchBySymbol = new Map();
 let primaryFetcher = null;
 
 function setPrimaryQuoteFetcher(fetcher) {
   primaryFetcher = typeof fetcher === 'function' ? fetcher : null;
-}
-
-function readFlag(name, fallback) {
-  const raw = String(process.env[name] ?? '').trim().toLowerCase();
-  if (!raw) return fallback;
-  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
-  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
-  return fallback;
 }
 
 function readNumber(name, fallback) {
@@ -38,7 +31,7 @@ async function getPrimaryQuote(symbol, opts = {}) {
 }
 
 async function getSecondaryQuote(symbol) {
-  const enabled = readFlag('SECONDARY_QUOTE_ENABLED', false);
+  const enabled = readEnvFlag('SECONDARY_QUOTE_ENABLED', false);
   if (!enabled) return null;
   const provider = String(process.env.SECONDARY_QUOTE_PROVIDER || 'cryptocompare').trim().toLowerCase();
   if (provider !== 'cryptocompare') return null;
