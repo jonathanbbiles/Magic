@@ -316,10 +316,13 @@ export default function App() {
   const quoteFreshness = meta?.quoteFreshness || {};
   const universe = meta?.universe || {};
   const warmup = meta?.predictorWarmup || {};
+  const warmupStatus = meta?.predictorWarmupStatus || {};
   const warmupInProgress = Boolean(warmup?.inProgress);
   const truth = meta?.truth || {};
+  const runtime = meta?.runtime || {};
   const backendReachable = truth?.backendReachable !== false;
-  const authOk = backendReachable && !error;
+  const alpacaConnected = runtime?.alpacaCredentialsPresent ?? meta?.connectionState?.alpaca?.alpacaAuthOk ?? false;
+  const authEnabled = runtime?.apiTokenEnabled ?? truth?.authConfigured ?? false;
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -353,10 +356,11 @@ export default function App() {
                 <Text style={styles.diagnosticsTitle}>Runtime truth</Text>
                 <Text style={styles.diagnosticsText}>{JSON.stringify({
                   backendReachable,
-                  authOk,
-                  dynamicUniverseActive: truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
-                  acceptedSymbolsCount: truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
-                  warmupInProgress: truth?.warmupInProgress ?? warmupInProgress,
+                  alpacaConnected,
+                  authEnabled,
+                  dynamicUniverseActive: meta?.dynamicUniverseActive ?? runtime?.dynamicUniverseActive ?? truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
+                  acceptedSymbolsCount: meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
+                  warmupInProgress: warmupStatus?.inProgress ?? runtime?.predictorWarmup?.inProgress ?? truth?.warmupInProgress ?? warmupInProgress,
                   topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
                   openPositions: truth?.openPositions ?? positions.length,
                   activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,

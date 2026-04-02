@@ -663,6 +663,8 @@ app.get('/dashboard', async (req, res) => {
     const entryDiagnostics = getEntryDiagnosticsSnapshot();
     const universeDiagnostics = getUniverseDiagnosticsSnapshot();
     const predictorWarmup = getPredictorWarmupSnapshot();
+    const alpacaAuthStatus = getAlpacaAuthStatus();
+    const baseStatus = getAlpacaBaseStatus();
     const lastError = getLastHttpError();
     const lastQuote = getLastQuoteSnapshot();
     const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
@@ -766,6 +768,25 @@ app.get('/dashboard', async (req, res) => {
       account,
       positions,
       meta: {
+        effectiveTradeBase: baseStatus?.tradeBase || null,
+        effectiveDataBase: baseStatus?.dataBase || null,
+        alpacaCredentialsPresent: Boolean(alpacaAuthStatus?.alpacaAuthOk),
+        apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+        effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
+        dynamicUniverseActive,
+        acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+        acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
+          ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+          : [],
+        fallbackReason: universeDiagnostics?.fallbackReason || null,
+        predictorWarmupStatus: {
+          inProgress: Boolean(predictorWarmup?.inProgress),
+          symbolsCompleted: predictorWarmup?.symbolsCompleted ?? null,
+          totalSymbolsPlanned: predictorWarmup?.totalSymbolsPlanned ?? null,
+          chunksCompleted: predictorWarmup?.chunksCompleted ?? null,
+          totalChunks: predictorWarmup?.totalChunks ?? null,
+          currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
+        },
         weeklyChangePct: toFiniteNumberOrNull(weekly?.weeklyPct),
         weekAgoEquity: toFiniteNumberOrNull(weekly?.weekAgoEquity),
         latestEquity: toFiniteNumberOrNull(weekly?.latestEquity),
@@ -792,12 +813,36 @@ app.get('/dashboard', async (req, res) => {
           authConfigured: Boolean(process.env.API_TOKEN),
           dynamicUniverseActive,
           acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
+            ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
           warmupInProgress: Boolean(predictorWarmup?.inProgress),
           topSkipReasons,
           openPositions: positions.length,
           activeSellLimits: positions.filter((position) => Number.isFinite(toFiniteNumberOrNull(position?.sell?.activeLimit))).length,
+        },
+        runtime: {
+          effectiveTradeBase: baseStatus?.tradeBase || null,
+          effectiveDataBase: baseStatus?.dataBase || null,
+          alpacaCredentialsPresent: Boolean(alpacaAuthStatus?.alpacaAuthOk),
+          apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+          effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
+          dynamicUniverseActive,
+          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
+            ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
+          fallbackReason: universeDiagnostics?.fallbackReason || null,
+          predictorWarmup: {
+            inProgress: Boolean(predictorWarmup?.inProgress),
+            symbolsCompleted: predictorWarmup?.symbolsCompleted ?? null,
+            totalSymbolsPlanned: predictorWarmup?.totalSymbolsPlanned ?? null,
+            chunksCompleted: predictorWarmup?.chunksCompleted ?? null,
+            totalChunks: predictorWarmup?.totalChunks ?? null,
+            currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
+          },
         },
         scorecard,
       },
@@ -1352,6 +1397,7 @@ app.get('/market/stocks/bars', async (req, res) => {
 
 const port = process.env.PORT || 3000;
 let bootstrapTradingStarted = false;
+let startupTruthLogged = false;
 
 function withTimeout(promise, ms, label) {
   let t;
@@ -1370,6 +1416,27 @@ async function bootstrapTrading() {
   console.log('bootstrap_start');
   logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
+  if (!startupTruthLogged) {
+    const baseStatus = getAlpacaBaseStatus();
+    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
+    const warmup = getPredictorWarmupSnapshot();
+    console.log('startup_truth_summary', {
+      alpacaCredentialsPresent: Boolean(authStatus?.alpacaAuthOk),
+      effectiveTradeBase: baseStatus?.tradeBase || null,
+      effectiveDataBase: baseStatus?.dataBase || null,
+      dynamicUniverseActive: Boolean(universeDiagnostics?.dynamicUniverseActive),
+      effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
+      acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+      warmupSettings: {
+        enabled: Boolean(process.env.PREDICTOR_WARMUP_ENABLED ? String(process.env.PREDICTOR_WARMUP_ENABLED) !== 'false' : true),
+        inProgress: Boolean(warmup?.inProgress),
+        chunkSize: runtimeConfig.entryPrefetchChunkSize,
+        prefetchConcurrency: runtimeConfig.predictorWarmupPrefetchConcurrency,
+      },
+      apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+    });
+    startupTruthLogged = true;
+  }
   if (!authStatus.alpacaAuthOk) {
     console.warn('startup_blocked_missing_alpaca_auth', {
       missing: authStatus.missing,

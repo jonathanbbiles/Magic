@@ -1,4 +1,6 @@
 const LIVE_CRITICAL_DEFAULTS = Object.freeze({
+  TRADE_BASE: 'https://api.alpaca.markets',
+  DATA_BASE: 'https://data.alpaca.markets',
   ENTRY_UNIVERSE_MODE: 'dynamic',
   ENTRY_SYMBOLS_PRIMARY: '',
   ENTRY_SYMBOLS_SECONDARY: '',
