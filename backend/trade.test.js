@@ -1219,3 +1219,30 @@ const kellyConfidenceOff = kellyConfidenceOffTrade.computeNotionalForEntry({
 assert.equal(kellyConfidenceOn.finalNotionalUsd < kellyConfidenceOff.finalNotionalUsd, true);
 
 assert.match(tradeSource, /const buyPayload = \{[\s\S]*side: 'buy',[\s\S]*\};/);
+
+const executionContextTrade = loadTrade();
+const executionContext = executionContextTrade.resolveEntryExecutionContext('YFI/USD', {
+  signalMeta: {
+    symbolTier: 'tier2',
+    targetProfitBps: 133,
+  },
+});
+assert.equal(executionContext.symbolTier, 'tier2');
+assert.equal(executionContext.targetProfitBps, 133);
+assert.equal(Number.isFinite(executionContext.requiredEdgeBps), true);
+
+const makerFnBody = tradeSource.slice(
+  tradeSource.indexOf('async function placeMakerLimitBuyThenSell'),
+  tradeSource.indexOf('async function placeMarketBuyThenSell'),
+);
+assert.ok(makerFnBody.includes('resolveEntryExecutionContext(normalizedSymbol, options)'));
+assert.ok(!makerFnBody.includes('resolvedEntryTakeProfitBps'));
+
+const marketFnBody = tradeSource.slice(
+  tradeSource.indexOf('async function placeMarketBuyThenSell'),
+  tradeSource.indexOf('async function submitManagedEntryBuy'),
+);
+assert.ok(marketFnBody.includes('resolveEntryExecutionContext(normalizedSymbol, options)'));
+assert.ok(!marketFnBody.includes('resolvedEntryTakeProfitBps'));
+assert.ok(marketFnBody.includes("reason: 'stale_quote_pre_execution_skip'"));
+assert.ok(marketFnBody.includes("return { skipped: true, reason: 'stale_quote'"));
