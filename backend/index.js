@@ -3,11 +3,39 @@ const path = require('path');
 const dotenv = require('dotenv');
 
 const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
-const dotenvPath = process.env.DOTENV_CONFIG_PATH
-  || (nodeEnv === 'production' && fs.existsSync(path.resolve(__dirname, '.env.production'))
-    ? path.resolve(__dirname, '.env.production')
-    : path.resolve(__dirname, '.env'));
-dotenv.config({ path: dotenvPath });
+const explicitDotenvPath = process.env.DOTENV_CONFIG_PATH ? path.resolve(process.env.DOTENV_CONFIG_PATH) : null;
+const localDevDotenvPath = path.resolve(__dirname, '.env');
+const localProdDotenvPath = path.resolve(__dirname, '.env.production.local');
+const localProdDotenvOptIn = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.LOAD_LOCAL_PRODUCTION_DOTENV || '').trim().toLowerCase(),
+);
+let dotenvPath = null;
+
+if (explicitDotenvPath) {
+  dotenvPath = explicitDotenvPath;
+} else if (nodeEnv === 'production') {
+  if (localProdDotenvOptIn && fs.existsSync(localProdDotenvPath)) {
+    dotenvPath = localProdDotenvPath;
+  }
+} else if (fs.existsSync(localDevDotenvPath)) {
+  dotenvPath = localDevDotenvPath;
+}
+
+if (dotenvPath) {
+  dotenv.config({ path: dotenvPath });
+  console.log('dotenv_loaded', {
+    nodeEnv,
+    path: path.relative(__dirname, dotenvPath),
+    explicit: Boolean(explicitDotenvPath),
+    localProductionOptIn: localProdDotenvOptIn,
+  });
+} else {
+  console.log('dotenv_skipped', {
+    nodeEnv,
+    explicitPathProvided: Boolean(explicitDotenvPath),
+    localProductionOptIn: localProdDotenvOptIn,
+  });
+}
 
 const express = require('express');
 const { execSync } = require('child_process');
@@ -650,6 +678,9 @@ app.get('/dashboard', async (req, res) => {
       }
     });
     const nowMs = Date.now();
+    const dynamicUniverseActive = Boolean(universeDiagnostics?.dynamicUniverseActive);
+    const fallbackOccurred = Boolean(universeDiagnostics?.fallbackOccurred);
+    const topSkipReasons = entryDiagnostics?.entryScan?.topSkipReasons || {};
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
       const rawSymbol = String(position?.symbol || position?.asset || '').toUpperCase();
@@ -756,6 +787,18 @@ app.get('/dashboard', async (req, res) => {
         quoteFreshness: entryDiagnostics?.quoteFreshness || null,
         universe: universeDiagnostics,
         predictorWarmup,
+        truth: {
+          backendReachable: true,
+          authConfigured: Boolean(process.env.API_TOKEN),
+          dynamicUniverseActive,
+          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          fallbackOccurred,
+          fallbackReason: universeDiagnostics?.fallbackReason || null,
+          warmupInProgress: Boolean(predictorWarmup?.inProgress),
+          topSkipReasons,
+          openPositions: positions.length,
+          activeSellLimits: positions.filter((position) => Number.isFinite(toFiniteNumberOrNull(position?.sell?.activeLimit))).length,
+        },
         scorecard,
       },
       diagnostics: {

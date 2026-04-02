@@ -10,12 +10,11 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 
 ## Production environment source of truth
 
-- `backend/.env.production` is the single canonical production config model for all live-critical defaults.
-- `backend/.env.live.example` must mirror those live-critical keys exactly and is only an example for operators.
-- `backend/config/liveDefaults.js` defines the same canonical live-critical defaults used by runtime parsing, checks, and engine fallbacks.
-- Start production with `npm run start:production` so the backend loads `backend/.env.production` before boot.
-- On managed hosts (Render/Fly/etc.), copy these same values into the platform environment because checked-in env files are not auto-synced.
-- **Production sync note:** managed-host env panels override checked-in env files. Manually keep `ENTRY_UNIVERSE_MODE`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION`, `SECONDARY_QUOTE_ENABLED`, `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN`, and `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN` aligned with repo defaults.
+- Managed-host production (Render/Fly/etc.) must use real platform environment variables as source of truth.
+- Checked-in env files are templates only: `backend/.env.example`, `backend/.env.live.example`, and `backend/.env.production.example`.
+- `backend/config/liveDefaults.js` defines non-secret live-critical defaults used by runtime parsing, checks, and engine fallbacks.
+- `backend/index.js` does **not** auto-load a production dotenv file by default. Production file loading is local-only and explicit (`LOAD_LOCAL_PRODUCTION_DOTENV=true` with `.env.production.local`).
+- Keep `ENTRY_UNIVERSE_MODE=dynamic` and `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true` in hosted production to retain full dynamic Alpaca USD-pair scanning.
 
 ## Node 22 requirement
 
@@ -102,6 +101,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `GET /debug/auth` is public for token diagnostics.
 - All other routes require a valid API token.
 - Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
+- `GET /dashboard` now exposes runtime-truth diagnostics in `meta.universe`, `meta.predictorWarmup`, and `meta.truth` (dynamic universe active flag, accepted symbol count/sample, fallback state/reason, warmup progress, top skip reasons, open positions, and active sell-limit count).
 
 ## Bulletproof upgrade env vars
 
@@ -261,6 +261,8 @@ After merging, manually copy these values into Render:
 - `QUOTE_RETRY=2`
 
 If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
+
+Do not store real secrets in git-tracked files. Keep `API_TOKEN`, `APCA_API_KEY_ID`, and `APCA_API_SECRET_KEY` only in Render env vars.
 
 ## Runtime preflight and Render deploy checklist
 

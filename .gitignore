@@ -14,4 +14,5 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 !backend/.env.live.example
+!backend/.env.production.example
 !Frontend/.env.live.example

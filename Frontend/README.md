@@ -11,7 +11,7 @@ The app polls `GET /dashboard` and renders account + position diagnostics.
 Set these Expo public env vars before running:
 
 - `EXPO_PUBLIC_BACKEND_URL` (optional override; default is `https://magic-lw8t.onrender.com`)
-- `EXPO_PUBLIC_API_TOKEN` (optional, but needed when backend `API_TOKEN` is set)
+- `EXPO_PUBLIC_API_TOKEN` (optional, but needed when backend secret `API_TOKEN` is set)
 
 Examples:
 
@@ -38,6 +38,11 @@ Then open in Expo Go or simulator.
   - `Authorization: Bearer <token>`
   - `x-api-key: <token>`
 - If token is missing, request is still sent without token.
+
+Backend/Frontend auth key mapping:
+- Backend secret env var: `API_TOKEN`
+- Expo token env var: `EXPO_PUBLIC_API_TOKEN`
+- Expo backend URL env var: `EXPO_PUBLIC_BACKEND_URL`
 
 ## Networking notes
 
