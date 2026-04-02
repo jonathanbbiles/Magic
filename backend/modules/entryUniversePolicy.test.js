@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets } = require('./entryUniversePolicy');
+const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./entryUniversePolicy');
 
 const uniPrimaryOnly = buildEntryUniverse({
   primaryRaw: 'BTC/USD,ETH/USD, btc/usd ',
@@ -37,5 +37,23 @@ assert.equal(dynamicUniverse.stats.acceptedCount, 2);
 assert.equal(dynamicUniverse.stats.malformedCount, 2);
 assert.equal(dynamicUniverse.stats.unsupportedCount, 0);
 assert.equal(dynamicUniverse.stats.duplicateCount, 1);
+
+const rawDynamicSymbols = ['BTC/USD', 'PEPE/USD', 'ETH/USD', 'PAXG/USD', 'UNI/USD'];
+assert.deepEqual(
+  filterDynamicUniverseByExecutionPolicy(rawDynamicSymbols, {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    executionTier2Symbols: ['UNI/USD'],
+    executionTier3Default: false,
+  }),
+  ['BTC/USD', 'ETH/USD', 'UNI/USD'],
+);
+assert.deepEqual(
+  filterDynamicUniverseByExecutionPolicy(rawDynamicSymbols, {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    executionTier2Symbols: ['UNI/USD'],
+    executionTier3Default: true,
+  }),
+  rawDynamicSymbols,
+);
 
 console.log('entry universe policy tests passed');

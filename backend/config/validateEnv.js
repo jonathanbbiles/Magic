@@ -216,10 +216,10 @@ const validateEnv = () => {
     const orderbookSparseConfirmRetry = parseBooleanEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
     const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
     const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
-    const executionTier1Symbols = parseSymbolListEnv('EXECUTION_TIER1_SYMBOLS', 'BTC/USD,ETH/USD');
-    const executionTier2Symbols = parseSymbolListEnv('EXECUTION_TIER2_SYMBOLS', 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
     const runtimeConfig = getRuntimeConfig(process.env);
-    const executionTier3Default = parseBooleanEnv('EXECUTION_TIER3_DEFAULT', runtimeConfig.executionTier3Default);
+    const executionTier1Symbols = dedupeSymbols(runtimeConfig.executionTier1Symbols);
+    const executionTier2Symbols = dedupeSymbols(runtimeConfig.executionTier2Symbols);
+    const executionTier3Default = runtimeConfig.executionTier3Default;
     const marketdataDedupeEnabled = parseBooleanEnv('MARKETDATA_DEDUPE_ENABLED', true);
     const marketdataQuoteTtlMs = parseFiniteNumberEnv('MARKETDATA_QUOTE_TTL_MS', 3000);
     const marketdataOrderbookTtlMs = parseFiniteNumberEnv('MARKETDATA_ORDERBOOK_TTL_MS', 2000);
@@ -352,8 +352,24 @@ const validateEnv = () => {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
     validateRuntimeConfig(process.env);
-    if (!executionTier1Symbols.length) {
-      throw new Error('EXECUTION_TIER1_SYMBOLS must include at least one symbol.');
+    if (
+      runtimeSummary.entryUniverseModeEffective === 'dynamic' &&
+      !executionTier3Default &&
+      executionTier1Symbols.length === 0 &&
+      executionTier2Symbols.length === 0
+    ) {
+      throw new Error('Dynamic universe with EXECUTION_TIER3_DEFAULT=false requires EXECUTION_TIER1_SYMBOLS or EXECUTION_TIER2_SYMBOLS.');
+    }
+    if (
+      runtimeSummary.entryUniverseModeEffective === 'dynamic' &&
+      !executionTier3Default
+    ) {
+      console.warn('config_warning', {
+        field: 'EXECUTION_TIER*_SYMBOLS',
+        message: 'Dynamic universe scan will be filtered to EXECUTION_TIER1_SYMBOLS + EXECUTION_TIER2_SYMBOLS because EXECUTION_TIER3_DEFAULT=false.',
+        tier1Count: executionTier1Symbols.length,
+        tier2Count: executionTier2Symbols.length,
+      });
     }
 
     console.log('config_guardrails', {

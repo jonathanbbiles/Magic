@@ -15,7 +15,7 @@ const cors = require('cors');
 const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 const validateEnv = require('./config/validateEnv');
-const { getRuntimeConfigSummary } = require('./config/runtimeConfig');
+const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { preflightStoragePaths, resolveStoragePaths, logOnce } = require('./modules/storagePaths');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
@@ -30,6 +30,7 @@ const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
+const runtimeConfig = getRuntimeConfig();
 const runtimeConfigSummary = getRuntimeConfigSummary();
 console.log('runtime_live_critical_config', {
   stage: 'startup',
@@ -111,11 +112,11 @@ function readLiveSymbols(key) {
 
 function resolvePrimarySymbolTier(symbol) {
   const normalized = normalizePair(symbol);
-  const tier1 = readLiveSymbols('EXECUTION_TIER1_SYMBOLS');
-  const tier2 = readLiveSymbols('EXECUTION_TIER2_SYMBOLS');
+  const tier1 = runtimeConfig.executionTier1Symbols;
+  const tier2 = runtimeConfig.executionTier2Symbols;
   if (tier1.includes(normalized)) return 'tier1';
   if (tier2.includes(normalized)) return 'tier2';
-  return 'tier3';
+  return runtimeConfig.executionTier3Default ? 'tier3' : 'unclassified';
 }
 
 const runtimeStrategyConfig = {
@@ -151,11 +152,15 @@ const runtimeStrategyConfig = {
 };
 console.log('runtime_live_strategy_config', runtimeStrategyConfig);
 console.log('runtime_entry_engine_flags', {
-  ENTRY_UNIVERSE_MODE: String(process.env.ENTRY_UNIVERSE_MODE || '').trim().toLowerCase() || null,
-  ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: readLiveBoolean('ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION'),
+  ENTRY_UNIVERSE_MODE: runtimeConfig.entryUniverseModeEffective,
+  ENTRY_UNIVERSE_MODE_RAW: runtimeConfig.entryUniverseModeRaw,
+  ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: runtimeConfig.allowDynamicUniverseInProduction,
   ENTRY_SYMBOLS_PRIMARY: readLiveSymbols('ENTRY_SYMBOLS_PRIMARY'),
   ENTRY_SYMBOLS_SECONDARY: readLiveSymbols('ENTRY_SYMBOLS_SECONDARY'),
-  ENTRY_UNIVERSE_EXCLUDE_STABLES: readLiveBoolean('ENTRY_UNIVERSE_EXCLUDE_STABLES'),
+  ENTRY_UNIVERSE_EXCLUDE_STABLES: runtimeConfig.entryUniverseExcludeStables,
+  EXECUTION_TIER1_SYMBOLS: runtimeConfig.executionTier1Symbols,
+  EXECUTION_TIER2_SYMBOLS: runtimeConfig.executionTier2Symbols,
+  EXECUTION_TIER3_DEFAULT: runtimeConfig.executionTier3Default,
   ENGINE_V2_ENABLED: runtimeStrategyConfig.engineV2Enabled,
   REGIME_ENGINE_V2_ENABLED: runtimeStrategyConfig.regimeEngineV2Enabled,
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
@@ -171,7 +176,7 @@ console.log('runtime_entry_engine_flags', {
   MAX_CONCURRENT_POSITIONS: readLiveNumber('MAX_CONCURRENT_POSITIONS'),
 });
 
-const configuredPrimary = readLiveSymbols('ENTRY_SYMBOLS_PRIMARY');
+const configuredPrimary = runtimeConfig.configuredPrimarySymbols;
 const sparseSymbols = new Set(runtimeStrategyConfig.sparseFallbackSymbols);
 for (const symbol of configuredPrimary) {
   const symbolTier = resolvePrimarySymbolTier(symbol);

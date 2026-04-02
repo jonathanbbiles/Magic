@@ -56,4 +56,10 @@ withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true' }, () => {
   assert.equal(getRuntimeConfig().entryUniverseExcludeStables, true);
 });
 
+withEnv({}, () => {
+  const cfg = getRuntimeConfig();
+  assert.deepEqual(cfg.executionTier1Symbols, ['BTC/USD', 'ETH/USD']);
+  assert.deepEqual(cfg.executionTier2Symbols, ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD']);
+});
+
 console.log('runtime config tests passed');

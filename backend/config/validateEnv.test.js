@@ -85,8 +85,22 @@ withEnv({ ORDERBOOK_SPARSE_CONFIRM_RETRY: 'invalid' }, () => {
   assert.throws(() => validateEnv(), /ORDERBOOK_SPARSE_CONFIRM_RETRY must be a boolean-like value/);
 });
 
-withEnv({ EXECUTION_TIER1_SYMBOLS: '' }, () => {
-  assert.throws(() => validateEnv(), /EXECUTION_TIER1_SYMBOLS must include at least one symbol/);
+withEnv({
+  ENTRY_UNIVERSE_MODE: 'dynamic',
+  EXECUTION_TIER3_DEFAULT: 'false',
+  EXECUTION_TIER1_SYMBOLS: '',
+  EXECUTION_TIER2_SYMBOLS: '',
+}, () => {
+  assert.throws(() => validateEnv(), /Dynamic universe with EXECUTION_TIER3_DEFAULT=false requires EXECUTION_TIER1_SYMBOLS or EXECUTION_TIER2_SYMBOLS/);
+});
+
+withEnv({
+  ENTRY_UNIVERSE_MODE: 'dynamic',
+  EXECUTION_TIER3_DEFAULT: 'true',
+  EXECUTION_TIER1_SYMBOLS: '',
+  EXECUTION_TIER2_SYMBOLS: '',
+}, () => {
+  assert.doesNotThrow(() => validateEnv());
 });
 
 withEnv({ ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: '' }, () => {

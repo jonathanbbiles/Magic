@@ -54,6 +54,9 @@ function getRuntimeConfig(env = process.env) {
   const configuredSecondarySymbols = dedupeSymbols(parseSymbols(env.ENTRY_SYMBOLS_SECONDARY ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_SECONDARY)).filter(
     (symbol) => !configuredPrimarySymbols.includes(symbol)
   );
+  const executionTier1Symbols = dedupeSymbols(parseSymbols(env.EXECUTION_TIER1_SYMBOLS ?? LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER1_SYMBOLS));
+  const executionTier2Symbols = dedupeSymbols(parseSymbols(env.EXECUTION_TIER2_SYMBOLS ?? LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER2_SYMBOLS))
+    .filter((symbol) => !executionTier1Symbols.includes(symbol));
 
   return {
     nodeEnv,
@@ -67,6 +70,8 @@ function getRuntimeConfig(env = process.env) {
       env.ENTRY_UNIVERSE_EXCLUDE_STABLES,
       parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, false),
     ),
+    executionTier1Symbols,
+    executionTier2Symbols,
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
     entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS, 10000)),
     entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE, 5)),
@@ -94,6 +99,10 @@ function getRuntimeConfigSummary(env = process.env) {
     configuredSecondaryCount: config.configuredSecondarySymbols.length,
     configuredPrimarySample: config.configuredPrimarySymbols.slice(0, 6),
     configuredSecondarySample: config.configuredSecondarySymbols.slice(0, 6),
+    executionTier1Symbols: config.executionTier1Symbols,
+    executionTier2Symbols: config.executionTier2Symbols,
+    executionTier1Count: config.executionTier1Symbols.length,
+    executionTier2Count: config.executionTier2Symbols.length,
     entryUniverseExcludeStables: config.entryUniverseExcludeStables,
     entryScanIntervalMs: config.entryScanIntervalMs,
     entryPrefetchChunkSize: config.entryPrefetchChunkSize,
