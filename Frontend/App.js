@@ -360,8 +360,10 @@ export default function App() {
                   authEnabled,
                   dynamicUniverseActive: meta?.dynamicUniverseActive ?? runtime?.dynamicUniverseActive ?? truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
                   acceptedSymbolsCount: meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
+                  engineState: meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—',
                   warmupInProgress: warmupStatus?.inProgress ?? runtime?.predictorWarmup?.inProgress ?? truth?.warmupInProgress ?? warmupInProgress,
                   topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
+                  signalBlockedByWarmupCount: truth?.signalBlockedByWarmupCount ?? entryScan?.signalBlockedByWarmupCount ?? 0,
                   openPositions: truth?.openPositions ?? positions.length,
                   activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
                 })}</Text>
@@ -373,6 +375,9 @@ export default function App() {
                 </Text>
                 <Text style={styles.diagnosticsText}>
                   Top skip reasons: {entryScan?.topSkipReasons ? JSON.stringify(entryScan.topSkipReasons) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Signals: ready={toNum(entryScan?.signalReadyCount) ?? 0} blockedByWarmup={toNum(entryScan?.signalBlockedByWarmupCount) ?? 0} staleQuoteSkips={toNum(entryScan?.staleEntryQuoteSkips) ?? 0}
                 </Text>
                 <Text style={styles.diagnosticsText}>
                   Predictor candidates: {predictorCandidates?.topCandidates ? JSON.stringify(predictorCandidates.topCandidates) : '—'}
@@ -472,9 +477,15 @@ export default function App() {
                       ⏳ Backend is warming up market data. Progress: {toNum(warmup?.symbolsCompleted) ?? 0}/{toNum(warmup?.totalSymbolsPlanned) ?? '—'} symbols.
                     </Text>
                   ) : null}
-                  <Text style={styles.errorHint}>
-                    🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
-                  </Text>
+                  {authEnabled ? (
+                    <Text style={styles.errorHint}>
+                      🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
+                    </Text>
+                  ) : (
+                    <Text style={styles.errorHint}>
+                      ℹ️ Backend auth token is disabled on server; only backend URL must be correct.
+                    </Text>
+                  )}
                 </View>
               ) : null}
 

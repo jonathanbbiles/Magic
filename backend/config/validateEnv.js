@@ -214,14 +214,21 @@ const validateEnv = () => {
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
   const alpacaSecretProvided = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY']
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
-  if (!String(alpacaKeyRaw || '').trim()) {
-    validationErrors.push('APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty.');
+  if (strictSecretsMode) {
+    if (!String(alpacaKeyRaw || '').trim()) {
+      validationErrors.push('APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty.');
+    }
+    if (!String(alpacaSecretRaw || '').trim()) {
+      validationErrors.push('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY is required and cannot be empty.');
+    }
+  } else if (!String(alpacaKeyRaw || '').trim() || !String(alpacaSecretRaw || '').trim()) {
+    console.warn('config_warning', {
+      field: 'APCA_API_*',
+      message: 'Alpaca credentials are missing. Startup may continue outside production/live mode, but trading endpoints require credentials.',
+    });
   }
-  if (!String(alpacaSecretRaw || '').trim()) {
-    validationErrors.push('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY is required and cannot be empty.');
-  }
-  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: true, provided: alpacaKeyProvided });
-  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: true, provided: alpacaSecretProvided });
+  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: strictSecretsMode, provided: alpacaKeyProvided });
+  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: strictSecretsMode, provided: alpacaSecretProvided });
 
   corsAllowedOrigins.forEach((origin) => {
     parseUrl('CORS_ALLOWED_ORIGINS', origin);

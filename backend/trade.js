@@ -453,9 +453,9 @@ const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const PREDICTOR_WARMUP_ENABLED = readEnvFlag('PREDICTOR_WARMUP_ENABLED', true);
 const PREDICTOR_DEBUG_VERBOSE = readEnvFlag('PREDICTOR_DEBUG_VERBOSE', false);
-const PREDICTOR_WARMUP_MIN_1M_BARS = readNumber('PREDICTOR_WARMUP_MIN_1M_BARS', 200);
-const PREDICTOR_WARMUP_MIN_5M_BARS = readNumber('PREDICTOR_WARMUP_MIN_5M_BARS', 200);
-const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS', 100);
+const PREDICTOR_WARMUP_MIN_1M_BARS = readNumber('PREDICTOR_WARMUP_MIN_1M_BARS', runtimeLiveConfig.predictorWarmupMinBars1m || 90);
+const PREDICTOR_WARMUP_MIN_5M_BARS = readNumber('PREDICTOR_WARMUP_MIN_5M_BARS', runtimeLiveConfig.predictorWarmupMinBars5m || 60);
+const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS', runtimeLiveConfig.predictorWarmupMinBars15m || 40);
 const PREDICTOR_MIN_BARS_1M = readNumber('PREDICTOR_MIN_BARS_1M', 30);
 const PREDICTOR_MIN_BARS_5M = readNumber('PREDICTOR_MIN_BARS_5M', 30);
 const PREDICTOR_MIN_BARS_15M = readNumber('PREDICTOR_MIN_BARS_15M', 20);
@@ -898,6 +898,7 @@ let lastBrokerTradingDisabledExitLogMs = 0;
 let lastEntryScanSummary = null;
 let lastPredictorCandidatesSummary = null;
 let lastEntrySkipReasonsBySymbol = {};
+let firstReadyScanLogged = false;
 let lastUniverseDiagnostics = {
   envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
   effectiveUniverseMode: null,
@@ -3809,6 +3810,8 @@ let lastPrefetchedBars = {
   bars5mBySymbol: new Map(),
   bars15mBySymbol: new Map(),
 };
+let lastPrefetchedBarsUpdatedAtMs = 0;
+let lastPrefetchedBarsSymbols = new Set();
 let predictorWarmupCompletedLogged = false;
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
@@ -4739,6 +4742,23 @@ function getWarmupBarLimits() {
     '15m': Math.max(60, thresholds['15m']),
   };
 }
+
+function getPrefetchedBarsIfReusable({ symbols = [], maxAgeMs = BARS_PREFETCH_INTERVAL_MS } = {}) {
+  if (!lastPrefetchedBars || !lastPrefetchedBarsUpdatedAtMs) return null;
+  const ageMs = Date.now() - lastPrefetchedBarsUpdatedAtMs;
+  if (Number.isFinite(maxAgeMs) && ageMs > maxAgeMs) return null;
+  const requested = new Set((Array.isArray(symbols) ? symbols : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean));
+  if (requested.size === 0) return null;
+  for (const symbol of requested) {
+    if (!lastPrefetchedBarsSymbols.has(symbol)) return null;
+  }
+  return {
+    bars: lastPrefetchedBars,
+    ageMs,
+    symbolCount: lastPrefetchedBarsSymbols.size,
+  };
+}
+
 
 function normalizeBarsDebugError(errorLike) {
   if (!errorLike) return null;
@@ -12600,6 +12620,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       ok: true,
       skipped: 'interval_gate',
       prefetchedBars: lastPrefetchedBars,
+      reusedPrefetch: true,
+      prefetchAgeMs: lastPrefetchedBarsUpdatedAtMs ? Date.now() - lastPrefetchedBarsUpdatedAtMs : null,
     };
   }
   if (symbols.length === 0) {
@@ -12758,6 +12780,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     bars5mBySymbol,
     bars15mBySymbol,
   };
+  lastPrefetchedBarsUpdatedAtMs = Date.now();
+  lastPrefetchedBarsSymbols = new Set(symbols);
 
   return {
     ok: true,
@@ -12950,6 +12974,8 @@ async function runEntryScanOnce() {
       fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
+      stableExclusionEnabled: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+      stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - scanSymbols.length),
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
@@ -13123,9 +13149,19 @@ async function runEntryScanOnce() {
     const resolveSkipReason = (reason, meta) => resolveEntrySkipReason(reason, meta);
 
     let prefetchedBars = null;
-    const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
-    if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
-      prefetchedBars = prefetchResult.prefetchedBars;
+    const reusablePrefetch = getPrefetchedBarsIfReusable({ symbols: scanSymbols });
+    if (reusablePrefetch?.bars) {
+      prefetchedBars = reusablePrefetch.bars;
+      console.log('entry_scan_prefetch_reused', {
+        reused: true,
+        ageMs: reusablePrefetch.ageMs,
+        cachedSymbols: reusablePrefetch.symbolCount,
+      });
+    } else {
+      const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+      if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
+        prefetchedBars = prefetchResult.prefetchedBars;
+      }
     }
     const entryMarketDataContext = buildEntryMarketDataContext({
       scanId: `${startMs}`,
@@ -13555,6 +13591,17 @@ async function runEntryScanOnce() {
       },
     };
     console.log('entry_scan', lastEntryScanSummary);
+    if (!firstReadyScanLogged && signalReadyCount > 0) {
+      firstReadyScanLogged = true;
+      console.log('entry_post_warmup_summary', {
+        scanned,
+        placed,
+        skipped,
+        topSkipReasons,
+        signalReadyCount,
+        signalBlockedByWarmupCount,
+      });
+    }
     if (PREDICTOR_WARMUP_ENABLED && !predictorWarmupCompletedLogged && signalBlockedByWarmupCount === 0 && signalReadyCount > 0) {
       predictorWarmupCompletedLogged = true;
       console.log('predictor_warmup_complete', { readySignals: signalReadyCount, universeSize });
@@ -15442,6 +15489,17 @@ function getSessionGovernorSummary() {
   };
 }
 
+
+function getEngineStateSnapshot() {
+  if (tradingHaltedReason) return 'halted';
+  if (entryScanRunning) return 'scanning';
+  const warmup = getPredictorWarmupStatus();
+  if (warmup?.inProgress) return 'warming_up';
+  if (Number(lastEntryScanSummary?.marketDataBudget?.rateLimited || 0) > 0) return 'rate_limited';
+  if (lastEntryScanSummary) return 'ready';
+  return 'warming_up';
+}
+
 function getTradingManagerStatus() {
   return {
     tradingEnabled: TRADING_ENABLED,
@@ -15688,6 +15746,7 @@ module.exports = {
   getEntryDiagnosticsSnapshot,
   getUniverseDiagnosticsSnapshot,
   getPredictorWarmupSnapshot,
+  getEngineStateSnapshot,
   getEntryRegimeStaleThresholdMs,
   requestAlpacaMarketData,
   resolveRegimePenaltyBps,

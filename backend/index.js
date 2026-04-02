@@ -114,6 +114,7 @@ const {
   getEntryDiagnosticsSnapshot,
   getUniverseDiagnosticsSnapshot,
   getPredictorWarmupSnapshot,
+  getEngineStateSnapshot,
   getEntryRegimeStaleThresholdMs,
 } = require('./trade');
 
@@ -772,13 +773,17 @@ app.get('/dashboard', async (req, res) => {
         effectiveDataBase: baseStatus?.dataBase || null,
         alpacaCredentialsPresent: Boolean(alpacaAuthStatus?.alpacaAuthOk),
         apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+        envRequestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeConfig.entryUniverseModeRaw || null,
         effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
         dynamicUniverseActive,
+        dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
         acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
           : [],
+        fallbackOccurred,
         fallbackReason: universeDiagnostics?.fallbackReason || null,
+        engineState: getEngineStateSnapshot(),
         predictorWarmupStatus: {
           inProgress: Boolean(predictorWarmup?.inProgress),
           symbolsCompleted: predictorWarmup?.symbolsCompleted ?? null,
@@ -819,7 +824,9 @@ app.get('/dashboard', async (req, res) => {
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
           warmupInProgress: Boolean(predictorWarmup?.inProgress),
+          engineState: getEngineStateSnapshot(),
           topSkipReasons,
+          signalBlockedByWarmupCount: Number(entryDiagnostics?.entryScan?.signalBlockedByWarmupCount || 0),
           openPositions: positions.length,
           activeSellLimits: positions.filter((position) => Number.isFinite(toFiniteNumberOrNull(position?.sell?.activeLimit))).length,
         },
@@ -828,13 +835,17 @@ app.get('/dashboard', async (req, res) => {
           effectiveDataBase: baseStatus?.dataBase || null,
           alpacaCredentialsPresent: Boolean(alpacaAuthStatus?.alpacaAuthOk),
           apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+          envRequestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeConfig.entryUniverseModeRaw || null,
           effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
           dynamicUniverseActive,
+          dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
           acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
             : [],
+          fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
+          engineState: getEngineStateSnapshot(),
           predictorWarmup: {
             inProgress: Boolean(predictorWarmup?.inProgress),
             symbolsCompleted: predictorWarmup?.symbolsCompleted ?? null,
@@ -1425,6 +1436,7 @@ async function bootstrapTrading() {
       effectiveTradeBase: baseStatus?.tradeBase || null,
       effectiveDataBase: baseStatus?.dataBase || null,
       dynamicUniverseActive: Boolean(universeDiagnostics?.dynamicUniverseActive),
+      requestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeConfig.entryUniverseModeRaw || null,
       effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
       acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
       warmupSettings: {
@@ -1434,6 +1446,8 @@ async function bootstrapTrading() {
         prefetchConcurrency: runtimeConfig.predictorWarmupPrefetchConcurrency,
       },
       apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
+      fallbackOccurred: Boolean(universeDiagnostics?.fallbackOccurred),
+      fallbackReason: universeDiagnostics?.fallbackReason || null,
     });
     startupTruthLogged = true;
   }
