@@ -52,7 +52,7 @@ const {
 const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
-const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets } = require('./modules/entryUniversePolicy');
+const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { resolveStoragePaths } = require('./modules/storagePaths');
 
@@ -665,8 +665,8 @@ const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCas
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
-const EXECUTION_TIER1_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER1_SYMBOLS || 'BTC/USD,ETH/USD');
-const EXECUTION_TIER2_SYMBOLS = parseSymbolSet(process.env.EXECUTION_TIER2_SYMBOLS || 'SOL/USD,LINK/USD,AVAX/USD');
+const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
+const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
 const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
@@ -4939,6 +4939,7 @@ async function getQuoteForTrading(symbol, opts = {}) {
     bid: best.bid,
     ask: best.ask,
     tsMs: Number.isFinite(best.ts) ? best.ts : Date.now(),
+    receivedAtMs: Number.isFinite(Number(best.receivedAtMs)) ? Number(best.receivedAtMs) : null,
     source: best.source || 'best_quote',
   };
 }
@@ -12762,7 +12763,26 @@ async function runEntryScanOnce() {
     const normalizedUniverse = universe
       .map((sym) => normalizeSymbol(sym))
       .filter(Boolean);
-    const scanSymbols = applyEntryUniverseStableFilter(normalizedUniverse, {
+    let tierFilteredUniverse = normalizedUniverse;
+    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && !EXECUTION_TIER3_DEFAULT) {
+      const allowedExecutionSymbols = new Set([...EXECUTION_TIER1_SYMBOLS, ...EXECUTION_TIER2_SYMBOLS]);
+      tierFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
+        executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+        executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+        executionTier3Default: EXECUTION_TIER3_DEFAULT,
+      });
+      const filteredOut = normalizedUniverse.filter((symbol) => !allowedExecutionSymbols.has(symbol));
+      console.log('entry_universe_tier_filter', {
+        rawDynamicCount: normalizedUniverse.length,
+        filteredCount: tierFilteredUniverse.length,
+        filteredOutCount: filteredOut.length,
+        tier1Count: EXECUTION_TIER1_SYMBOLS.size,
+        tier2Count: EXECUTION_TIER2_SYMBOLS.size,
+        tier3Default: EXECUTION_TIER3_DEFAULT,
+        filteredOutSample: filteredOut.slice(0, 10),
+      });
+    }
+    const scanSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
     console.log('entry_universe_selection', {

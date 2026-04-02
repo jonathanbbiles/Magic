@@ -86,8 +86,27 @@ function buildEntryUniverse({ primaryRaw, secondaryRaw, includeSecondary = false
   };
 }
 
+function filterDynamicUniverseByExecutionPolicy(symbols = [], {
+  executionTier1Symbols = [],
+  executionTier2Symbols = [],
+  executionTier3Default = true,
+} = {}) {
+  const normalizedSymbols = uniqSymbols((Array.isArray(symbols) ? symbols : [])
+    .map((symbol) => normalizePair(symbol))
+    .filter(Boolean));
+  if (executionTier3Default) {
+    return normalizedSymbols;
+  }
+  const allowed = new Set([
+    ...uniqSymbols(executionTier1Symbols.map((symbol) => normalizePair(symbol)).filter(Boolean)),
+    ...uniqSymbols(executionTier2Symbols.map((symbol) => normalizePair(symbol)).filter(Boolean)),
+  ]);
+  return normalizedSymbols.filter((symbol) => allowed.has(symbol));
+}
+
 module.exports = {
   parseSymbolList,
   buildEntryUniverse,
   buildDynamicCryptoUniverseFromAssets,
+  filterDynamicUniverseByExecutionPolicy,
 };

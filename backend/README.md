@@ -209,6 +209,8 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 - **dynamic**: backend discovers tradable symbols from Alpaca assets at runtime (`dynamic_full_universe`). This is the intended live/production mode.
 - **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY` (plus optional `ENTRY_SYMBOLS_SECONDARY`).
+- With dynamic full-universe scanning, symbols not explicitly listed in `EXECUTION_TIER1_SYMBOLS` or `EXECUTION_TIER2_SYMBOLS` are treated as tier3 when `EXECUTION_TIER3_DEFAULT=true`.
+- When `EXECUTION_TIER3_DEFAULT=false`, dynamic scanning is filtered to `EXECUTION_TIER1_SYMBOLS + EXECUTION_TIER2_SYMBOLS` only.
 
 Production safety rule:
 - Keep `ENTRY_UNIVERSE_MODE=dynamic` **and** `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true` for full live universe scanning, or
@@ -239,7 +241,9 @@ After merging, manually copy these values into Render:
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
-- `EXECUTION_TIER3_DEFAULT=false`
+- `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
+- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
+- `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
 - `ENTRY_PREFETCH_ORDERBOOKS=false`
@@ -267,7 +271,9 @@ Intended live non-secret env values:
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
-- `EXECUTION_TIER3_DEFAULT=false`
+- `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
+- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
+- `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
 - `ENTRY_PREFETCH_ORDERBOOKS=false`

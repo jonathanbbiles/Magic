@@ -22,6 +22,7 @@ const policy = {
 assert.equal(resolveSymbolTier('BTCUSD', policy), 'tier1');
 assert.equal(resolveSymbolTier('SOL/USD', policy), 'tier2');
 assert.equal(resolveSymbolTier('DOGE/USD', policy), 'tier3');
+assert.equal(resolveSymbolTier('DOGE/USD', { ...policy, tier3Default: false }), 'unclassified');
 
 const healthyResult = evaluateEntryMarketData({
   symbol: 'BTC/USD',

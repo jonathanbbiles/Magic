@@ -53,10 +53,12 @@ async function getSecondaryQuote(symbol) {
   const ask = Number(raw?.ASK ?? raw?.PRICE);
   const ts = Number(raw?.LASTUPDATE) * 1000;
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return null;
+  const receivedAtMs = Date.now();
   return {
     bid,
     ask,
     ts: Number.isFinite(ts) ? ts : Date.now(),
+    receivedAtMs,
     source: 'cryptocompare',
   };
 }
@@ -74,14 +76,28 @@ async function getBestQuote(symbol, opts = {}) {
   const primary = await getPrimaryQuote(symbol, opts).catch(() => null);
   const primaryAge = primary && Number.isFinite(primary.tsMs) ? Math.max(0, Date.now() - primary.tsMs) : null;
   if (primary && (!Number.isFinite(primaryAge) || primaryAge <= maxAgeMs)) {
-    return { bid: primary.bid, ask: primary.ask, ts: primary.tsMs || Date.now(), source: 'primary' };
+    return {
+      bid: primary.bid,
+      ask: primary.ask,
+      ts: primary.tsMs || Date.now(),
+      receivedAtMs: Number.isFinite(Number(primary.receivedAtMs)) ? Number(primary.receivedAtMs) : null,
+      source: 'primary',
+    };
   }
   const secondary = await getSecondaryQuote(symbol).catch(() => null);
   const age = secondary && Number.isFinite(secondary.ts) ? Math.max(0, Date.now() - secondary.ts) : null;
   if (secondary && (!Number.isFinite(age) || age <= maxAgeMs)) {
     return secondary;
   }
-  if (primary) return { bid: primary.bid, ask: primary.ask, ts: primary.tsMs || Date.now(), source: 'primary_stale' };
+  if (primary) {
+    return {
+      bid: primary.bid,
+      ask: primary.ask,
+      ts: primary.tsMs || Date.now(),
+      receivedAtMs: Number.isFinite(Number(primary.receivedAtMs)) ? Number(primary.receivedAtMs) : null,
+      source: 'primary_stale',
+    };
+  }
   return null;
 }
 

@@ -34,6 +34,9 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY, '');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, 'false');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER1_SYMBOLS, 'BTC/USD,ETH/USD');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER2_SYMBOLS, 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_FALLBACK_SYMBOLS, 'BTC/USD,ETH/USD');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS, '240');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER1, 'true');
@@ -52,6 +55,9 @@ withEnv({}, () => {
   for (const sourceText of [envProduction, envLiveExample, envExample]) {
     assert.match(sourceText, /ENTRY_UNIVERSE_MODE=dynamic/);
     assert.match(sourceText, /ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true/);
+    assert.match(sourceText, /EXECUTION_TIER1_SYMBOLS=BTC\/USD,ETH\/USD/);
+    assert.match(sourceText, /EXECUTION_TIER2_SYMBOLS=LINK\/USD,AVAX\/USD,SOL\/USD,UNI\/USD/);
+    assert.match(sourceText, /EXECUTION_TIER3_DEFAULT=true/);
     assert.match(sourceText, /SECONDARY_QUOTE_ENABLED=true/);
     assert.match(sourceText, /SECONDARY_QUOTE_PROVIDER=cryptocompare/);
     assert.match(sourceText, /QUOTE_RETRY=2/);
