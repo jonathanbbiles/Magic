@@ -15,6 +15,7 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 - `backend/config/liveDefaults.js` defines the same canonical live-critical defaults used by runtime parsing, checks, and engine fallbacks.
 - Start production with `npm run start:production` so the backend loads `backend/.env.production` before boot.
 - On managed hosts (Render/Fly/etc.), copy these same values into the platform environment because checked-in env files are not auto-synced.
+- **Production sync note:** managed-host env panels override checked-in env files. Manually keep `ENTRY_UNIVERSE_MODE`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION`, `SECONDARY_QUOTE_ENABLED`, `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN`, and `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN` aligned with repo defaults.
 
 ## Node 22 requirement
 
@@ -162,11 +163,11 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `RISK_KILL_SWITCH_FILE=./data/KILL_SWITCH`
 - `RISK_METRICS_LOG_INTERVAL_MS=60000`
 
-- `SECONDARY_QUOTE_ENABLED=false`
+- `SECONDARY_QUOTE_ENABLED=true`
 - `SECONDARY_QUOTE_PROVIDER=cryptocompare`
 - `MAX_QUOTE_AGE_MS=8000`
 - `QUOTE_TIMEOUT_MS=2500`
-- `QUOTE_RETRY=1`
+- `QUOTE_RETRY=2`
 
 - `PREDICTOR_CALIBRATION_ENABLED=false`
 - `CALIBRATION_FILE=./data/calibration.json`
@@ -196,7 +197,8 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS=15000` (bounded sparse-fallback tolerance for tier1 quote staleness)
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
+- `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
 - `ALPACA_BARS_USE_TIME_RANGE=true`
 - `ALPACA_MD_MAX_CONCURRENCY=2`
 - `ALPACA_MD_MIN_DELAY_MS=200`
@@ -245,10 +247,14 @@ After merging, manually copy these values into Render:
 - `BARS_MAX_CONCURRENT=1`
 - `BARS_PREFETCH_INTERVAL_MS=120000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
+- `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
+- `SECONDARY_QUOTE_ENABLED=true`
+- `SECONDARY_QUOTE_PROVIDER=cryptocompare`
+- `QUOTE_RETRY=2`
 
 If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
 
@@ -269,7 +275,7 @@ Intended live non-secret env values:
 - `BARS_MAX_CONCURRENT=1`
 - `BARS_PREFETCH_INTERVAL_MS=120000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=2`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`

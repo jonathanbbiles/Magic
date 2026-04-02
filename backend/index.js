@@ -161,9 +161,12 @@ console.log('runtime_entry_engine_flags', {
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS_env: runtimeStrategyConfig.regimeStaleThresholdMs,
   regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
+  SECONDARY_QUOTE_ENABLED: readLiveBoolean('SECONDARY_QUOTE_ENABLED'),
+  QUOTE_RETRY: readLiveNumber('QUOTE_RETRY'),
   ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS: runtimeStrategyConfig.sparseRequireStrongerEdgeBps,
   ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
   ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN: readLiveNumber('ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN'),
+  PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN: readLiveNumber('PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN'),
   ORDERBOOK_SPARSE_FALLBACK_SYMBOLS: readLiveSymbols('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS'),
   MAX_CONCURRENT_POSITIONS: readLiveNumber('MAX_CONCURRENT_POSITIONS'),
 });

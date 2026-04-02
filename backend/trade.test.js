@@ -206,7 +206,27 @@ const {
   getOpenSellOrdersForSymbol,
   computeExitSellability,
   findPositionInSnapshot,
+  shouldMarkProviderQuoteStaleAfterRefresh,
+  computeProviderQuoteAgeMs,
+  computeEffectivePerScanBudget,
 } = tradeEntryBasis;
+
+assert.equal(
+  shouldMarkProviderQuoteStaleAfterRefresh({
+    quoteRefreshForced: true,
+    realAgeMs: 16001,
+    providerAgeMs: 14999,
+    toleranceMs: 15000,
+  }),
+  false,
+);
+
+assert.equal(computeProviderQuoteAgeMs(1700000010000, 1700000000000), 10000);
+assert.equal(computeProviderQuoteAgeMs(null, 1700000000000), null);
+
+assert.equal(computeEffectivePerScanBudget(2, 8), 4);
+assert.equal(computeEffectivePerScanBudget(2, 40), 10);
+assert.equal(computeEffectivePerScanBudget(8, 20), 8);
 
 const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
 assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
@@ -214,6 +234,11 @@ assert.equal(resolvedEntry.entryBasis, 100);
 
 const desiredLimit = computeTargetSellPrice(resolvedEntry.entryBasis, 50, 0.01);
 assert.equal(desiredLimit, 100.5);
+
+const tradeSourceEarly = fs.readFileSync(path.resolve(__dirname, 'trade.js'), 'utf8');
+assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetConfigured: ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN'));
+assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetEffective: sparseConfirmBudgetEffective'));
+assert.ok(tradeSourceEarly.includes('providerAgeMs: sparseRetryDetails.providerAgeMs'));
 
 const desiredLimitFromEntry = computeTargetSellPrice(100, 75, 0.01);
 assert.equal(desiredLimitFromEntry, 100.75);
