@@ -317,6 +317,9 @@ export default function App() {
   const universe = meta?.universe || {};
   const warmup = meta?.predictorWarmup || {};
   const warmupInProgress = Boolean(warmup?.inProgress);
+  const truth = meta?.truth || {};
+  const backendReachable = truth?.backendReachable !== false;
+  const authOk = backendReachable && !error;
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -346,6 +349,19 @@ export default function App() {
                 <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
               </View>
 
+              <View style={styles.diagnosticsBlock}>
+                <Text style={styles.diagnosticsTitle}>Runtime truth</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify({
+                  backendReachable,
+                  authOk,
+                  dynamicUniverseActive: truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
+                  acceptedSymbolsCount: truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
+                  warmupInProgress: truth?.warmupInProgress ?? warmupInProgress,
+                  topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
+                  openPositions: truth?.openPositions ?? positions.length,
+                  activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
+                })}</Text>
+              </View>
               <View style={styles.diagnosticsBlock}>
                 <Text style={styles.diagnosticsTitle}>Entry diagnostics</Text>
                 <Text style={styles.diagnosticsText}>
@@ -416,12 +432,14 @@ export default function App() {
                 <Text style={styles.diagnosticsText}>{JSON.stringify({
                   requested: universe?.envRequestedUniverseMode,
                   effective: universe?.effectiveUniverseMode,
+                  dynamicUniverseActive: universe?.dynamicUniverseActive,
                   allowDynamicInProd: universe?.allowDynamicUniverseInProduction,
                   dynamicTradableSymbolsFound: universe?.dynamicTradableSymbolsFound,
                   acceptedSymbolsCount: universe?.acceptedSymbolsCount,
                   configuredPrimaryCount: universe?.configuredPrimaryCount,
                   configuredSecondaryCount: universe?.configuredSecondaryCount,
                   sample: universe?.acceptedSymbolsSample,
+                  fallbackOccurred: universe?.fallbackOccurred,
                   fallbackReason: universe?.fallbackReason,
                   lastUniverseRefreshAt: universe?.lastUniverseRefreshAt,
                 })}</Text>
@@ -434,6 +452,8 @@ export default function App() {
                   symbolsCompleted: warmup?.symbolsCompleted,
                   chunksCompleted: warmup?.chunksCompleted,
                   totalChunks: warmup?.totalChunks,
+                  currentTimeframe: warmup?.currentTimeframe,
+                  lastCompletedTimeframe: warmup?.lastCompletedTimeframe,
                   timeframesCompleted: warmup?.timeframesCompleted,
                   lastBatchSummary: warmup?.lastBatchSummary,
                   lastError: warmup?.lastError,

@@ -54,6 +54,8 @@ function createInitialWarmupStatus() {
       '5Min': 0,
       '15Min': 0,
     },
+    currentTimeframe: null,
+    lastCompletedTimeframe: null,
     lastBatchSummary: null,
     lastError: null,
   };
@@ -82,6 +84,8 @@ function updatePredictorWarmupProgress({
   symbolsCompleted = null,
   chunksCompleted = null,
   timeframesCompleted = null,
+  currentTimeframe = null,
+  lastCompletedTimeframe = null,
   lastBatchSummary = null,
 } = {}) {
   if (Number.isFinite(Number(symbolsCompleted))) {
@@ -97,6 +101,14 @@ function updatePredictorWarmupProgress({
     }
     warmupStatus.timeframesCompleted = safe;
   }
+  if (currentTimeframe === null) {
+    warmupStatus.currentTimeframe = null;
+  } else if (typeof currentTimeframe === 'string' && currentTimeframe.trim()) {
+    warmupStatus.currentTimeframe = currentTimeframe.trim();
+  }
+  if (typeof lastCompletedTimeframe === 'string' && lastCompletedTimeframe.trim()) {
+    warmupStatus.lastCompletedTimeframe = lastCompletedTimeframe.trim();
+  }
   if (lastBatchSummary && typeof lastBatchSummary === 'object') {
     warmupStatus.lastBatchSummary = { ...lastBatchSummary };
   }
@@ -105,6 +117,7 @@ function updatePredictorWarmupProgress({
 function finishPredictorWarmup({ error = null } = {}) {
   warmupStatus.inProgress = false;
   warmupStatus.finishedAt = new Date().toISOString();
+  warmupStatus.currentTimeframe = null;
   warmupStatus.lastError = error ? String(error?.message || error) : null;
 }
 

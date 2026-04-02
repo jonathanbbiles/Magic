@@ -11,7 +11,7 @@
     "smoke": "node smoke.test.js",
     "check:runtime-env": "node scripts/check_runtime_env.js",
     "preflight": "node scripts/check_runtime_env.js && node smoke.test.js",
-    "start:production": "DOTENV_CONFIG_PATH=.env.production NODE_ENV=production node index.js"
+    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js"
   },
   "dependencies": {
     "axios": "^1.13.2",

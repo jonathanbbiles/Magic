@@ -900,10 +900,12 @@ let lastEntrySkipReasonsBySymbol = {};
 let lastUniverseDiagnostics = {
   envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
   effectiveUniverseMode: null,
+  dynamicUniverseActive: false,
   allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
   dynamicTradableSymbolsFound: null,
   acceptedSymbolsCount: 0,
   acceptedSymbolsSample: [],
+  fallbackOccurred: false,
   configuredPrimaryCount: 0,
   configuredSecondaryCount: 0,
   warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
@@ -7995,6 +7997,7 @@ async function fetchCryptoBarsWarmupPaged({
     retries,
   });
   updatePredictorWarmupProgress({
+    currentTimeframe: timeframeRequested,
     lastBatchSummary: {
       requestedSymbols: normalizedSymbols.length,
       foundSymbols: foundSymbols.length,
@@ -12701,12 +12704,21 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       const batch = chunks.slice(i, i + warmupPrefetchConcurrency);
       const batchResults = await Promise.all(batch.map((chunkSymbols) => processChunk(chunkSymbols)));
       for (const result of batchResults) {
+        updatePredictorWarmupProgress({
+          currentTimeframe: '1Min',
+        });
         for (const [symbol, series] of result.bars1m.entries()) {
           bars1mBySymbol.set(symbol, series);
         }
+        updatePredictorWarmupProgress({
+          currentTimeframe: '5Min',
+        });
         for (const [symbol, series] of result.bars5m.entries()) {
           bars5mBySymbol.set(symbol, series);
         }
+        updatePredictorWarmupProgress({
+          currentTimeframe: '15Min',
+        });
         for (const [symbol, series] of result.bars15m.entries()) {
           bars15mBySymbol.set(symbol, series);
         }
@@ -12719,6 +12731,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
           symbolsCompleted,
           chunksCompleted,
           timeframesCompleted,
+          currentTimeframe: null,
+          lastCompletedTimeframe: '15Min',
           lastBatchSummary: {
             chunkSymbols: result.bars1m.size,
             warmupPrefetchConcurrency,
@@ -12927,10 +12941,12 @@ async function runEntryScanOnce() {
     lastUniverseDiagnostics = {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
       effectiveUniverseMode: universeMode,
+      dynamicUniverseActive: universeMode.startsWith('dynamic'),
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       acceptedSymbolsCount: scanSymbols.length,
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
@@ -12963,6 +12979,12 @@ async function runEntryScanOnce() {
       effectiveMode: universeMode,
       acceptedSymbolsCount: scanSymbols.length,
       dynamicUniverseActive: universeMode.startsWith('dynamic'),
+      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      configuredPrimaryCount: configuredUniverse.primaryCount,
+      configuredSecondaryCount: configuredUniverse.secondaryCount,
+      stableSymbolsExcludedCount: normalizedUniverse.length - scanSymbols.length,
+      lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       fallbackOccurred: Boolean(fallbackReason),

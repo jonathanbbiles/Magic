@@ -31,7 +31,7 @@ const requireApiToken = (req, res, next) => {
     res.set('x-auth-hint', 'token-mismatch');
     return res.status(401).json({
       error: 'unauthorized',
-      hint: 'Set API_TOKEN on the backend, EXPO_PUBLIC_API_TOKEN in the Expo frontend, and EXPO_PUBLIC_BACKEND_URL to this backend URL. Or unset API_TOKEN on backend to disable auth.',
+      hint: 'Backend secret is API_TOKEN. Set API_TOKEN on the backend, EXPO_PUBLIC_API_TOKEN in Expo, and EXPO_PUBLIC_BACKEND_URL to this backend URL. Or unset API_TOKEN on backend to disable auth.',
       serverTokenSet: Boolean(expectedToken),
     });
   }

@@ -180,7 +180,7 @@ const validateEnv = () => {
     const hasPatternMatch = placeholderSecretPatterns.some((pattern) => pattern.test(raw));
     const looksSentinel = lowered.includes('your ') || lowered.includes('example') || lowered.includes('placeholder');
     if (hasPatternMatch || looksSentinel) {
-      validationErrors.push(`${name} appears to be a placeholder value in production/live mode. Set a real secret via environment variables.`);
+      validationErrors.push(`${name} appears to be a placeholder value in production/live mode. Set a real secret in host/platform environment variables (not checked-in example files).`);
     }
   };
 
