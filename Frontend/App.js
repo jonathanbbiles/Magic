@@ -323,6 +323,12 @@ export default function App() {
   const backendReachable = truth?.backendReachable !== false;
   const alpacaConnected = runtime?.alpacaCredentialsPresent ?? meta?.connectionState?.alpaca?.alpacaAuthOk ?? false;
   const authEnabled = runtime?.apiTokenEnabled ?? truth?.authConfigured ?? false;
+  const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—';
+  const lastEntryScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt ?? '—';
+  const lastEntryScanSummary = meta?.lastEntryScanSummary ?? truth?.lastEntryScanSummary ?? entryScan ?? null;
+  const lastSuccessfulAction = meta?.lastSuccessfulAction ?? truth?.lastSuccessfulAction ?? null;
+  const lastExecutionFailure = meta?.lastExecutionFailure ?? truth?.lastExecutionFailure ?? null;
+  const stalled = String(engineState).toLowerCase() === 'degraded' && Boolean(meta?.lastEntryScanAt || truth?.lastEntryScanAt);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -376,7 +382,26 @@ export default function App() {
               <View style={styles.diagnosticsBlock}>
                 <Text style={styles.diagnosticsTitle}>Entry diagnostics</Text>
                 <Text style={styles.diagnosticsText}>
+                  Engine: {engineState} {stalled ? '(possible stall/watchdog)' : ''}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Last entry scan at: {lastEntryScanAt && lastEntryScanAt !== '—' ? `${lastEntryScanAt} (${minsSince(lastEntryScanAt)} ago)` : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
                   Last scan: scanned={toNum(entryScan?.scanned) ?? '—'} placed={toNum(entryScan?.placed) ?? '—'} skipped={toNum(entryScan?.skipped) ?? '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Last scan summary: {lastEntryScanSummary ? JSON.stringify({
+                    scanned: lastEntryScanSummary.scanned,
+                    placed: lastEntryScanSummary.placed,
+                    skipped: lastEntryScanSummary.skipped,
+                    signalReadyCount: lastEntryScanSummary.signalReadyCount,
+                    signalBlockedByWarmupCount: lastEntryScanSummary.signalBlockedByWarmupCount,
+                    staleEntryQuoteSkips: lastEntryScanSummary.staleEntryQuoteSkips,
+                    topSkipReasons: lastEntryScanSummary.topSkipReasons,
+                    marketDataBudget: lastEntryScanSummary.marketDataBudget,
+                    at: lastEntryScanAt,
+                  }) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
                   Top skip reasons: {entryScan?.topSkipReasons ? JSON.stringify(entryScan.topSkipReasons) : '—'}
@@ -418,6 +443,12 @@ export default function App() {
                     dataQualityReason: firstSkip.dataQualityReason,
                     sparseRetry: firstSkip.sparseRetry,
                   }) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Last successful action: {lastSuccessfulAction ? JSON.stringify(lastSuccessfulAction) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Last execution failure: {lastExecutionFailure ? JSON.stringify(lastExecutionFailure) : '—'}
                 </Text>
               </View>
               <View style={styles.diagnosticsBlock}>

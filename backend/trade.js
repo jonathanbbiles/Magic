@@ -213,6 +213,24 @@ async function placeOrderUnified({
       context,
       intent,
     });
+    if (String(intent || '').toLowerCase() === 'entry' && String(payload?.side || '').toLowerCase() === 'buy') {
+      setEngineState('waiting_for_fill', { reason: 'buy_submitted', context: { symbol } });
+      setLastActionTrace('lastBuySubmit', {
+        symbol,
+        orderId: order?.id ?? null,
+        clientOrderId: payload?.client_order_id ?? null,
+        type: payload?.type || null,
+      });
+    }
+    if (String(payload?.side || '').toLowerCase() === 'sell') {
+      setEngineState('placing_sell', { reason: 'sell_submitted', context: { symbol } });
+      setLastActionTrace('lastSellSubmit', {
+        symbol,
+        orderId: order?.id ?? null,
+        clientOrderId: payload?.client_order_id ?? null,
+        type: payload?.type || null,
+      });
+    }
 
     return order;
   } catch (err) {
@@ -257,6 +275,15 @@ async function placeOrderUnified({
         responseText,
       });
     }
+    setLastActionTrace('lastExecutionFailure', {
+      stage: 'order_submit',
+      symbol,
+      label,
+      reason: reason || null,
+      message: err?.message || String(err),
+      statusCode,
+    });
+    setEngineState('degraded', { reason: 'order_submit_failed', context: { symbol, statusCode } });
 
     throw err;
   }
@@ -503,6 +530,12 @@ function getEntryDiagnosticsSnapshot() {
   const dataRejectionCount = Object.entries(skipDetailCounts)
     .filter(([reason]) => String(reason).includes('data') || String(reason).includes('rate') || String(reason).includes('warmup') || String(reason).includes('predictor_missing') || String(reason).includes('marketdata'))
     .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const warmupBlockedCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => String(reason).includes('warmup') || String(reason).includes('predictor_missing'))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const concurrencyRiskGuardCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => String(reason).includes('concurrency') || String(reason).includes('risk') || String(reason).includes('guard') || String(reason).includes('cooldown'))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
   return {
     entryScan: lastEntryScanSummary,
     predictorCandidates: lastPredictorCandidatesSummary,
@@ -516,7 +549,9 @@ function getEntryDiagnosticsSnapshot() {
       dataRejectionCount,
       staleQuoteRejectionCount,
       insufficientBarsCount,
+      warmupBlockedCount,
       rateLimitSuppressionCount,
+      concurrencyRiskGuardCount,
       executionFailureCount,
     },
     topSkipReasonsRolling: Array.from(entrySkipReasonTotals.entries())
@@ -527,6 +562,23 @@ function getEntryDiagnosticsSnapshot() {
         return acc;
       }, {}),
     ratePressureState,
+    engineState: getEngineStateSnapshot(),
+    engineStateDetail: {
+      state: getEngineStateSnapshot(),
+      updatedAt: engineStateUpdatedAt,
+      reason: engineStateReason || null,
+      context: engineStateContext || null,
+    },
+    entryManager: { ...entryManagerHeartbeat },
+    lastSuccessfulAction: {
+      lastWarmupBatch: lastActionTrace.lastWarmupBatch,
+      lastEntryScan: lastActionTrace.lastEntryScan,
+      lastBuyDecision: lastActionTrace.lastBuyDecision,
+      lastBuySubmit: lastActionTrace.lastBuySubmit,
+      lastBuyFill: lastActionTrace.lastBuyFill,
+      lastSellSubmit: lastActionTrace.lastSellSubmit,
+    },
+    lastExecutionFailure: lastActionTrace.lastExecutionFailure,
   };
 }
 
@@ -3959,6 +4011,7 @@ const positionsListCache = {
 let entryManagerRunning = false;
 let entryScanRunning = false;
 let entryManagerIntervalId = null;
+let entryWatchdogIntervalId = null;
 const openPositionsCache = {
   tsMs: 0,
   data: null,
@@ -3984,6 +4037,44 @@ let lastPrefetchedBars = {
 let lastPrefetchedBarsUpdatedAtMs = 0;
 let lastPrefetchedBarsSymbols = new Set();
 let predictorWarmupCompletedLogged = false;
+let engineState = 'booting';
+let engineStateUpdatedAt = null;
+let engineStateReason = 'boot';
+let engineStateContext = null;
+const ENGINE_STATE_ALLOWED = new Set([
+  'booting',
+  'warming_up',
+  'scanning',
+  'evaluating',
+  'placing_buy',
+  'waiting_for_fill',
+  'placing_sell',
+  'ready',
+  'halted',
+  'rate_limited',
+  'degraded',
+]);
+const entryManagerHeartbeat = {
+  started: false,
+  startedAt: null,
+  running: false,
+  lastHeartbeatAt: null,
+  lastScanAt: null,
+  lastScanDurationMs: null,
+  lastScanResult: null,
+  totalScans: 0,
+  lastWatchdogWarningAt: null,
+  lastWatchdogReason: null,
+};
+const lastActionTrace = {
+  lastWarmupBatch: null,
+  lastEntryScan: null,
+  lastBuyDecision: null,
+  lastBuySubmit: null,
+  lastBuyFill: null,
+  lastSellSubmit: null,
+  lastExecutionFailure: null,
+};
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
 let equityPeak = null;
@@ -3993,6 +4084,37 @@ let lastRiskMetricsLogAt = 0;
 let tradingHaltedByGuard = false;
 let lastRiskSnapshot = null;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
+
+function safeIso(tsMs = Date.now()) {
+  return new Date(tsMs).toISOString();
+}
+
+function setEngineState(nextState, { reason = null, context = null } = {}) {
+  const normalized = String(nextState || '').trim().toLowerCase();
+  if (!ENGINE_STATE_ALLOWED.has(normalized)) return;
+  const nowMs = Date.now();
+  if (engineState !== normalized) {
+    console.log('engine_transition', {
+      from: engineState,
+      to: normalized,
+      reason: reason || null,
+      at: safeIso(nowMs),
+      context: context && typeof context === 'object' ? context : null,
+    });
+  }
+  engineState = normalized;
+  engineStateUpdatedAt = safeIso(nowMs);
+  engineStateReason = reason || engineStateReason || null;
+  engineStateContext = context && typeof context === 'object' ? context : null;
+}
+
+function setLastActionTrace(field, payload) {
+  if (!Object.prototype.hasOwnProperty.call(lastActionTrace, field)) return;
+  lastActionTrace[field] = {
+    at: safeIso(),
+    ...(payload && typeof payload === 'object' ? payload : {}),
+  };
+}
 
  
 
@@ -4781,6 +4903,14 @@ function logBuyDecision(symbol, computedNotionalUsd, decision) {
     decision,
 
   });
+  setLastActionTrace('lastBuyDecision', {
+    symbol: normalizeSymbol(symbol),
+    computedNotionalUsd: Number.isFinite(Number(computedNotionalUsd)) ? Number(computedNotionalUsd) : null,
+    decision,
+  });
+  if (String(decision || '').toUpperCase() === 'BUY') {
+    setEngineState('placing_buy', { reason: 'buy_gate_accepted', context: { symbol: normalizeSymbol(symbol) } });
+  }
 
 }
 
@@ -12950,6 +13080,12 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
             chunkSize,
           },
         });
+        setLastActionTrace('lastWarmupBatch', {
+          symbolsCompleted,
+          chunksCompleted,
+          currentTimeframe: '15Min',
+          chunkSize,
+        });
       }
     }
     finishPredictorWarmup();
@@ -12984,10 +13120,55 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   };
 }
 
+function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
+  const endMs = Date.now();
+  lastEntryScanSummary = {
+    startMs,
+    endMs,
+    durationMs: endMs - startMs,
+    scanned: 0,
+    placed: 0,
+    skipped: 1,
+    signalReadyCount: 0,
+    signalBlockedByWarmupCount: 0,
+    staleEntryQuoteSkips: entryStaleQuoteSkipCount,
+    topSkipReasons: { [reason]: 1 },
+    skipDetailCounts: { [reason]: 1 },
+    marketDataBudget: {
+      cacheHits: 0,
+      freshFetches: 0,
+      rateLimited: 0,
+      cooldownBlocked: 0,
+      endpointCooldowns: entryMarketDataCoordinator.getCooldownSnapshot(),
+      ratePressureState: getRatePressureState(),
+    },
+    ...extra,
+  };
+  entryManagerHeartbeat.lastScanAt = safeIso(endMs);
+  entryManagerHeartbeat.lastScanDurationMs = endMs - startMs;
+  entryManagerHeartbeat.lastScanResult = reason;
+  entryManagerHeartbeat.totalScans += 1;
+  setLastActionTrace('lastEntryScan', {
+    reason,
+    scanned: 0,
+    placed: 0,
+    skipped: 1,
+  });
+  console.log('entry_scan', lastEntryScanSummary);
+}
+
 async function runEntryScanOnce() {
   beginMarketDataPass();
   if (entryScanRunning) return;
   entryScanRunning = true;
+  entryManagerHeartbeat.running = true;
+  entryManagerHeartbeat.lastHeartbeatAt = safeIso();
+  const warmupSnapshot = getPredictorWarmupStatus();
+  if (warmupSnapshot?.inProgress && !entryManagerHeartbeat.lastScanAt) {
+    setEngineState('warming_up', { reason: 'warmup_active_before_first_scan' });
+  } else {
+    setEngineState('scanning', { reason: 'entry_scan_start' });
+  }
   try {
     const startMs = Date.now();
     const MAX_ATTEMPTS = Number(process.env.SIMPLE_SCALPER_MAX_ENTRY_ATTEMPTS_PER_SCAN ?? 5);
@@ -12995,6 +13176,8 @@ async function runEntryScanOnce() {
     const autoTradeEnabled = readEnvFlag('AUTO_TRADE', true);
     const liveMode = readEnvFlag('LIVE', readEnvFlag('LIVE_MODE', readEnvFlag('LIVE_TRADING', true)));
     if (!autoTradeEnabled || !liveMode) {
+      emitEntryScanNoopSummary({ startMs, reason: 'trading_disabled_by_env' });
+      setEngineState('degraded', { reason: 'trading_disabled_by_env' });
       return;
     }
     const standdown = getStanddownStatus(Date.now());
@@ -13004,22 +13187,18 @@ async function runEntryScanOnce() {
         triggerType: 'rolling_losses',
         recentLossCount: standdown.recentLossCount,
       });
+      emitEntryScanNoopSummary({ startMs, reason: 'entry_standdown_active' });
+      setEngineState('halted', { reason: 'entry_standdown_active' });
       return;
     }
     if (Date.now() < riskHaltUntilMs) {
       tradingHaltedReason = 'risk_cooldown';
-      const endMs = Date.now();
-      console.log('entry_scan', {
+      emitEntryScanNoopSummary({
         startMs,
-        endMs,
-        durationMs: endMs - startMs,
-        scanned: 0,
-        placed: 0,
-        skipped: 1,
-        topSkipReasons: { risk_cooldown: 1 },
-        universeSize: 0,
-        universeIsOverride: false,
+        reason: 'risk_cooldown',
+        extra: { universeSize: 0, universeIsOverride: false },
       });
+      setEngineState('halted', { reason: 'risk_cooldown' });
       return;
     }
     if (tradingHaltedReason === 'risk_cooldown' && Date.now() >= riskHaltUntilMs) {
@@ -13045,24 +13224,21 @@ async function runEntryScanOnce() {
       if (orphans2.length > 0) {
         tradingHaltedReason = 'orphans_present';
         console.warn('HALT_TRADING_ORPHANS', { count: orphans2.length, symbols: orphans2.map((orphan) => orphan.symbol) });
-        const endMs = Date.now();
-        console.log('entry_scan', {
+        emitEntryScanNoopSummary({
           startMs,
-          endMs,
-          durationMs: endMs - startMs,
-          scanned: 0,
-          placed: 0,
-          skipped: 1,
-          topSkipReasons: { halted_orphans: 1 },
-          universeSize: 0,
-          universeIsOverride,
-          maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
-          maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
-          maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
-          maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
-          capEnabled,
-          heldPositionsCount: null,
+          reason: 'halted_orphans',
+          extra: {
+            universeSize: 0,
+            universeIsOverride,
+            maxSpreadBpsSimple: MAX_SPREAD_BPS_SIMPLE,
+            maxConcurrentPositions: MAX_CONCURRENT_POSITIONS,
+            maxConcurrentPositionsEnv: MAX_CONCURRENT_POSITIONS,
+            maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
+            capEnabled,
+            heldPositionsCount: null,
+          },
         });
+        setEngineState('halted', { reason: 'orphans_present' });
         return;
       }
       tradingHaltedReason = null;
@@ -13643,6 +13819,14 @@ async function runEntryScanOnce() {
       }
       if (result?.skipped || result?.failed) {
         skipped += 1;
+        if (['attempt_failed', 'entry_not_filled', 'entry_terminal', 'intent_rejected'].includes(String(result?.reason || ''))) {
+          setLastActionTrace('lastExecutionFailure', {
+            stage: 'entry_pipeline',
+            symbol,
+            reason: result?.reason || null,
+          });
+          setEngineState('degraded', { reason: 'entry_pipeline_failure', context: { symbol, reason: result?.reason || null } });
+        }
         if (activeIntent) {
           updateIntentState(symbol, {
             state: result?.reason === 'shadow_intent' ? 'confirmed' : 'rejected',
@@ -13670,6 +13854,7 @@ async function runEntryScanOnce() {
       }
     }
 
+    setEngineState('evaluating', { reason: 'entry_scan_candidates_processed' });
     const topSkipReasons = Array.from(skipDetailCounts.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
@@ -13796,9 +13981,22 @@ async function runEntryScanOnce() {
         ratePressureState: getRatePressureState(),
       },
     };
+    entryManagerHeartbeat.lastScanAt = safeIso(endMs);
+    entryManagerHeartbeat.lastScanDurationMs = endMs - startMs;
+    entryManagerHeartbeat.lastScanResult = placed > 0 ? 'placed' : 'no_trade';
+    entryManagerHeartbeat.totalScans += 1;
+    setLastActionTrace('lastEntryScan', {
+      scanned,
+      placed,
+      skipped,
+      signalReadyCount,
+      signalBlockedByWarmupCount,
+      topSkipReasons,
+    });
     console.log('entry_scan', lastEntryScanSummary);
     if (!firstReadyScanLogged && signalReadyCount > 0) {
       firstReadyScanLogged = true;
+      setEngineState('scanning', { reason: 'post_warmup_scan_active', context: { signalReadyCount } });
       console.log('entry_post_warmup_summary', {
         scanned,
         placed,
@@ -13812,8 +14010,17 @@ async function runEntryScanOnce() {
       predictorWarmupCompletedLogged = true;
       console.log('predictor_warmup_complete', { readySignals: signalReadyCount, universeSize });
     }
+    if (placed > 0) {
+      setEngineState('placing_buy', { reason: 'entry_submitted' });
+    } else if (signalReadyCount > 0) {
+      setEngineState('ready', { reason: 'scan_complete_no_entry' });
+    } else {
+      setEngineState('warming_up', { reason: 'signals_not_ready' });
+    }
   } finally {
     entryScanRunning = false;
+    entryManagerHeartbeat.running = Boolean(entryManagerIntervalId);
+    entryManagerHeartbeat.lastHeartbeatAt = safeIso();
   }
 }
 
@@ -13863,6 +14070,11 @@ function startEntryManager() {
     return;
   }
   entryManagerRunning = true;
+  entryManagerHeartbeat.started = true;
+  entryManagerHeartbeat.startedAt = safeIso();
+  entryManagerHeartbeat.running = true;
+  entryManagerHeartbeat.lastHeartbeatAt = safeIso();
+  setEngineState(PREDICTOR_WARMUP_ENABLED ? 'warming_up' : 'scanning', { reason: 'entry_manager_started' });
   if (PREDICTOR_WARMUP_ENABLED) {
     setTimeout(async () => {
       try {
@@ -13898,6 +14110,42 @@ function startEntryManager() {
     quoteFreshness: getQuoteFreshnessPolicy(),
   });
   console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS, predictorWarmupEnabled: PREDICTOR_WARMUP_ENABLED, predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, predictorWarmupLogEveryMs: PREDICTOR_WARMUP_LOG_EVERY_MS });
+  if (entryWatchdogIntervalId) clearInterval(entryWatchdogIntervalId);
+  const watchdogIntervalMs = Math.max(5000, ENTRY_SCAN_INTERVAL_MS);
+  entryWatchdogIntervalId = setInterval(() => {
+    const nowMs = Date.now();
+    const lastScanMs = Date.parse(String(entryManagerHeartbeat.lastScanAt || ''));
+    const maxGapMs = ENTRY_SCAN_INTERVAL_MS * 3;
+    if (Number.isFinite(lastScanMs) && nowMs - lastScanMs <= maxGapMs) return;
+    const warmup = getPredictorWarmupStatus();
+    const reason = Number.isFinite(lastScanMs)
+      ? 'entry_scan_gap_exceeded'
+      : 'entry_scan_not_observed_yet';
+    if (
+      entryManagerHeartbeat.lastWatchdogWarningAt &&
+      nowMs - Date.parse(entryManagerHeartbeat.lastWatchdogWarningAt) < ENTRY_SCAN_INTERVAL_MS
+    ) {
+      return;
+    }
+    entryManagerHeartbeat.lastWatchdogWarningAt = safeIso(nowMs);
+    entryManagerHeartbeat.lastWatchdogReason = reason;
+    console.warn('engine_stall_warning', {
+      reason,
+      engineState,
+      entryManagerState: {
+        started: entryManagerHeartbeat.started,
+        running: entryManagerHeartbeat.running,
+        lastScanAt: entryManagerHeartbeat.lastScanAt,
+        totalScans: entryManagerHeartbeat.totalScans,
+      },
+      warmupState: {
+        inProgress: Boolean(warmup?.inProgress),
+        symbolsCompleted: warmup?.symbolsCompleted ?? null,
+        totalSymbolsPlanned: warmup?.totalSymbolsPlanned ?? null,
+      },
+    });
+    setEngineState('degraded', { reason, context: { stallMs: Number.isFinite(lastScanMs) ? nowMs - lastScanMs : null } });
+  }, watchdogIntervalMs);
 }
 
 function monitorSimpleScalperTpFill({ symbol, orderId, maxMs = 600000, intervalMs = 5000 }) {
@@ -14653,6 +14901,13 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     filledQty: Number.isFinite(filledQty) ? filledQty : null,
     avgPrice: Number.isFinite(avgPrice) ? avgPrice : null,
   });
+  setLastActionTrace('lastBuyFill', {
+    symbol: normalizedSymbol,
+    entryOrderId: filledOrder?.id || buyOrder?.id || null,
+    filledQty: Number.isFinite(filledQty) ? filledQty : null,
+    avgPrice: Number.isFinite(avgPrice) ? avgPrice : null,
+  });
+  setEngineState('placing_sell', { reason: 'buy_filled_attach_sell', context: { symbol: normalizedSymbol } });
   const decisionBid = toFiniteOrNull(decisionSnapshot?.bid);
   const decisionAsk = toFiniteOrNull(decisionSnapshot?.ask);
   const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
@@ -14721,6 +14976,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     sellOrderId: sellOrder?.id || null,
     entryOrderId: filledOrder.id || buyOrder?.id || null,
   });
+  setEngineState('ready', { reason: 'sell_limit_placed', context: { symbol: normalizedSymbol } });
 
   return { buy: filledOrder, sell: sellOrder, submitted };
 }
@@ -14971,6 +15227,13 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
     filledQty: Number.isFinite(filledQty) ? filledQty : null,
     avgPrice: Number.isFinite(avgFillPrice) ? avgFillPrice : null,
   });
+  setLastActionTrace('lastBuyFill', {
+    symbol: normalizedSymbol,
+    entryOrderId: filled?.id || buyOrder?.id || null,
+    filledQty: Number.isFinite(filledQty) ? filledQty : null,
+    avgPrice: Number.isFinite(avgFillPrice) ? avgFillPrice : null,
+  });
+  setEngineState('placing_sell', { reason: 'buy_filled_attach_sell', context: { symbol: normalizedSymbol } });
   const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
   const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgFillPrice)
     ? ((avgFillPrice - decisionMid) / decisionMid) * 10000
@@ -15026,12 +15289,19 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
       sellOrderId: sellOrder?.id || null,
       entryOrderId: filled.id || buyOrder?.id || null,
     });
+    setEngineState('ready', { reason: 'sell_limit_placed', context: { symbol: normalizedSymbol } });
 
     return { buy: filled, sell: sellOrder, submitted };
 
   } catch (err) {
 
     console.error('Sell order failed:', err?.responseSnippet200 || err?.errorMessage || err.message);
+    setLastActionTrace('lastExecutionFailure', {
+      stage: 'sell_submit_after_fill',
+      symbol: normalizedSymbol,
+      message: err?.message || String(err),
+    });
+    setEngineState('degraded', { reason: 'sell_submit_after_fill_failed', context: { symbol: normalizedSymbol } });
 
     return { buy: filled, sell: null, sellError: err.message, submitted };
 
@@ -15138,6 +15408,13 @@ async function submitManagedEntryBuy({
   const avgPrice = Number.isFinite(avgPriceRaw)
     ? avgPriceRaw
     : (Number.isFinite(limitPriceNum) ? limitPriceNum : 0);
+  setLastActionTrace('lastBuyFill', {
+    symbol: normalizedSymbol,
+    entryOrderId: filled?.id || buyOrder?.id || null,
+    filledQty: Number(filled?.filled_qty) || null,
+    avgPrice: Number.isFinite(avgPrice) ? avgPrice : null,
+  });
+  setEngineState('placing_sell', { reason: 'managed_buy_filled_attach_sell', context: { symbol: normalizedSymbol } });
   updateInventoryFromBuy(normalizedSymbol, filled.filled_qty, avgPrice);
   const sellOrder = await handleBuyFill({
     symbol: normalizedSymbol,
@@ -15151,6 +15428,7 @@ async function submitManagedEntryBuy({
     intentId,
     tradeId,
   });
+  setEngineState('ready', { reason: 'managed_sell_limit_placed', context: { symbol: normalizedSymbol } });
 
   return { ok: true, buy: filled, sell: sellOrder || null };
 }
@@ -15739,10 +16017,11 @@ function getEngineStateSnapshot() {
   if (ratePressure.active) return 'rate_limited';
   if (entryScanRunning) return 'scanning';
   const warmup = getPredictorWarmupStatus();
-  if (warmup?.inProgress) return 'seeding';
-  if (Number(lastEntryScanSummary?.marketDataBudget?.rateLimited || 0) > 0) return 'degraded_data_mode';
+  if (warmup?.inProgress && !entryManagerHeartbeat.lastScanAt) return 'warming_up';
+  if (Number(lastEntryScanSummary?.marketDataBudget?.rateLimited || 0) > 0) return 'degraded';
+  if (engineState && ENGINE_STATE_ALLOWED.has(engineState)) return engineState;
   if (lastEntryScanSummary) return 'ready';
-  return 'seeding';
+  return 'booting';
 }
 
 function getTradingManagerStatus() {
@@ -15778,20 +16057,29 @@ function getTradingManagerStatus() {
       drawdownPct: Number(lastRiskSnapshot?.drawdownPct) || null,
       dailyDrawdownPct: Number(lastRiskSnapshot?.dailyDrawdownPct) || null,
     },
+    engine: {
+      state: getEngineStateSnapshot(),
+      updatedAt: engineStateUpdatedAt,
+      reason: engineStateReason || null,
+    },
+    entryManagerHeartbeat: { ...entryManagerHeartbeat },
   };
 }
 
 function __resetManagerIntervalsForTests() {
   if (entryManagerIntervalId) clearInterval(entryManagerIntervalId);
+  if (entryWatchdogIntervalId) clearInterval(entryWatchdogIntervalId);
   if (exitManagerIntervalId) clearInterval(exitManagerIntervalId);
   if (exitRepairIntervalId) clearInterval(exitRepairIntervalId);
   if (exitRepairBootstrapTimeoutId) clearTimeout(exitRepairBootstrapTimeoutId);
   entryManagerIntervalId = null;
+  entryWatchdogIntervalId = null;
   exitManagerIntervalId = null;
   exitRepairIntervalId = null;
   exitRepairBootstrapTimeoutId = null;
   entryManagerRunning = false;
   exitManagerRunning = false;
+  entryManagerHeartbeat.running = false;
 }
 
 function getLastHttpError() {

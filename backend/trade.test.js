@@ -251,10 +251,19 @@ assert.ok(tradeSourceEarly.includes('providerAgeMs: sparseRetryDetails.providerA
 assert.ok(tradeSourceEarly.includes('entryQuoteFreshness: getQuoteFreshnessPolicy()'));
 assert.ok(!tradeSourceEarly.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
 assert.ok(!tradeSourceEarly.includes("const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);"));
+assert.ok(tradeSourceEarly.includes("console.log('engine_transition'"));
+assert.ok(tradeSourceEarly.includes("console.warn('engine_stall_warning'"));
+assert.ok(tradeSourceEarly.includes('lastSuccessfulAction'));
+assert.ok(tradeSourceEarly.includes('lastExecutionFailure'));
 
 const quoteFreshness = tradeLifecycle.getEntryDiagnosticsSnapshot()?.quoteFreshness || {};
 assert.equal(typeof quoteFreshness.entryQuoteMaxAgeMs, 'number');
 assert.equal(typeof quoteFreshness.sparseStaleQuoteToleranceMs, 'number');
+const engineSnapshot = tradeLifecycle.getEntryDiagnosticsSnapshot();
+assert.equal(typeof engineSnapshot?.engineState, 'string');
+assert.equal(typeof engineSnapshot?.entryManager?.started, 'boolean');
+assert.ok(Object.prototype.hasOwnProperty.call(engineSnapshot || {}, 'lastSuccessfulAction'));
+assert.ok(Object.prototype.hasOwnProperty.call(engineSnapshot || {}, 'lastExecutionFailure'));
 
 const desiredLimitFromEntry = computeTargetSellPrice(100, 75, 0.01);
 assert.equal(desiredLimitFromEntry, 100.75);

@@ -691,6 +691,12 @@ app.get('/dashboard', async (req, res) => {
     const insufficientBarsCount = Number(entryDiagnostics?.gating?.insufficientBarsCount || 0);
     const rateLimitSuppressionCount = Number(entryDiagnostics?.gating?.rateLimitSuppressionCount || 0);
     const executionFailureCount = Number(entryDiagnostics?.gating?.executionFailureCount || 0);
+    const warmupBlockedCount = Number(entryDiagnostics?.gating?.warmupBlockedCount || 0);
+    const concurrencyRiskGuardCount = Number(entryDiagnostics?.gating?.concurrencyRiskGuardCount || 0);
+    const lastEntryScanSummary = entryDiagnostics?.entryScan || null;
+    const entryManagerState = entryDiagnostics?.entryManager || managerStatus?.entryManagerHeartbeat || {};
+    const lastSuccessfulAction = entryDiagnostics?.lastSuccessfulAction || null;
+    const lastExecutionFailure = entryDiagnostics?.lastExecutionFailure || null;
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
       const rawSymbol = String(position?.symbol || position?.asset || '').toUpperCase();
@@ -818,6 +824,13 @@ app.get('/dashboard', async (req, res) => {
         risk: managerStatus?.risk || null,
         concurrency: concurrency || null,
         quoteFreshness: entryDiagnostics?.quoteFreshness || null,
+        entryManagerStarted: Boolean(entryManagerState?.started),
+        lastEntryScanAt: entryManagerState?.lastScanAt || null,
+        lastEntryScanSummary,
+        lastSuccessfulAction,
+        lastExecutionFailure,
+        staleQuoteSkipCount: Number(entryDiagnostics?.quoteFreshness?.staleEntryQuoteSkips || 0),
+        marketRejectionCount,
         universe: universeDiagnostics,
         predictorWarmup,
         truth: {
@@ -842,12 +855,19 @@ app.get('/dashboard', async (req, res) => {
           dataRejectionCount,
           staleQuoteRejectionCount,
           insufficientBarsCount,
+          warmupBlockedCount,
           rateLimitSuppressionCount,
+          concurrencyRiskGuardCount,
           executionFailureCount,
           fallbackSuppressionCount: Number(entryDiagnostics?.entryScan?.marketDataBudget?.cooldownBlocked || 0),
           topSkipReasons,
           topSkipReasonsRolling: entryDiagnostics?.topSkipReasonsRolling || {},
           signalBlockedByWarmupCount: Number(entryDiagnostics?.entryScan?.signalBlockedByWarmupCount || 0),
+          entryManagerStarted: Boolean(entryManagerState?.started),
+          lastEntryScanAt: entryManagerState?.lastScanAt || null,
+          lastEntryScanSummary,
+          lastSuccessfulAction,
+          lastExecutionFailure,
           openPositions: positions.length,
           activeSellLimits: positions.filter((position) => Number.isFinite(toFiniteNumberOrNull(position?.sell?.activeLimit))).length,
         },
@@ -876,6 +896,9 @@ app.get('/dashboard', async (req, res) => {
             currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
           },
           ratePressureState,
+          entryManager: entryManagerState,
+          lastSuccessfulAction,
+          lastExecutionFailure,
         },
         scorecard,
       },
