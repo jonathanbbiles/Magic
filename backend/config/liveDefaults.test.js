@@ -39,8 +39,25 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER1, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER2, 'false');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER3, 'false');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN, '2');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN, '8');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, '8');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED, 'true');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '120000');
+
+  const envProduction = fs.readFileSync(path.resolve(__dirname, '..', '.env.production'), 'utf8');
+  const envLiveExample = fs.readFileSync(path.resolve(__dirname, '..', '.env.live.example'), 'utf8');
+  const envExample = fs.readFileSync(path.resolve(__dirname, '..', '.env.example'), 'utf8');
+  for (const sourceText of [envProduction, envLiveExample, envExample]) {
+    assert.match(sourceText, /ENTRY_UNIVERSE_MODE=dynamic/);
+    assert.match(sourceText, /ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true/);
+    assert.match(sourceText, /SECONDARY_QUOTE_ENABLED=true/);
+    assert.match(sourceText, /SECONDARY_QUOTE_PROVIDER=cryptocompare/);
+    assert.match(sourceText, /QUOTE_RETRY=2/);
+    assert.match(sourceText, /ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8/);
+    assert.match(sourceText, /PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8/);
+  }
 });
 
 assert.throws(

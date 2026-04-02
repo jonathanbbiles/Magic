@@ -491,6 +491,31 @@ function shouldCountSparseRetryFailureReject({ reason, sparseRetryDetails }) {
   ].includes(reason) || String(reason).startsWith('sparse_fallback_');
 }
 
+function computeProviderQuoteAgeMs(quoteReceivedAtMs, quoteTsMs) {
+  if (!Number.isFinite(quoteReceivedAtMs) || !Number.isFinite(quoteTsMs)) return null;
+  return Math.max(0, quoteReceivedAtMs - quoteTsMs);
+}
+
+function shouldMarkProviderQuoteStaleAfterRefresh({
+  quoteRefreshForced,
+  realAgeMs,
+  providerAgeMs,
+  toleranceMs,
+}) {
+  return Boolean(
+    quoteRefreshForced &&
+    Number.isFinite(realAgeMs) &&
+    realAgeMs > toleranceMs &&
+    Number.isFinite(providerAgeMs) &&
+    providerAgeMs > toleranceMs
+  );
+}
+
+function computeEffectivePerScanBudget(baseBudget, symbolCount) {
+  const scaledBudget = Math.min(12, Math.max(4, Math.ceil(symbolCount * 0.25)));
+  return Math.max(baseBudget, scaledBudget);
+}
+
 function resolveEntrySkipReason(reason, meta) {
   if (reason === 'orderbook_unavailable' && meta?.obReason) return meta.obReason;
   if (reason === 'orderbook_liquidity_gate' && meta?.reason) return meta.reason;
@@ -1308,6 +1333,9 @@ function resolveRegimeVolatilityContext({ predictorSignals, barSeries1m, refPric
 async function computeEntrySignal(symbol, opts = {}) {
   const asset = { symbol: normalizeSymbol(symbol) };
   const entryMdContext = opts?.entryMarketDataContext || null;
+  const sparseConfirmBudgetEffective = Number.isFinite(opts?.sparseConfirmBudgetEffective)
+    ? Math.max(1, Math.floor(opts.sparseConfirmBudgetEffective))
+    : ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN;
   const executionTierPolicy = getExecutionTierPolicy();
   const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
   const resolvedEntryTakeProfitBps = resolveEntryTakeProfitBps(symbolTier);
@@ -1525,7 +1553,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     (orderbookMeta?.depthState === 'orderbook_sparse' || sparseByLevelCount);
   const sparseConfirmAlreadyAttempted = entryMdContext?.sparseConfirmAttempts?.has(asset.symbol);
   const sparseConfirmAttemptAllowed = !sparseConfirmAlreadyAttempted &&
-    (!entryMdContext?.sparseConfirmAttempts || entryMdContext.sparseConfirmAttempts.size < ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN);
+    (!entryMdContext?.sparseConfirmAttempts || entryMdContext.sparseConfirmAttempts.size < sparseConfirmBudgetEffective);
   if (shouldConfirmSparse && ORDERBOOK_SPARSE_RETRY_ONCE && sparseConfirmAttemptAllowed) {
     if (entryMdContext?.sparseConfirmAttempts) {
       entryMdContext.sparseConfirmAttempts.add(asset.symbol);
@@ -1568,6 +1596,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       quoteSource = quote?.source || null;
       quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
     }
+    const providerAgeMs = computeProviderQuoteAgeMs(quoteReceivedAtMs, quoteTsMs);
     sparseRetryDetails = {
       quoteMaxAgeMsUsed: shouldForceQuoteRefreshForSparseRetry
         ? ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS
@@ -1576,6 +1605,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       quoteTsMs: { before: priorQuoteTsMs, after: quoteTsMs },
       quoteReceivedAtMs: { before: priorQuoteReceivedAtMs, after: quoteReceivedAtMs },
       quoteAgeMs: { before: priorQuoteAgeMs, after: quoteAgeMs },
+      providerAgeMs,
       retrySource: {
         quote: quote?.source || null,
         quoteBefore: priorQuoteSource,
@@ -1586,10 +1616,12 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteForced: shouldForceQuoteRefreshForSparseRetry,
         orderbookForced: true,
       },
-      providerQuoteStaleAfterRefresh:
-        Boolean(shouldForceQuoteRefreshForSparseRetry) &&
-        Number.isFinite(quoteAgeMs) &&
-        quoteAgeMs > ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+      providerQuoteStaleAfterRefresh: shouldMarkProviderQuoteStaleAfterRefresh({
+        quoteRefreshForced: shouldForceQuoteRefreshForSparseRetry,
+        realAgeMs: quoteAgeMs,
+        providerAgeMs,
+        toleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+      }),
     };
     const obRetry = entryMdContext
       ? obRetrySnapshot?.orderbook
@@ -1610,6 +1642,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteTsMs: sparseRetryDetails.quoteTsMs,
         quoteReceivedAtMs: sparseRetryDetails.quoteReceivedAtMs,
         quoteAgeMs: sparseRetryDetails.quoteAgeMs,
+        providerAgeMs: sparseRetryDetails.providerAgeMs,
         retrySource: sparseRetryDetails.retrySource,
         refresh: sparseRetryDetails.refresh,
         providerQuoteStaleAfterRefresh: sparseRetryDetails.providerQuoteStaleAfterRefresh,
@@ -1619,7 +1652,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   } else if (shouldConfirmSparse && entryMdContext) {
     const confirmAttemptsUsed = entryMdContext?.sparseConfirmAttempts?.size || 0;
-    const confirmAttemptsBudget = ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN;
+    const confirmAttemptsBudget = sparseConfirmBudgetEffective;
     let retryBlockedReason = 'endpoint_cooldown_active';
     if (sparseConfirmAlreadyAttempted) {
       retryBlockedReason = 'already_attempted_this_scan';
@@ -1633,6 +1666,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       reason: retryBlockedReason,
       confirmAttemptsUsed,
       confirmAttemptsBudget,
+      confirmAttemptsBudgetConfigured: ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN,
+      confirmAttemptsBudgetEffective: sparseConfirmBudgetEffective,
     });
   }
   baseRecord.orderbookAskDepthUsd = orderbookMeta.askDepthUsd;
@@ -12759,6 +12794,23 @@ async function runEntryScanOnce() {
         configuredSecondaryCount: configuredUniverse.secondaryCount,
       });
     }
+    if (
+      ENTRY_UNIVERSE_MODE === 'dynamic' &&
+      ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION &&
+      ['configured_primary_secondary', 'configured_fallback', 'core_tracked_fallback'].includes(universeMode)
+    ) {
+      console.warn('entry_universe_mode_mismatch', {
+        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+        effectiveUniverseMode: universeMode,
+        reason: universeModeReason,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        configuredSecondaryCount: configuredUniverse.secondaryCount,
+        dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+        acceptedSymbols: scanSymbols.length,
+        allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+        nodeEnv: NODE_ENV,
+      });
+    }
     if (NODE_ENV === 'production' && ENTRY_UNIVERSE_MODE !== 'configured' && ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION) {
       console.warn('entry_universe_dynamic_production_opt_in', {
         nodeEnv: NODE_ENV,
@@ -12860,8 +12912,16 @@ async function runEntryScanOnce() {
       scanId: `${startMs}`,
       prefetchedBars,
     });
+    const effectiveSparseConfirmBudget = computeEffectivePerScanBudget(
+      ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN,
+      scanSymbols.length,
+    );
+    const effectiveWarmupFallbackBudget = computeEffectivePerScanBudget(
+      PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
+      scanSymbols.length,
+    );
 
-    const fallbackBudgetState = { remaining: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN };
+    const fallbackBudgetState = { remaining: effectiveWarmupFallbackBudget };
 
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
@@ -12920,7 +12980,12 @@ async function runEntryScanOnce() {
         }
       }
 
-      const signal = await computeEntrySignal(symbol, { prefetchedBars, fallbackBudgetState, entryMarketDataContext });
+      const signal = await computeEntrySignal(symbol, {
+        prefetchedBars,
+        fallbackBudgetState,
+        entryMarketDataContext,
+        sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
+      });
       const recordBase = signal?.record ? { ...signal.record } : null;
       const candidateMeta = signal?.meta || {};
       const candidateDecision = signal?.entryReady ? 'entry_ready' : 'skipped';
@@ -13251,6 +13316,11 @@ async function runEntryScanOnce() {
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       dynamicAcceptedSymbols: dynamicUniverseStats?.acceptedCount ?? null,
       dynamicSampleSymbols: scanSymbols.slice(0, 10),
+      sparseConfirmBudgetConfigured: ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN,
+      sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
+      warmupFallbackBudgetConfigured: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
+      warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
+      secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -15389,6 +15459,9 @@ module.exports = {
   shouldCountSparseRetryFailureReject,
   resolveEntrySkipReason,
   buildPredictorCandidateSignal,
+  computeProviderQuoteAgeMs,
+  shouldMarkProviderQuoteStaleAfterRefresh,
+  computeEffectivePerScanBudget,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
     quoteCache.set(normalizeSymbol(symbol), quote);
