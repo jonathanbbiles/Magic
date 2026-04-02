@@ -60,9 +60,9 @@ withEnv({}, () => {
   const cfg = getRuntimeConfig();
   assert.deepEqual(cfg.executionTier1Symbols, ['BTC/USD', 'ETH/USD']);
   assert.deepEqual(cfg.executionTier2Symbols, ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD']);
-  assert.equal(cfg.predictorWarmupMinBars1m, 90);
-  assert.equal(cfg.predictorWarmupMinBars5m, 60);
-  assert.equal(cfg.predictorWarmupMinBars15m, 40);
+  assert.equal(cfg.predictorWarmupMinBars1m, 35);
+  assert.equal(cfg.predictorWarmupMinBars5m, 30);
+  assert.equal(cfg.predictorWarmupMinBars15m, 20);
 });
 
 console.log('runtime config tests passed');

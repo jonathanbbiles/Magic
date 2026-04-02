@@ -50,9 +50,9 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
   assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '120000');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_1M_BARS, '90');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_5M_BARS, '60');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_15M_BARS, '40');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_1M_BARS, '35');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_5M_BARS, '30');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_15M_BARS, '20');
 
   const envProduction = fs.readFileSync(path.resolve(__dirname, '..', '.env.production.example'), 'utf8');
   const envLiveExample = fs.readFileSync(path.resolve(__dirname, '..', '.env.live.example'), 'utf8');

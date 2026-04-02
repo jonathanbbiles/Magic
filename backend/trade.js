@@ -2,7 +2,7 @@ const { randomUUID, randomBytes } = require('crypto');
 
 const { httpJson, buildHttpsUrl } = require('./httpClient');
 const { requestJson, logHttpError } = require('./modules/http');
-const { withAlpacaMdLimit } = require('./modules/alpacaRateLimiter');
+const { withAlpacaMdLimit, getRatePressureState, isUnderRatePressure } = require('./modules/alpacaRateLimiter');
 const {
   MARKET_DATA_TIMEOUT_MS,
   MARKET_DATA_RETRIES,
@@ -60,6 +60,7 @@ const {
 const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
+const { createMarketDataCache } = require('./modules/marketDataCache');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
@@ -476,11 +477,24 @@ function getLiveRuntimeTuning() {
 }
 
 function getEntryDiagnosticsSnapshot() {
+  const ratePressureState = getRatePressureState();
+  const skipDetailCounts = lastEntryScanSummary?.skipDetailCounts || {};
+  const marketRejectionCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => !String(reason).includes('data') && !String(reason).includes('rate') && !String(reason).includes('warmup') && !String(reason).includes('predictor_missing'))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const dataRejectionCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => String(reason).includes('data') || String(reason).includes('rate') || String(reason).includes('warmup') || String(reason).includes('predictor_missing') || String(reason).includes('marketdata'))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
   return {
     entryScan: lastEntryScanSummary,
     predictorCandidates: lastPredictorCandidatesSummary,
     skipReasonsBySymbol: lastEntrySkipReasonsBySymbol,
     quoteFreshness: { entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS, staleEntryQuoteSkips: entryStaleQuoteSkipCount },
+    gating: {
+      marketRejectionCount,
+      dataRejectionCount,
+    },
+    ratePressureState,
   };
 }
 
@@ -499,6 +513,29 @@ function getPredictorWarmupSnapshot() {
 
 function getEntryRegimeStaleThresholdMs() {
   return ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS;
+}
+
+function getBarsFallbackCooldownState(symbol, timeframe) {
+  const key = `${normalizeSymbol(symbol)}:${String(timeframe || '').toLowerCase()}`;
+  const state = barsFallbackCooldownByKey.get(key) || { untilMs: 0, attempts: 0 };
+  const nowMs = Date.now();
+  return {
+    key,
+    active: Number(state.untilMs) > nowMs,
+    untilMs: Number(state.untilMs) || 0,
+    attempts: Number(state.attempts) || 0,
+    remainingMs: Number(state.untilMs) > nowMs ? Number(state.untilMs) - nowMs : 0,
+  };
+}
+
+function noteBarsFallbackAttempt(symbol, timeframe, { success = false } = {}) {
+  const current = getBarsFallbackCooldownState(symbol, timeframe);
+  const nextAttempts = success ? 0 : (current.attempts + 1);
+  const cooldownMs = success ? 0 : Math.min(60000, 5000 * nextAttempts);
+  barsFallbackCooldownByKey.set(current.key, {
+    attempts: nextAttempts,
+    untilMs: cooldownMs > 0 ? Date.now() + cooldownMs : 0,
+  });
 }
 
 function shouldCountSparseFallbackReject({ marketDataEval }) {
@@ -1447,6 +1484,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     const mdSnapshot = await getOrFetchSymbolMarketData({
       context: entryMdContext,
       coordinator: entryMarketDataCoordinator,
+      marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
       fetchQuote: getQuoteForTrading,
       fetchOrderbook: getLatestOrderbook,
@@ -1627,6 +1665,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       ? await getOrFetchSymbolMarketData({
         context: entryMdContext,
         coordinator: entryMarketDataCoordinator,
+        marketDataCache: scanMarketDataCache,
         symbol: asset.symbol,
         fetchQuote: getQuoteForTrading,
         fetchOrderbook: getLatestOrderbook,
@@ -1866,9 +1905,12 @@ async function computeEntrySignal(symbol, opts = {}) {
   const prefSeries5m = hasPrefetchedBarsMaps ? bars5mBySymbol.get(asset.symbol) : (Array.isArray(barsSnapshot?.fiveMin) ? barsSnapshot.fiveMin : null);
   const prefSeries15m = hasPrefetchedBarsMaps ? bars15mBySymbol.get(asset.symbol) : (Array.isArray(barsSnapshot?.fifteenMin) ? barsSnapshot.fifteenMin : null);
 
-  const normalizedPrefSeries1m = Array.isArray(prefSeries1m) ? prefSeries1m : [];
-  const normalizedPrefSeries5m = Array.isArray(prefSeries5m) ? prefSeries5m : [];
-  const normalizedPrefSeries15m = Array.isArray(prefSeries15m) ? prefSeries15m : [];
+  const cacheSeries1m = scanMarketDataCache.getBars(asset.symbol, '1m');
+  const cacheSeries5m = scanMarketDataCache.getBars(asset.symbol, '5m');
+  const cacheSeries15m = scanMarketDataCache.getBars(asset.symbol, '15m');
+  const normalizedPrefSeries1m = Array.isArray(prefSeries1m) && prefSeries1m.length ? prefSeries1m : (cacheSeries1m?.ok ? cacheSeries1m.value : []);
+  const normalizedPrefSeries5m = Array.isArray(prefSeries5m) && prefSeries5m.length ? prefSeries5m : (cacheSeries5m?.ok ? cacheSeries5m.value : []);
+  const normalizedPrefSeries15m = Array.isArray(prefSeries15m) && prefSeries15m.length ? prefSeries15m : (cacheSeries15m?.ok ? cacheSeries15m.value : []);
 
   bars1m = { bars: { [asset.symbol]: normalizedPrefSeries1m } };
   bars5m = { bars: { [asset.symbol]: normalizedPrefSeries5m } };
@@ -1991,7 +2033,14 @@ async function computeEntrySignal(symbol, opts = {}) {
 
   if (warmupGate.missing.length || predictorInputGateBeforeFallback.missing.length) {
     const fallbackBudget = Number.isFinite(opts?.fallbackBudgetState?.remaining) ? opts.fallbackBudgetState.remaining : 0;
-    const canFallback = ALLOW_PER_SYMBOL_BARS_FALLBACK && fallbackBudget > 0;
+    const fallbackCooldownStates = {
+      '1m': getBarsFallbackCooldownState(asset.symbol, '1m'),
+      '5m': getBarsFallbackCooldownState(asset.symbol, '5m'),
+      '15m': getBarsFallbackCooldownState(asset.symbol, '15m'),
+    };
+    const fallbackCooldownActive = Object.values(fallbackCooldownStates).some((state) => state.active);
+    const barsRatePressure = isUnderRatePressure('BARS');
+    const canFallback = ALLOW_PER_SYMBOL_BARS_FALLBACK && fallbackBudget > 0 && !fallbackCooldownActive && !barsRatePressure;
     if (warmupGate.skip && !canFallback) {
       return {
         entryReady: false,
@@ -2016,6 +2065,9 @@ async function computeEntrySignal(symbol, opts = {}) {
         missing: warmupGate.missing,
         fallbackAllowed: ALLOW_PER_SYMBOL_BARS_FALLBACK,
         fallbackBudget,
+        fallbackCooldownActive,
+        cooldownStates: fallbackCooldownStates,
+        ratePressureActive: barsRatePressure,
       });
     } else {
 
@@ -2036,6 +2088,9 @@ async function computeEntrySignal(symbol, opts = {}) {
         fetchBarsWithDebug({ symbol: asset.symbol, timeframe: '15Min', limit: fetchThresholds['15m'] }),
       ]);
       if (!bars1mResult.ok || !bars5mResult.ok || !bars15mResult.ok) {
+        noteBarsFallbackAttempt(asset.symbol, '1m', { success: false });
+        noteBarsFallbackAttempt(asset.symbol, '5m', { success: false });
+        noteBarsFallbackAttempt(asset.symbol, '15m', { success: false });
         if (predictorInputGateBeforeFallback.missing.length) {
           const resolvedReason = sparseRetryDetails?.providerQuoteStaleAfterRefresh
             ? 'provider_quote_stale_after_refresh'
@@ -2071,9 +2126,15 @@ async function computeEntrySignal(symbol, opts = {}) {
           };
         }
       } else {
+        noteBarsFallbackAttempt(asset.symbol, '1m', { success: true });
+        noteBarsFallbackAttempt(asset.symbol, '5m', { success: true });
+        noteBarsFallbackAttempt(asset.symbol, '15m', { success: true });
         if (opts?.fallbackBudgetState && Number.isFinite(opts.fallbackBudgetState.remaining)) {
           opts.fallbackBudgetState.remaining = Math.max(0, opts.fallbackBudgetState.remaining - 1);
         }
+        scanMarketDataCache.upsertBars(asset.symbol, '1m', extractBarSeriesForSymbol(bars1mResult.response, asset.symbol));
+        scanMarketDataCache.upsertBars(asset.symbol, '5m', extractBarSeriesForSymbol(bars5mResult.response, asset.symbol));
+        scanMarketDataCache.upsertBars(asset.symbol, '15m', extractBarSeriesForSymbol(bars15mResult.response, asset.symbol));
         bars1m = bars1mResult.response;
         bars5m = bars5mResult.response;
         bars15m = bars15mResult.response;
@@ -3625,6 +3686,14 @@ async function waitForPositionQtyVisibility(symbol, minQty = 0) {
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
+const scanMarketDataCache = createMarketDataCache({
+  quoteTtlMs: MARKETDATA_QUOTE_TTL_MS,
+  orderbookTtlMs: MARKETDATA_ORDERBOOK_TTL_MS,
+  bars1mTtlMs: MARKETDATA_BARS_TTL_MS,
+  bars5mTtlMs: MARKETDATA_BARS_TTL_MS * 2,
+  bars15mTtlMs: MARKETDATA_BARS_TTL_MS * 3,
+});
+const barsFallbackCooldownByKey = new Map();
 const spreadHistoryBySymbol = new Map(); // symbol -> [{ tMs, spreadBps }]
 const orderbookFeatureHistory = new Map(); // symbol -> [{ tMs, imbalance, bidDepthUsd, askDepthUsd, bestBid, bestAsk }]
 const AVG_ENTRY_CACHE_TTL_MS = 20000;
@@ -7318,6 +7387,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     const fallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMsFinal });
     if (!fallback) return null;
     quoteCache.set(symbol, fallback);
+    scanMarketDataCache.upsertQuote(symbol, fallback, fallback?.tsMs || Date.now());
     recordLastQuoteAt(symbol, { tsMs: fallback.tsMs, source: fallback.source });
     recordQuoteSuccess(symbol);
     const fallbackQuote = {
@@ -7477,6 +7547,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     source: 'alpaca',
   };
   quoteCache.set(symbol, normalizedQuote);
+  scanMarketDataCache.upsertQuote(symbol, normalizedQuote, normalizedQuote?.tsMs || Date.now());
   recordLastQuoteAt(symbol, { tsMs, source: 'fresh' });
   recordQuoteSuccess(symbol);
   quotePassCache.set(symbol, { passId: marketDataPassId, quote: normalizedQuote });
@@ -7557,6 +7628,7 @@ async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
     source: 'alpaca_direct',
   };
   quoteCache.set(symbol, normalizedQuote);
+  scanMarketDataCache.upsertQuote(symbol, normalizedQuote, normalizedQuote?.tsMs || Date.now());
   recordLastQuoteAt(symbol, { tsMs, source: 'alpaca_direct' });
   return normalizedQuote;
 }
@@ -7789,6 +7861,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
                   receivedAtMs: now,
                 };
                 orderbookCache.set(symbol, normalized);
+                scanMarketDataCache.upsertOrderbook(symbol, { ok: true, orderbook: normalized, source: 'alpaca' }, normalized?.tsMs || Date.now());
                 orderbookPassCache.set(symbol, { passId: marketDataPassId, orderbook: normalized });
                 return { ok: true, orderbook: normalized, source: 'fresh' };
               }
@@ -7830,6 +7903,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
       source: 'quote_fallback',
     };
     orderbookCache.set(symbol, syntheticOrderbook);
+    scanMarketDataCache.upsertOrderbook(symbol, { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' }, syntheticOrderbook?.tsMs || Date.now());
     orderbookPassCache.set(symbol, { passId: marketDataPassId, orderbook: syntheticOrderbook });
     return { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' };
   }
@@ -12554,6 +12628,7 @@ function warmQuoteCacheFromBatch(symbols, quotesResp) {
       receivedAtMs: nowMs,
       source: 'alpaca_prefetch',
     });
+    scanMarketDataCache.upsertQuote(normalizedSymbol, quoteCache.get(normalizedSymbol), tsMs || nowMs);
   }
 }
 
@@ -12588,6 +12663,11 @@ function warmOrderbookCacheFromBatch(symbols, orderbooksResp) {
       receivedAtMs: nowMs,
       source: 'alpaca_prefetch',
     });
+    scanMarketDataCache.upsertOrderbook(normalizedSymbol, {
+      ok: true,
+      orderbook: orderbookCache.get(normalizedSymbol),
+      source: 'alpaca_prefetch',
+    }, parsedTsMs || nowMs);
   }
 }
 
@@ -12614,6 +12694,8 @@ function buildBarsMapFromBatch(symbols, barsResp) {
 
 async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
+  const seedSymbols = symbols.slice(0, maxSeedSymbolsPerPass);
   const nowMs = Date.now();
   if (!opts.force && nowMs - lastBarsPrefetchMs < BARS_PREFETCH_INTERVAL_MS) {
     return {
@@ -12657,7 +12739,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
   lastBarsPrefetchMs = nowMs;
   const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
-  const chunks = chunkArray(symbols, chunkSize);
+  const chunks = chunkArray(seedSymbols, chunkSize);
   const bars1mBySymbol = new Map();
   const bars5mBySymbol = new Map();
   const bars15mBySymbol = new Map();
@@ -12673,7 +12755,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, chunks.length || 1),
   );
   startPredictorWarmup({
-    totalSymbolsPlanned: symbols.length,
+    totalSymbolsPlanned: seedSymbols.length,
     totalChunks: chunks.length,
   });
   let symbolsCompleted = 0;
@@ -12684,10 +12766,6 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     '15Min': 0,
   };
   const processChunk = async (chunkSymbols) => {
-    const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
-    const orderbooksResp = ENTRY_PREFETCH_ORDERBOOKS
-      ? await fetchCryptoOrderbooks({ symbols: chunkSymbols })
-      : null;
     const bars1mResp = await fetchCryptoBarsWarmupPaged({
       symbols: chunkSymbols,
       perSymbolLimit: warmupLimits['1m'],
@@ -12710,11 +12788,6 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       end: ranges['15m'].end,
     });
 
-    warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
-    if (ENTRY_PREFETCH_ORDERBOOKS && orderbooksResp) {
-      warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
-    }
-
     return {
       bars1m: buildBarsMapFromBatch(chunkSymbols, bars1mResp),
       bars5m: buildBarsMapFromBatch(chunkSymbols, bars5mResp),
@@ -12732,18 +12805,21 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         });
         for (const [symbol, series] of result.bars1m.entries()) {
           bars1mBySymbol.set(symbol, series);
+          scanMarketDataCache.upsertBars(symbol, '1m', series);
         }
         updatePredictorWarmupProgress({
           currentTimeframe: '5Min',
         });
         for (const [symbol, series] of result.bars5m.entries()) {
           bars5mBySymbol.set(symbol, series);
+          scanMarketDataCache.upsertBars(symbol, '5m', series);
         }
         updatePredictorWarmupProgress({
           currentTimeframe: '15Min',
         });
         for (const [symbol, series] of result.bars15m.entries()) {
           bars15mBySymbol.set(symbol, series);
+          scanMarketDataCache.upsertBars(symbol, '15m', series);
         }
         symbolsCompleted += result.bars1m.size;
         chunksCompleted += 1;
@@ -12781,7 +12857,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     bars15mBySymbol,
   };
   lastPrefetchedBarsUpdatedAtMs = Date.now();
-  lastPrefetchedBarsSymbols = new Set(symbols);
+  lastPrefetchedBarsSymbols = new Set(seedSymbols);
 
   return {
     ok: true,
@@ -12790,6 +12866,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     warmupPrefetchConcurrency,
     chunkSize,
     chunkSizeCap: 20,
+    seededSymbols: seedSymbols.length,
+    totalSymbolsObserved: symbols.length,
     orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'enabled' : 'skipped_env_disabled',
   };
 }
@@ -13588,6 +13666,7 @@ async function runEntryScanOnce() {
         sparseFallbackAccepts: entryMarketDataContext.stats.sparseFallbackAccepts,
         sparseFallbackRejects: entryMarketDataContext.stats.sparseFallbackRejects,
         endpointCooldowns: entryMarketDataCoordinator.getCooldownSnapshot(),
+        ratePressureState: getRatePressureState(),
       },
     };
     console.log('entry_scan', lastEntryScanSummary);
@@ -15492,12 +15571,14 @@ function getSessionGovernorSummary() {
 
 function getEngineStateSnapshot() {
   if (tradingHaltedReason) return 'halted';
+  const ratePressure = getRatePressureState();
+  if (ratePressure.active) return 'rate_limited';
   if (entryScanRunning) return 'scanning';
   const warmup = getPredictorWarmupStatus();
-  if (warmup?.inProgress) return 'warming_up';
-  if (Number(lastEntryScanSummary?.marketDataBudget?.rateLimited || 0) > 0) return 'rate_limited';
+  if (warmup?.inProgress) return 'seeding';
+  if (Number(lastEntryScanSummary?.marketDataBudget?.rateLimited || 0) > 0) return 'degraded_data_mode';
   if (lastEntryScanSummary) return 'ready';
-  return 'warming_up';
+  return 'seeding';
 }
 
 function getTradingManagerStatus() {

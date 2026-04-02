@@ -684,6 +684,9 @@ app.get('/dashboard', async (req, res) => {
     const dynamicUniverseActive = Boolean(universeDiagnostics?.dynamicUniverseActive);
     const fallbackOccurred = Boolean(universeDiagnostics?.fallbackOccurred);
     const topSkipReasons = entryDiagnostics?.entryScan?.topSkipReasons || {};
+    const ratePressureState = entryDiagnostics?.ratePressureState || null;
+    const marketRejectionCount = Number(entryDiagnostics?.gating?.marketRejectionCount || 0);
+    const dataRejectionCount = Number(entryDiagnostics?.gating?.dataRejectionCount || 0);
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
       const rawSymbol = String(position?.symbol || position?.asset || '').toUpperCase();
@@ -825,6 +828,15 @@ app.get('/dashboard', async (req, res) => {
           fallbackReason: universeDiagnostics?.fallbackReason || null,
           warmupInProgress: Boolean(predictorWarmup?.inProgress),
           engineState: getEngineStateSnapshot(),
+          ratePressureState,
+          seedingProgress: {
+            inProgress: Boolean(predictorWarmup?.inProgress),
+            completed: Number(predictorWarmup?.symbolsCompleted || 0),
+            total: Number(predictorWarmup?.totalSymbolsPlanned || 0),
+          },
+          marketRejectionCount,
+          dataRejectionCount,
+          fallbackSuppressionCount: Number(entryDiagnostics?.entryScan?.marketDataBudget?.cooldownBlocked || 0),
           topSkipReasons,
           signalBlockedByWarmupCount: Number(entryDiagnostics?.entryScan?.signalBlockedByWarmupCount || 0),
           openPositions: positions.length,
@@ -854,6 +866,7 @@ app.get('/dashboard', async (req, res) => {
             totalChunks: predictorWarmup?.totalChunks ?? null,
             currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
           },
+          ratePressureState,
         },
         scorecard,
       },

@@ -4,6 +4,7 @@ const {
   buildEntryMarketDataContext,
   getOrFetchSymbolMarketData,
 } = require('./entryMarketDataContext');
+const { createMarketDataCache } = require('./marketDataCache');
 
 (async () => {
   const coordinator = createRequestCoordinator({
@@ -34,6 +35,7 @@ const {
   const data = await getOrFetchSymbolMarketData({
     context,
     coordinator,
+    marketDataCache: createMarketDataCache(),
     symbol: 'BTC/USD',
     fetchQuote,
     fetchOrderbook: async () => {
@@ -49,6 +51,7 @@ const {
   await getOrFetchSymbolMarketData({
     context,
     coordinator,
+    marketDataCache: createMarketDataCache(),
     symbol: 'BTC/USD',
     fetchQuote,
     fetchOrderbook: async () => {
@@ -64,6 +67,7 @@ const {
   await getOrFetchSymbolMarketData({
     context,
     coordinator,
+    marketDataCache: createMarketDataCache(),
     symbol: 'BTC/USD',
     fetchQuote: async () => {
       forcedQuoteCalls += 1;
@@ -99,6 +103,38 @@ const {
   });
   assert.equal(blocked.state, 'cooldown_active');
   assert.equal(rateLimitedCalls, 1, 'cooldown should block immediate retry thrash');
+
+  const layerCache = createMarketDataCache();
+  layerCache.upsertQuote('SOL/USD', { bid: 20, ask: 21, tsMs: Date.now() }, Date.now());
+  layerCache.upsertOrderbook('SOL/USD', { ok: true, orderbook: { bestBid: 20, bestAsk: 21, bids: [{ p: 20, s: 1 }], asks: [{ p: 21, s: 1 }] } }, Date.now());
+  layerCache.upsertBars('SOL/USD', '1m', [{ c: 20 }]);
+  layerCache.upsertBars('SOL/USD', '5m', [{ c: 20 }]);
+  layerCache.upsertBars('SOL/USD', '15m', [{ c: 20 }]);
+  let cacheMissFetcherCalls = 0;
+  const cacheLayerResult = await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-cache' }),
+    coordinator: createRequestCoordinator({}),
+    marketDataCache: layerCache,
+    symbol: 'SOL/USD',
+    includeOrderbook: false,
+    fetchQuote: async () => {
+      cacheMissFetcherCalls += 1;
+      return { bid: 0, ask: 0, tsMs: Date.now() };
+    },
+    fetchOrderbook: async () => {
+      cacheMissFetcherCalls += 1;
+      return { ok: false };
+    },
+    fetchBars: async () => {
+      cacheMissFetcherCalls += 1;
+      return [];
+    },
+    barsWarmup: { '1m': 1, '5m': 1, '15m': 1 },
+    fallbackPolicy: { suppress: true, reason: 'rate_pressure' },
+  });
+  assert.equal(cacheLayerResult.quoteResult.state, 'cache_layer');
+  assert.equal(cacheLayerResult.orderbook, undefined, 'includeOrderbook=false should defer orderbook fetches');
+  assert.equal(cacheMissFetcherCalls, 0, 'cache layer should avoid fallback fetches for ready symbols');
 
   console.log('entry market data context tests passed');
 })().catch((err) => {
