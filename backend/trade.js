@@ -1237,6 +1237,23 @@ function getConfiguredTargetProfitBpsForSymbol(symbol) {
   const tier = resolveSymbolTier(symbol, executionTierPolicy);
   return getConfiguredTargetProfitBpsForTier(tier);
 }
+
+function resolveEntryExecutionContext(symbol, options = {}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const signalMeta = options?.signalMeta || null;
+  const symbolTier = signalMeta?.symbolTier || resolveSymbolTier(normalizedSymbol, getExecutionTierPolicy());
+  const signalTargetProfitBps = Number(signalMeta?.targetProfitBps ?? signalMeta?.takeProfitBps);
+  const targetProfitBps = Number.isFinite(signalTargetProfitBps)
+    ? signalTargetProfitBps
+    : getConfiguredTargetProfitBpsForTier(symbolTier);
+  const requiredEdgeBps = computeRequiredEntryEdgeBps(symbolTier);
+  return {
+    symbolTier,
+    targetProfitBps,
+    takeProfitBps: targetProfitBps,
+    requiredEdgeBps,
+  };
+}
 function resolveExitSlippageBufferBps(symbolTier) {
   const tier = normalizeSymbolTier(symbolTier);
   if (tier === 'tier1' && Number.isFinite(EXIT_SLIPPAGE_BUFFER_BPS_TIER1)) return EXIT_SLIPPAGE_BUFFER_BPS_TIER1;
@@ -2996,6 +3013,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       quoteReceivedAtMs,
       regimeLabel: regimeScorecard?.label || null,
       sparseRetry: sparseRetryDetails,
+      targetProfitBps: resolvedEntryTakeProfitBps,
+      takeProfitBps: resolvedEntryTakeProfitBps,
     },
     record: baseRecord,
   };
@@ -3078,7 +3097,7 @@ function buildForensicsDecisionSnapshot({ normalizedSymbol, quote, signalRecord 
       maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
     },
     thresholds: {
-      targetProfitBps: resolvedEntryTakeProfitBps,
+      targetProfitBps: (typeof signalRecord !== 'undefined' ? (Number(signalRecord?.config?.targetProfitBps) || Number(signalRecord?.config?.entryTakeProfitBps)) : null) || getConfiguredTargetProfitBpsForSymbol(normalizedSymbol),
       minProbToEnter: MIN_PROB_TO_ENTER,
       minProbToEnterTp: MIN_PROB_TO_ENTER_TP,
       minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
@@ -5627,9 +5646,11 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
       spreadBps = ((ask - bid) / bid) * 10000;
     }
   } catch (err) {
-    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err, reason: 'stale_quote_pre_execution_skip' });
+    return { skipped: true, reason: 'stale_quote', meta: { stage: 'pre_execution_quote', error: err?.message || err } };
   }
-  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  const executionContext = resolveEntryExecutionContext(normalizedSymbol);
+  const requiredEdgeBps = executionContext.requiredEdgeBps;
   if (Number.isFinite(spreadBps) && spreadBps > requiredEdgeBps) {
     logEntrySkip({ symbol: normalizedSymbol, spreadBps, requiredEdgeBps, reason: 'profit_gate' });
     logSkip('profit_gate', {
@@ -5638,7 +5659,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: resolvedEntryTakeProfitBps,
+      targetProfitBps: executionContext.targetProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -5714,6 +5735,8 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     limit_price: limitPrice,
     client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
+  console.log('entry_execution_submit', { symbol: normalizedSymbol, mode: 'maker_limit', stage: 'before_order_submit' });
+  console.log('entry_execution_submit', { symbol: normalizedSymbol, mode: 'market_buy', stage: 'before_order_submit' });
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
     url: buyOrderUrl,
@@ -9211,6 +9234,7 @@ async function handleBuyFill({
     filledAtMs: Date.now(),
   });
 
+  console.log('entry_exit_attach_context', { symbol, entryOrderId: entryOrderId || null, qty: qtyNum, entryPrice: entryPriceNum, entryBid: Number(entryBid) || null, entryAsk: Number(entryAsk) || null, entrySpreadBps: Number.isFinite(entrySpreadBpsUsed) ? entrySpreadBpsUsed : null });
   const settle = await waitForPositionQtyVisibility(symbol, qtyNum);
 
   console.log('post_fill_position_settle', {
@@ -13928,7 +13952,8 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
     return { skipped: true, reason: 'invalid_quote' };
   }
   const spreadBps = ((ask - bid) / mid) * BPS;
-  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  const executionContext = resolveEntryExecutionContext(normalizedSymbol);
+  const requiredEdgeBps = executionContext.requiredEdgeBps;
   if (options?.signalMeta?.weakLiquidity === true) {
     console.log('entry_liquidity_gate', { symbol: normalizedSymbol, spreadBps, weakLiquidity: true, reason: 'weak_liquidity_pre_order' });
     return { skipped: true, reason: 'weak_liquidity' };
@@ -13938,7 +13963,7 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
     logSimpleScalperSkip(normalizedSymbol, 'profit_gate', {
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: resolvedEntryTakeProfitBps,
+      targetProfitBps: executionContext.targetProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -14260,9 +14285,11 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
       spreadBps = ((ask - bid) / bid) * 10000;
     }
   } catch (err) {
-    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err, reason: 'stale_quote_pre_execution_skip' });
+    return { skipped: true, reason: 'stale_quote', meta: { stage: 'pre_execution_quote', error: err?.message || err } };
   }
-  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  const executionContext = resolveEntryExecutionContext(normalizedSymbol, options);
+  const requiredEdgeBps = executionContext.requiredEdgeBps;
   if (options?.signalMeta?.weakLiquidity === true) {
     console.log('entry_liquidity_gate', { symbol: normalizedSymbol, spreadBps, weakLiquidity: true, reason: 'weak_liquidity_pre_order' });
     return { skipped: true, reason: 'weak_liquidity' };
@@ -14275,7 +14302,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: resolvedEntryTakeProfitBps,
+      targetProfitBps: executionContext.targetProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -14564,6 +14591,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     return { buy: filledOrder, sell: null, sellError: 'No inventory to sell', submitted };
   }
 
+  console.log('entry_execution_handoff', { symbol: normalizedSymbol, stage: 'filled_buy_to_exit_attach', mode: 'maker_limit', entryOrderId: filledOrder.id || buyOrder?.id || null });
   const sellOrder = await handleBuyFill({
     symbol: normalizedSymbol,
     qty: filledOrder.filled_qty,
@@ -14598,9 +14626,11 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
       spreadBps = ((ask - bid) / bid) * 10000;
     }
   } catch (err) {
-    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err, reason: 'stale_quote_pre_execution_skip' });
+    return { skipped: true, reason: 'stale_quote', meta: { stage: 'pre_execution_quote', error: err?.message || err } };
   }
-  const requiredEdgeBps = computeRequiredEntryEdgeBps();
+  const executionContext = resolveEntryExecutionContext(normalizedSymbol, options);
+  const requiredEdgeBps = executionContext.requiredEdgeBps;
   if (options?.signalMeta?.weakLiquidity === true) {
     console.log('entry_liquidity_gate', { symbol: normalizedSymbol, spreadBps, weakLiquidity: true, reason: 'weak_liquidity_pre_order' });
     return { skipped: true, reason: 'weak_liquidity' };
@@ -14613,7 +14643,7 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: resolvedEntryTakeProfitBps,
+      targetProfitBps: executionContext.targetProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -14849,6 +14879,7 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
 
   try {
 
+    console.log('entry_execution_handoff', { symbol: normalizedSymbol, stage: 'filled_buy_to_exit_attach', mode: 'market_buy', entryOrderId: filled.id || buyOrder?.id || null });
     const sellOrder = await handleBuyFill({
 
       symbol: normalizedSymbol,
@@ -15838,6 +15869,7 @@ module.exports = {
   computeProviderQuoteAgeMs,
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeEffectivePerScanBudget,
+  resolveEntryExecutionContext,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
     quoteCache.set(normalizeSymbol(symbol), quote);
