@@ -347,3 +347,30 @@ Set `SHADOW_INTENTS_ENABLED=true` with `ENGINE_V2_ENABLED=true` to run intent/co
 2. Run tests: `npm test` from `backend/`.
 3. Turn on `ENGINE_V2_ENABLED=true` + `SHADOW_INTENTS_ENABLED=true` first.
 4. Inspect `/dashboard` and `/debug/forensics/recent` before enabling live routing flags.
+
+
+## Credential requirements (live trading vs route auth)
+
+- **Alpaca trading credentials are mandatory for live/production startup and trading**:
+  - `APCA_API_KEY_ID` (or supported alias)
+  - `APCA_API_SECRET_KEY` (or supported alias)
+- **`API_TOKEN` is optional** and only protects backend HTTP routes.
+  - If `API_TOKEN` is unset, backend startup still succeeds and routes are not auth-protected.
+  - If `API_TOKEN` is set, auth middleware enforces it.
+  - In production/live mode, placeholder `API_TOKEN` values are rejected at startup.
+- Hosted production (Render, etc.) should provide secrets via platform environment variables.
+  Checked-in dotenv files are templates/local examples and are not production truth.
+
+## Dashboard runtime truth
+
+`GET /dashboard` now exposes compact runtime truth fields in `meta` including:
+
+- `effectiveTradeBase`, `effectiveDataBase`, `alpacaCredentialsPresent`, `apiTokenEnabled`
+- `envRequestedUniverseMode`, `effectiveUniverseMode`, `dynamicUniverseActive`
+- `dynamicTradableSymbolsFound`, `acceptedSymbolsCount`, `acceptedSymbolsSample`
+- `fallbackOccurred`, `fallbackReason`
+- `predictorWarmup` progress and error fields
+- `engineState` (`warming_up`, `scanning`, `rate_limited`, `halted`, `ready`)
+- buy gating summaries (`entryScan`, `topSkipReasons`, `skipReasonsBySymbol`, signal-ready vs warmup-blocked counts)
+
+Stablecoin handling remains configuration-driven with `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `false`), and diagnostics report stable filtering impact.

@@ -137,6 +137,19 @@ async function expectStartupSuccessNoApiToken() {
     mustContain: 'appears to be a placeholder value in production/live mode',
   });
 
+
+  await expectStartupFailure({
+    envOverrides: {
+      NODE_ENV: 'production',
+      TRADE_BASE: 'https://api.alpaca.markets',
+      DATA_BASE: 'https://data.alpaca.markets',
+      APCA_API_KEY_ID: 'pk_live_realistic_key_123456',
+      APCA_API_SECRET_KEY: 'sk_live_realistic_secret_abcdef123456',
+      API_TOKEN: '<your long random token>',
+    },
+    mustContain: 'API_TOKEN appears to be a placeholder value',
+  });
+
   await expectStartupSuccessNoApiToken();
 
   console.log('startup_test_ok');
