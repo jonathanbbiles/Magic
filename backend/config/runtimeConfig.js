@@ -86,6 +86,19 @@ function getRuntimeConfig(env = process.env) {
     predictorWarmupMinBars5m: parsePositiveInt(env.PREDICTOR_WARMUP_MIN_5M_BARS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_5M_BARS, 60)),
     predictorWarmupMinBars15m: parsePositiveInt(env.PREDICTOR_WARMUP_MIN_15M_BARS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_15M_BARS, 40)),
     marketdataRateLimitCooldownMs: parsePositiveInt(env.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.MARKETDATA_RATE_LIMIT_COOLDOWN_MS, 5000)),
+    entryQuoteMaxAgeMs: parsePositiveInt(env.ENTRY_QUOTE_MAX_AGE_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_MAX_AGE_MS, 30000)),
+    entryRegimeStaleQuoteMaxAgeMs: parsePositiveInt(
+      env.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS,
+      parsePositiveInt(env.ENTRY_QUOTE_MAX_AGE_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, 30000)),
+    ),
+    orderbookSparseRequireQuoteFreshMs: parsePositiveInt(
+      env.ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS, 10000),
+    ),
+    orderbookSparseStaleQuoteToleranceMs: parsePositiveInt(
+      env.ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS, 30000),
+    ),
     configuredPrimarySymbols,
     configuredSecondarySymbols,
   };
@@ -117,6 +130,10 @@ function getRuntimeConfigSummary(env = process.env) {
     predictorWarmupFallbackBudgetPerScan: config.predictorWarmupFallbackBudgetPerScan,
     predictorWarmupPrefetchConcurrency: config.predictorWarmupPrefetchConcurrency,
     marketdataRateLimitCooldownMs: config.marketdataRateLimitCooldownMs,
+    entryQuoteMaxAgeMs: config.entryQuoteMaxAgeMs,
+    entryRegimeStaleQuoteMaxAgeMs: config.entryRegimeStaleQuoteMaxAgeMs,
+    orderbookSparseRequireQuoteFreshMs: config.orderbookSparseRequireQuoteFreshMs,
+    orderbookSparseStaleQuoteToleranceMs: config.orderbookSparseStaleQuoteToleranceMs,
     executionTier3Default: config.executionTier3Default,
   };
 }

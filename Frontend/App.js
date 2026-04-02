@@ -434,7 +434,16 @@ export default function App() {
                 <Text style={styles.diagnosticsTitle}>Quote freshness / guards</Text>
                 <Text style={styles.diagnosticsText}>{JSON.stringify({
                   entryQuoteMaxAgeMs: quoteFreshness?.entryQuoteMaxAgeMs,
+                  entryRegimeStaleQuoteMaxAgeMs: quoteFreshness?.entryRegimeStaleQuoteMaxAgeMs,
+                  sparseRequireQuoteFreshMs: quoteFreshness?.sparseRequireQuoteFreshMs,
+                  sparseStaleQuoteToleranceMs: quoteFreshness?.sparseStaleQuoteToleranceMs,
                   staleEntryQuoteSkips: quoteFreshness?.staleEntryQuoteSkips,
+                  staleQuoteRejectionCount: truth?.staleQuoteRejectionCount ?? entryDiagnostics?.gating?.staleQuoteRejectionCount ?? 0,
+                  marketRejectionCount: truth?.marketRejectionCount ?? 0,
+                  topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
+                  topSkipReasonsRolling: truth?.topSkipReasonsRolling ?? {},
+                  positions: truth?.openPositions ?? positions.length,
+                  activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
                   drawdownPct: risk?.drawdownPct,
                   dailyDrawdownPct: risk?.dailyDrawdownPct,
                   drawdownGuardEnabled: risk?.drawdownGuardEnabled,

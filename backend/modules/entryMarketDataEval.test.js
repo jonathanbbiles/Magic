@@ -6,14 +6,14 @@ const policy = {
   tier2Symbols: parseSymbolSet('SOL/USD,LINK/USD'),
   tier3Default: true,
   maxSpreadBpsToEnter: 40,
-  quoteMaxAgeMs: 120000,
+  quoteMaxAgeMs: 30000,
   sparseFallback: {
     enabled: true,
     symbols: parseSymbolSet('BTC/USD,ETH/USD'),
     maxSpreadBps: 12,
     requireStrongerEdgeBps: 2,
-    requireQuoteFreshMs: 5000,
-    staleQuoteToleranceMs: 15000,
+    requireQuoteFreshMs: 10000,
+    staleQuoteToleranceMs: 30000,
     minProbability: 0.6,
     confidenceCapMultiplier: 0.5,
   },
@@ -161,5 +161,43 @@ const spreadRejected = evaluateEntryMarketData({
   policy,
 });
 assert.equal(spreadRejected.reason, 'spread_wide');
+
+const quoteAgeWithinNewThreshold = evaluateEntryMarketData({
+  symbol: 'ETH/USD',
+  symbolTier: 'tier1',
+  spreadBps: 7,
+  quoteAgeMs: 22000, // previously would fail against 10s/15s style gates; now accepted under 30s config.
+  requiredEdgeBps: 50,
+  minNetEdgeBps: 5,
+  netEdgeBps: 9,
+  predictorProbability: 0.7,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 200,
+  orderbookMeta: { ok: true, depthState: 'ok', impactBpsBuy: 2.1 },
+  policy,
+});
+assert.equal(quoteAgeWithinNewThreshold.executionMode, 'normal');
+assert.equal(quoteAgeWithinNewThreshold.reason, null);
+
+const trulyStaleQuoteRejected = evaluateEntryMarketData({
+  symbol: 'ETH/USD',
+  symbolTier: 'tier1',
+  spreadBps: 7,
+  quoteAgeMs: 45000,
+  requiredEdgeBps: 50,
+  minNetEdgeBps: 5,
+  netEdgeBps: 9,
+  predictorProbability: 0.7,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 200,
+  orderbookMeta: { ok: true, depthState: 'ok', impactBpsBuy: 2.1 },
+  policy,
+});
+assert.equal(trulyStaleQuoteRejected.executionMode, 'reject');
+assert.equal(trulyStaleQuoteRejected.reason, 'quote_stale');
 
 console.log('entry market data eval tests passed');

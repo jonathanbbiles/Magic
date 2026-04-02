@@ -155,18 +155,18 @@ const runtimeStrategyConfig = {
   version: VERSION,
   commit: process.env.RENDER_GIT_COMMIT || process.env.COMMIT_SHA || process.env.GIT_COMMIT || null,
   telemetrySchemaVersion: 2,
-  entryQuoteMaxAgeMs: readLiveNumber('ENTRY_QUOTE_MAX_AGE_MS'),
+  entryQuoteMaxAgeMs: runtimeConfig.entryQuoteMaxAgeMs,
   cryptoQuoteMaxAgeOverrideEnabled: readLiveBoolean('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED'),
   sparseFallbackEnabled: readLiveBoolean('ORDERBOOK_SPARSE_FALLBACK_ENABLED'),
   sparseFallbackSymbols: readLiveSymbols('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS'),
   sparseAllowTier1: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER1'),
   sparseAllowTier2: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER2'),
   sparseAllowTier3: readLiveBoolean('ORDERBOOK_SPARSE_ALLOW_TIER3'),
-  sparseRequireQuoteFreshMs: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS'),
+  sparseRequireQuoteFreshMs: runtimeConfig.orderbookSparseRequireQuoteFreshMs,
   sparseRequireStrongerEdgeBps: readLiveNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS'),
-  sparseStaleQuoteToleranceMs: readLiveNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS'),
+  sparseStaleQuoteToleranceMs: runtimeConfig.orderbookSparseStaleQuoteToleranceMs,
   sparseMaxSpreadBps: readLiveNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS'),
-  regimeStaleThresholdMs: readLiveNumber('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS') ?? readLiveNumber('ENTRY_QUOTE_MAX_AGE_MS'),
+  regimeStaleThresholdMs: runtimeConfig.entryRegimeStaleQuoteMaxAgeMs,
   engineV2Enabled: readLiveBoolean('ENGINE_V2_ENABLED'),
   regimeEngineV2Enabled: readLiveBoolean('REGIME_ENGINE_V2_ENABLED'),
   entryTakeProfitBpsDefault: readLiveNumber('ENTRY_TAKE_PROFIT_BPS'),
@@ -687,6 +687,10 @@ app.get('/dashboard', async (req, res) => {
     const ratePressureState = entryDiagnostics?.ratePressureState || null;
     const marketRejectionCount = Number(entryDiagnostics?.gating?.marketRejectionCount || 0);
     const dataRejectionCount = Number(entryDiagnostics?.gating?.dataRejectionCount || 0);
+    const staleQuoteRejectionCount = Number(entryDiagnostics?.gating?.staleQuoteRejectionCount || 0);
+    const insufficientBarsCount = Number(entryDiagnostics?.gating?.insufficientBarsCount || 0);
+    const rateLimitSuppressionCount = Number(entryDiagnostics?.gating?.rateLimitSuppressionCount || 0);
+    const executionFailureCount = Number(entryDiagnostics?.gating?.executionFailureCount || 0);
 
     const positions = (Array.isArray(positionsRaw) ? positionsRaw : []).map((position) => {
       const rawSymbol = String(position?.symbol || position?.asset || '').toUpperCase();
@@ -836,8 +840,13 @@ app.get('/dashboard', async (req, res) => {
           },
           marketRejectionCount,
           dataRejectionCount,
+          staleQuoteRejectionCount,
+          insufficientBarsCount,
+          rateLimitSuppressionCount,
+          executionFailureCount,
           fallbackSuppressionCount: Number(entryDiagnostics?.entryScan?.marketDataBudget?.cooldownBlocked || 0),
           topSkipReasons,
+          topSkipReasonsRolling: entryDiagnostics?.topSkipReasonsRolling || {},
           signalBlockedByWarmupCount: Number(entryDiagnostics?.entryScan?.signalBlockedByWarmupCount || 0),
           openPositions: positions.length,
           activeSellLimits: positions.filter((position) => Number.isFinite(toFiniteNumberOrNull(position?.sell?.activeLimit))).length,
