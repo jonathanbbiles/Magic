@@ -27,6 +27,15 @@ const source = fs.readFileSync(path.resolve(__dirname, 'index.js'), 'utf8');
   'executionFailureCount',
   'skipReasonsBySymbol',
   'signalBlockedByWarmupCount',
+  'entryManagerStarted',
+  'lastEntryScanAt',
+  'lastEntryScanSummary',
+  'lastSuccessfulAction',
+  'lastExecutionFailure',
+  'staleQuoteSkipCount',
+  'marketRejectionCount',
+  'warmupBlockedCount',
+  'concurrencyRiskGuardCount',
 ].forEach((token) => {
   assert.ok(source.includes(token), `Expected /dashboard meta/diagnostics to include ${token}`);
 });
