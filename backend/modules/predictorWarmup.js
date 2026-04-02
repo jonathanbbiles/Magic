@@ -40,7 +40,97 @@ function evaluatePredictorWarmupGate({ lengths, thresholds, enabled, blockTrades
   };
 }
 
+function createInitialWarmupStatus() {
+  return {
+    startedAt: null,
+    finishedAt: null,
+    inProgress: false,
+    totalSymbolsPlanned: 0,
+    symbolsCompleted: 0,
+    chunksCompleted: 0,
+    totalChunks: 0,
+    timeframesCompleted: {
+      '1Min': 0,
+      '5Min': 0,
+      '15Min': 0,
+    },
+    lastBatchSummary: null,
+    lastError: null,
+  };
+}
+
+const warmupStatus = createInitialWarmupStatus();
+
+function startPredictorWarmup({ totalSymbolsPlanned = 0, totalChunks = 0 } = {}) {
+  warmupStatus.startedAt = new Date().toISOString();
+  warmupStatus.finishedAt = null;
+  warmupStatus.inProgress = true;
+  warmupStatus.totalSymbolsPlanned = Math.max(0, Number(totalSymbolsPlanned) || 0);
+  warmupStatus.symbolsCompleted = 0;
+  warmupStatus.chunksCompleted = 0;
+  warmupStatus.totalChunks = Math.max(0, Number(totalChunks) || 0);
+  warmupStatus.timeframesCompleted = {
+    '1Min': 0,
+    '5Min': 0,
+    '15Min': 0,
+  };
+  warmupStatus.lastBatchSummary = null;
+  warmupStatus.lastError = null;
+}
+
+function updatePredictorWarmupProgress({
+  symbolsCompleted = null,
+  chunksCompleted = null,
+  timeframesCompleted = null,
+  lastBatchSummary = null,
+} = {}) {
+  if (Number.isFinite(Number(symbolsCompleted))) {
+    warmupStatus.symbolsCompleted = Math.max(0, Math.floor(Number(symbolsCompleted)));
+  }
+  if (Number.isFinite(Number(chunksCompleted))) {
+    warmupStatus.chunksCompleted = Math.max(0, Math.floor(Number(chunksCompleted)));
+  }
+  if (timeframesCompleted && typeof timeframesCompleted === 'object') {
+    const safe = {};
+    for (const timeframe of ['1Min', '5Min', '15Min']) {
+      safe[timeframe] = Math.max(0, Math.floor(Number(timeframesCompleted[timeframe]) || 0));
+    }
+    warmupStatus.timeframesCompleted = safe;
+  }
+  if (lastBatchSummary && typeof lastBatchSummary === 'object') {
+    warmupStatus.lastBatchSummary = { ...lastBatchSummary };
+  }
+}
+
+function finishPredictorWarmup({ error = null } = {}) {
+  warmupStatus.inProgress = false;
+  warmupStatus.finishedAt = new Date().toISOString();
+  warmupStatus.lastError = error ? String(error?.message || error) : null;
+}
+
+function setPredictorWarmupError(error) {
+  warmupStatus.lastError = error ? String(error?.message || error) : null;
+}
+
+function getPredictorWarmupStatus() {
+  return {
+    ...warmupStatus,
+    timeframesCompleted: { ...warmupStatus.timeframesCompleted },
+    lastBatchSummary: warmupStatus.lastBatchSummary ? { ...warmupStatus.lastBatchSummary } : null,
+  };
+}
+
+function resetPredictorWarmupStatus() {
+  const next = createInitialWarmupStatus();
+  Object.assign(warmupStatus, next);
+}
+
 module.exports = {
   evaluatePredictorWarmupGate,
+  startPredictorWarmup,
+  updatePredictorWarmupProgress,
+  finishPredictorWarmup,
+  setPredictorWarmupError,
+  getPredictorWarmupStatus,
+  resetPredictorWarmupStatus,
 };
-

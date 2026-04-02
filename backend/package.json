@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node startup.test.js && node quoteUtils.test.js && node symbolUtils.test.js && node trade.test.js && node predictorWarmup.test.js && node modules/orderbookMetrics.test.js && node modules/entryMarketDataEval.test.js && node modules/entryMarketDataContext.test.js && node modules/entryUniversePolicy.test.js && node modules/tradeGuards.test.js && node modules/quotes.test.js && node config/runtimeConfig.test.js && node config/validateEnv.test.js && node config/liveDefaults.test.js && node modules/storagePaths.test.js && node trade.telemetryExit.test.js",
+    "test": "node startup.test.js && node auth.test.js && node quoteUtils.test.js && node symbolUtils.test.js && node trade.test.js && node predictorWarmup.test.js && node modules/orderbookMetrics.test.js && node modules/entryMarketDataEval.test.js && node modules/entryMarketDataContext.test.js && node modules/entryUniversePolicy.test.js && node modules/tradeGuards.test.js && node modules/quotes.test.js && node config/runtimeConfig.test.js && node config/validateEnv.test.js && node config/liveDefaults.test.js && node modules/storagePaths.test.js && node trade.telemetryExit.test.js",
     "smoke": "node smoke.test.js",
     "check:runtime-env": "node scripts/check_runtime_env.js",
     "preflight": "node scripts/check_runtime_env.js && node smoke.test.js",

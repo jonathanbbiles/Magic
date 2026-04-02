@@ -31,7 +31,14 @@ const {
 const fs = require('fs');
 const path = require('path');
 const { predictOne, logBarsDebug } = require('./modules/predictor');
-const { evaluatePredictorWarmupGate } = require('./modules/predictorWarmup');
+const {
+  evaluatePredictorWarmupGate,
+  startPredictorWarmup,
+  updatePredictorWarmupProgress,
+  finishPredictorWarmup,
+  setPredictorWarmupError,
+  getPredictorWarmupStatus,
+} = require('./modules/predictorWarmup');
 const { computeATR, atrToBps } = require('./modules/indicators');
 const { computeCorrelationMatrix, clusterSymbols } = require('./modules/correlation');
 const { planTwap, computeNextLimitPrice } = require('./modules/twap');
@@ -476,6 +483,19 @@ function getEntryDiagnosticsSnapshot() {
   };
 }
 
+function getUniverseDiagnosticsSnapshot() {
+  return {
+    ...lastUniverseDiagnostics,
+    acceptedSymbolsSample: Array.isArray(lastUniverseDiagnostics.acceptedSymbolsSample)
+      ? lastUniverseDiagnostics.acceptedSymbolsSample.slice(0, 10)
+      : [],
+  };
+}
+
+function getPredictorWarmupSnapshot() {
+  return getPredictorWarmupStatus();
+}
+
 function getEntryRegimeStaleThresholdMs() {
   return ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS;
 }
@@ -877,6 +897,22 @@ let lastBrokerTradingDisabledExitLogMs = 0;
 let lastEntryScanSummary = null;
 let lastPredictorCandidatesSummary = null;
 let lastEntrySkipReasonsBySymbol = {};
+let lastUniverseDiagnostics = {
+  envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+  effectiveUniverseMode: null,
+  allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+  dynamicTradableSymbolsFound: null,
+  acceptedSymbolsCount: 0,
+  acceptedSymbolsSample: [],
+  configuredPrimaryCount: 0,
+  configuredSecondaryCount: 0,
+  warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
+  warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
+  barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
+  alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
+  lastUniverseRefreshAt: null,
+  fallbackReason: null,
+};
 
 function isTradingBlockedNow() {
   return Date.now() < tradingBlockedUntilMs;
@@ -7958,6 +7994,17 @@ async function fetchCryptoBarsWarmupPaged({
     rateLimited,
     retries,
   });
+  updatePredictorWarmupProgress({
+    lastBatchSummary: {
+      requestedSymbols: normalizedSymbols.length,
+      foundSymbols: foundSymbols.length,
+      missingSymbols: missingSymbols.length,
+      timeframe: timeframeRequested,
+      pages,
+      rateLimited,
+      retries,
+    },
+  });
 
   return {
     bars: barsBySymbol,
@@ -12599,6 +12646,17 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     1,
     Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, chunks.length || 1),
   );
+  startPredictorWarmup({
+    totalSymbolsPlanned: symbols.length,
+    totalChunks: chunks.length,
+  });
+  let symbolsCompleted = 0;
+  let chunksCompleted = 0;
+  const timeframesCompleted = {
+    '1Min': 0,
+    '5Min': 0,
+    '15Min': 0,
+  };
   const processChunk = async (chunkSymbols) => {
     const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
     const orderbooksResp = ENTRY_PREFETCH_ORDERBOOKS
@@ -12652,9 +12710,27 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         for (const [symbol, series] of result.bars15m.entries()) {
           bars15mBySymbol.set(symbol, series);
         }
+        symbolsCompleted += result.bars1m.size;
+        chunksCompleted += 1;
+        timeframesCompleted['1Min'] += 1;
+        timeframesCompleted['5Min'] += 1;
+        timeframesCompleted['15Min'] += 1;
+        updatePredictorWarmupProgress({
+          symbolsCompleted,
+          chunksCompleted,
+          timeframesCompleted,
+          lastBatchSummary: {
+            chunkSymbols: result.bars1m.size,
+            warmupPrefetchConcurrency,
+            chunkSize,
+          },
+        });
       }
     }
+    finishPredictorWarmup();
   } catch (err) {
+    setPredictorWarmupError(err);
+    finishPredictorWarmup({ error: err });
     console.warn('entry_scan_prefetch_failed', {
       errorName: err?.name || null,
       errorMessage: err?.message || String(err),
@@ -12771,6 +12847,7 @@ async function runEntryScanOnce() {
     let universe = [];
     let universeMode = 'dynamic_full_universe';
     let universeModeReason = 'dynamic_default';
+    let fallbackReason = null;
     let dynamicUniverseStats = getSupportedCryptoPairsSnapshot().stats || null;
     if (autoScanSymbols.length) {
       universe = autoScanSymbols;
@@ -12789,6 +12866,7 @@ async function runEntryScanOnce() {
         universe = configuredUniverse.scanSymbols;
         universeMode = 'configured_fallback';
         universeModeReason = 'dynamic_empty_fallback_configured';
+        fallbackReason = universeModeReason;
       }
     } else {
       await loadSupportedCryptoPairs();
@@ -12799,11 +12877,13 @@ async function runEntryScanOnce() {
         universe = configuredUniverse.scanSymbols;
         universeMode = 'configured_fallback';
         universeModeReason = 'dynamic_empty_fallback_configured';
+        fallbackReason = universeModeReason;
       }
       if (!universe.length) {
         universe = CRYPTO_CORE_TRACKED;
         universeMode = 'core_tracked_fallback';
         universeModeReason = 'dynamic_and_configured_empty_fallback_core';
+        fallbackReason = universeModeReason;
       }
     }
     if (ENTRY_UNIVERSE_MODE === 'configured' && !universe.length) {
@@ -12815,6 +12895,7 @@ async function runEntryScanOnce() {
         universe = snapshot.pairs;
         universeMode = 'dynamic_fallback';
         universeModeReason = 'configured_empty_fallback_dynamic';
+        fallbackReason = universeModeReason;
       }
     }
     const normalizedUniverse = universe
@@ -12842,6 +12923,23 @@ async function runEntryScanOnce() {
     const scanSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
+    const supportedSnapshot = getSupportedCryptoPairsSnapshot();
+    lastUniverseDiagnostics = {
+      envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+      effectiveUniverseMode: universeMode,
+      allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+      dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      acceptedSymbolsCount: scanSymbols.length,
+      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      configuredPrimaryCount: configuredUniverse.primaryCount,
+      configuredSecondaryCount: configuredUniverse.secondaryCount,
+      warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
+      warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
+      barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
+      alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
+      lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
+      fallbackReason,
+    };
     console.log('entry_universe_selection', {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
       effectiveUniverseMode: universeMode,
@@ -12859,6 +12957,16 @@ async function runEntryScanOnce() {
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
       nodeEnv: NODE_ENV,
+    });
+    console.log('entry_universe_startup_summary', {
+      requestedMode: ENTRY_UNIVERSE_MODE,
+      effectiveMode: universeMode,
+      acceptedSymbolsCount: scanSymbols.length,
+      dynamicUniverseActive: universeMode.startsWith('dynamic'),
+      warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
+      warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
+      fallbackOccurred: Boolean(fallbackReason),
+      fallbackReason,
     });
     if (
       ENTRY_UNIVERSE_MODE === 'configured' &&
@@ -15545,6 +15653,8 @@ module.exports = {
   runEntryScanOnce,
   getLiveRuntimeTuning,
   getEntryDiagnosticsSnapshot,
+  getUniverseDiagnosticsSnapshot,
+  getPredictorWarmupSnapshot,
   getEntryRegimeStaleThresholdMs,
   requestAlpacaMarketData,
   resolveRegimePenaltyBps,
