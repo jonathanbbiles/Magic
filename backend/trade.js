@@ -15,7 +15,6 @@ const {
   MIN_PROB_TO_ENTER_STRETCH,
 } = require('./config/marketData');
 const {
-  MAX_QUOTE_AGE_MS,
   ABSURD_AGE_MS,
   normalizeQuoteTsMs,
   computeQuoteAgeMs,
@@ -476,9 +475,28 @@ function getLiveRuntimeTuning() {
   };
 }
 
+function getQuoteFreshnessPolicy() {
+  return {
+    entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+    entryRegimeStaleQuoteMaxAgeMs: ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS,
+    sparseRequireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+    sparseStaleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+  };
+}
+
 function getEntryDiagnosticsSnapshot() {
   const ratePressureState = getRatePressureState();
   const skipDetailCounts = lastEntryScanSummary?.skipDetailCounts || {};
+  const staleQuoteRejectionCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => String(reason).includes('stale_quote') || String(reason).includes('quote_stale'))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const insufficientBarsCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => ['predictor_warmup', 'predictor_missing_1m', 'predictor_missing_5m', 'predictor_missing_15m'].includes(String(reason)))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const rateLimitSuppressionCount = Number(lastEntryScanSummary?.marketDataBudget?.cooldownBlocked || 0);
+  const executionFailureCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => ['attempt_failed', 'entry_not_filled', 'intent_rejected'].includes(String(reason)))
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
   const marketRejectionCount = Object.entries(skipDetailCounts)
     .filter(([reason]) => !String(reason).includes('data') && !String(reason).includes('rate') && !String(reason).includes('warmup') && !String(reason).includes('predictor_missing'))
     .reduce((sum, [, count]) => sum + Number(count || 0), 0);
@@ -489,11 +507,25 @@ function getEntryDiagnosticsSnapshot() {
     entryScan: lastEntryScanSummary,
     predictorCandidates: lastPredictorCandidatesSummary,
     skipReasonsBySymbol: lastEntrySkipReasonsBySymbol,
-    quoteFreshness: { entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS, staleEntryQuoteSkips: entryStaleQuoteSkipCount },
+    quoteFreshness: {
+      ...getQuoteFreshnessPolicy(),
+      staleEntryQuoteSkips: entryStaleQuoteSkipCount,
+    },
     gating: {
       marketRejectionCount,
       dataRejectionCount,
+      staleQuoteRejectionCount,
+      insufficientBarsCount,
+      rateLimitSuppressionCount,
+      executionFailureCount,
     },
+    topSkipReasonsRolling: Array.from(entrySkipReasonTotals.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .reduce((acc, [reason, count]) => {
+        acc[reason] = count;
+        return acc;
+      }, {}),
     ratePressureState,
   };
 }
@@ -536,6 +568,51 @@ function noteBarsFallbackAttempt(symbol, timeframe, { success = false } = {}) {
     attempts: nextAttempts,
     untilMs: cooldownMs > 0 ? Date.now() + cooldownMs : 0,
   });
+}
+
+function getStaleQuoteCooldownState(symbol) {
+  const key = normalizeSymbol(symbol);
+  const state = staleQuoteSkipStateBySymbol.get(key) || { attempts: 0, untilMs: 0, skipCount: 0 };
+  const nowMs = Date.now();
+  return {
+    key,
+    attempts: Number(state.attempts) || 0,
+    skipCount: Number(state.skipCount) || 0,
+    untilMs: Number(state.untilMs) || 0,
+    active: Number(state.untilMs) > nowMs,
+    remainingMs: Number(state.untilMs) > nowMs ? Number(state.untilMs) - nowMs : 0,
+  };
+}
+
+function noteStaleQuoteSkip(symbol) {
+  const prev = getStaleQuoteCooldownState(symbol);
+  const attempts = prev.attempts + 1;
+  const cooldownMs = Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * attempts);
+  staleQuoteSkipStateBySymbol.set(prev.key, {
+    attempts,
+    skipCount: prev.skipCount + 1,
+    untilMs: Date.now() + cooldownMs,
+  });
+}
+
+function clearStaleQuoteSkipState(symbol) {
+  if (!symbol) return;
+  const key = normalizeSymbol(symbol);
+  if (!staleQuoteSkipStateBySymbol.has(key)) return;
+  const prev = staleQuoteSkipStateBySymbol.get(key);
+  staleQuoteSkipStateBySymbol.set(key, {
+    attempts: 0,
+    skipCount: Number(prev?.skipCount) || 0,
+    untilMs: 0,
+  });
+}
+
+function incrementEntrySkipReasonTotal(reason) {
+  const normalizedReason = String(reason || 'signal_skip');
+  entrySkipReasonTotals.set(normalizedReason, (entrySkipReasonTotals.get(normalizedReason) || 0) + 1);
+  if (entrySkipReasonTotals.size <= ENTRY_SKIP_REASON_TOTALS_MAX_KEYS) return;
+  const oldestKey = entrySkipReasonTotals.keys().next().value;
+  if (oldestKey) entrySkipReasonTotals.delete(oldestKey);
 }
 
 function shouldCountSparseFallbackReject({ marketDataEval }) {
@@ -707,8 +784,11 @@ const ORDERBOOK_SPARSE_FALLBACK_ENABLED = readEnvFlag('ORDERBOOK_SPARSE_FALLBACK
 const ORDERBOOK_SPARSE_FALLBACK_SYMBOLS = parseSymbolSet(process.env.ORDERBOOK_SPARSE_FALLBACK_SYMBOLS || 'BTC/USD,ETH/USD,AVAX/USD,LINK/USD');
 const ORDERBOOK_SPARSE_MAX_SPREAD_BPS = readNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
 const ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS = readNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
-const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = readNumber('ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS', 5000);
-const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);
+const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = Math.max(1000, runtimeLiveConfig.orderbookSparseRequireQuoteFreshMs);
+const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = Math.max(
+  ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+  runtimeLiveConfig.orderbookSparseStaleQuoteToleranceMs,
+);
 const ORDERBOOK_SPARSE_MIN_PROBABILITY = readNumber('ORDERBOOK_SPARSE_MIN_PROBABILITY', 0.60);
 const ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT = readNumber('ORDERBOOK_SPARSE_CONFIDENCE_CAP_MULT', 0.50);
 const ORDERBOOK_SPARSE_RETRY_ONCE = readEnvFlag('ORDERBOOK_SPARSE_RETRY_ONCE', true);
@@ -777,6 +857,7 @@ function logRuntimeConfigEffective() {
     entrySymbolsSecondary: ENTRY_SYMBOLS_SECONDARY,
     entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
+    quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
   });
 }
 
@@ -890,11 +971,8 @@ const RISK_COOLDOWN_MS = readNumber('RISK_COOLDOWN_MS', 1800000);
 const EXIT_REFRESH_COOLDOWN_MS = 30000;
 const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
 const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
-const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);
-const ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS = Math.max(
-  0,
-  readNumber('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', ENTRY_QUOTE_MAX_AGE_MS),
-);
+const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.entryQuoteMaxAgeMs);
+const ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS = Math.max(ENTRY_QUOTE_MAX_AGE_MS, runtimeLiveConfig.entryRegimeStaleQuoteMaxAgeMs);
 const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
 const CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED = readEnvFlag('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED', false);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
@@ -3724,6 +3802,11 @@ const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
+const staleQuoteSkipStateBySymbol = new Map();
+const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 60000;
+const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS, 10000);
+const ENTRY_SKIP_REASON_TOTALS_MAX_KEYS = 50;
+const entrySkipReasonTotals = new Map();
 let exitManagerRunning = false;
 let exitRepairIntervalId = null;
 let exitManagerIntervalId = null;
@@ -5097,7 +5180,12 @@ async function getQuoteForTrading(symbol, opts = {}) {
     throw new Error(`Quote unavailable for ${symbol}`);
   }
   const quoteAgeMs = Number.isFinite(best.ts) ? Math.max(0, Date.now() - best.ts) : null;
-  console.log('quote_source', { symbol: normalizeSymbol(symbol), source: best.source || 'unknown', quoteAgeMs });
+  console.log('quote_source', {
+    symbol: normalizeSymbol(symbol),
+    source: best.source || 'unknown',
+    quoteAgeMs,
+    maxAgeMs: Number.isFinite(opts.maxAgeMs) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS,
+  });
   return {
     bid: best.bid,
     ask: best.ask,
@@ -7256,7 +7344,7 @@ function applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs })
 }
 
 async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
-  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : ENTRY_QUOTE_MAX_AGE_MS;
   const isCrypto = isCryptoSymbol(symbol);
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
@@ -7338,7 +7426,7 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
 async function getLatestQuote(rawSymbol, opts = {}) {
 
   const symbol = normalizeSymbol(rawSymbol);
-  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : ENTRY_QUOTE_MAX_AGE_MS;
   const forceRefresh = Boolean(opts.forceRefresh || opts.bypassCache);
   const isCrypto = isCryptoSymbol(symbol);
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
@@ -7582,7 +7670,7 @@ quoteRouter.setPrimaryQuoteFetcher(async (symbol, opts = {}) => getLatestQuote(s
 
 async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   const symbol = normalizeSymbol(rawSymbol);
-  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : ENTRY_QUOTE_MAX_AGE_MS;
   const nowMs = Date.now();
   const isCrypto = isCryptoSymbol(symbol);
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
@@ -13241,6 +13329,7 @@ async function runEntryScanOnce() {
     const recordSkip = (reason, symbol, details) => {
       const normalizedReason = reason || 'signal_skip';
       skipDetailCounts.set(normalizedReason, (skipDetailCounts.get(normalizedReason) || 0) + 1);
+      incrementEntrySkipReasonTotal(normalizedReason);
       if (!symbol) return;
       const existing = skipSamples.get(normalizedReason) || [];
       if (existing.length >= 5) return;
@@ -13336,6 +13425,12 @@ async function runEntryScanOnce() {
           continue;
         }
       }
+      const staleCooldown = getStaleQuoteCooldownState(symbol);
+      if (staleCooldown.active) {
+        skipped += 1;
+        recordSkip('stale_quote_cooldown', symbol, { untilMs: staleCooldown.untilMs, remainingMs: staleCooldown.remainingMs, attempts: staleCooldown.attempts });
+        continue;
+      }
 
       const signal = await computeEntrySignal(symbol, {
         prefetchedBars,
@@ -13365,7 +13460,12 @@ async function runEntryScanOnce() {
       }
       if (!signal.entryReady) {
         skipped += 1;
-        if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) entryStaleQuoteSkipCount += 1;
+        if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) {
+          entryStaleQuoteSkipCount += 1;
+          noteStaleQuoteSkip(symbol);
+        } else {
+          clearStaleQuoteSkipState(symbol);
+        }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
         recordSkip(skipReason, symbol, signal.meta || null);
@@ -13381,6 +13481,7 @@ async function runEntryScanOnce() {
       }
 
       signalReadyCount += 1;
+      clearStaleQuoteSkipState(symbol);
       const riskGuard = await maybeUpdateRiskGuards();
       if (!riskGuard.ok || tradingHaltedReason || tradingHaltedByGuard) {
         skipped += 1;
@@ -13680,7 +13781,9 @@ async function runEntryScanOnce() {
       warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
       secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
       entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,
+      staleQuoteCooldownActive: Array.from(staleQuoteSkipStateBySymbol.values()).filter((state) => Number(state?.untilMs) > endMs).length,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -13789,7 +13892,11 @@ function startEntryManager() {
     });
   }, ENTRY_SCAN_INTERVAL_MS);
   logRuntimeConfigEffective();
-  console.log('entry_manager_runtime_config', { stage: 'entry_manager_start', ...getRuntimeConfigSummary() });
+  console.log('entry_manager_runtime_config', {
+    stage: 'entry_manager_start',
+    ...getRuntimeConfigSummary(),
+    quoteFreshness: getQuoteFreshnessPolicy(),
+  });
   console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS, predictorWarmupEnabled: PREDICTOR_WARMUP_ENABLED, predictorWarmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, predictorWarmupLogEveryMs: PREDICTOR_WARMUP_LOG_EVERY_MS });
 }
 
@@ -14539,6 +14646,13 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
   const filledQty = Number(filledOrder?.filled_qty || 0);
+  console.log('entry_fill_handled', {
+    symbol: normalizedSymbol,
+    mode: 'maker_limit',
+    entryOrderId: filledOrder?.id || buyOrder?.id || null,
+    filledQty: Number.isFinite(filledQty) ? filledQty : null,
+    avgPrice: Number.isFinite(avgPrice) ? avgPrice : null,
+  });
   const decisionBid = toFiniteOrNull(decisionSnapshot?.bid);
   const decisionAsk = toFiniteOrNull(decisionSnapshot?.ask);
   const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
@@ -14600,6 +14714,12 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
     entryBid: bid,
     entryAsk: ask,
     entrySpreadBps: spreadBps,
+  });
+  console.log('entry_sell_limit_placed', {
+    symbol: normalizedSymbol,
+    mode: 'maker_limit',
+    sellOrderId: sellOrder?.id || null,
+    entryOrderId: filledOrder.id || buyOrder?.id || null,
   });
 
   return { buy: filledOrder, sell: sellOrder, submitted };
@@ -14844,6 +14964,13 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
 
   const avgFillPrice = Number(filled?.filled_avg_price);
   const filledQty = Number(filled?.filled_qty);
+  console.log('entry_fill_handled', {
+    symbol: normalizedSymbol,
+    mode: 'market_buy',
+    entryOrderId: filled?.id || buyOrder?.id || null,
+    filledQty: Number.isFinite(filledQty) ? filledQty : null,
+    avgPrice: Number.isFinite(avgFillPrice) ? avgFillPrice : null,
+  });
   const decisionMid = toFiniteOrNull(decisionSnapshot?.mid);
   const slippageBps = Number.isFinite(decisionMid) && decisionMid > 0 && Number.isFinite(avgFillPrice)
     ? ((avgFillPrice - decisionMid) / decisionMid) * 10000
@@ -14892,6 +15019,12 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
       entryAsk: ask,
       entrySpreadBps: spreadBps,
 
+    });
+    console.log('entry_sell_limit_placed', {
+      symbol: normalizedSymbol,
+      mode: 'market_buy',
+      sellOrderId: sellOrder?.id || null,
+      entryOrderId: filled.id || buyOrder?.id || null,
     });
 
     return { buy: filled, sell: sellOrder, submitted };

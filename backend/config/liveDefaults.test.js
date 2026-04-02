@@ -30,6 +30,9 @@ withEnv({}, () => {
   assert.ok(tradeSource.includes('const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;'));
   assert.ok(tradeSource.includes('const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;'));
   assert.ok(tradeSource.includes('const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, runtimeLiveConfig.marketdataRateLimitCooldownMs);'));
+  assert.ok(tradeSource.includes('const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.entryQuoteMaxAgeMs);'));
+  assert.ok(tradeSource.includes('const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = Math.max('));
+  assert.ok(!tradeSource.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
   assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
   assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
@@ -49,7 +52,10 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
   assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '120000');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_MAX_AGE_MS, '30000');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '30000');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS, '10000');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS, '30000');
   assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_1M_BARS, '35');
   assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_5M_BARS, '30');
   assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_MIN_15M_BARS, '20');

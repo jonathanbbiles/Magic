@@ -63,6 +63,23 @@ withEnv({}, () => {
   assert.equal(cfg.predictorWarmupMinBars1m, 35);
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
+  assert.equal(cfg.entryQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 10000);
+  assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 30000);
+});
+
+withEnv({
+  ENTRY_QUOTE_MAX_AGE_MS: '45000',
+  ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS: '70000',
+  ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS: '9000',
+  ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: '55000',
+}, () => {
+  const cfg = getRuntimeConfig();
+  assert.equal(cfg.entryQuoteMaxAgeMs, 45000);
+  assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 70000);
+  assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 9000);
+  assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 55000);
 });
 
 console.log('runtime config tests passed');

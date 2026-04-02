@@ -49,6 +49,10 @@ Optional:
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 - `ENTRY_UNIVERSE_MODE` (`dynamic` scans Alpaca tradable pairs at runtime; `configured` uses only symbols you provide via `ENTRY_SYMBOLS_PRIMARY` and optional `ENTRY_SYMBOLS_SECONDARY`)
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (set `true` in production to run the full dynamic Alpaca tradable crypto universe)
+- `ENTRY_QUOTE_MAX_AGE_MS` (runtime-configured entry quote freshness window; default `30000`)
+- `ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS` (runtime-configured regime stale gate; default `30000`)
+- `ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS` (runtime-configured sparse-path fresh quote target; default `10000`)
+- `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS` (runtime-configured sparse stale tolerance cap; default `30000`)
 - `ENTRY_SYMBOLS_PRIMARY` (required when `ENTRY_UNIVERSE_MODE=configured`; provide at least one symbol such as `BTC/USD`)
 - `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
@@ -104,7 +108,10 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - If `API_TOKEN` is not set, route auth middleware is permissive.
 - Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
 - `GET /dashboard` now exposes runtime-truth diagnostics in `meta.universe`, `meta.predictorWarmup`, and `meta.truth` (dynamic universe active flag, accepted symbol count/sample, fallback state/reason, warmup progress, top skip reasons, open positions, and active sell-limit count).
+- `/dashboard` diagnostics explicitly separate market rejection vs stale/data rejection vs insufficient bars vs rate-limit suppression vs execution failures.
 - Entry scanning is cache-first: rolling in-memory quote/orderbook/bar caches are reused between scans, broad warmup is now bounded seeding, and per-symbol bars fallback is budgeted/cooldown-gated under rate pressure.
+- Alpaca **live** execution/account/orders/positions behavior remains unchanged; dynamic full-universe scanning remains unchanged.
+- Entry quote freshness is unified under runtime config (no hidden entry-path fallback literals), stale-data protection remains active, and market-condition rejections remain distinct from data-quality rejections.
 
 ## Bulletproof upgrade env vars
 

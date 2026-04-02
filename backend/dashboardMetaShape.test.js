@@ -20,6 +20,11 @@ const source = fs.readFileSync(path.resolve(__dirname, 'index.js'), 'utf8');
   'predictorWarmup',
   'engineState',
   'topSkipReasons',
+  'topSkipReasonsRolling',
+  'staleQuoteRejectionCount',
+  'insufficientBarsCount',
+  'rateLimitSuppressionCount',
+  'executionFailureCount',
   'skipReasonsBySymbol',
   'signalBlockedByWarmupCount',
 ].forEach((token) => {

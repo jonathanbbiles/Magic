@@ -248,6 +248,13 @@ const tradeSourceEarly = fs.readFileSync(path.resolve(__dirname, 'trade.js'), 'u
 assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetConfigured: ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN'));
 assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetEffective: sparseConfirmBudgetEffective'));
 assert.ok(tradeSourceEarly.includes('providerAgeMs: sparseRetryDetails.providerAgeMs'));
+assert.ok(tradeSourceEarly.includes('entryQuoteFreshness: getQuoteFreshnessPolicy()'));
+assert.ok(!tradeSourceEarly.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
+assert.ok(!tradeSourceEarly.includes("const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);"));
+
+const quoteFreshness = tradeLifecycle.getEntryDiagnosticsSnapshot()?.quoteFreshness || {};
+assert.equal(typeof quoteFreshness.entryQuoteMaxAgeMs, 'number');
+assert.equal(typeof quoteFreshness.sparseStaleQuoteToleranceMs, 'number');
 
 const desiredLimitFromEntry = computeTargetSellPrice(100, 75, 0.01);
 assert.equal(desiredLimitFromEntry, 100.75);

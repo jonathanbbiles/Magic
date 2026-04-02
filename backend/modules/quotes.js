@@ -72,10 +72,18 @@ async function getBestQuote(symbol, opts = {}) {
   }
   lastFetchBySymbol.set(symbol, Date.now());
 
-  const maxAgeMs = Number.isFinite(Number(opts.maxAgeMs)) ? Number(opts.maxAgeMs) : readNumber('MAX_QUOTE_AGE_MS', 8000);
+  const maxAgeMs = Number.isFinite(Number(opts.maxAgeMs)) ? Number(opts.maxAgeMs) : readNumber('MAX_QUOTE_AGE_MS', 30000);
   const primary = await getPrimaryQuote(symbol, opts).catch(() => null);
+  const secondary = await getSecondaryQuote(symbol).catch(() => null);
   const primaryAge = primary && Number.isFinite(primary.tsMs) ? Math.max(0, Date.now() - primary.tsMs) : null;
-  if (primary && (!Number.isFinite(primaryAge) || primaryAge <= maxAgeMs)) {
+  const secondaryAge = secondary && Number.isFinite(secondary.ts) ? Math.max(0, Date.now() - secondary.ts) : null;
+  const primaryFresh = Boolean(primary && (!Number.isFinite(primaryAge) || primaryAge <= maxAgeMs));
+  const secondaryFresh = Boolean(secondary && (!Number.isFinite(secondaryAge) || secondaryAge <= maxAgeMs));
+
+  // Source priority is explicit:
+  // 1) Prefer Alpaca primary when it is fresh and at least as fresh as secondary (trustworthy direct source wins ties).
+  // 2) Use secondary only when it is materially fresher than primary or primary is unavailable/stale.
+  if (primaryFresh && (!secondaryFresh || !Number.isFinite(secondaryAge) || !Number.isFinite(primaryAge) || primaryAge <= secondaryAge)) {
     return {
       bid: primary.bid,
       ask: primary.ask,
@@ -84,11 +92,7 @@ async function getBestQuote(symbol, opts = {}) {
       source: 'primary',
     };
   }
-  const secondary = await getSecondaryQuote(symbol).catch(() => null);
-  const age = secondary && Number.isFinite(secondary.ts) ? Math.max(0, Date.now() - secondary.ts) : null;
-  if (secondary && (!Number.isFinite(age) || age <= maxAgeMs)) {
-    return secondary;
-  }
+  if (secondaryFresh) return secondary;
   if (primary) {
     return {
       bid: primary.bid,
