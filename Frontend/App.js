@@ -40,7 +40,10 @@ const BASE_URL =
 
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
-const DASHBOARD_FETCH_TIMEOUT_MS = 9000;
+const DASHBOARD_FETCH_TIMEOUT_MS = 20000;
+const DASHBOARD_INITIAL_RETRIES = 3;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function fetchDashboard() {
   const url = `${String(BASE_URL).replace(/\/$/, '')}/dashboard`;
@@ -79,6 +82,32 @@ async function fetchDashboard() {
     throw err;
   }
   return json;
+}
+
+function isTransientFetchError(err) {
+  const status = Number(err?.status);
+  if ([408, 425, 429, 500, 502, 503, 504].includes(status)) return true;
+  const message = String(err?.message || '').toLowerCase();
+  return (
+    message.includes('timed out') ||
+    message.includes('network request failed') ||
+    message.includes('failed to fetch') ||
+    message.includes('network')
+  );
+}
+
+async function fetchDashboardWithRetry({ retries = 0 } = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetchDashboard();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === retries || !isTransientFetchError(err)) throw err;
+      await sleep(Math.min(1500 * (attempt + 1), 5000));
+    }
+  }
+  throw lastErr;
 }
 
 function toNum(v) {
@@ -225,7 +254,7 @@ export default function App() {
     if (isRefresh) setRefreshing(true);
     if (!isRefresh) setLoading(true);
     try {
-      const payload = await fetchDashboard();
+      const payload = await fetchDashboardWithRetry({ retries: isRefresh ? 1 : DASHBOARD_INITIAL_RETRIES });
       setDashboard(payload);
       setError(null);
     } catch (err) {
@@ -285,6 +314,9 @@ export default function App() {
   const risk = meta?.risk || {};
   const concurrency = meta?.concurrency || {};
   const quoteFreshness = meta?.quoteFreshness || {};
+  const universe = meta?.universe || {};
+  const warmup = meta?.predictorWarmup || {};
+  const warmupInProgress = Boolean(warmup?.inProgress);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -379,10 +411,43 @@ export default function App() {
                   correlationGuardEnabled: risk?.correlationGuardEnabled,
                 })}</Text>
               </View>
+              <View style={styles.diagnosticsBlock}>
+                <Text style={styles.diagnosticsTitle}>Universe truth</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify({
+                  requested: universe?.envRequestedUniverseMode,
+                  effective: universe?.effectiveUniverseMode,
+                  allowDynamicInProd: universe?.allowDynamicUniverseInProduction,
+                  dynamicTradableSymbolsFound: universe?.dynamicTradableSymbolsFound,
+                  acceptedSymbolsCount: universe?.acceptedSymbolsCount,
+                  configuredPrimaryCount: universe?.configuredPrimaryCount,
+                  configuredSecondaryCount: universe?.configuredSecondaryCount,
+                  sample: universe?.acceptedSymbolsSample,
+                  fallbackReason: universe?.fallbackReason,
+                  lastUniverseRefreshAt: universe?.lastUniverseRefreshAt,
+                })}</Text>
+                <Text style={styles.diagnosticsTitle}>Predictor warmup</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify({
+                  inProgress: warmupInProgress,
+                  startedAt: warmup?.startedAt,
+                  finishedAt: warmup?.finishedAt,
+                  totalSymbolsPlanned: warmup?.totalSymbolsPlanned,
+                  symbolsCompleted: warmup?.symbolsCompleted,
+                  chunksCompleted: warmup?.chunksCompleted,
+                  totalChunks: warmup?.totalChunks,
+                  timeframesCompleted: warmup?.timeframesCompleted,
+                  lastBatchSummary: warmup?.lastBatchSummary,
+                  lastError: warmup?.lastError,
+                })}</Text>
+              </View>
 
               {error ? (
                 <View style={styles.errorBanner}>
                   <Text style={styles.errorText}>{error}</Text>
+                  {warmupInProgress ? (
+                    <Text style={styles.errorHint}>
+                      ⏳ Backend is warming up market data. Progress: {toNum(warmup?.symbolsCompleted) ?? 0}/{toNum(warmup?.totalSymbolsPlanned) ?? '—'} symbols.
+                    </Text>
+                  ) : null}
                   <Text style={styles.errorHint}>
                     🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
                   </Text>
@@ -390,6 +455,11 @@ export default function App() {
               ) : null}
 
               {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
+              {!error && warmupInProgress ? (
+                <Text style={styles.empty}>
+                  ⏳ warming up market data ({toNum(warmup?.symbolsCompleted) ?? 0}/{toNum(warmup?.totalSymbolsPlanned) ?? '—'} symbols)
+                </Text>
+              ) : null}
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
             </View>
           }

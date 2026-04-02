@@ -84,6 +84,8 @@ const {
   getLifecycleSnapshot,
   getSessionGovernorSummary,
   getEntryDiagnosticsSnapshot,
+  getUniverseDiagnosticsSnapshot,
+  getPredictorWarmupSnapshot,
   getEntryRegimeStaleThresholdMs,
 } = require('./trade');
 
@@ -631,6 +633,8 @@ app.get('/dashboard', async (req, res) => {
     const concurrency = await getConcurrencyGuardStatus().catch(() => null);
     const scorecard = closedTradeStats.buildScorecard();
     const entryDiagnostics = getEntryDiagnosticsSnapshot();
+    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
+    const predictorWarmup = getPredictorWarmupSnapshot();
     const lastError = getLastHttpError();
     const lastQuote = getLastQuoteSnapshot();
     const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
@@ -750,6 +754,8 @@ app.get('/dashboard', async (req, res) => {
         risk: managerStatus?.risk || null,
         concurrency: concurrency || null,
         quoteFreshness: entryDiagnostics?.quoteFreshness || null,
+        universe: universeDiagnostics,
+        predictorWarmup,
         scorecard,
       },
       diagnostics: {

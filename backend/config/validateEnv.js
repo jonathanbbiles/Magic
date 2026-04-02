@@ -45,6 +45,7 @@ const parseBooleanEnv = (name, defaultValue) => {
   if (['false', '0', 'no', 'n', 'off'].includes(raw)) return false;
   throw new Error(`${name} must be a boolean-like value (true/false/1/0/yes/no/on/off). Received: "${process.env[name]}"`);
 };
+const isTrueLike = (value) => ['true', '1', 'yes', 'y', 'on'].includes(String(value ?? '').trim().toLowerCase());
 
 const parseFiniteNumberEnv = (name, defaultValue) => {
   const raw = process.env[name];
@@ -136,11 +137,52 @@ const validateEnv = () => {
   const effectiveTradeBase = normalizeTradeBase(RAW_TRADE_BASE);
   const effectiveDataBase = normalizeDataBase(RAW_DATA_BASE);
   const apiToken = String(process.env.API_TOKEN || '').trim();
+  const alpacaKeyRaw =
+    process.env.APCA_API_KEY_ID ||
+    process.env.ALPACA_KEY_ID ||
+    process.env.ALPACA_API_KEY_ID ||
+    process.env.ALPACA_API_KEY ||
+    '';
+  const alpacaSecretRaw =
+    process.env.APCA_API_SECRET_KEY ||
+    process.env.ALPACA_SECRET_KEY ||
+    process.env.ALPACA_API_SECRET_KEY ||
+    '';
   const corsAllowedOrigins = parseCorsOrigins(process.env.CORS_ALLOWED_ORIGINS);
   const corsAllowedRegexes = parseCorsRegexes(process.env.CORS_ALLOWED_ORIGIN_REGEX);
   const corsAllowLan = String(process.env.CORS_ALLOW_LAN || '').toLowerCase() === 'true';
   const recorderEnabled = resolveRecorderEnabled();
   const validationErrors = [];
+  const nodeEnv = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
+  const strictSecretsMode = nodeEnv === 'production' || isTrueLike(process.env.LIVE) || isTrueLike(process.env.LIVE_MODE) || isTrueLike(process.env.LIVE_TRADING);
+  const placeholderSecretPatterns = [
+    /<[^>]+>/i,
+    /^changeme$/i,
+    /^change[-_ ]?me$/i,
+    /^replace[-_ ]?me$/i,
+    /^your[-_ ]?(token|key|secret)$/i,
+    /^test(?:[-_ ]?token)?$/i,
+    /^example$/i,
+    /^placeholder$/i,
+    /^dummy$/i,
+    /^fake$/i,
+  ];
+  const assertNonPlaceholderSecret = (name, value, { required = false, provided = false } = {}) => {
+    if (!strictSecretsMode) return;
+    const raw = String(value ?? '').trim();
+    if (!raw) {
+      if (required || provided) {
+        validationErrors.push(`${name} is required in production/live mode and cannot be empty.`);
+      }
+      return;
+    }
+    const lowered = raw.toLowerCase();
+    const hasPatternMatch = placeholderSecretPatterns.some((pattern) => pattern.test(raw));
+    const looksSentinel = lowered.includes('your ') || lowered.includes('example') || lowered.includes('placeholder');
+    if (hasPatternMatch || looksSentinel) {
+      validationErrors.push(`${name} appears to be a placeholder value in production/live mode. Set a real secret via environment variables.`);
+    }
+  };
 
   if (!process.env.TRADE_BASE) {
     console.warn('config_warning', {
@@ -171,6 +213,13 @@ const validateEnv = () => {
       message: 'API_TOKEN not set. Backend endpoints are unprotected.',
     });
   }
+  assertNonPlaceholderSecret('API_TOKEN', apiToken, { required: true, provided: Object.prototype.hasOwnProperty.call(process.env, 'API_TOKEN') });
+  const alpacaKeyProvided = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY']
+    .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
+  const alpacaSecretProvided = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY']
+    .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
+  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: false, provided: alpacaKeyProvided });
+  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: false, provided: alpacaSecretProvided });
 
   corsAllowedOrigins.forEach((origin) => {
     parseUrl('CORS_ALLOWED_ORIGINS', origin);

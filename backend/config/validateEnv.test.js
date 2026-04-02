@@ -133,6 +133,25 @@ withEnv({ NODE_ENV: 'development', ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC
   assert.doesNotThrow(() => validateEnv());
 });
 
+withEnv({
+  NODE_ENV: 'production',
+  ENTRY_UNIVERSE_MODE: 'configured',
+  ENTRY_SYMBOLS_PRIMARY: 'BTC/USD',
+  API_TOKEN: '<your long random token>',
+}, () => {
+  assert.throws(() => validateEnv(), /API_TOKEN appears to be a placeholder value/);
+});
+
+withEnv({
+  NODE_ENV: 'production',
+  ENTRY_UNIVERSE_MODE: 'configured',
+  ENTRY_SYMBOLS_PRIMARY: 'BTC/USD',
+  APCA_API_KEY_ID: '<your alpaca key id>',
+  APCA_API_SECRET_KEY: '<your alpaca secret>',
+}, () => {
+  assert.throws(() => validateEnv(), /APCA_API_KEY_ID\/ALPACA_KEY_ID appears to be a placeholder value/);
+});
+
 withEnv({ MARKETDATA_ORDERBOOK_TTL_MS: '0' }, () => {
   assert.throws(() => validateEnv(), /MARKETDATA_ORDERBOOK_TTL_MS must be between 1 and 600000/);
 });

@@ -123,11 +123,20 @@ assert.equal(
 const tradeLifecycle = loadTrade({ ENGINE_V2_ENABLED: '1', ENTRY_INTENTS_ENABLED: '1' });
 assert.equal(typeof tradeLifecycle.getLifecycleSnapshot, 'function');
 assert.equal(typeof tradeLifecycle.getSessionGovernorSummary, 'function');
+assert.equal(typeof tradeLifecycle.getUniverseDiagnosticsSnapshot, 'function');
+assert.equal(typeof tradeLifecycle.getPredictorWarmupSnapshot, 'function');
 const lifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
 assert.equal(typeof lifecycleSnapshot, 'object');
 assert.equal(typeof lifecycleSnapshot.authoritativeCount, 'number');
 const governorSnapshot = tradeLifecycle.getSessionGovernorSummary();
 assert.equal(typeof governorSnapshot.coolDownActive, 'boolean');
+const universeSnapshot = tradeLifecycle.getUniverseDiagnosticsSnapshot();
+assert.equal(typeof universeSnapshot, 'object');
+assert.ok(Object.prototype.hasOwnProperty.call(universeSnapshot, 'envRequestedUniverseMode'));
+assert.ok(Object.prototype.hasOwnProperty.call(universeSnapshot, 'effectiveUniverseMode'));
+const warmupSnapshot = tradeLifecycle.getPredictorWarmupSnapshot();
+assert.equal(typeof warmupSnapshot, 'object');
+assert.ok(Object.prototype.hasOwnProperty.call(warmupSnapshot, 'inProgress'));
 
 const tradeManagers = loadTrade({ TRADING_ENABLED: '0' });
 tradeManagers.__resetManagerIntervalsForTests();
