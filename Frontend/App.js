@@ -279,6 +279,12 @@ export default function App() {
   const firstSkip = firstSkipSymbol && Array.isArray(skipReasonsBySymbol[firstSkipSymbol])
     ? skipReasonsBySymbol[firstSkipSymbol][0]
     : null;
+  const meta = dashboard?.meta || {};
+  const scorecard = meta?.scorecard || {};
+  const sizing = meta?.sizing || {};
+  const risk = meta?.risk || {};
+  const concurrency = meta?.concurrency || {};
+  const quoteFreshness = meta?.quoteFreshness || {};
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -351,6 +357,27 @@ export default function App() {
                     sparseRetry: firstSkip.sparseRetry,
                   }) : '—'}
                 </Text>
+              </View>
+              <View style={styles.diagnosticsBlock}>
+                <Text style={styles.diagnosticsTitle}>Closed-trade scorecard</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify(scorecard)}</Text>
+                <Text style={styles.diagnosticsTitle}>Sizing / concurrency</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify({
+                  mode: sizing?.activeMode,
+                  kellyEnabled: sizing?.kellyEnabled,
+                  kellyShadowMode: sizing?.kellyShadowMode,
+                  activeSlotsUsed: concurrency?.activeSlotsUsed,
+                  cap: concurrency?.capMaxEffective,
+                })}</Text>
+                <Text style={styles.diagnosticsTitle}>Quote freshness / guards</Text>
+                <Text style={styles.diagnosticsText}>{JSON.stringify({
+                  entryQuoteMaxAgeMs: quoteFreshness?.entryQuoteMaxAgeMs,
+                  staleEntryQuoteSkips: quoteFreshness?.staleEntryQuoteSkips,
+                  drawdownPct: risk?.drawdownPct,
+                  dailyDrawdownPct: risk?.dailyDrawdownPct,
+                  drawdownGuardEnabled: risk?.drawdownGuardEnabled,
+                  correlationGuardEnabled: risk?.correlationGuardEnabled,
+                })}</Text>
               </View>
 
               {error ? (

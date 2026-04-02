@@ -25,6 +25,7 @@ const { getFailureSnapshot } = require('./symbolFailures');
 const { normalizePair } = require('./symbolUtils');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
+const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 
@@ -627,6 +628,8 @@ app.get('/dashboard', async (req, res) => {
     const lifecycleSnapshot = getLifecycleSnapshot();
     const governorSummary = getSessionGovernorSummary();
     const managerStatus = getTradingManagerStatus();
+    const concurrency = await getConcurrencyGuardStatus().catch(() => null);
+    const scorecard = closedTradeStats.buildScorecard();
     const entryDiagnostics = getEntryDiagnosticsSnapshot();
     const lastError = getLastHttpError();
     const lastQuote = getLastQuoteSnapshot();
@@ -709,6 +712,11 @@ app.get('/dashboard', async (req, res) => {
           entryPriceUsed: toFiniteNumberOrNull(botState?.entryPriceUsed),
           sellOrderId: botState?.sellOrderId || null,
           sellOrderSubmittedAt: botState?.sellOrderSubmittedAt || null,
+          expectedOpenSell: Boolean(botState?.expectedOpenSell),
+          brokerOpenSellFound: Boolean(botState?.brokerOpenSellFound),
+          brokerOpenSellQty: toFiniteNumberOrNull(botState?.brokerOpenSellQty),
+          lastSeenOpenSellAt: botState?.lastSeenOpenSellAt || null,
+          reconciliationState: botState?.reconciliationState || null,
         },
       };
     });
@@ -738,6 +746,11 @@ app.get('/dashboard', async (req, res) => {
           authoritativeCount: lifecycleSnapshot?.authoritativeCount || 0,
           failedEntries: governorSummary?.failedEntries || 0,
         },
+        sizing: managerStatus?.sizing || null,
+        risk: managerStatus?.risk || null,
+        concurrency: concurrency || null,
+        quoteFreshness: entryDiagnostics?.quoteFreshness || null,
+        scorecard,
       },
       diagnostics: {
         entryScan: entryDiagnostics?.entryScan || null,
@@ -792,6 +805,19 @@ app.get('/debug/forensics/:tradeId', (req, res) => {
     return res.status(404).json({ error: 'forensics_not_found' });
   }
   return res.json(item);
+});
+
+app.get('/dashboard/scorecard', (req, res) => {
+  const limit = Number(req.query?.limit || 5000);
+  res.json({
+    ts: new Date().toISOString(),
+    scorecard: closedTradeStats.buildScorecard(limit),
+  });
+});
+
+app.get('/debug/trades/closed', (req, res) => {
+  const limit = Number(req.query?.limit || 200);
+  res.json({ items: closedTradeStats.getRecent(limit) });
 });
 
 app.get('/debug/labels/recent', (req, res) => {

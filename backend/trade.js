@@ -38,6 +38,7 @@ const { planTwap, computeNextLimitPrice } = require('./modules/twap');
 const quoteRouter = require('./modules/quotes');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
+const closedTradeStats = require('./modules/closedTradeStats');
 const { quoteLimiter } = require('./limiters');
 const {
   evaluateMomentumState,
@@ -297,6 +298,7 @@ const ENTRY_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.ENTRY_SLIPPAGE_BUFFER
 const ENTRY_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER2);
 const EXIT_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER1);
 const EXIT_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER2);
+const ENTRY_TAKE_PROFIT_BPS_RAW = Number(process.env.ENTRY_TAKE_PROFIT_BPS);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
@@ -323,13 +325,17 @@ const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const ORDER_FETCH_THROTTLE_MS = 1000;
+const EXIT_RECON_MISS_THRESHOLD = Math.max(1, readNumber('EXIT_RECON_MISS_THRESHOLD', 2));
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
 const REPRICE_TTL_MS = readNumber('REPRICE_TTL_MS', SELL_ORDER_TTL_MS);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 // Stop-loss distance (bps). If unset, use a smaller default that makes EV gating realistic for scalping.
 // You can always override via STOP_LOSS_BPS in the environment.
-const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', Math.max(30, Math.round(TARGET_PROFIT_BPS * 0.5)));
+const STOP_LOSS_BPS = readNumber(
+  'STOP_LOSS_BPS',
+  Math.max(30, Math.round((Number.isFinite(ENTRY_TAKE_PROFIT_BPS_RAW) ? ENTRY_TAKE_PROFIT_BPS_RAW : TARGET_PROFIT_BPS) * 0.5)),
+);
 const STOPS_ENABLED = readEnvFlag('STOPS_ENABLED', true);
 const STOPLOSS_ENABLED = readEnvFlag('STOPLOSS_ENABLED', true);
 const STOPLOSS_MODE = String(process.env.STOPLOSS_MODE || 'atr').trim().toLowerCase();
@@ -353,7 +359,7 @@ const KELLY_MAX_FRACTION = readNumber('KELLY_MAX_FRACTION', 0.05);
 const KELLY_MIN_PROB_EDGE = readNumber('KELLY_MIN_PROB_EDGE', 0.02);
 const KELLY_MIN_REWARD_RISK = readNumber('KELLY_MIN_REWARD_RISK', 1.10);
 const KELLY_USE_CONFIDENCE_MULT = readEnvFlag('KELLY_USE_CONFIDENCE_MULT', true);
-const KELLY_SHADOW_MODE = readEnvFlag('KELLY_SHADOW_MODE', true);
+const KELLY_SHADOW_MODE = readEnvFlag('KELLY_SHADOW_MODE', false);
 const CORRELATION_GUARD_ENABLED = readEnvFlag('CORRELATION_GUARD_ENABLED', false);
 const CORRELATION_LOOKBACK_BARS = readNumber('CORRELATION_LOOKBACK_BARS', 120);
 const CORRELATION_MAX = readNumber('CORRELATION_MAX', 0.75);
@@ -466,6 +472,7 @@ function getEntryDiagnosticsSnapshot() {
     entryScan: lastEntryScanSummary,
     predictorCandidates: lastPredictorCandidatesSummary,
     skipReasonsBySymbol: lastEntrySkipReasonsBySymbol,
+    quoteFreshness: { entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS, staleEntryQuoteSkips: entryStaleQuoteSkipCount },
   };
 }
 
@@ -675,7 +682,7 @@ const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
 // Entry gating should be aligned to the REAL take-profit you actually execute.
 // This is the "take OK profit" target.
-const ENTRY_TAKE_PROFIT_BPS = readNumber('ENTRY_TAKE_PROFIT_BPS', MAX_GROSS_TAKE_PROFIT_BASIS_POINTS);
+const ENTRY_TAKE_PROFIT_BPS = readNumber('ENTRY_TAKE_PROFIT_BPS', TARGET_PROFIT_BPS);
 
 // This is the "stretch confidence" target (predict bigger than you take).
 // Default keeps existing behavior (TARGET_MOVE_BPS).
@@ -685,7 +692,7 @@ const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
-const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 0);
+const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
 
 function logRuntimeConfigEffective() {
   console.log('runtime_config_effective', {
@@ -825,7 +832,7 @@ const RISK_COOLDOWN_MS = readNumber('RISK_COOLDOWN_MS', 1800000);
 const EXIT_REFRESH_COOLDOWN_MS = 30000;
 const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
 const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
-const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000);
+const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);
 const ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS = Math.max(
   0,
   readNumber('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', ENTRY_QUOTE_MAX_AGE_MS),
@@ -1117,7 +1124,7 @@ function normalizeSymbolTier(symbolTier) {
   return symbolTier === 'tier1' || symbolTier === 'tier2' || symbolTier === 'tier3' ? symbolTier : 'default';
 }
 
-function resolveEntryTakeProfitBps(symbolTier) {
+function getConfiguredTargetProfitBpsForTier(symbolTier) {
   const tier = normalizeSymbolTier(symbolTier);
   if (tier === 'tier1' && Number.isFinite(ENTRY_TAKE_PROFIT_BPS_TIER1)) return ENTRY_TAKE_PROFIT_BPS_TIER1;
   if (tier === 'tier2' && Number.isFinite(ENTRY_TAKE_PROFIT_BPS_TIER2)) return ENTRY_TAKE_PROFIT_BPS_TIER2;
@@ -1126,7 +1133,7 @@ function resolveEntryTakeProfitBps(symbolTier) {
 
 function resolveEntryStretchMoveBps(symbolTier, resolvedTakeProfitBps) {
   const tier = normalizeSymbolTier(symbolTier);
-  const tpTarget = Number.isFinite(resolvedTakeProfitBps) ? resolvedTakeProfitBps : resolveEntryTakeProfitBps(symbolTier);
+  const tpTarget = Number.isFinite(resolvedTakeProfitBps) ? resolvedTakeProfitBps : getConfiguredTargetProfitBpsForTier(symbolTier);
   let stretchTarget = ENTRY_STRETCH_MOVE_BPS;
   if (tier === 'tier1' && Number.isFinite(ENTRY_STRETCH_MOVE_BPS_TIER1)) stretchTarget = ENTRY_STRETCH_MOVE_BPS_TIER1;
   if (tier === 'tier2' && Number.isFinite(ENTRY_STRETCH_MOVE_BPS_TIER2)) stretchTarget = ENTRY_STRETCH_MOVE_BPS_TIER2;
@@ -1147,6 +1154,12 @@ function resolveEntrySlippageBufferBps(symbolTier) {
   return ENTRY_SLIPPAGE_BUFFER_BPS;
 }
 
+
+function getConfiguredTargetProfitBpsForSymbol(symbol) {
+  const executionTierPolicy = getExecutionTierPolicy();
+  const tier = resolveSymbolTier(symbol, executionTierPolicy);
+  return getConfiguredTargetProfitBpsForTier(tier);
+}
 function resolveExitSlippageBufferBps(symbolTier) {
   const tier = normalizeSymbolTier(symbolTier);
   if (tier === 'tier1' && Number.isFinite(EXIT_SLIPPAGE_BUFFER_BPS_TIER1)) return EXIT_SLIPPAGE_BUFFER_BPS_TIER1;
@@ -1339,7 +1352,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     : ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN;
   const executionTierPolicy = getExecutionTierPolicy();
   const symbolTier = resolveSymbolTier(asset.symbol, executionTierPolicy);
-  const resolvedEntryTakeProfitBps = resolveEntryTakeProfitBps(symbolTier);
+  const resolvedEntryTakeProfitBps = getConfiguredTargetProfitBpsForTier(symbolTier);
   const resolvedEntryStretchMoveBps = resolveEntryStretchMoveBps(symbolTier, resolvedEntryTakeProfitBps);
   const resolvedEntrySlippageBufferBps = resolveEntrySlippageBufferBps(symbolTier);
   const resolvedExitSlippageBufferBps = resolveExitSlippageBufferBps(symbolTier);
@@ -1356,7 +1369,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
     maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
     requiredEdgeBps,
-    targetProfitBps: TARGET_PROFIT_BPS,
+    targetProfitBps: resolvedEntryTakeProfitBps,
     entryBufferBps: ENTRY_BUFFER_BPS,
     orderbookBandBps: ORDERBOOK_BAND_BPS,
     orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
@@ -1410,7 +1423,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       return {
         entryReady: false,
         why: 'stale_quote',
-        meta: { symbol: asset.symbol, error: err?.message || err },
+        meta: { symbol: asset.symbol, error: err?.message || err, staleEntryQuote: true },
         record: baseRecord,
       };
     }
@@ -2366,6 +2379,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     return {
       entryReady: false,
       why: 'quote_stale_regime_gate',
+      staleEntryQuote: true,
       meta: {
         symbol: asset.symbol,
         quoteAgeMs,
@@ -2438,7 +2452,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         spreadBps,
         requiredEdgeBps: edgeRequirements.requiredEdgeBps,
         maxAffordableSpreadBps: edgeRequirements.maxAffordableSpreadBps,
-        targetProfitBps: TARGET_PROFIT_BPS,
+        targetProfitBps: resolvedEntryTakeProfitBps,
       },
       record: baseRecord,
     };
@@ -2738,7 +2752,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     // Optional slippage cost (bps). Default 0 unless user sets SLIPPAGE_BPS.
     const slipBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : 0;
     const costBps = feesRoundTripBps + spreadCostBps + slipBps;
-    const grossWinBps = TARGET_PROFIT_BPS;
+    const grossWinBps = resolvedEntryTakeProfitBps;
     const grossLossBps = STOP_LOSS_BPS;
     const netWinBps = grossWinBps - costBps;
     const netLossBps = grossLossBps + costBps;
@@ -2963,7 +2977,7 @@ function buildForensicsDecisionSnapshot({ normalizedSymbol, quote, signalRecord 
       maxSpreadBpsToEnter: MAX_SPREAD_BPS_TO_ENTER,
     },
     thresholds: {
-      targetProfitBps: TARGET_PROFIT_BPS,
+      targetProfitBps: resolvedEntryTakeProfitBps,
       minProbToEnter: MIN_PROB_TO_ENTER,
       minProbToEnterTp: MIN_PROB_TO_ENTER_TP,
       minProbToEnterStretch: MIN_PROB_TO_ENTER_STRETCH,
@@ -3581,6 +3595,7 @@ const QUOTE_COOLDOWN_MS = 300000;
 const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
+let entryStaleQuoteSkipCount = 0;
 let exitManagerRunning = false;
 let exitRepairIntervalId = null;
 let exitManagerIntervalId = null;
@@ -3763,6 +3778,7 @@ let equityTodayOpen = null;
 let equityTodayKey = null;
 let lastRiskMetricsLogAt = 0;
 let tradingHaltedByGuard = false;
+let lastRiskSnapshot = null;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
 
  
@@ -3788,7 +3804,7 @@ function computeEntryEdgeRequirements({
   profitBufferBps,
   symbolTier,
 } = {}) {
-  const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : resolveEntryTakeProfitBps(symbolTier);
+  const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : getConfiguredTargetProfitBpsForTier(symbolTier);
   const feeBpsRoundTripUsed = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : (Number(FEE_BPS_ROUND_TRIP) || 0);
   const entrySlippageBpsUsed = Number(resolveEntrySlippageBufferBps(symbolTier)) || 0;
   const exitSlippageBpsUsed = Number(resolveExitSlippageBufferBps(symbolTier)) || 0;
@@ -3863,12 +3879,12 @@ function computeRequiredExitBpsNet({ feeBpsRoundTrip, minNetProfitBps, spreadBps
   return fee + minNet + buffer;
 }
 
-function logEntryDecision({ symbol, spreadBps, requiredEdgeBps }) {
+function logEntryDecision({ symbol, spreadBps, requiredEdgeBps, targetProfitBps = null }) {
   console.log('entry_decision', {
     symbol,
     spreadBps,
     requiredEdgeBps,
-    targetProfitBps: TARGET_PROFIT_BPS,
+    targetProfitBps: Number.isFinite(targetProfitBps) ? targetProfitBps : getConfiguredTargetProfitBpsForSymbol(symbol),
     decision: 'enter',
   });
 }
@@ -5003,6 +5019,7 @@ async function maybeUpdateRiskGuards() {
     tradingHaltedReason = 'kill_switch_file';
     tradingHaltedByGuard = true;
   }
+  lastRiskSnapshot = { drawdownPct, dailyDrawdownPct };
   if (DRAWDOWN_GUARD_ENABLED && (drawdownPct >= MAX_DRAWDOWN_PCT || dailyDrawdownPct >= DAILY_DRAWDOWN_PCT)) {
     tradingHaltedReason = 'drawdown_guard';
     tradingHaltedByGuard = true;
@@ -5493,7 +5510,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: TARGET_PROFIT_BPS,
+      targetProfitBps: resolvedEntryTakeProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -6655,6 +6672,11 @@ async function resolveExitSellabilityFromBrokerTruth({
       openOrders: openList,
       trackedState,
     });
+    trackedState.expectedOpenSell = Boolean(trackedOrderId || trackedClientOrderId);
+    trackedState.brokerOpenSellFound = finalSellability.openSellCount > 0;
+    trackedState.brokerOpenSellQty = finalSellability.openSellQty;
+    trackedState.lastSeenOpenSellAt = finalSellability.openSellCount > 0 ? Date.now() : (trackedState.lastSeenOpenSellAt || null);
+    trackedState.reconciliationState = finalSellability.openSellCount > 0 ? 'open_sell_found' : 'pending_lookup';
 
     console.log('broker_truth_position_found', {
       symbol: canonicalSymbol,
@@ -6757,14 +6779,22 @@ async function resolveExitSellabilityFromBrokerTruth({
     }
 
     if (trackedOrderId || trackedClientOrderId) {
-      console.log('open_sell_not_found_after_direct_lookup', {
-        symbol: canonicalSymbol,
-        orderId: trackedOrderId || null,
-        client_order_id: trackedClientOrderId || null,
-        status: null,
-        limit_price: null,
-        qty: null,
-      });
+      trackedState.openSellMissCount = Number(trackedState.openSellMissCount || 0) + 1;
+      trackedState.reconciliationState = trackedState.openSellMissCount >= EXIT_RECON_MISS_THRESHOLD
+        ? 'open_sell_missing_confirmed'
+        : 'open_sell_missing_unconfirmed';
+      if (trackedState.openSellMissCount >= EXIT_RECON_MISS_THRESHOLD) {
+        console.log('open_sell_not_found_after_direct_lookup', {
+          symbol: canonicalSymbol,
+          orderId: trackedOrderId || null,
+          client_order_id: trackedClientOrderId || null,
+          missCount: trackedState.openSellMissCount,
+          missThreshold: EXIT_RECON_MISS_THRESHOLD,
+          status: null,
+          limit_price: null,
+          qty: null,
+        });
+      }
     }
 
     if (attempt < maxAttempts) {
@@ -6783,6 +6813,7 @@ async function resolveExitSellabilityFromBrokerTruth({
   }
 
   if (finalSellability.openSellCount > 0) {
+    trackedState.openSellMissCount = 0;
     const bestKnown = Array.isArray(finalSellability.openSellOrders) ? finalSellability.openSellOrders[0] : null;
     if (bestKnown) {
       updateTrackedSellIdentity(trackedState, {
@@ -6993,6 +7024,32 @@ async function logExitRealized({
   if (reasonCode === 'failed_trade' && (!Number.isFinite(netPnlEstimateUsd) || netPnlEstimateUsd >= 0)) {
     recordAdverseExit('failed_trade');
   }
+
+  const latestTrade = tradeId ? tradeForensics.getByTradeId(tradeId) : null;
+  closedTradeStats.append({
+    symbol,
+    tradeId: tradeId || null,
+    entryTime: safeIso(latestTrade?.fill?.filledAt || latestTrade?.tsDecision || exitState.get(symbol)?.entryTime),
+    exitTime: new Date().toISOString(),
+    holdSeconds: Number.isFinite(heldSeconds) ? heldSeconds : null,
+    entryPrice: Number.isFinite(entryPriceNum) ? entryPriceNum : null,
+    exitPrice,
+    qty: qtyFilled,
+    grossPnlUsd,
+    grossPnlBps,
+    estimatedFeesUsd: feeEstimateUsd,
+    netPnlUsd: netPnlEstimateUsd,
+    netPnlBps: Number.isFinite(netPnlEstimateUsd) && Number.isFinite(entryPriceNum) && Number.isFinite(qtyFilled) && entryPriceNum > 0 && qtyFilled > 0 ? (netPnlEstimateUsd / (entryPriceNum * qtyFilled)) * 10000 : null,
+    slippageEstimateBps: null,
+    effectiveTargetBps: Number(latestTrade?.config?.entryTakeProfitBps) || Number(exitState.get(symbol)?.targetProfitBps) || null,
+    stopDistanceBps: Number(exitState.get(symbol)?.stopDistanceBps) || null,
+    predictorProbability: Number(latestTrade?.predictorProbability) || null,
+    evBpsAtEntry: Number(latestTrade?.meta?.evBps) || null,
+    entrySpreadBps: Number(entrySpreadBpsUsed) || null,
+    entryQuoteAgeMs: Number(latestTrade?.decision?.quoteAgeMs) || null,
+    exitReason: reasonCode || null,
+    exitRoute: reasonCode || null,
+  });
 
   console.log('exit_realized', {
     symbol,
@@ -12878,7 +12935,7 @@ async function runEntryScanOnce() {
       }
     });
     if (!capEnabled) {
-      console.log('max_concurrent_positions_disabled', { env: MAX_CONCURRENT_POSITIONS });
+      console.log('max_concurrent_positions_config', { env: MAX_CONCURRENT_POSITIONS, effective: getEffectiveMaxConcurrentPositions() });
     }
     if (capEnabled && heldPositionsCount >= maxConcurrentPositionsEffective) {
       const endMs = Date.now();
@@ -13029,6 +13086,7 @@ async function runEntryScanOnce() {
       }
       if (!signal.entryReady) {
         skipped += 1;
+        if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) entryStaleQuoteSkipCount += 1;
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
         recordSkip(skipReason, symbol, signal.meta || null);
@@ -13342,6 +13400,8 @@ async function runEntryScanOnce() {
       warmupFallbackBudgetConfigured: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
       warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
       secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
+      entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      staleEntryQuoteSkips: entryStaleQuoteSkipCount,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -13611,7 +13671,7 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
     logSimpleScalperSkip(normalizedSymbol, 'profit_gate', {
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: TARGET_PROFIT_BPS,
+      targetProfitBps: resolvedEntryTakeProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -13870,7 +13930,7 @@ async function placeSimpleScalperEntry(symbol, options = {}) {
   }
   const requiredExitBps = computeRequiredExitBpsNet({
     feeBpsRoundTrip: FEE_BPS_TAKER + FEE_BPS_MAKER,
-    minNetProfitBps: TARGET_PROFIT_BPS,
+    minNetProfitBps: getConfiguredTargetProfitBpsForSymbol(normalizedSymbol),
     spreadBps: spreadBpsForTp,
     volatilityBps: decisionSnapshot?.volatilityBps,
   });
@@ -13948,7 +14008,7 @@ async function placeMakerLimitBuyThenSell(symbol, options = {}) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: TARGET_PROFIT_BPS,
+      targetProfitBps: resolvedEntryTakeProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -14286,7 +14346,7 @@ async function placeMarketBuyThenSell(symbol, options = {}) {
       ask,
       spreadBps,
       requiredEdgeBps,
-      targetProfitBps: TARGET_PROFIT_BPS,
+      targetProfitBps: resolvedEntryTakeProfitBps,
     });
     return { skipped: true, reason: 'profit_gate', spreadBps };
   }
@@ -15262,6 +15322,18 @@ function getTradingManagerStatus() {
     },
     lifecycle: getLifecycleSnapshot(),
     sessionGovernor: getSessionGovernorSummary(),
+    sizing: {
+      activeMode: POSITION_SIZING_MODE,
+      kellyEnabled: KELLY_ENABLED,
+      kellyShadowMode: KELLY_SHADOW_MODE,
+    },
+    risk: {
+      drawdownGuardEnabled: DRAWDOWN_GUARD_ENABLED,
+      correlationGuardEnabled: CORRELATION_GUARD_ENABLED,
+      tradingHaltedReason: tradingHaltedReason || null,
+      drawdownPct: Number(lastRiskSnapshot?.drawdownPct) || null,
+      dailyDrawdownPct: Number(lastRiskSnapshot?.dailyDrawdownPct) || null,
+    },
   };
 }
 
