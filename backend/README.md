@@ -5,7 +5,7 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 ## Setup
 
 1. `npm install`
-2. Create a `.env` file with your Alpaca API keys and API token.
+2. Create a `.env` file with your Alpaca API credentials (required for trading). `API_TOKEN` is optional route protection.
 3. `npm start`
 
 ## Production environment source of truth
@@ -24,12 +24,14 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 ## Environment Variables
 
 Required:
-- `ALPACA_API_KEY`
-- `ALPACA_SECRET_KEY`
-- `TRADE_BASE` (required live trading base URL; or `ALPACA_API_BASE` for legacy configs)
+- `APCA_API_KEY_ID` (or compatible aliases: `ALPACA_KEY_ID`, `ALPACA_API_KEY_ID`, `ALPACA_API_KEY`)
+- `APCA_API_SECRET_KEY` (or compatible aliases: `ALPACA_SECRET_KEY`, `ALPACA_API_SECRET_KEY`)
+- `TRADE_BASE=https://api.alpaca.markets` (or `ALPACA_API_BASE` for legacy configs)
+- `DATA_BASE=https://data.alpaca.markets`
 
-Recommended:
-- `API_TOKEN` (required for non-public routes in production; include it as `Authorization: Bearer <token>` or `x-api-key`.)
+Optional auth:
+- `API_TOKEN` protects backend routes when set (send as `Authorization: Bearer <token>` or `x-api-key`).
+- If `API_TOKEN` is unset, backend starts normally and route auth is disabled.
 
 Optional:
 - `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
@@ -38,7 +40,7 @@ Optional:
 - `RATE_LIMIT_WINDOW_MS` (default `60000`)
 - `RATE_LIMIT_MAX` (default `120`)
 - `HTTP_TIMEOUT_MS` (default `10000`)
-- `DATA_BASE` (defaults to Alpaca data API base URL)
+- `DATA_BASE` (defaults to Alpaca live data API base URL)
 - `DATASET_DIR` (default `./data`; set to a persistent disk on hosts like Render)
 - `DESIRED_NET_PROFIT_BASIS_POINTS` (default `100`, target net profit per trade after fees)
 - `MAX_GROSS_TAKE_PROFIT_BASIS_POINTS` (default `220`, cap on gross take-profit distance above entry)
@@ -97,9 +99,9 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 ## Notes
 
-- `GET /health` remains public for uptime checks.
-- `GET /debug/auth` is public for token diagnostics.
-- All other routes require a valid API token.
+- `GET /health`, `GET /debug/auth`, and `GET /debug/status` remain public for uptime/auth/runtime diagnostics.
+- If `API_TOKEN` is set, non-public routes require a valid token.
+- If `API_TOKEN` is not set, route auth middleware is permissive.
 - Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
 - `GET /dashboard` now exposes runtime-truth diagnostics in `meta.universe`, `meta.predictorWarmup`, and `meta.truth` (dynamic universe active flag, accepted symbol count/sample, fallback state/reason, warmup progress, top skip reasons, open positions, and active sell-limit count).
 

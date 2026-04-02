@@ -2,6 +2,7 @@ const path = require('path');
 const recorder = require('../modules/recorder');
 const { normalizePair } = require('../symbolUtils');
 const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
+const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 
 const maskSecret = (value) => {
   const raw = String(value || '');
@@ -88,8 +89,8 @@ const isRenderEnvironment = () =>
       process.env.RENDER_GIT_COMMIT
   );
 
-const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE;
-const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
+const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
 
 function normalizeTradeBase(baseUrl) {
   if (!baseUrl) return 'https://api.alpaca.markets';
@@ -191,13 +192,6 @@ const validateEnv = () => {
     });
   }
 
-  if (!RAW_TRADE_BASE) {
-    console.error('config_error', {
-      message: 'Missing TRADE_BASE/ALPACA_API_BASE; trading/account calls will fail.',
-      howToFix: 'Set TRADE_BASE or ALPACA_API_BASE to https://api.alpaca.markets',
-    });
-  }
-
   parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
   parseUrl('DATA_BASE', effectiveDataBase);
 
@@ -213,13 +207,21 @@ const validateEnv = () => {
       message: 'API_TOKEN not set. Backend endpoints are unprotected.',
     });
   }
-  assertNonPlaceholderSecret('API_TOKEN', apiToken, { required: true, provided: Object.prototype.hasOwnProperty.call(process.env, 'API_TOKEN') });
+  if (apiToken) {
+    assertNonPlaceholderSecret('API_TOKEN', apiToken, { required: false, provided: true });
+  }
   const alpacaKeyProvided = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY']
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
   const alpacaSecretProvided = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY']
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
-  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: false, provided: alpacaKeyProvided });
-  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: false, provided: alpacaSecretProvided });
+  if (!String(alpacaKeyRaw || '').trim()) {
+    validationErrors.push('APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty.');
+  }
+  if (!String(alpacaSecretRaw || '').trim()) {
+    validationErrors.push('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY is required and cannot be empty.');
+  }
+  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: true, provided: alpacaKeyProvided });
+  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: true, provided: alpacaSecretProvided });
 
   corsAllowedOrigins.forEach((origin) => {
     parseUrl('CORS_ALLOWED_ORIGINS', origin);

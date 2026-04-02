@@ -4,7 +4,8 @@ const validateEnv = require('./validateEnv');
 const REQUIRED_BASE_ENV = {
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
-  API_TOKEN: 'test_token_123456',
+  APCA_API_KEY_ID: 'pk_live_realistic_key_123456',
+  APCA_API_SECRET_KEY: 'sk_live_realistic_secret_abcdef123456',
 };
 
 function withEnv(overrides, fn) {
@@ -18,6 +19,14 @@ function withEnv(overrides, fn) {
 }
 
 withEnv({}, () => {
+  assert.doesNotThrow(() => validateEnv());
+});
+
+withEnv({ NODE_ENV: 'production', APCA_API_KEY_ID: '', APCA_API_SECRET_KEY: '' }, () => {
+  assert.throws(() => validateEnv(), /APCA_API_KEY_ID\/ALPACA_KEY_ID is required and cannot be empty/);
+});
+
+withEnv({ NODE_ENV: 'production', API_TOKEN: '' }, () => {
   assert.doesNotThrow(() => validateEnv());
 });
 

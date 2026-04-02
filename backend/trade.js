@@ -62,10 +62,11 @@ const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
+const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { resolveStoragePaths } = require('./modules/storagePaths');
 
-const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
-const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
+const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
 const DEBUG_ALPACA_HTTP = String(process.env.DEBUG_ALPACA_HTTP || '').trim() === '1';
 const DEBUG_ALPACA_HTTP_OK = String(process.env.DEBUG_ALPACA_HTTP_OK || '').trim() === '1';
 
@@ -12990,6 +12991,16 @@ async function runEntryScanOnce() {
       fallbackOccurred: Boolean(fallbackReason),
       fallbackReason,
     });
+    if (fallbackReason) {
+      console.warn('entry_universe_fallback_active', {
+        fallbackReason,
+        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+        effectiveUniverseMode: universeMode,
+        dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        configuredSecondaryCount: configuredUniverse.secondaryCount,
+      });
+    }
     if (
       ENTRY_UNIVERSE_MODE === 'configured' &&
       !['configured_primary_secondary', 'configured_fallback'].includes(universeMode)

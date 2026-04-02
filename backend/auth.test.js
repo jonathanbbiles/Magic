@@ -45,4 +45,64 @@ function mockReq(headers = {}) {
   }
 })();
 
+(function testAllowsWhenApiTokenMissing() {
+  const previous = process.env.API_TOKEN;
+  delete process.env.API_TOKEN;
+  const req = mockReq({});
+  const response = {
+    headers: {},
+    statusCode: 200,
+    payload: null,
+    set() {},
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      this.payload = payload;
+      return this;
+    },
+  };
+  let nextCalled = false;
+  requireApiToken(req, response, () => {
+    nextCalled = true;
+  });
+  assert.equal(nextCalled, true);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.payload, null);
+  if (previous !== undefined) process.env.API_TOKEN = previous;
+})();
+
+(function testEnforcesWhenApiTokenPresent() {
+  const previous = process.env.API_TOKEN;
+  process.env.API_TOKEN = 'backend_token_123456789';
+  const req = mockReq({ 'x-api-key': 'backend_token_123456789' });
+  const response = {
+    headers: {},
+    statusCode: 200,
+    payload: null,
+    set() {},
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(payload) {
+      this.payload = payload;
+      return this;
+    },
+  };
+  let nextCalled = false;
+  requireApiToken(req, response, () => {
+    nextCalled = true;
+  });
+  assert.equal(nextCalled, true);
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.payload, null);
+  if (previous === undefined) {
+    delete process.env.API_TOKEN;
+  } else {
+    process.env.API_TOKEN = previous;
+  }
+})();
+
 console.log('auth.test.js passed');
