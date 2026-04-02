@@ -64,7 +64,10 @@ withEnv({}, () => {
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
   assert.equal(cfg.entryQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 30000);
   assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.sparseQuoteFreshMs, 10000);
+  assert.equal(cfg.sparseStaleToleranceMs, 30000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 10000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 30000);
 });
@@ -77,7 +80,10 @@ withEnv({
 }, () => {
   const cfg = getRuntimeConfig();
   assert.equal(cfg.entryQuoteMaxAgeMs, 45000);
+  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 45000);
   assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 70000);
+  assert.equal(cfg.sparseQuoteFreshMs, 9000);
+  assert.equal(cfg.sparseStaleToleranceMs, 55000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 9000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 55000);
 });

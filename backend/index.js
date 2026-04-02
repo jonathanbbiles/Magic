@@ -687,6 +687,8 @@ app.get('/dashboard', async (req, res) => {
     const ratePressureState = entryDiagnostics?.ratePressureState || null;
     const marketRejectionCount = Number(entryDiagnostics?.gating?.marketRejectionCount || 0);
     const dataRejectionCount = Number(entryDiagnostics?.gating?.dataRejectionCount || 0);
+    const staleDataRejectionCount = Number(entryDiagnostics?.gating?.staleDataRejectionCount || dataRejectionCount || 0);
+    const staleCooldownSuppressionCount = Number(entryDiagnostics?.gating?.staleCooldownSuppressionCount || 0);
     const staleQuoteRejectionCount = Number(entryDiagnostics?.gating?.staleQuoteRejectionCount || 0);
     const insufficientBarsCount = Number(entryDiagnostics?.gating?.insufficientBarsCount || 0);
     const rateLimitSuppressionCount = Number(entryDiagnostics?.gating?.rateLimitSuppressionCount || 0);
@@ -831,6 +833,9 @@ app.get('/dashboard', async (req, res) => {
         lastExecutionFailure,
         staleQuoteSkipCount: Number(entryDiagnostics?.quoteFreshness?.staleEntryQuoteSkips || 0),
         marketRejectionCount,
+        staleDataRejectionCount,
+        dataRejectionCount: staleDataRejectionCount,
+        staleCooldownSuppressionCount,
         universe: universeDiagnostics,
         predictorWarmup,
         truth: {
@@ -852,7 +857,9 @@ app.get('/dashboard', async (req, res) => {
             total: Number(predictorWarmup?.totalSymbolsPlanned || 0),
           },
           marketRejectionCount,
-          dataRejectionCount,
+          dataRejectionCount: staleDataRejectionCount,
+          staleDataRejectionCount,
+          staleCooldownSuppressionCount,
           staleQuoteRejectionCount,
           insufficientBarsCount,
           warmupBlockedCount,
@@ -866,6 +873,13 @@ app.get('/dashboard', async (req, res) => {
           entryManagerStarted: Boolean(entryManagerState?.started),
           lastEntryScanAt: entryManagerState?.lastScanAt || null,
           lastEntryScanSummary,
+          currentEntryScanProgress: {
+            startedAt: entryManagerState?.currentScanStartedAt || null,
+            lastProgressAt: entryManagerState?.currentScanLastProgressAt || null,
+            symbolsProcessed: Number(entryManagerState?.currentScanSymbolsProcessed || 0),
+            universeSize: Number(entryManagerState?.currentScanUniverseSize || 0),
+            state: entryManagerState?.currentScanState || 'idle',
+          },
           lastSuccessfulAction,
           lastExecutionFailure,
           openPositions: positions.length,

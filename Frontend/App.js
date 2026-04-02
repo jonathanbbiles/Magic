@@ -326,6 +326,7 @@ export default function App() {
   const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—';
   const lastEntryScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt ?? '—';
   const lastEntryScanSummary = meta?.lastEntryScanSummary ?? truth?.lastEntryScanSummary ?? entryScan ?? null;
+  const currentEntryScanProgress = truth?.currentEntryScanProgress ?? meta?.currentEntryScanProgress ?? null;
   const lastSuccessfulAction = meta?.lastSuccessfulAction ?? truth?.lastSuccessfulAction ?? null;
   const lastExecutionFailure = meta?.lastExecutionFailure ?? truth?.lastExecutionFailure ?? null;
   const stalled = String(engineState).toLowerCase() === 'degraded' && Boolean(meta?.lastEntryScanAt || truth?.lastEntryScanAt);
@@ -404,6 +405,9 @@ export default function App() {
                   }) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
+                  Current scan progress: {currentEntryScanProgress ? JSON.stringify(currentEntryScanProgress) : '—'}
+                </Text>
+                <Text style={styles.diagnosticsText}>
                   Top skip reasons: {entryScan?.topSkipReasons ? JSON.stringify(entryScan.topSkipReasons) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
@@ -471,6 +475,8 @@ export default function App() {
                   staleEntryQuoteSkips: quoteFreshness?.staleEntryQuoteSkips,
                   staleQuoteRejectionCount: truth?.staleQuoteRejectionCount ?? entryDiagnostics?.gating?.staleQuoteRejectionCount ?? 0,
                   marketRejectionCount: truth?.marketRejectionCount ?? 0,
+                  staleDataRejectionCount: truth?.staleDataRejectionCount ?? truth?.dataRejectionCount ?? 0,
+                  staleCooldownSuppressionCount: truth?.staleCooldownSuppressionCount ?? 0,
                   topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
                   topSkipReasonsRolling: truth?.topSkipReasonsRolling ?? {},
                   positions: truth?.openPositions ?? positions.length,
