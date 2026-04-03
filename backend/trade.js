@@ -9302,14 +9302,8 @@ async function submitIocLimitSell({
   const finalQty = sizeGuard.qty ?? adjustedQty;
 
   if (DISABLE_IOC_EXITS) {
-    console.log('ioc_disabled_market_sell', { symbol, qty: finalQty, reason });
-    const order = await submitMarketSell({
-      symbol,
-      qty: finalQty,
-      reason: `${reason}_market`,
-      allowSellBelowMin,
-    });
-    return { order, requestedQty: finalQty };
+    console.log('ioc_disabled_skip', { symbol, qty: finalQty, reason });
+    return { skipped: true, reason: 'ioc_disabled' };
   }
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_exit_limit_sell' });
@@ -9345,6 +9339,7 @@ async function attachInitialExitLimit({
   maxFill = null,
   availableQtyOverride = null,
   entryMomentumState = null,
+  floorPrice = null,
 }) {
   const symbol = normalizeSymbol(rawSymbol);
   const entryPriceNum = Number(entryPrice);
@@ -9455,10 +9450,15 @@ async function attachInitialExitLimit({
   const targetPrice = exitPlan.targetPrice;
   const trueBreakevenPrice = exitPlan.trueBreakevenPrice;
   const profitabilityFloorPrice = exitPlan.profitabilityFloorPrice;
+  const requestedFloorPrice = Number(floorPrice);
+  const profitabilityFloorEffective =
+    Number.isFinite(requestedFloorPrice) && requestedFloorPrice > 0
+      ? Math.max(profitabilityFloorPrice, requestedFloorPrice)
+      : profitabilityFloorPrice;
   const entryPriceUsed = exitPlan.entryPriceUsed;
   const postOnly = EXIT_POST_ONLY;
   const wantOco = false;
-  let initialLimit = targetPrice;
+  let initialLimit = Math.max(targetPrice, profitabilityFloorEffective);
   let bookBid = null;
   let bookAsk = null;
 
@@ -9470,6 +9470,7 @@ async function attachInitialExitLimit({
     console.warn('tp_attach_quote_failed', { symbol, error: err?.message || err });
   }
   initialLimit = applyMakerGuard(initialLimit, bookBid, exitPlan.tickSize);
+  initialLimit = roundToTick(Math.max(initialLimit, profitabilityFloorEffective), exitPlan.tickSize, 'up');
 
   console.log('tp_attach_plan', {
     symbol,
@@ -9493,7 +9494,7 @@ async function attachInitialExitLimit({
     requiredExitBpsFinal,
     maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     trueBreakevenPrice,
-    profitabilityFloorPrice,
+    profitabilityFloorPrice: profitabilityFloorEffective,
     targetPrice,
     finalLimit: initialLimit,
     currentLimit: null,
@@ -9565,6 +9566,8 @@ async function attachInitialExitLimit({
     notionalUsd,
     minNetProfitBps,
     targetPrice,
+    trueBreakevenPrice,
+    profitabilityFloorPrice: profitabilityFloorEffective,
     feeBpsRoundTrip,
     profitBufferBps,
     desiredNetExitBps: desiredNetExitBpsValue,
@@ -9580,6 +9583,13 @@ async function attachInitialExitLimit({
     sellClientOrderId,
     sellOrderSubmittedAt: Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now,
     sellOrderLimit,
+    exitMode: 'locked_tp',
+    lockedTpEnabled: true,
+    lockedTpLimitPrice: sellOrderLimit,
+    lockedTpOrderId: sellOrderId,
+    lockedTpClientOrderId: sellClientOrderId,
+    initialTpAttached: Boolean(sellOrderId),
+    protected: Boolean(sellOrderId),
     takerAttempted: false,
     entryMomentumState: entryMomentumState || null,
   };
@@ -9629,6 +9639,105 @@ async function attachInitialExitLimit({
 
   updateIntentState(symbol, { state: 'managing' });
   return sellOrder;
+}
+
+function resolveLockedTpFloorPrice(state = {}, fallbackTargetPrice = null) {
+  const profitabilityFloor = Number(state.profitabilityFloorPrice);
+  if (Number.isFinite(profitabilityFloor) && profitabilityFloor > 0) return profitabilityFloor;
+  const trueBreakeven = Number(state.trueBreakevenPrice);
+  if (Number.isFinite(trueBreakeven) && trueBreakeven > 0) return trueBreakeven;
+  const targetPrice = Number(state.targetPrice);
+  if (Number.isFinite(targetPrice) && targetPrice > 0) return targetPrice;
+  const fallbackTarget = Number(fallbackTargetPrice);
+  if (Number.isFinite(fallbackTarget) && fallbackTarget > 0) return fallbackTarget;
+  return null;
+}
+
+async function ensureInitialExitLimitAttached({
+  symbol,
+  qty,
+  entryPrice,
+  entryOrderId = null,
+  maxFill = null,
+  availableQtyOverride = null,
+  entryMomentumState = null,
+}) {
+  const startedAt = Date.now();
+  const maxAttempts = Math.max(1, POST_FILL_EXIT_ATTACH_ATTEMPTS);
+  let lastError = null;
+  let lastSellOrder = null;
+  for (let attempt = 1; attempt <= maxAttempts && Date.now() - startedAt <= POST_FILL_POSITION_SETTLE_MS; attempt += 1) {
+    const trackedState = exitState.get(symbol) || {};
+    const floorPrice = resolveLockedTpFloorPrice(trackedState);
+    console.log('locked_tp_attach_attempt', { symbol, attempt, floorPrice: Number.isFinite(floorPrice) ? floorPrice : null });
+
+    const brokerTruth = await resolveExitSellabilityFromBrokerTruth({
+      symbol,
+      trackedSellOrderId: trackedState.sellOrderId || trackedState.lockedTpOrderId || null,
+      trackedSellClientOrderId: trackedState.sellClientOrderId || trackedState.lockedTpClientOrderId || null,
+      maxAttempts: 2,
+      retryMs: Math.min(POST_FILL_POSITION_POLL_MS, 400),
+    });
+    const existingOpenSell = Array.isArray(brokerTruth?.openSellOrders) ? brokerTruth.openSellOrders[0] : null;
+    if (existingOpenSell) {
+      const adoptedLimit = normalizeOrderLimitPrice(existingOpenSell);
+      const adoptedFloor = resolveLockedTpFloorPrice(trackedState, adoptedLimit);
+      if (Number.isFinite(adoptedLimit) && Number.isFinite(adoptedFloor) && adoptedLimit + 1e-12 < adoptedFloor) {
+        console.error('locked_tp_attach_failed', { symbol, reason: 'existing_order_below_floor', adoptedLimit, adoptedFloor });
+        throw new Error(`locked_tp_existing_order_below_floor:${symbol}`);
+      }
+      updateTrackedSellIdentity(trackedState, {
+        symbol,
+        order: existingOpenSell,
+        source: 'locked_tp_adopt_existing',
+      });
+      trackedState.exitMode = 'locked_tp';
+      trackedState.lockedTpEnabled = true;
+      trackedState.lockedTpOrderId = trackedState.sellOrderId || trackedState.lockedTpOrderId || null;
+      trackedState.lockedTpClientOrderId = trackedState.sellClientOrderId || trackedState.lockedTpClientOrderId || null;
+      trackedState.lockedTpLimitPrice = Number.isFinite(adoptedLimit) ? adoptedLimit : trackedState.lockedTpLimitPrice;
+      trackedState.initialTpAttached = true;
+      trackedState.protected = true;
+      console.log('locked_tp_adopt_existing', { symbol, orderId: trackedState.lockedTpOrderId || null });
+      return { order: existingOpenSell, adopted: true };
+    }
+
+    const attachOrder = await attachInitialExitLimit({
+      symbol,
+      qty,
+      entryPrice,
+      entryOrderId,
+      maxFill,
+      availableQtyOverride,
+      entryMomentumState,
+      floorPrice,
+    });
+    lastSellOrder = attachOrder;
+    if (attachOrder?.id || attachOrder?.order_id) {
+      const lockedState = exitState.get(symbol) || {};
+      lockedState.initialTpAttached = true;
+      lockedState.protected = true;
+      lockedState.exitMode = 'locked_tp';
+      lockedState.lockedTpEnabled = true;
+      lockedState.lockedTpOrderId = attachOrder?.id || attachOrder?.order_id || null;
+      lockedState.lockedTpClientOrderId = attachOrder?.client_order_id || attachOrder?.clientOrderId || null;
+      lockedState.lockedTpLimitPrice = normalizeOrderLimitPrice(attachOrder) ?? lockedState.sellOrderLimit ?? null;
+      console.log('locked_tp_attached', { symbol, orderId: lockedState.lockedTpOrderId || null });
+      return { order: attachOrder, adopted: false };
+    }
+    if (attachOrder?.reason === 'qty_reserved_or_unavailable' || attachOrder?.reason === 'awaiting_broker_sellable_qty') {
+      await sleep(POST_FILL_POSITION_POLL_MS);
+      continue;
+    }
+    lastError = new Error(`locked_tp_attach_attempt_failed:${attachOrder?.reason || 'unknown'}`);
+    await sleep(POST_FILL_POSITION_POLL_MS);
+  }
+  console.error('locked_tp_attach_failed', {
+    symbol,
+    elapsedMs: Date.now() - startedAt,
+    lastReason: lastSellOrder?.reason || lastError?.message || 'unknown',
+  });
+  throw lastError || new Error(`locked_tp_attach_failed:${symbol}`);
 }
 
 async function handleBuyFill({
@@ -9716,7 +9825,7 @@ async function handleBuyFill({
     source: settle.source,
   });
 
-  const sellOrder = await attachInitialExitLimit({
+  const attachResult = await ensureInitialExitLimitAttached({
     symbol,
     qty: qtyNum,
     entryPrice: entryPriceNum,
@@ -9728,6 +9837,7 @@ async function handleBuyFill({
         : null,
     entryMomentumState,
   });
+  const sellOrder = attachResult?.order || null;
 
   if (sellOrder?.id || sellOrder?.order_id) {
     clearPendingExitAttach(symbol);
@@ -9736,6 +9846,9 @@ async function handleBuyFill({
       exitOrderId: sellOrder?.id || sellOrder?.order_id || null,
       reservedQty: qtyNum,
     });
+  } else {
+    console.error('initial_tp_attach_failed', { symbol, entryOrderId: entryOrderId || null });
+    throw new Error(`initial_tp_attach_failed:${symbol}`);
   }
 
   if (STOPS_ENABLED && STOPLOSS_ENABLED && STOPLOSS_MODE === 'atr') {
@@ -11221,6 +11334,84 @@ async function manageExitStates() {
 
             continue;
           }
+        }
+
+        const lockedTpActive = state?.lockedTpEnabled === true || state?.exitMode === 'locked_tp';
+        if (lockedTpActive && qtyNum > 0) {
+          state.exitMode = 'locked_tp';
+          state.lockedTpEnabled = true;
+          const lockedTpFloor = resolveLockedTpFloorPrice(state, targetPrice);
+          const lockedTpTick = Number.isFinite(tickSize) && tickSize > 0 ? tickSize : getTickSize({ symbol, price: targetPrice });
+          const intendedLockedTpLimitRaw = Number(state.lockedTpLimitPrice);
+          const intendedLockedTpLimitBase = Number.isFinite(intendedLockedTpLimitRaw) && intendedLockedTpLimitRaw > 0
+            ? intendedLockedTpLimitRaw
+            : targetPrice;
+          const intendedLockedTpLimit = roundToTick(
+            Math.max(intendedLockedTpLimitBase, lockedTpFloor ?? intendedLockedTpLimitBase),
+            lockedTpTick,
+            'up',
+          );
+          state.lockedTpLimitPrice = intendedLockedTpLimit;
+          state.profitabilityFloorPrice = Number.isFinite(lockedTpFloor) ? lockedTpFloor : state.profitabilityFloorPrice;
+          state.initialTpAttached = Boolean(state.initialTpAttached || state.sellOrderId || openSellOrders.length > 0);
+          state.protected = true;
+
+          if (openSellOrders.length > 0) {
+            const activeOrder = state.sellOrderId
+              ? openSellOrders.find((order) => (order?.id || order?.order_id) === state.sellOrderId) || openSellOrders[0]
+              : openSellOrders[0];
+            updateTrackedSellIdentity(state, { symbol, order: activeOrder, source: 'locked_tp_hold_existing' });
+            state.lockedTpOrderId = state.sellOrderId || state.lockedTpOrderId || null;
+            state.lockedTpClientOrderId = state.sellClientOrderId || state.lockedTpClientOrderId || null;
+            const liveLimit = normalizeOrderLimitPrice(activeOrder);
+            if (Number.isFinite(liveLimit) && Number.isFinite(lockedTpFloor) && liveLimit + 1e-12 < lockedTpFloor) {
+              console.error('locked_tp_attach_failed', { symbol, reason: 'live_limit_below_floor', liveLimit, lockedTpFloor });
+              throw new Error(`locked_tp_live_limit_below_floor:${symbol}`);
+            }
+            state.lockedTpLimitPrice = Number.isFinite(liveLimit) ? liveLimit : state.lockedTpLimitPrice;
+            console.log('locked_tp_hold_existing', {
+              symbol,
+              orderId: state.lockedTpOrderId || null,
+              orderLimit: Number.isFinite(liveLimit) ? liveLimit : null,
+            });
+          } else {
+            console.log('locked_tp_missing_reattach', { symbol, intendedLockedTpLimit, lockedTpFloor: lockedTpFloor ?? null });
+            const plannedQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty;
+            const replacement = await submitLimitSell({
+              symbol,
+              qty: plannedQty,
+              limitPrice: intendedLockedTpLimit,
+              reason: 'locked_tp_missing_reattach',
+              intentRef: state.entryOrderId || getOrderIntentBucket(),
+              openOrders: symbolOrders,
+              availableQtyOverride,
+              allowSellBelowMin: false,
+              postOnly: EXIT_POST_ONLY,
+            });
+            if (replacement?.id || replacement?.order_id) {
+              updateTrackedSellIdentity(state, { symbol, order: replacement, source: 'locked_tp_missing_reattach' });
+              state.lockedTpOrderId = state.sellOrderId || state.lockedTpOrderId || null;
+              state.lockedTpClientOrderId = state.sellClientOrderId || state.lockedTpClientOrderId || null;
+              state.lockedTpLimitPrice = normalizeOrderLimitPrice(replacement) ?? intendedLockedTpLimit;
+              state.initialTpAttached = true;
+              state.protected = true;
+              console.log('locked_tp_reattached', {
+                symbol,
+                orderId: state.lockedTpOrderId || null,
+                limitPrice: state.lockedTpLimitPrice,
+              });
+            } else {
+              console.error('locked_tp_attach_failed', { symbol, reason: replacement?.reason || 'unknown' });
+              throw new Error(`locked_tp_reattach_failed:${symbol}:${replacement?.reason || 'unknown'}`);
+            }
+          }
+          console.log('locked_tp_loss_exit_blocked', {
+            symbol,
+            blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
+          });
+          actionTaken = 'hold_existing_order';
+          reasonCode = 'locked_tp_active';
+          continue;
         }
 
         const maxHoldMsForced =
