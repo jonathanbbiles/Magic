@@ -668,16 +668,24 @@ function getStaleQuoteCooldownState(symbol) {
 function noteStaleQuoteSkip(symbol, options = {}) {
   const prev = getStaleQuoteCooldownState(symbol);
   const attempts = prev.attempts + 1;
+  const quoteAgeMs = Number(options?.quoteAgeMs);
   const requestedCooldownMs = Number(options?.cooldownMs);
+  const adaptiveHopelessCooldownMs = Number.isFinite(quoteAgeMs) && quoteAgeMs > 0
+    ? Math.min(15 * 60 * 1000, Math.max(STALE_QUOTE_HOPELESS_COOLDOWN_MS, Math.floor(quoteAgeMs / 4)))
+    : STALE_QUOTE_HOPELESS_COOLDOWN_MS;
+  const requestedReason = String(options?.reason || '').toLowerCase();
+  const baseCooldownMs = requestedReason === 'stale_quote_hopeless'
+    ? adaptiveHopelessCooldownMs
+    : Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * attempts);
   const cooldownMs = Number.isFinite(requestedCooldownMs) && requestedCooldownMs > 0
     ? requestedCooldownMs
-    : Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * attempts);
+    : baseCooldownMs;
   staleQuoteSkipStateBySymbol.set(prev.key, {
     attempts,
     skipCount: prev.skipCount + 1,
     untilMs: Date.now() + cooldownMs,
     reason: options?.reason || null,
-    quoteAgeMs: Number.isFinite(Number(options?.quoteAgeMs)) ? Number(options.quoteAgeMs) : null,
+    quoteAgeMs: Number.isFinite(quoteAgeMs) ? quoteAgeMs : null,
   });
 }
 
@@ -1673,6 +1681,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      includeOrderbook: false,
     });
     quote = mdSnapshot?.quote || null;
     obResult = mdSnapshot?.orderbook || null;
@@ -1784,6 +1793,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : 'stale_quote',
       quoteAgeMs,
       quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
+      thresholdName: 'sparseStaleToleranceMs',
       thresholdAppliedMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
       sparsePolicy: 'stale_tolerance_gate_pre_orderbook',
       action: 'skip_orderbook_fetch',
@@ -1805,7 +1815,22 @@ async function computeEntrySignal(symbol, opts = {}) {
   }
 
   if (!obResult) {
-    obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+    if (entryMdContext) {
+      const obSnapshot = await getOrFetchSymbolMarketData({
+        context: entryMdContext,
+        coordinator: entryMarketDataCoordinator,
+        marketDataCache: scanMarketDataCache,
+        symbol: asset.symbol,
+        fetchQuote: getQuoteForTrading,
+        fetchOrderbook: getLatestOrderbook,
+        quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        includeOrderbook: true,
+      });
+      obResult = obSnapshot?.orderbook || null;
+    } else {
+      obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+    }
   }
   if (!obResult.ok) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
@@ -1872,6 +1897,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       action: 'retry_skipped_quote_unviable',
       reason: 'quote_age_exceeds_sparse_stale_tolerance',
       quoteAgeMs,
+      thresholdName: 'sparseStaleToleranceMs',
       thresholdAppliedMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
       policyApplied: 'sparse_stale_tolerance_ms',
       skippedOrderbookConfirmation: true,
@@ -3944,10 +3970,11 @@ const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
 const staleQuoteSkipStateBySymbol = new Map();
-const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 60000;
+const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 300000;
 const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS, 10000);
-const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 3, 90000);
+const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 3, 300000);
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
+const ENTRY_SCAN_PROGRESS_HEARTBEAT_MS = Math.max(2000, Math.min(ENTRY_SCAN_INTERVAL_MS, 5000));
 const ENTRY_SKIP_REASON_TOTALS_MAX_KEYS = 50;
 const entrySkipReasonTotals = new Map();
 let exitManagerRunning = false;
@@ -13665,9 +13692,27 @@ async function runEntryScanOnce() {
         cachedSymbols: reusablePrefetch.symbolCount,
       });
     } else {
-      const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
-      if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
-        prefetchedBars = prefetchResult.prefetchedBars;
+      updateEntryScanProgress({
+        startMs,
+        symbolsProcessed: 0,
+        universeSize: scanSymbols.length,
+        state: 'prefetching_market_data',
+      });
+      const prefetchHeartbeat = setInterval(() => {
+        updateEntryScanProgress({
+          startMs,
+          symbolsProcessed: 0,
+          universeSize: scanSymbols.length,
+          state: 'prefetching_market_data',
+        });
+      }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
+      try {
+        const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+        if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
+          prefetchedBars = prefetchResult.prefetchedBars;
+        }
+      } finally {
+        clearInterval(prefetchHeartbeat);
       }
     }
     const entryMarketDataContext = buildEntryMarketDataContext({
@@ -14301,12 +14346,18 @@ function startEntryManager() {
   entryWatchdogIntervalId = setInterval(() => {
     const nowMs = Date.now();
     const lastScanMs = Date.parse(String(entryManagerHeartbeat.lastScanAt || ''));
+    const currentScanStartMs = Date.parse(String(entryManagerHeartbeat.currentScanStartedAt || ''));
     const currentProgressMs = Date.parse(String(entryManagerHeartbeat.currentScanLastProgressAt || ''));
+    const scanState = String(entryManagerHeartbeat.currentScanState || '').toLowerCase();
+    const scanStateActive = scanState && !['idle', 'aborted'].includes(scanState);
     const activeScanProgress = Number.isFinite(currentProgressMs) &&
-      (nowMs - currentProgressMs <= ENTRY_SCAN_INTERVAL_MS * 2) &&
-      Number(entryManagerHeartbeat.currentScanSymbolsProcessed || 0) >= 0;
+      (nowMs - currentProgressMs <= ENTRY_SCAN_INTERVAL_MS * 3) &&
+      scanStateActive;
+    const activeScanWithoutSummary = Number.isFinite(currentScanStartMs) &&
+      scanStateActive &&
+      (nowMs - currentScanStartMs <= ENTRY_SCAN_INTERVAL_MS * 6);
     const maxGapMs = ENTRY_SCAN_INTERVAL_MS * 3;
-    if (activeScanProgress) return;
+    if (activeScanProgress || activeScanWithoutSummary) return;
     if (Number.isFinite(lastScanMs) && nowMs - lastScanMs <= maxGapMs) return;
     const warmup = getPredictorWarmupStatus();
     const reason = Number.isFinite(lastScanMs)
