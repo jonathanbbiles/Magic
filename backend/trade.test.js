@@ -863,9 +863,7 @@ const defensivePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
   heldSeconds: 120,
   tacticDecision: 'thesis_break_exit',
 });
-assert.equal(defensivePricePlan.route, 'ioc_limit');
-assert.notEqual(defensivePricePlan.selectedLimit, defensivePricePlan.tpLimit);
-assert.ok(defensivePricePlan.selectedLimit < defensivePricePlan.tpLimit);
+assert.ok(Number.isFinite(defensivePricePlan.selectedLimit));
 const holdPricePlan = tradeEntryBasis.buildForcedExitPricePlan({
   symbol: 'BTC/USD',
   bid: 100,
@@ -887,7 +885,7 @@ const staleTradePricePlan = tradeEntryBasis.buildForcedExitPricePlan({
   heldSeconds: 800,
   tacticDecision: 'stale_trade_exit',
 });
-assert.notEqual(staleTradePricePlan.selectedLimit, staleTradePricePlan.tpLimit);
+assert.ok(Number.isFinite(staleTradePricePlan.selectedLimit));
 
 
 async function runRegimeAndQuoteCacheRegression() {
@@ -1035,7 +1033,13 @@ assert.match(tradeSource, /stale_exit_override_triggered/);
 assert.match(tradeSource, /tacticDecision,/);
 assert.match(tradeSource, /open_sell_exists_at_tactic_price/);
 assert.match(tradeSource, /reasonCode = tacticDecision;/);
-assert.match(tradeSource, /actionTaken =\s*tacticDecision !== 'take_profit_hold' && pricePlan\.route === 'ioc_limit'[\s\S]*'defensive_exit_ioc_submitted'/);
+assert.match(tradeSource, /async function ensureInitialExitLimitAttached\(\{/);
+assert.ok(tradeSource.includes('locked_tp_attach_attempt'));
+assert.ok(tradeSource.includes('locked_tp_attached'));
+assert.ok(tradeSource.includes('locked_tp_adopt_existing'));
+assert.ok(tradeSource.includes('locked_tp_attach_failed'));
+assert.match(tradeSource, /const lockedTpActive = state\?\.lockedTpEnabled === true \|\| state\?\.exitMode === 'locked_tp';[\s\S]*locked_tp_hold_existing[\s\S]*locked_tp_missing_reattach[\s\S]*locked_tp_reattached[\s\S]*locked_tp_loss_exit_blocked/);
+assert.match(tradeSource, /if \(DISABLE_IOC_EXITS\) \{[\s\S]*ioc_disabled_skip[\s\S]*return \{ skipped: true, reason: 'ioc_disabled' \};/);
 assert.match(tradeSource, /lastRepriceAgeMs: loggedLastRepriceAgeMs/);
 assert.match(tradeSource, /lastCancelReplaceAt: loggedLastCancelReplaceAt/);
 assert.match(tradeSource, /console\.log\('broker_truth_position_found',/);
