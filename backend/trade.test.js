@@ -218,6 +218,10 @@ const {
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeProviderQuoteAgeMs,
   computeEffectivePerScanBudget,
+  evaluatePrimaryQuoteViability,
+  __testNoteStaleQuoteSkip,
+  __testGetStaleQuoteCooldownState,
+  __testClearStaleQuoteSkipState,
 } = tradeEntryBasis;
 
 assert.equal(
@@ -236,6 +240,31 @@ assert.equal(computeProviderQuoteAgeMs(null, 1700000000000), null);
 assert.equal(computeEffectivePerScanBudget(2, 8), 4);
 assert.equal(computeEffectivePerScanBudget(2, 40), 10);
 assert.equal(computeEffectivePerScanBudget(8, 20), 8);
+
+const stalePrimaryViability = evaluatePrimaryQuoteViability({
+  quote: { tsMs: Date.now() - 45000 },
+  nowMs: Date.now(),
+  maxAgeMs: 30000,
+});
+assert.equal(stalePrimaryViability.ok, false);
+assert.equal(stalePrimaryViability.reason, 'stale_quote_primary');
+
+const freshPrimaryViability = evaluatePrimaryQuoteViability({
+  quote: { tsMs: Date.now() - 5000 },
+  nowMs: Date.now(),
+  maxAgeMs: 30000,
+});
+assert.equal(freshPrimaryViability.ok, true);
+
+__testClearStaleQuoteSkipState('XRP/USD');
+__testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
+const cooldown1 = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(cooldown1.active, true);
+const remaining1 = cooldown1.remainingMs;
+__testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
+const cooldown2 = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(cooldown2.active, true);
+assert.ok(cooldown2.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
 
 const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
 assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
@@ -258,7 +287,14 @@ assert.ok(tradeSourceEarly.includes("console.log('entry_scan_progress'"));
 assert.ok(tradeSourceEarly.includes('currentScanLastProgressAt'));
 assert.ok(tradeSourceEarly.includes("state: 'prefetching_market_data'"));
 assert.ok(tradeSourceEarly.includes('includeOrderbook: false'));
-assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_fetch'"));
+assert.ok(tradeSourceEarly.includes("fetchQuote: getLatestQuoteFromQuotesOnly"));
+assert.ok(tradeSourceEarly.includes("why: 'marketdata_unavailable'"));
+assert.ok(tradeSourceEarly.includes("reason: 'stale_quote_primary'"));
+assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_trade_and_sparse'"));
+assert.ok(tradeSourceEarly.includes('staleQuoteCooldownCount'));
+assert.ok(tradeSourceEarly.includes('stalePrimaryQuoteCount'));
+assert.ok(tradeSourceEarly.includes('dataUnavailableCount'));
+assert.ok(tradeSourceEarly.includes('marketRejectionCount'));
 assert.ok(tradeSourceEarly.includes('lastSuccessfulAction'));
 assert.ok(tradeSourceEarly.includes('lastExecutionFailure'));
 

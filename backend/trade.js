@@ -676,7 +676,10 @@ function noteStaleQuoteSkip(symbol, options = {}) {
   const requestedReason = String(options?.reason || '').toLowerCase();
   const baseCooldownMs = requestedReason === 'stale_quote_hopeless'
     ? adaptiveHopelessCooldownMs
-    : Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * attempts);
+    : Math.min(
+      STALE_QUOTE_SCAN_COOLDOWN_MAX_MS,
+      STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * Math.max(1, 2 ** Math.max(0, attempts - 1)),
+    );
   const cooldownMs = Number.isFinite(requestedCooldownMs) && requestedCooldownMs > 0
     ? requestedCooldownMs
     : baseCooldownMs;
@@ -756,10 +759,41 @@ function computeEffectivePerScanBudget(baseBudget, symbolCount) {
 }
 
 function resolveEntrySkipReason(reason, meta) {
+  if (reason === 'marketdata_unavailable' && meta?.reason) return meta.reason;
   if (reason === 'orderbook_unavailable' && meta?.obReason) return meta.obReason;
   if (reason === 'orderbook_liquidity_gate' && meta?.reason) return meta.reason;
   if (reason === 'predictor_unavailable' && meta?.dataQualityReason) return meta.dataQualityReason;
   return reason || 'signal_skip';
+}
+
+function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = ENTRY_QUOTE_MAX_AGE_MS } = {}) {
+  const quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+  const quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
+  if (!Number.isFinite(quoteAgeMs)) {
+    return {
+      ok: false,
+      reason: 'marketdata_unavailable',
+      staleReasonCode: 'marketdata_unavailable',
+      quoteAgeMs: null,
+      thresholdAppliedMs: maxAgeMs,
+    };
+  }
+  if (quoteAgeMs > maxAgeMs) {
+    return {
+      ok: false,
+      reason: 'stale_quote_primary',
+      staleReasonCode: 'stale_quote_primary',
+      quoteAgeMs,
+      thresholdAppliedMs: maxAgeMs,
+    };
+  }
+  return {
+    ok: true,
+    reason: null,
+    staleReasonCode: null,
+    quoteAgeMs,
+    thresholdAppliedMs: maxAgeMs,
+  };
 }
 
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
@@ -1677,7 +1711,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       coordinator: entryMarketDataCoordinator,
       marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
-      fetchQuote: getQuoteForTrading,
+      fetchQuote: getLatestQuoteFromQuotesOnly,
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -1688,7 +1722,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     barsSnapshot = mdSnapshot?.bars || null;
   } else {
     try {
-      quote = await getQuoteForTrading(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+      quote = await getLatestQuoteFromQuotesOnly(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     } catch (err) {
       return {
         entryReady: false,
@@ -1778,37 +1812,45 @@ async function computeEntrySignal(symbol, opts = {}) {
     return shouldCount;
   };
 
-  const quoteClearlyBeyondSparseTolerance = Number.isFinite(quoteAgeMs) && quoteAgeMs > ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS;
-  const quoteHopelesslyStale = Number.isFinite(quoteAgeMs) && quoteAgeMs > (ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
-  if (quoteClearlyBeyondSparseTolerance) {
+  const primaryQuoteViability = evaluatePrimaryQuoteViability({
+    quote,
+    nowMs,
+    maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+  });
+  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViability.quoteAgeMs)
+    && primaryQuoteViability.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
+  if (!primaryQuoteViability.ok) {
     const cooldownMs = quoteHopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null;
     noteStaleQuoteSkip(asset.symbol, {
       cooldownMs,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : 'stale_quote',
-      quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.reason,
+      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
     });
     console.log('entry_quote_viability_skip', {
       symbol: asset.symbol,
       symbolTier,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : 'stale_quote',
-      quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.staleReasonCode,
+      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
       quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
-      thresholdName: 'sparseStaleToleranceMs',
-      thresholdAppliedMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
-      sparsePolicy: 'stale_tolerance_gate_pre_orderbook',
-      action: 'skip_orderbook_fetch',
+      thresholdName: 'normalEntryQuoteMaxAgeMs',
+      thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+      sourcePriority: 'primary_alpaca_quote_first',
+      action: 'skip_orderbook_trade_and_sparse',
       cooldownMs: cooldownMs || STALE_QUOTE_SCAN_COOLDOWN_STEP_MS,
     });
     return {
       entryReady: false,
-      why: 'stale_quote',
+      why: 'marketdata_unavailable',
       meta: {
         symbol: asset.symbol,
         symbolTier,
-        quoteAgeMs,
-        thresholdAppliedMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
+        reason: primaryQuoteViability.staleReasonCode,
+        quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+        thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
         staleQuoteHopeless: quoteHopelesslyStale,
         skippedOrderbookFetch: true,
+        skippedTradeFetch: true,
+        skippedSparseRetry: true,
       },
       record: baseRecord,
     };
@@ -1821,7 +1863,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         coordinator: entryMarketDataCoordinator,
         marketDataCache: scanMarketDataCache,
         symbol: asset.symbol,
-        fetchQuote: getQuoteForTrading,
+        fetchQuote: getLatestQuoteFromQuotesOnly,
         fetchOrderbook: getLatestOrderbook,
         quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -1924,7 +1966,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         coordinator: entryMarketDataCoordinator,
         marketDataCache: scanMarketDataCache,
         symbol: asset.symbol,
-        fetchQuote: getQuoteForTrading,
+        fetchQuote: getLatestQuoteFromQuotesOnly,
         fetchOrderbook: getLatestOrderbook,
         quoteMaxAgeMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -3970,7 +4012,7 @@ const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
 const staleQuoteSkipStateBySymbol = new Map();
-const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 300000;
+const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 15 * 60 * 1000;
 const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS, 10000);
 const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 3, 300000);
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
@@ -4185,6 +4227,11 @@ const entryManagerHeartbeat = {
   currentScanSymbolsProcessed: 0,
   currentScanUniverseSize: 0,
   currentScanState: 'idle',
+  currentScanStaleQuoteCooldownCount: 0,
+  currentScanStalePrimaryQuoteCount: 0,
+  currentScanDataUnavailableCount: 0,
+  currentScanMarketRejectionCount: 0,
+  currentScanTopSkipReasons: {},
   totalScans: 0,
   lastWatchdogWarningAt: null,
   lastWatchdogReason: null,
@@ -4244,12 +4291,22 @@ function updateEntryScanProgress({
   symbolsProcessed = null,
   universeSize = null,
   state = null,
+  staleQuoteCooldownCount = null,
+  stalePrimaryQuoteCount = null,
+  dataUnavailableCount = null,
+  marketRejectionCount = null,
+  topSkipReasons = null,
 } = {}) {
   const nowIso = safeIso();
   if (Number.isFinite(startMs)) entryManagerHeartbeat.currentScanStartedAt = safeIso(startMs);
   if (Number.isFinite(symbolsProcessed)) entryManagerHeartbeat.currentScanSymbolsProcessed = Math.max(0, Math.floor(symbolsProcessed));
   if (Number.isFinite(universeSize)) entryManagerHeartbeat.currentScanUniverseSize = Math.max(0, Math.floor(universeSize));
   if (typeof state === 'string' && state.trim()) entryManagerHeartbeat.currentScanState = state.trim();
+  if (Number.isFinite(staleQuoteCooldownCount)) entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = Math.max(0, Math.floor(staleQuoteCooldownCount));
+  if (Number.isFinite(stalePrimaryQuoteCount)) entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = Math.max(0, Math.floor(stalePrimaryQuoteCount));
+  if (Number.isFinite(dataUnavailableCount)) entryManagerHeartbeat.currentScanDataUnavailableCount = Math.max(0, Math.floor(dataUnavailableCount));
+  if (Number.isFinite(marketRejectionCount)) entryManagerHeartbeat.currentScanMarketRejectionCount = Math.max(0, Math.floor(marketRejectionCount));
+  if (topSkipReasons && typeof topSkipReasons === 'object') entryManagerHeartbeat.currentScanTopSkipReasons = { ...topSkipReasons };
   entryManagerHeartbeat.currentScanLastProgressAt = nowIso;
   entryManagerHeartbeat.lastHeartbeatAt = nowIso;
 }
@@ -4260,6 +4317,11 @@ function clearEntryScanProgress({ state = 'idle' } = {}) {
   entryManagerHeartbeat.currentScanSymbolsProcessed = 0;
   entryManagerHeartbeat.currentScanUniverseSize = 0;
   entryManagerHeartbeat.currentScanState = state;
+  entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = 0;
+  entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = 0;
+  entryManagerHeartbeat.currentScanDataUnavailableCount = 0;
+  entryManagerHeartbeat.currentScanMarketRejectionCount = 0;
+  entryManagerHeartbeat.currentScanTopSkipReasons = {};
 }
 
  
@@ -7771,6 +7833,10 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
 
   const tryFallbackTradeQuote = async () => {
+    // Source priority rule:
+    // 1) Prefer fresh primary Alpaca quote.
+    // 2) Only use trade fallback when primary quote is missing/invalid/unreachable.
+    //    Do not let ancient trade fallback dominate stale-primary paths.
     const fallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMsFinal });
     if (!fallback) return null;
     quoteCache.set(symbol, fallback);
@@ -7890,10 +7956,6 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
 
   if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
-    const fallbackQuote = await tryFallbackTradeQuote();
-    if (fallbackQuote) {
-      return fallbackQuote;
-    }
     logSkip('stale_quote', buildStaleQuoteLogMeta({
       symbol,
       source: 'alpaca',
@@ -7908,10 +7970,6 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
 
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
-    const fallbackQuote = await tryFallbackTradeQuote();
-    if (fallbackQuote) {
-      return fallbackQuote;
-    }
     logSkip('stale_quote', buildStaleQuoteLogMeta({
       symbol,
       source: 'alpaca',
@@ -13732,29 +13790,64 @@ async function runEntryScanOnce() {
 
     let nextProgressLogAtMs = Date.now() + 10000;
     const progressMilestoneStep = 10;
+    const buildSkipCountsSoFar = () => Array.from(skipDetailCounts.entries()).reduce((acc, [reason, count]) => {
+      acc[reason] = count;
+      return acc;
+    }, {});
+    const computeProgressCounters = () => {
+      const skipCountsSoFar = buildSkipCountsSoFar();
+      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0);
+      const stalePrimaryQuoteCount = Number(skipCountsSoFar.stale_quote_primary || 0);
+      const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
+      const marketRejectionCount = Object.entries(skipCountsSoFar)
+        .filter(([reason]) => classifyEntrySkipReason(reason) === 'market')
+        .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+      const topSkipReasons = Object.entries(skipCountsSoFar)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .reduce((acc, [reason, count]) => {
+          acc[reason] = count;
+          return acc;
+        }, {});
+      return {
+        skipCountsSoFar,
+        staleQuoteCooldownCount,
+        stalePrimaryQuoteCount,
+        dataUnavailableCount,
+        marketRejectionCount,
+        topSkipReasons,
+      };
+    };
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
         break;
       }
       scanned += 1;
+      const progressCounters = computeProgressCounters();
       updateEntryScanProgress({
         startMs,
         symbolsProcessed: scanned,
         universeSize: scanSymbols.length,
         state: 'scanning_symbols',
+        staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+        stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
+        dataUnavailableCount: progressCounters.dataUnavailableCount,
+        marketRejectionCount: progressCounters.marketRejectionCount,
+        topSkipReasons: progressCounters.topSkipReasons,
       });
       if ((scanned % progressMilestoneStep === 0) || Date.now() >= nextProgressLogAtMs) {
         nextProgressLogAtMs = Date.now() + 10000;
-        const skipCountsSoFar = Array.from(skipDetailCounts.entries()).reduce((acc, [reason, count]) => {
-          acc[reason] = count;
-          return acc;
-        }, {});
         console.log('entry_scan_progress', {
           startedAt: safeIso(startMs),
           symbolsProcessed: scanned,
           universeSize: scanSymbols.length,
           signalReadyCountSoFar: signalReadyCount,
-          skipCountsSoFar,
+          skipCountsSoFar: progressCounters.skipCountsSoFar,
+          staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+          stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
+          dataUnavailableCount: progressCounters.dataUnavailableCount,
+          marketRejectionCount: progressCounters.marketRejectionCount,
+          topSkipReasons: progressCounters.topSkipReasons,
           currentEngineState: getEngineStateSnapshot(),
         });
       }
@@ -13812,7 +13905,14 @@ async function runEntryScanOnce() {
       const staleCooldown = getStaleQuoteCooldownState(symbol);
       if (staleCooldown.active) {
         skipped += 1;
-        recordSkip('stale_quote_cooldown', symbol, { untilMs: staleCooldown.untilMs, remainingMs: staleCooldown.remainingMs, attempts: staleCooldown.attempts });
+        recordSkip('stale_quote_cooldown', symbol, {
+          untilMs: staleCooldown.untilMs,
+          remainingMs: staleCooldown.remainingMs,
+          attempts: staleCooldown.attempts,
+          suppressed: true,
+          reason: staleCooldown.reason || null,
+          quoteAgeMs: staleCooldown.quoteAgeMs,
+        });
         continue;
       }
 
@@ -14074,6 +14174,12 @@ async function runEntryScanOnce() {
       acc[reason] = count;
       return acc;
     }, {});
+    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0);
+    const stalePrimaryQuoteCount = Number(skipDetailCountsObj.stale_quote_primary || 0);
+    const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
+    const marketRejectionCount = Object.entries(skipDetailCountsObj)
+      .filter(([reason]) => classifyEntrySkipReason(reason) === 'market')
+      .reduce((sum, [, count]) => sum + Number(count || 0), 0);
     const skipSamplesObj = Array.from(skipSamples.entries()).reduce((acc, [reason, samples]) => {
       acc[reason] = samples;
       return acc;
@@ -14176,6 +14282,10 @@ async function runEntryScanOnce() {
       entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,
+      staleQuoteCooldownCount,
+      stalePrimaryQuoteCount,
+      dataUnavailableCount,
+      marketRejectionCount,
       staleQuoteCooldownActive: Array.from(staleQuoteSkipStateBySymbol.values()).filter((state) => Number(state?.untilMs) > endMs).length,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
@@ -16540,6 +16650,7 @@ module.exports = {
   computeProviderQuoteAgeMs,
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeEffectivePerScanBudget,
+  evaluatePrimaryQuoteViability,
   resolveEntryExecutionContext,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
@@ -16552,5 +16663,8 @@ module.exports = {
     quoteCache.clear();
     quotePassCache.clear();
   },
+  __testNoteStaleQuoteSkip: noteStaleQuoteSkip,
+  __testGetStaleQuoteCooldownState: getStaleQuoteCooldownState,
+  __testClearStaleQuoteSkipState: clearStaleQuoteSkipState,
 
 };
