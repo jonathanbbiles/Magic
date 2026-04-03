@@ -526,6 +526,8 @@ export default function App() {
                   requested: universe?.envRequestedUniverseMode,
                   effective: universe?.effectiveUniverseMode,
                   dynamicUniverseActive: universe?.dynamicUniverseActive,
+                  stableExclusionEnabled: universe?.stableExclusionEnabled,
+                  stableSymbolsExcludedCount: universe?.stableSymbolsExcludedCount,
                   allowDynamicInProd: universe?.allowDynamicUniverseInProduction,
                   dynamicTradableSymbolsFound: universe?.dynamicTradableSymbolsFound,
                   acceptedSymbolsCount: universe?.acceptedSymbolsCount,

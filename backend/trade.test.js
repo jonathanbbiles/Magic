@@ -219,6 +219,7 @@ const {
   computeProviderQuoteAgeMs,
   computeEffectivePerScanBudget,
   evaluatePrimaryQuoteViability,
+  classifyQuoteFetchFailureReason,
   __testNoteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState,
@@ -255,6 +256,9 @@ const freshPrimaryViability = evaluatePrimaryQuoteViability({
   maxAgeMs: 30000,
 });
 assert.equal(freshPrimaryViability.ok, true);
+assert.equal(classifyQuoteFetchFailureReason(new Error('Quote stale for BTC/USD')), 'stale_quote_primary');
+assert.equal(classifyQuoteFetchFailureReason(new Error('Quote not available for BTC/USD')), 'marketdata_unavailable');
+assert.equal(classifyQuoteFetchFailureReason(new Error('socket timeout')), 'marketdata_unavailable');
 
 __testClearStaleQuoteSkipState('XRP/USD');
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
@@ -291,6 +295,12 @@ assert.ok(tradeSourceEarly.includes("fetchQuote: getLatestQuoteFromQuotesOnly"))
 assert.ok(tradeSourceEarly.includes("why: 'marketdata_unavailable'"));
 assert.ok(tradeSourceEarly.includes("reason: 'stale_quote_primary'"));
 assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_trade_and_sparse'"));
+assert.ok(tradeSourceEarly.includes('skippedOrderbookFetch: true'));
+assert.ok(tradeSourceEarly.includes('skippedTradeFetch: true'));
+assert.ok(tradeSourceEarly.includes('skippedSparseRetry: true'));
+assert.ok(tradeSourceEarly.includes("'predictor_gate'"));
+assert.ok(tradeSourceEarly.includes("'entry_regime_gate'"));
+assert.ok(tradeSourceEarly.includes("'net_edge_gate'"));
 assert.ok(tradeSourceEarly.includes('staleQuoteCooldownCount'));
 assert.ok(tradeSourceEarly.includes('stalePrimaryQuoteCount'));
 assert.ok(tradeSourceEarly.includes('dataUnavailableCount'));
