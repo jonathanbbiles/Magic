@@ -111,6 +111,8 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `GET /dashboard` meta now also exposes explicit engine/entry-loop proof fields: `engineState`, `entryManagerStarted`, `lastEntryScanAt`, `lastEntryScanSummary`, `lastSuccessfulAction`, `lastExecutionFailure`, and skip-category counters for stale quotes/market/data/rate-limit/concurrency-risk.
 - `GET /dashboard` truth diagnostics now include live mid-scan heartbeat (`currentEntryScanProgress`) so active scans are visible before end-of-scan summary emission.
 - `/dashboard` diagnostics explicitly separate market rejection vs stale/data rejection vs insufficient bars vs rate-limit suppression vs execution failures.
+- Entry scans now short-circuit stale primary Alpaca quotes (`stale_quote_primary`) before sparse confirmation, latest-trade fallback, or orderbook fetch; this preserves request budget for viable symbols.
+- `entry_scan_progress`/`lastEntryScanSummary` now expose `staleQuoteCooldownCount`, `stalePrimaryQuoteCount`, `dataUnavailableCount`, and `marketRejectionCount` so stale-symbol suppression is visible in-flight and post-scan.
 - Entry scanning is cache-first: rolling in-memory quote/orderbook/bar caches are reused between scans, broad warmup is now bounded seeding, and per-symbol bars fallback is budgeted/cooldown-gated under rate pressure.
 - Alpaca **live** execution/account/orders/positions behavior remains unchanged; dynamic full-universe scanning remains unchanged.
 - Entry quote freshness is unified under runtime config (no hidden entry-path fallback literals), stale-data protection remains active, and market-condition rejections remain distinct from data-quality rejections.
@@ -241,6 +243,7 @@ For stable live deployments, also set:
 - dynamic full Alpaca tradable crypto universe (`ENTRY_UNIVERSE_MODE=dynamic`)
 - explicit production opt-in for dynamic universe (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`)
 - optional stablecoin exclusion is disabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=false`)
+- if enabled (`ENTRY_UNIVERSE_EXCLUDE_STABLES=true`), exclusions are surfaced in runtime diagnostics (`stableExclusionEnabled`, `stableSymbolsExcludedCount`) and universe-selection logs
 - no configured primary/secondary pinning by default (`ENTRY_SYMBOLS_PRIMARY=` and `ENTRY_SYMBOLS_SECONDARY=`)
 - conservative scan cadence/prefetch/rate-limit settings remain unchanged
 

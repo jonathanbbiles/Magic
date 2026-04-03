@@ -329,6 +329,33 @@ export default function App() {
   const currentEntryScanProgress = truth?.currentEntryScanProgress ?? meta?.currentEntryScanProgress ?? null;
   const lastSuccessfulAction = meta?.lastSuccessfulAction ?? truth?.lastSuccessfulAction ?? null;
   const lastExecutionFailure = meta?.lastExecutionFailure ?? truth?.lastExecutionFailure ?? null;
+  const compactScanSummary = {
+    progress: currentEntryScanProgress
+      ? `${toNum(currentEntryScanProgress.symbolsProcessed) ?? 0}/${toNum(currentEntryScanProgress.universeSize) ?? 0} (${currentEntryScanProgress.state || '—'})`
+      : '—',
+    staleQuoteCooldownCount:
+      toNum(currentEntryScanProgress?.staleQuoteCooldownCount)
+      ?? toNum(entryScan?.staleQuoteCooldownCount)
+      ?? 0,
+    stalePrimaryQuoteCount:
+      toNum(currentEntryScanProgress?.stalePrimaryQuoteCount)
+      ?? toNum(entryScan?.stalePrimaryQuoteCount)
+      ?? 0,
+    dataUnavailableCount:
+      toNum(currentEntryScanProgress?.dataUnavailableCount)
+      ?? toNum(entryScan?.dataUnavailableCount)
+      ?? 0,
+    marketRejectionCount:
+      toNum(currentEntryScanProgress?.marketRejectionCount)
+      ?? toNum(entryScan?.marketRejectionCount)
+      ?? toNum(truth?.marketRejectionCount)
+      ?? 0,
+    topSkipReasons:
+      currentEntryScanProgress?.topSkipReasons
+      ?? entryScan?.topSkipReasons
+      ?? truth?.topSkipReasons
+      ?? {},
+  };
   const stalled = String(engineState).toLowerCase() === 'degraded' && Boolean(meta?.lastEntryScanAt || truth?.lastEntryScanAt);
 
   return (
@@ -408,7 +435,13 @@ export default function App() {
                   Current scan progress: {currentEntryScanProgress ? JSON.stringify(currentEntryScanProgress) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
-                  Top skip reasons: {entryScan?.topSkipReasons ? JSON.stringify(entryScan.topSkipReasons) : '—'}
+                  Scan progress compact: {compactScanSummary.progress}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  staleCooldown={compactScanSummary.staleQuoteCooldownCount} stalePrimary={compactScanSummary.stalePrimaryQuoteCount} dataUnavailable={compactScanSummary.dataUnavailableCount} marketRejections={compactScanSummary.marketRejectionCount}
+                </Text>
+                <Text style={styles.diagnosticsText}>
+                  Top skip reasons: {compactScanSummary.topSkipReasons ? JSON.stringify(compactScanSummary.topSkipReasons) : '—'}
                 </Text>
                 <Text style={styles.diagnosticsText}>
                   Signals: ready={toNum(entryScan?.signalReadyCount) ?? 0} blockedByWarmup={toNum(entryScan?.signalBlockedByWarmupCount) ?? 0} staleQuoteSkips={toNum(entryScan?.staleEntryQuoteSkips) ?? 0}
