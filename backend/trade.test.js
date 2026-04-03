@@ -1139,8 +1139,8 @@ const universeFilteredTrade = loadTrade({
   ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true',
 });
 assert.deepEqual(
-  universeFilteredTrade.applyEntryUniverseStableFilter(['BTC/USD', 'USDC/USD', 'ETH/USD'], { excludeStables: true }),
-  ['BTC/USD', 'ETH/USD'],
+  universeFilteredTrade.applyEntryUniverseStableFilter(['BTC/USD', 'USDC/USD', 'USDC/USDT', 'ETH/USDT'], { excludeStables: true }),
+  ['BTC/USD', 'ETH/USDT'],
 );
 
 const sizingKellyDisabledTrade = loadTrade({

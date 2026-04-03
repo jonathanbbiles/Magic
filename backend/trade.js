@@ -26,6 +26,7 @@ const {
   alpacaSymbol,
   normalizeSymbolInternal,
   normalizeSymbolForAlpaca,
+  isCrypto: isCryptoPair,
 } = require('./symbolUtils');
 const fs = require('fs');
 const path = require('path');
@@ -1002,11 +1003,15 @@ function logRuntimeConfigEffective() {
   });
 }
 
-const ENTRY_UNIVERSE_STABLE_SYMBOLS = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
+const ENTRY_UNIVERSE_STABLE_BASE_ASSETS = new Set(['USDC', 'USDT', 'BUSD', 'DAI']);
 
 function applyEntryUniverseStableFilter(symbols = [], { excludeStables = false } = {}) {
   if (!excludeStables) return symbols.slice();
-  return symbols.filter((sym) => !ENTRY_UNIVERSE_STABLE_SYMBOLS.has(sym));
+  return symbols.filter((sym) => {
+    const normalized = normalizePair(sym);
+    const base = String(normalized || '').split('/')[0];
+    return !ENTRY_UNIVERSE_STABLE_BASE_ASSETS.has(base);
+  });
 }
 
 function getEffectiveMaxConcurrentPositions() {
@@ -4673,6 +4678,7 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       malformedExcluded: dynamicUniverse.stats.malformedCount,
       unsupportedExcluded: dynamicUniverse.stats.unsupportedCount,
       duplicateExcluded: dynamicUniverse.stats.duplicateCount,
+      acceptedByQuote: dynamicUniverse.stats.quoteCounts,
       sampleSymbols: dynamicUniverse.symbols.slice(0, 10),
       refreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
       loadedAt: supportedCryptoPairsState.lastUpdated,
@@ -6306,7 +6312,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 // Fetch latest trade price for a symbol
 
 function isCryptoSymbol(symbol) {
-  return Boolean(symbol && normalizePair(symbol).endsWith('/USD'));
+  return Boolean(symbol && isCryptoPair(symbol));
 }
 
 async function getLatestPrice(symbol) {

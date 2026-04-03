@@ -1,4 +1,4 @@
-const { normalizePair } = require('../symbolUtils');
+const { normalizePair, SUPPORTED_CRYPTO_QUOTES } = require('../symbolUtils');
 
 function parseSymbolList(raw) {
   return String(raw || '')
@@ -19,7 +19,10 @@ function uniqSymbols(symbols) {
 }
 
 function isValidCryptoPair(symbol) {
-  return /^[A-Z0-9]+\/USD$/.test(String(symbol || ''));
+  const value = String(symbol || '');
+  const match = value.match(/^([A-Z0-9]+)\/([A-Z0-9]+)$/);
+  if (!match) return false;
+  return SUPPORTED_CRYPTO_QUOTES.includes(match[2]);
 }
 
 function buildDynamicCryptoUniverseFromAssets(assets = [], { allowedSymbols = null } = {}) {
@@ -30,6 +33,7 @@ function buildDynamicCryptoUniverseFromAssets(assets = [], { allowedSymbols = nu
   let malformedCount = 0;
   let unsupportedCount = 0;
   let duplicateCount = 0;
+  const quoteCounts = {};
 
   for (const asset of Array.isArray(assets) ? assets : []) {
     const assetClass = String(asset?.class || asset?.asset_class || '').toLowerCase();
@@ -54,6 +58,10 @@ function buildDynamicCryptoUniverseFromAssets(assets = [], { allowedSymbols = nu
     }
     seen.add(normalized);
     accepted.push(normalized);
+    const quote = normalized.split('/')[1] || null;
+    if (quote) {
+      quoteCounts[quote] = (quoteCounts[quote] || 0) + 1;
+    }
   }
 
   return {
@@ -64,6 +72,7 @@ function buildDynamicCryptoUniverseFromAssets(assets = [], { allowedSymbols = nu
       malformedCount,
       unsupportedCount,
       duplicateCount,
+      quoteCounts,
     },
   };
 }
