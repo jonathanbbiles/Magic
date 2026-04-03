@@ -112,6 +112,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `GET /dashboard` truth diagnostics now include live mid-scan heartbeat (`currentEntryScanProgress`) so active scans are visible before end-of-scan summary emission.
 - `/dashboard` diagnostics explicitly separate market rejection vs stale/data rejection vs insufficient bars vs rate-limit suppression vs execution failures.
 - Entry scans now short-circuit stale primary Alpaca quotes (`stale_quote_primary`) before sparse confirmation, latest-trade fallback, or orderbook fetch; this preserves request budget for viable symbols.
+- Repeated stale-symbol failures now escalate per-symbol cooldown suppression and expose active cooldown samples in scan diagnostics (`stale_quote_cooldown`, `staleQuoteCooldownCount`, `staleQuoteCooldownSample`).
 - `entry_scan_progress`/`lastEntryScanSummary` now expose `staleQuoteCooldownCount`, `stalePrimaryQuoteCount`, `dataUnavailableCount`, and `marketRejectionCount` so stale-symbol suppression is visible in-flight and post-scan.
 - Entry scanning is cache-first: rolling in-memory quote/orderbook/bar caches are reused between scans, broad warmup is now bounded seeding, and per-symbol bars fallback is budgeted/cooldown-gated under rate pressure.
 - Alpaca **live** execution/account/orders/positions behavior remains unchanged; dynamic full-universe scanning remains unchanged.

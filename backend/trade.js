@@ -581,6 +581,9 @@ function getEntryDiagnosticsSnapshot() {
       concurrencyRiskGuardCount,
       executionFailureCount,
     },
+    staleQuoteCooldownSample: Array.isArray(lastEntryScanSummary?.staleQuoteCooldownSample)
+      ? lastEntryScanSummary.staleQuoteCooldownSample
+      : [],
     topSkipReasonsRolling: Array.from(entrySkipReasonTotals.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
@@ -794,6 +797,14 @@ function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = E
     quoteAgeMs,
     thresholdAppliedMs: maxAgeMs,
   };
+}
+
+function classifyQuoteFetchFailureReason(error, fallbackReason = 'marketdata_unavailable') {
+  const normalizedFallback = String(fallbackReason || 'marketdata_unavailable');
+  const message = String(error?.message || error || '').toLowerCase();
+  if (message.includes('quote stale') || message.includes('stale quote')) return 'stale_quote_primary';
+  if (message.includes('quote not available')) return 'marketdata_unavailable';
+  return normalizedFallback;
 }
 
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
@@ -1720,10 +1731,47 @@ async function computeEntrySignal(symbol, opts = {}) {
     quote = mdSnapshot?.quote || null;
     obResult = mdSnapshot?.orderbook || null;
     barsSnapshot = mdSnapshot?.bars || null;
+    const quoteFetchReason = classifyQuoteFetchFailureReason(
+      mdSnapshot?.quoteResult?.error,
+      mdSnapshot?.quoteResult?.reason || 'marketdata_unavailable',
+    );
+    if (!quote && quoteFetchReason === 'stale_quote_primary') {
+      noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+      return {
+        entryReady: false,
+        why: 'marketdata_unavailable',
+        meta: {
+          symbol: asset.symbol,
+          symbolTier,
+          reason: 'stale_quote_primary',
+          skippedOrderbookFetch: true,
+          skippedTradeFetch: true,
+          skippedSparseRetry: true,
+        },
+        record: baseRecord,
+      };
+    }
   } else {
     try {
       quote = await getLatestQuoteFromQuotesOnly(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     } catch (err) {
+      const quoteFetchReason = classifyQuoteFetchFailureReason(err, 'marketdata_unavailable');
+      if (quoteFetchReason === 'stale_quote_primary') {
+        noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+        return {
+          entryReady: false,
+          why: 'marketdata_unavailable',
+          meta: {
+            symbol: asset.symbol,
+            symbolTier,
+            reason: 'stale_quote_primary',
+            skippedOrderbookFetch: true,
+            skippedTradeFetch: true,
+            skippedSparseRetry: true,
+          },
+          record: baseRecord,
+        };
+      }
       return {
         entryReady: false,
         why: 'stale_quote',
@@ -4012,9 +4060,9 @@ const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
 const staleQuoteSkipStateBySymbol = new Map();
-const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 15 * 60 * 1000;
-const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS, 10000);
-const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 3, 300000);
+const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 20 * 60 * 1000;
+const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 30000);
+const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 4, 600000);
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
 const ENTRY_SCAN_PROGRESS_HEARTBEAT_MS = Math.max(2000, Math.min(ENTRY_SCAN_INTERVAL_MS, 5000));
 const ENTRY_SKIP_REASON_TOTALS_MAX_KEYS = 50;
@@ -14248,6 +14296,18 @@ async function runEntryScanOnce() {
         });
         return acc;
       }, {});
+    const staleQuoteCooldownSample = Array.from(staleQuoteSkipStateBySymbol.entries())
+      .filter(([, state]) => Number(state?.untilMs) > endMs)
+      .sort((a, b) => Number(b?.[1]?.untilMs || 0) - Number(a?.[1]?.untilMs || 0))
+      .slice(0, 8)
+      .map(([symbol, state]) => ({
+        symbol,
+        untilMs: Number(state?.untilMs) || 0,
+        remainingMs: Math.max(0, Number(state?.untilMs || 0) - endMs),
+        attempts: Number(state?.attempts) || 0,
+        reason: state?.reason || null,
+        quoteAgeMs: Number.isFinite(Number(state?.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
+      }));
     const completedSummary = {
       startMs,
       endMs,
@@ -14286,7 +14346,8 @@ async function runEntryScanOnce() {
       stalePrimaryQuoteCount,
       dataUnavailableCount,
       marketRejectionCount,
-      staleQuoteCooldownActive: Array.from(staleQuoteSkipStateBySymbol.values()).filter((state) => Number(state?.untilMs) > endMs).length,
+      staleQuoteCooldownActive: staleQuoteCooldownSample.length,
+      staleQuoteCooldownSample,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -16651,6 +16712,7 @@ module.exports = {
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeEffectivePerScanBudget,
   evaluatePrimaryQuoteViability,
+  classifyQuoteFetchFailureReason,
   resolveEntryExecutionContext,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
