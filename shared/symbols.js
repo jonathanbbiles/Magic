@@ -1,3 +1,5 @@
+const SUPPORTED_CRYPTO_QUOTES = ['USDT', 'USDC', 'USD'];
+
 function normalizePair(rawSymbol) {
   if (!rawSymbol) return rawSymbol;
   const symbol = String(rawSymbol).trim().toUpperCase();
@@ -5,8 +7,12 @@ function normalizePair(rawSymbol) {
   if (symbol.includes('/')) {
     return symbol;
   }
-  if (symbol.endsWith('USD') && symbol.length > 3 && !symbol.includes('-')) {
-    return `${symbol.slice(0, -3)}/USD`;
+  if (!symbol.includes('-')) {
+    for (const quote of SUPPORTED_CRYPTO_QUOTES) {
+      if (symbol.endsWith(quote) && symbol.length > quote.length) {
+        return `${symbol.slice(0, -quote.length)}/${quote}`;
+      }
+    }
   }
   return symbol;
 }
@@ -59,7 +65,7 @@ function toDataSymbol(rawSymbol) {
 
 function isCrypto(sym) {
   const normalized = normalizePair(sym);
-  return /\/USD$/.test(normalized || '');
+  return new RegExp(`/(${SUPPORTED_CRYPTO_QUOTES.join('|')})$`).test(normalized || '');
 }
 
 function isStock(sym) {
@@ -81,6 +87,7 @@ const exportsObject = {
   toDataSymbol,
   isCrypto,
   isStock,
+  SUPPORTED_CRYPTO_QUOTES,
 };
 
 module.exports = exportsObject;

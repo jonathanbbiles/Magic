@@ -6,6 +6,8 @@ const {
   alpacaSymbol,
   normalizeSymbolInternal,
   normalizeSymbolForAlpaca,
+  isCrypto,
+  SUPPORTED_CRYPTO_QUOTES,
 } = require('../shared/symbols');
 
 module.exports = {
@@ -16,4 +18,6 @@ module.exports = {
   alpacaSymbol,
   normalizeSymbolInternal,
   normalizeSymbolForAlpaca,
+  isCrypto,
+  SUPPORTED_CRYPTO_QUOTES,
 };
