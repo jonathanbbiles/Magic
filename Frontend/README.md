@@ -22,11 +22,12 @@ export EXPO_PUBLIC_API_TOKEN="your_api_token"
 
 ## Run the frontend
 
-From `Frontend/`:
+This repository contains multiple projects. Always run Expo commands from `Frontend/` (the Expo project root), not the repository root.
 
 ```bash
+cd Frontend
 npm install
-npm run start
+npx expo start -c
 ```
 
 Then open in Expo Go or simulator.

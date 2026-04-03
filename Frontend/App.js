@@ -9,7 +9,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 
 const theme = {
   colors: {
@@ -361,7 +360,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
+      <View style={styles.screen}>
         <FlatList
           data={positions}
           numColumns={2}
@@ -586,14 +585,14 @@ export default function App() {
           }
           renderItem={({ item }) => <CompactPositionRow position={item} />}
         />
-      </LinearGradient>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
-  screen: { flex: 1 },
+  screen: { flex: 1, backgroundColor: theme.colors.bg },
   content: { padding: theme.spacing.md, paddingBottom: 100 },
   gridRow: {
     justifyContent: 'space-between',
