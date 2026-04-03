@@ -207,7 +207,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `MIN_NET_EDGE_BPS=5`
 - `ENTRY_PROFIT_BUFFER_BPS=5`
 - `REQUIRED_EDGE_BPS` (optional legacy hard override; leave unset to keep derived edge economics)
-- `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS=15000` (bounded sparse-fallback tolerance for tier1 quote staleness)
+- `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS=30000` (runtime-aligned sparse stale tolerance cap; symbols repeatedly far beyond this threshold enter stale-quote cooldown suppression)
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
 - `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8`

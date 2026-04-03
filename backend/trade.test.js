@@ -253,9 +253,11 @@ assert.ok(!tradeSourceEarly.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber(
 assert.ok(!tradeSourceEarly.includes("const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);"));
 assert.ok(tradeSourceEarly.includes("console.log('engine_transition'"));
 assert.ok(tradeSourceEarly.includes("console.warn('engine_stall_warning'"));
-assert.ok(tradeSourceEarly.includes('if (activeScanProgress) return;'));
+assert.ok(tradeSourceEarly.includes('if (activeScanProgress || activeScanWithoutSummary) return;'));
 assert.ok(tradeSourceEarly.includes("console.log('entry_scan_progress'"));
 assert.ok(tradeSourceEarly.includes('currentScanLastProgressAt'));
+assert.ok(tradeSourceEarly.includes("state: 'prefetching_market_data'"));
+assert.ok(tradeSourceEarly.includes('includeOrderbook: false'));
 assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_fetch'"));
 assert.ok(tradeSourceEarly.includes('lastSuccessfulAction'));
 assert.ok(tradeSourceEarly.includes('lastExecutionFailure'));
