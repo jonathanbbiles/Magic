@@ -1,18 +1,23 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Clipboard,
   FlatList,
+  Pressable,
   RefreshControl,
   SafeAreaView,
   StatusBar,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
 } from 'react-native';
+import { LinearGradient } from 'expo-linear-gradient';
 
 const theme = {
   colors: {
     bg: '#070A12',
+    bgAlt: '#0A1020',
     text: 'rgba(255,255,255,0.92)',
     muted: 'rgba(255,255,255,0.65)',
     faint: 'rgba(255,255,255,0.45)',
@@ -21,6 +26,7 @@ const theme = {
     positive: '#72FFB6',
     negative: '#FF5C8A',
     warning: '#FFD36E',
+    accent: '#88A7FF',
     border: 'rgba(255,255,255,0.10)',
     glowPos: 'rgba(114,255,182,0.55)',
     glowNeg: 'rgba(255,92,138,0.55)',
@@ -140,29 +146,6 @@ function minsSince(isoTs) {
   return `${mins}m`;
 }
 
-function ageLabelFromPosition(position) {
-  const heldDirect = toNum(position?.heldSeconds);
-  if (Number.isFinite(heldDirect) && heldDirect >= 0) {
-    const mins = Math.floor(heldDirect / 60);
-    const rem = Math.floor(heldDirect % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const heldSnake = toNum(position?.held_seconds);
-  if (Number.isFinite(heldSnake) && heldSnake >= 0) {
-    const mins = Math.floor(heldSnake / 60);
-    const rem = Math.floor(heldSnake % 60);
-    return `${mins}m ${rem}s`;
-  }
-  const createdMs = Date.parse(String(position?.created_at || ''));
-  if (Number.isFinite(createdMs)) {
-    const seconds = Math.max(0, Math.floor((Date.now() - createdMs) / 1000));
-    const mins = Math.floor(seconds / 60);
-    const rem = Math.floor(seconds % 60);
-    return `${mins}m ${rem}s`;
-  }
-  return '—';
-}
-
 function ageLabelShort(position) {
   const heldDirect = toNum(position?.heldSeconds);
   if (Number.isFinite(heldDirect) && heldDirect >= 0) {
@@ -180,7 +163,6 @@ function ageLabelShort(position) {
   return '—';
 }
 
-
 function distToTargetPct(position) {
   const current = toNum(position?.current_price);
   const sellLimit =
@@ -191,22 +173,29 @@ function distToTargetPct(position) {
   return ((sellLimit - current) / current) * 100;
 }
 
-function Chip({ value }) {
+function StatusChip({ label, ok }) {
   return (
-    <View style={headerStyles.chip}>
-      <Text style={headerStyles.chipValue}>{value}</Text>
+    <View style={[styles.statusChip, ok ? styles.statusChipOk : styles.statusChipWarn]}>
+      <Text style={styles.statusChipText}>{label}</Text>
     </View>
   );
 }
 
-function CompactPositionRow({ position }) {
-  const symbol = position?.symbol || '—';
+function KpiPill({ label, value, valueStyle }) {
+  return (
+    <View style={styles.kpiPill}>
+      <Text style={styles.kpiLabel}>{label}</Text>
+      <Text style={[styles.kpiValue, valueStyle]} numberOfLines={1}>{value}</Text>
+    </View>
+  );
+}
 
+function CompactPositionRow({ position, tileWidth }) {
+  const symbol = position?.symbol || '—';
   const upnl = toNum(position?.unrealized_pl);
   const upnlPctRaw = toNum(position?.unrealized_plpc);
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
   const pnlPositive = (upnl || 0) >= 0;
-
   const dist = distToTargetPct(position);
 
   const distText = Number.isFinite(dist) ? `${dist >= 0 ? '+' : ''}${dist.toFixed(2)}%` : '—';
@@ -214,41 +203,51 @@ function CompactPositionRow({ position }) {
   const pnlPercent = pct(upnlPct);
   const timeShort = ageLabelShort(position);
 
-  const glow = pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg;
-
   return (
-    <View style={[compactStyles.tile, { borderColor: glow }]}>
+    <View style={[compactStyles.tile, { width: tileWidth, borderColor: pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg }]}>
       <View style={compactStyles.line1}>
-        <Text style={compactStyles.sym} numberOfLines={1} ellipsizeMode="tail">
-          {symbol}
-        </Text>
-        <Text style={compactStyles.delta} numberOfLines={1} ellipsizeMode="tail">
-          Δ🎯 {distText}
-        </Text>
+        <Text style={compactStyles.sym} numberOfLines={1}>{symbol}</Text>
+        <Text style={compactStyles.delta} numberOfLines={1}>Δ🎯 {distText}</Text>
       </View>
-
       <View style={compactStyles.line2}>
-        <Text
-          style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]}
-          numberOfLines={1}
-          ellipsizeMode="tail"
-        >
+        <Text style={[compactStyles.pnl, { color: pnlPositive ? theme.colors.positive : theme.colors.negative }]} numberOfLines={1}>
           📌 {pnlDollar} ({pnlPercent})
         </Text>
-
-        <Text style={compactStyles.timeInline} numberOfLines={1} ellipsizeMode="tail">
-          ⏱️ {timeShort}
-        </Text>
+        <Text style={compactStyles.timeInline} numberOfLines={1}>⏱️ {timeShort}</Text>
       </View>
     </View>
   );
 }
 
+function DiagnosticsCard({ title, preview, raw, expanded, onToggle, onCopy, copied }) {
+  return (
+    <View style={styles.diagCard}>
+      <View style={styles.diagHead}>
+        <Text style={styles.diagTitle}>{title}</Text>
+        <View style={styles.diagActions}>
+          <Pressable onPress={onCopy} style={styles.actionBtn}>
+            <Text style={styles.actionText}>{copied ? 'Copied' : 'Copy'}</Text>
+          </Pressable>
+          <Pressable onPress={onToggle} style={styles.actionBtn}>
+            <Text style={styles.actionText}>{expanded ? 'Hide' : 'Expand'}</Text>
+          </Pressable>
+        </View>
+      </View>
+      <Text style={styles.diagPreview} numberOfLines={expanded ? 0 : 2}>{preview}</Text>
+      {expanded ? <Text style={styles.diagRaw}>{raw}</Text> : null}
+    </View>
+  );
+}
+
 export default function App() {
+  const { width } = useWindowDimensions();
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
+  const [expandedCards, setExpandedCards] = useState({});
+  const [copiedCardId, setCopiedCardId] = useState('');
+
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
     if (!isRefresh) setLoading(true);
@@ -274,30 +273,27 @@ export default function App() {
 
   const positions = useMemo(() => {
     const list = Array.isArray(dashboard?.positions) ? dashboard.positions.slice() : [];
-
     list.sort((a, b) => {
       const aDist = distToTargetPct(a);
       const bDist = distToTargetPct(b);
       if (!Number.isFinite(aDist)) return 1;
       if (!Number.isFinite(bDist)) return -1;
-      return aDist - bDist; // closest to fill first
+      return aDist - bDist;
     });
-
     return list;
   }, [dashboard]);
 
   const account = dashboard?.account || {};
   const portfolioValue = account?.portfolio_value ?? account?.equity;
-
   const weeklyChangePct = toNum(dashboard?.meta?.weeklyChangePct);
 
   const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
-
   const openPLPct = useMemo(() => {
     const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
     if (!Number.isFinite(mv) || mv <= 0) return null;
     return (openPL / mv) * 100;
   }, [positions, openPL]);
+
   const entryDiagnostics = dashboard?.diagnostics || {};
   const entryScan = entryDiagnostics?.entryScan || null;
   const predictorCandidates = entryDiagnostics?.predictorCandidates || null;
@@ -307,6 +303,7 @@ export default function App() {
   const firstSkip = firstSkipSymbol && Array.isArray(skipReasonsBySymbol[firstSkipSymbol])
     ? skipReasonsBySymbol[firstSkipSymbol][0]
     : null;
+
   const meta = dashboard?.meta || {};
   const scorecard = meta?.scorecard || {};
   const sizing = meta?.sizing || {};
@@ -328,6 +325,7 @@ export default function App() {
   const currentEntryScanProgress = truth?.currentEntryScanProgress ?? meta?.currentEntryScanProgress ?? null;
   const lastSuccessfulAction = meta?.lastSuccessfulAction ?? truth?.lastSuccessfulAction ?? null;
   const lastExecutionFailure = meta?.lastExecutionFailure ?? truth?.lastExecutionFailure ?? null;
+
   const compactScanSummary = {
     progress: currentEntryScanProgress
       ? `${toNum(currentEntryScanProgress.symbolsProcessed) ?? 0}/${toNum(currentEntryScanProgress.universeSize) ?? 0} (${currentEntryScanProgress.state || '—'})`
@@ -355,7 +353,200 @@ export default function App() {
       ?? truth?.topSkipReasons
       ?? {},
   };
+
   const stalled = String(engineState).toLowerCase() === 'degraded' && Boolean(meta?.lastEntryScanAt || truth?.lastEntryScanAt);
+
+  const runtimeTruthRaw = {
+    backendReachable,
+    alpacaConnected,
+    authEnabled,
+    dynamicUniverseActive: meta?.dynamicUniverseActive ?? runtime?.dynamicUniverseActive ?? truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
+    acceptedSymbolsCount: meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
+    engineState: meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—',
+    ratePressureState: truth?.ratePressureState ?? runtime?.ratePressureState ?? null,
+    warmupInProgress: warmupStatus?.inProgress ?? runtime?.predictorWarmup?.inProgress ?? truth?.warmupInProgress ?? warmupInProgress,
+    seedingProgress: truth?.seedingProgress ?? null,
+    marketRejectionCount: truth?.marketRejectionCount ?? 0,
+    dataRejectionCount: truth?.dataRejectionCount ?? 0,
+    fallbackSuppressionCount: truth?.fallbackSuppressionCount ?? 0,
+    topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
+    signalBlockedByWarmupCount: truth?.signalBlockedByWarmupCount ?? entryScan?.signalBlockedByWarmupCount ?? 0,
+    openPositions: truth?.openPositions ?? positions.length,
+    activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
+  };
+
+  const entryDiagnosticsRaw = {
+    engineState,
+    stalled,
+    lastEntryScanAt,
+    lastEntryScanSummary: lastEntryScanSummary ? {
+      scanned: lastEntryScanSummary.scanned,
+      placed: lastEntryScanSummary.placed,
+      skipped: lastEntryScanSummary.skipped,
+      signalReadyCount: lastEntryScanSummary.signalReadyCount,
+      signalBlockedByWarmupCount: lastEntryScanSummary.signalBlockedByWarmupCount,
+      staleEntryQuoteSkips: lastEntryScanSummary.staleEntryQuoteSkips,
+      topSkipReasons: lastEntryScanSummary.topSkipReasons,
+      marketDataBudget: lastEntryScanSummary.marketDataBudget,
+      at: lastEntryScanAt,
+    } : null,
+    currentEntryScanProgress,
+    compactScanSummary,
+    signals: {
+      ready: toNum(entryScan?.signalReadyCount) ?? 0,
+      blockedByWarmup: toNum(entryScan?.signalBlockedByWarmupCount) ?? 0,
+      staleQuoteSkips: toNum(entryScan?.staleEntryQuoteSkips) ?? 0,
+    },
+    predictorCandidates: predictorCandidates?.topCandidates ?? null,
+    topCandidateDetail: topCandidate ? {
+      symbol: topCandidate.symbol,
+      requiredEdgeBps: topCandidate.requiredEdgeBps,
+      netEdgeBps: topCandidate.netEdgeBps,
+      quoteAgeMs: topCandidate.quoteAgeMs,
+      quoteTsMs: topCandidate.quoteTsMs,
+      quoteReceivedAtMs: topCandidate.quoteReceivedAtMs,
+      regimeLabel: topCandidate.regimeLabel,
+      regimePenaltyBps: topCandidate.regimePenaltyBps,
+      dataQualityReason: topCandidate.dataQualityReason,
+      sparseRetry: topCandidate.sparseRetry,
+    } : null,
+    perSymbolSkips: Object.keys(skipReasonsBySymbol).length ? skipReasonsBySymbol : null,
+    firstSkipDetail: firstSkip ? {
+      symbol: firstSkipSymbol,
+      reason: firstSkip.reason,
+      requiredEdgeBps: firstSkip.requiredEdgeBps,
+      netEdgeBps: firstSkip.netEdgeBps,
+      quoteAgeMs: firstSkip.quoteAgeMs,
+      quoteTsMs: firstSkip.quoteTsMs,
+      quoteReceivedAtMs: firstSkip.quoteReceivedAtMs,
+      regimeLabel: firstSkip.regimeLabel,
+      regimePenaltyBps: firstSkip.regimePenaltyBps,
+      dataQualityReason: firstSkip.dataQualityReason,
+      sparseRetry: firstSkip.sparseRetry,
+    } : null,
+    lastSuccessfulAction,
+    lastExecutionFailure,
+  };
+
+  const scorecardRaw = scorecard;
+  const sizingConcurrencyRaw = {
+    mode: sizing?.activeMode,
+    kellyEnabled: sizing?.kellyEnabled,
+    kellyShadowMode: sizing?.kellyShadowMode,
+    activeSlotsUsed: concurrency?.activeSlotsUsed,
+    cap: concurrency?.capMaxEffective,
+  };
+  const quoteGuardsRaw = {
+    entryQuoteMaxAgeMs: quoteFreshness?.entryQuoteMaxAgeMs,
+    entryRegimeStaleQuoteMaxAgeMs: quoteFreshness?.entryRegimeStaleQuoteMaxAgeMs,
+    sparseRequireQuoteFreshMs: quoteFreshness?.sparseRequireQuoteFreshMs,
+    sparseStaleQuoteToleranceMs: quoteFreshness?.sparseStaleQuoteToleranceMs,
+    staleEntryQuoteSkips: quoteFreshness?.staleEntryQuoteSkips,
+    staleQuoteRejectionCount: truth?.staleQuoteRejectionCount ?? entryDiagnostics?.gating?.staleQuoteRejectionCount ?? 0,
+    marketRejectionCount: truth?.marketRejectionCount ?? 0,
+    staleDataRejectionCount: truth?.staleDataRejectionCount ?? truth?.dataRejectionCount ?? 0,
+    staleCooldownSuppressionCount: truth?.staleCooldownSuppressionCount ?? 0,
+    topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
+    topSkipReasonsRolling: truth?.topSkipReasonsRolling ?? {},
+    positions: truth?.openPositions ?? positions.length,
+    activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
+    drawdownPct: risk?.drawdownPct,
+    dailyDrawdownPct: risk?.dailyDrawdownPct,
+    drawdownGuardEnabled: risk?.drawdownGuardEnabled,
+    correlationGuardEnabled: risk?.correlationGuardEnabled,
+  };
+  const universeRaw = {
+    requested: universe?.envRequestedUniverseMode,
+    effective: universe?.effectiveUniverseMode,
+    dynamicUniverseActive: universe?.dynamicUniverseActive,
+    stableExclusionEnabled: universe?.stableExclusionEnabled,
+    stableSymbolsExcludedCount: universe?.stableSymbolsExcludedCount,
+    allowDynamicInProd: universe?.allowDynamicUniverseInProduction,
+    dynamicTradableSymbolsFound: universe?.dynamicTradableSymbolsFound,
+    acceptedSymbolsCount: universe?.acceptedSymbolsCount,
+    configuredPrimaryCount: universe?.configuredPrimaryCount,
+    configuredSecondaryCount: universe?.configuredSecondaryCount,
+    sample: universe?.acceptedSymbolsSample,
+    fallbackOccurred: universe?.fallbackOccurred,
+    fallbackReason: universe?.fallbackReason,
+    lastUniverseRefreshAt: universe?.lastUniverseRefreshAt,
+  };
+  const warmupRaw = {
+    inProgress: warmupInProgress,
+    startedAt: warmup?.startedAt,
+    finishedAt: warmup?.finishedAt,
+    totalSymbolsPlanned: warmup?.totalSymbolsPlanned,
+    symbolsCompleted: warmup?.symbolsCompleted,
+    chunksCompleted: warmup?.chunksCompleted,
+    totalChunks: warmup?.totalChunks,
+    currentTimeframe: warmup?.currentTimeframe,
+    lastCompletedTimeframe: warmup?.lastCompletedTimeframe,
+    timeframesCompleted: warmup?.timeframesCompleted,
+    lastBatchSummary: warmup?.lastBatchSummary,
+    lastError: warmup?.lastError,
+  };
+
+  const diagCards = [
+    {
+      id: 'runtime-truth',
+      title: 'Runtime truth',
+      preview: `engine=${runtimeTruthRaw.engineState} • backend=${runtimeTruthRaw.backendReachable ? 'up' : 'down'} • alpaca=${runtimeTruthRaw.alpacaConnected ? 'ok' : 'off'} • open=${runtimeTruthRaw.openPositions}`,
+      raw: runtimeTruthRaw,
+    },
+    {
+      id: 'entry-diagnostics',
+      title: 'Entry diagnostics',
+      preview: `scan=${compactScanSummary.progress} • ready=${entryDiagnosticsRaw.signals.ready} • skipped=${toNum(entryScan?.skipped) ?? '—'} • stale=${compactScanSummary.stalePrimaryQuoteCount}`,
+      raw: entryDiagnosticsRaw,
+    },
+    {
+      id: 'scorecard',
+      title: 'Closed-trade scorecard',
+      preview: `wins=${toNum(scorecard?.wins) ?? '—'} • losses=${toNum(scorecard?.losses) ?? '—'} • pnl=${signedUsd(scorecard?.realizedPnL ?? scorecard?.realizedPnl ?? scorecard?.totalPnl)}`,
+      raw: scorecardRaw,
+    },
+    {
+      id: 'sizing-concurrency',
+      title: 'Sizing / concurrency',
+      preview: `mode=${sizingConcurrencyRaw.mode || '—'} • slots=${sizingConcurrencyRaw.activeSlotsUsed ?? '—'}/${sizingConcurrencyRaw.cap ?? '—'} • kelly=${sizingConcurrencyRaw.kellyEnabled ? 'on' : 'off'}`,
+      raw: sizingConcurrencyRaw,
+    },
+    {
+      id: 'quote-guards',
+      title: 'Quote freshness / guards',
+      preview: `staleSkips=${toNum(quoteGuardsRaw.staleEntryQuoteSkips) ?? 0} • marketReject=${toNum(quoteGuardsRaw.marketRejectionCount) ?? 0} • staleReject=${toNum(quoteGuardsRaw.staleDataRejectionCount) ?? 0}`,
+      raw: quoteGuardsRaw,
+    },
+    {
+      id: 'universe-truth',
+      title: 'Universe truth',
+      preview: `effective=${universeRaw.effective || '—'} • accepted=${toNum(universeRaw.acceptedSymbolsCount) ?? '—'} • fallback=${universeRaw.fallbackOccurred ? 'yes' : 'no'}`,
+      raw: universeRaw,
+    },
+    {
+      id: 'predictor-warmup',
+      title: 'Predictor warmup',
+      preview: `inProgress=${warmupInProgress ? 'yes' : 'no'} • symbols=${toNum(warmupRaw.symbolsCompleted) ?? 0}/${toNum(warmupRaw.totalSymbolsPlanned) ?? '—'} • chunks=${toNum(warmupRaw.chunksCompleted) ?? 0}/${toNum(warmupRaw.totalChunks) ?? '—'}`,
+      raw: warmupRaw,
+    },
+  ];
+
+  const isTablet = width >= 768;
+  const numColumns = width >= 980 ? 4 : width >= 700 ? 3 : 2;
+  const gap = 10;
+  const horizontalPad = theme.spacing.md * 2;
+  const tileWidth = (width - horizontalPad - gap * (numColumns - 1)) / numColumns;
+
+  const toggleCard = useCallback((id) => {
+    setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
+  }, []);
+
+  const copyCard = useCallback(async (id, raw) => {
+    const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+    Clipboard.setString(text);
+    setCopiedCardId(id);
+    setTimeout(() => setCopiedCardId((prev) => (prev === id ? '' : prev)), 1200);
+  }, []);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -363,7 +554,8 @@ export default function App() {
       <View style={styles.screen}>
         <FlatList
           data={positions}
-          numColumns={2}
+          numColumns={numColumns}
+          key={`cols-${numColumns}`}
           columnWrapperStyle={styles.gridRow}
           keyExtractor={(item) => String(item?.symbol || 'unknown')}
           contentContainerStyle={styles.content}
@@ -371,188 +563,44 @@ export default function App() {
             <RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} tintColor="#fff" />
           }
           ListHeaderComponent={
-            <View style={headerStyles.wrap}>
-              <View style={headerStyles.topRow}>
-                <Text style={headerStyles.title}>🎩 Magic Money</Text>
-                <Text style={headerStyles.titleRight}>{usd(portfolioValue)}</Text>
+            <View style={styles.headerWrap}>
+              <LinearGradient
+                colors={['#18213B', '#0E1529', '#0A1020']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.hero}
+              >
+                <View style={styles.heroTopRow}>
+                  <Text style={styles.heroTitle}>🎩 Magic Money</Text>
+                  <Text style={styles.heroValue}>{usd(portfolioValue)}</Text>
+                </View>
+                <View style={styles.kpiRow}>
+                  <KpiPill label="Weekly" value={Number.isFinite(weeklyChangePct) ? pct(weeklyChangePct) : '—'} />
+                  <KpiPill
+                    label="Open P/L"
+                    value={`${signedUsd(openPL)} (${pct(openPLPct)})`}
+                    valueStyle={{ color: openPL >= 0 ? theme.colors.positive : theme.colors.negative }}
+                  />
+                </View>
+                <View style={styles.statusRow}>
+                  <StatusChip label={`Engine ${engineState}`} ok={String(engineState).toLowerCase() !== 'degraded'} />
+                  <StatusChip label={`Auth ${authEnabled ? 'on' : 'off'}`} ok={authEnabled} />
+                  <StatusChip label={`Alpaca ${alpacaConnected ? 'ok' : 'off'}`} ok={alpacaConnected} />
+                  <StatusChip label={`Backend ${backendReachable ? 'up' : 'down'}`} ok={backendReachable} />
+                </View>
+              </LinearGradient>
+
+              <View style={[styles.controlPanel, isTablet && styles.controlPanelTablet]}>
+                <KpiPill label="Positions" value={String(positions.length)} />
+                <KpiPill
+                  label="Last Scan"
+                  value={lastEntryScanAt && lastEntryScanAt !== '—' ? `${minsSince(lastEntryScanAt)} ago` : '—'}
+                />
+                <KpiPill label="Scan State" value={compactScanSummary.progress} />
+                <KpiPill label="Stale Quotes" value={String(compactScanSummary.stalePrimaryQuoteCount)} />
               </View>
 
-              <View style={headerStyles.chipsRow}>
-                <Chip value={`Weekly: ${Number.isFinite(weeklyChangePct) ? pct(weeklyChangePct) : '—'}`} />
-              </View>
-
-              <View style={headerStyles.openRow}>
-                <Text style={headerStyles.openLine}>Open P/L: {signedUsd(openPL)} ({pct(openPLPct)})</Text>
-              </View>
-
-              <View style={styles.diagnosticsBlock}>
-                <Text style={styles.diagnosticsTitle}>Runtime truth</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify({
-                  backendReachable,
-                  alpacaConnected,
-                  authEnabled,
-                  dynamicUniverseActive: meta?.dynamicUniverseActive ?? runtime?.dynamicUniverseActive ?? truth?.dynamicUniverseActive ?? universe?.dynamicUniverseActive ?? false,
-                  acceptedSymbolsCount: meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount ?? universe?.acceptedSymbolsCount ?? 0,
-                  engineState: meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—',
-                  ratePressureState: truth?.ratePressureState ?? runtime?.ratePressureState ?? null,
-                  warmupInProgress: warmupStatus?.inProgress ?? runtime?.predictorWarmup?.inProgress ?? truth?.warmupInProgress ?? warmupInProgress,
-                  seedingProgress: truth?.seedingProgress ?? null,
-                  marketRejectionCount: truth?.marketRejectionCount ?? 0,
-                  dataRejectionCount: truth?.dataRejectionCount ?? 0,
-                  fallbackSuppressionCount: truth?.fallbackSuppressionCount ?? 0,
-                  topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
-                  signalBlockedByWarmupCount: truth?.signalBlockedByWarmupCount ?? entryScan?.signalBlockedByWarmupCount ?? 0,
-                  openPositions: truth?.openPositions ?? positions.length,
-                  activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
-                })}</Text>
-              </View>
-              <View style={styles.diagnosticsBlock}>
-                <Text style={styles.diagnosticsTitle}>Entry diagnostics</Text>
-                <Text style={styles.diagnosticsText}>
-                  Engine: {engineState} {stalled ? '(possible stall/watchdog)' : ''}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Last entry scan at: {lastEntryScanAt && lastEntryScanAt !== '—' ? `${lastEntryScanAt} (${minsSince(lastEntryScanAt)} ago)` : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Last scan: scanned={toNum(entryScan?.scanned) ?? '—'} placed={toNum(entryScan?.placed) ?? '—'} skipped={toNum(entryScan?.skipped) ?? '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Last scan summary: {lastEntryScanSummary ? JSON.stringify({
-                    scanned: lastEntryScanSummary.scanned,
-                    placed: lastEntryScanSummary.placed,
-                    skipped: lastEntryScanSummary.skipped,
-                    signalReadyCount: lastEntryScanSummary.signalReadyCount,
-                    signalBlockedByWarmupCount: lastEntryScanSummary.signalBlockedByWarmupCount,
-                    staleEntryQuoteSkips: lastEntryScanSummary.staleEntryQuoteSkips,
-                    topSkipReasons: lastEntryScanSummary.topSkipReasons,
-                    marketDataBudget: lastEntryScanSummary.marketDataBudget,
-                    at: lastEntryScanAt,
-                  }) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Current scan progress: {currentEntryScanProgress ? JSON.stringify(currentEntryScanProgress) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Scan progress compact: {compactScanSummary.progress}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  staleCooldown={compactScanSummary.staleQuoteCooldownCount} stalePrimary={compactScanSummary.stalePrimaryQuoteCount} dataUnavailable={compactScanSummary.dataUnavailableCount} marketRejections={compactScanSummary.marketRejectionCount}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Top skip reasons: {compactScanSummary.topSkipReasons ? JSON.stringify(compactScanSummary.topSkipReasons) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Signals: ready={toNum(entryScan?.signalReadyCount) ?? 0} blockedByWarmup={toNum(entryScan?.signalBlockedByWarmupCount) ?? 0} staleQuoteSkips={toNum(entryScan?.staleEntryQuoteSkips) ?? 0}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Predictor candidates: {predictorCandidates?.topCandidates ? JSON.stringify(predictorCandidates.topCandidates) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Top candidate detail: {topCandidate ? JSON.stringify({
-                    symbol: topCandidate.symbol,
-                    requiredEdgeBps: topCandidate.requiredEdgeBps,
-                    netEdgeBps: topCandidate.netEdgeBps,
-                    quoteAgeMs: topCandidate.quoteAgeMs,
-                    quoteTsMs: topCandidate.quoteTsMs,
-                    quoteReceivedAtMs: topCandidate.quoteReceivedAtMs,
-                    regimeLabel: topCandidate.regimeLabel,
-                    regimePenaltyBps: topCandidate.regimePenaltyBps,
-                    dataQualityReason: topCandidate.dataQualityReason,
-                    sparseRetry: topCandidate.sparseRetry,
-                  }) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Per-symbol skips: {Object.keys(skipReasonsBySymbol).length ? JSON.stringify(skipReasonsBySymbol) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  First skip detail: {firstSkip ? JSON.stringify({
-                    symbol: firstSkipSymbol,
-                    reason: firstSkip.reason,
-                    requiredEdgeBps: firstSkip.requiredEdgeBps,
-                    netEdgeBps: firstSkip.netEdgeBps,
-                    quoteAgeMs: firstSkip.quoteAgeMs,
-                    quoteTsMs: firstSkip.quoteTsMs,
-                    quoteReceivedAtMs: firstSkip.quoteReceivedAtMs,
-                    regimeLabel: firstSkip.regimeLabel,
-                    regimePenaltyBps: firstSkip.regimePenaltyBps,
-                    dataQualityReason: firstSkip.dataQualityReason,
-                    sparseRetry: firstSkip.sparseRetry,
-                  }) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Last successful action: {lastSuccessfulAction ? JSON.stringify(lastSuccessfulAction) : '—'}
-                </Text>
-                <Text style={styles.diagnosticsText}>
-                  Last execution failure: {lastExecutionFailure ? JSON.stringify(lastExecutionFailure) : '—'}
-                </Text>
-              </View>
-              <View style={styles.diagnosticsBlock}>
-                <Text style={styles.diagnosticsTitle}>Closed-trade scorecard</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify(scorecard)}</Text>
-                <Text style={styles.diagnosticsTitle}>Sizing / concurrency</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify({
-                  mode: sizing?.activeMode,
-                  kellyEnabled: sizing?.kellyEnabled,
-                  kellyShadowMode: sizing?.kellyShadowMode,
-                  activeSlotsUsed: concurrency?.activeSlotsUsed,
-                  cap: concurrency?.capMaxEffective,
-                })}</Text>
-                <Text style={styles.diagnosticsTitle}>Quote freshness / guards</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify({
-                  entryQuoteMaxAgeMs: quoteFreshness?.entryQuoteMaxAgeMs,
-                  entryRegimeStaleQuoteMaxAgeMs: quoteFreshness?.entryRegimeStaleQuoteMaxAgeMs,
-                  sparseRequireQuoteFreshMs: quoteFreshness?.sparseRequireQuoteFreshMs,
-                  sparseStaleQuoteToleranceMs: quoteFreshness?.sparseStaleQuoteToleranceMs,
-                  staleEntryQuoteSkips: quoteFreshness?.staleEntryQuoteSkips,
-                  staleQuoteRejectionCount: truth?.staleQuoteRejectionCount ?? entryDiagnostics?.gating?.staleQuoteRejectionCount ?? 0,
-                  marketRejectionCount: truth?.marketRejectionCount ?? 0,
-                  staleDataRejectionCount: truth?.staleDataRejectionCount ?? truth?.dataRejectionCount ?? 0,
-                  staleCooldownSuppressionCount: truth?.staleCooldownSuppressionCount ?? 0,
-                  topSkipReasons: truth?.topSkipReasons ?? entryScan?.topSkipReasons ?? {},
-                  topSkipReasonsRolling: truth?.topSkipReasonsRolling ?? {},
-                  positions: truth?.openPositions ?? positions.length,
-                  activeSellLimits: truth?.activeSellLimits ?? positions.filter((p) => Number.isFinite(toNum(p?.sell?.activeLimit))).length,
-                  drawdownPct: risk?.drawdownPct,
-                  dailyDrawdownPct: risk?.dailyDrawdownPct,
-                  drawdownGuardEnabled: risk?.drawdownGuardEnabled,
-                  correlationGuardEnabled: risk?.correlationGuardEnabled,
-                })}</Text>
-              </View>
-              <View style={styles.diagnosticsBlock}>
-                <Text style={styles.diagnosticsTitle}>Universe truth</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify({
-                  requested: universe?.envRequestedUniverseMode,
-                  effective: universe?.effectiveUniverseMode,
-                  dynamicUniverseActive: universe?.dynamicUniverseActive,
-                  stableExclusionEnabled: universe?.stableExclusionEnabled,
-                  stableSymbolsExcludedCount: universe?.stableSymbolsExcludedCount,
-                  allowDynamicInProd: universe?.allowDynamicUniverseInProduction,
-                  dynamicTradableSymbolsFound: universe?.dynamicTradableSymbolsFound,
-                  acceptedSymbolsCount: universe?.acceptedSymbolsCount,
-                  configuredPrimaryCount: universe?.configuredPrimaryCount,
-                  configuredSecondaryCount: universe?.configuredSecondaryCount,
-                  sample: universe?.acceptedSymbolsSample,
-                  fallbackOccurred: universe?.fallbackOccurred,
-                  fallbackReason: universe?.fallbackReason,
-                  lastUniverseRefreshAt: universe?.lastUniverseRefreshAt,
-                })}</Text>
-                <Text style={styles.diagnosticsTitle}>Predictor warmup</Text>
-                <Text style={styles.diagnosticsText}>{JSON.stringify({
-                  inProgress: warmupInProgress,
-                  startedAt: warmup?.startedAt,
-                  finishedAt: warmup?.finishedAt,
-                  totalSymbolsPlanned: warmup?.totalSymbolsPlanned,
-                  symbolsCompleted: warmup?.symbolsCompleted,
-                  chunksCompleted: warmup?.chunksCompleted,
-                  totalChunks: warmup?.totalChunks,
-                  currentTimeframe: warmup?.currentTimeframe,
-                  lastCompletedTimeframe: warmup?.lastCompletedTimeframe,
-                  timeframesCompleted: warmup?.timeframesCompleted,
-                  lastBatchSummary: warmup?.lastBatchSummary,
-                  lastError: warmup?.lastError,
-                })}</Text>
-              </View>
+              <Text style={styles.sectionTitle}>Positions</Text>
 
               {error ? (
                 <View style={styles.errorBanner}>
@@ -563,27 +611,41 @@ export default function App() {
                     </Text>
                   ) : null}
                   {authEnabled ? (
-                    <Text style={styles.errorHint}>
-                      🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)
-                    </Text>
+                    <Text style={styles.errorHint}>🔑 token mismatch? base url wrong? (EXPO_PUBLIC_API_TOKEN / EXPO_PUBLIC_BACKEND_URL)</Text>
                   ) : (
-                    <Text style={styles.errorHint}>
-                      ℹ️ Backend auth token is disabled on server; only backend URL must be correct.
-                    </Text>
+                    <Text style={styles.errorHint}>ℹ️ Backend auth token is disabled on server; only backend URL must be correct.</Text>
                   )}
                 </View>
               ) : null}
 
               {loading ? <ActivityIndicator color="#fff" style={styles.loader} /> : null}
               {!error && warmupInProgress ? (
-                <Text style={styles.empty}>
-                  ⏳ warming up market data ({toNum(warmup?.symbolsCompleted) ?? 0}/{toNum(warmup?.totalSymbolsPlanned) ?? '—'} symbols)
-                </Text>
+                <Text style={styles.empty}>⏳ warming up market data ({toNum(warmup?.symbolsCompleted) ?? 0}/{toNum(warmup?.totalSymbolsPlanned) ?? '—'} symbols)</Text>
               ) : null}
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
+
+              <Text style={[styles.sectionTitle, { marginTop: theme.spacing.md }]}>Diagnostics</Text>
+              <View style={styles.diagList}>
+                {diagCards.map((card) => {
+                  const expanded = Boolean(expandedCards[card.id]);
+                  const rawText = JSON.stringify(card.raw, null, 2);
+                  return (
+                    <DiagnosticsCard
+                      key={card.id}
+                      title={card.title}
+                      preview={card.preview}
+                      raw={rawText}
+                      expanded={expanded}
+                      copied={copiedCardId === card.id}
+                      onToggle={() => toggleCard(card.id)}
+                      onCopy={() => copyCard(card.id, rawText)}
+                    />
+                  );
+                })}
+              </View>
             </View>
           }
-          renderItem={({ item }) => <CompactPositionRow position={item} />}
+          renderItem={({ item }) => <CompactPositionRow position={item} tileWidth={tileWidth} />}
         />
       </View>
     </SafeAreaView>
@@ -593,131 +655,105 @@ export default function App() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
   screen: { flex: 1, backgroundColor: theme.colors.bg },
-  content: { padding: theme.spacing.md, paddingBottom: 100 },
-  gridRow: {
-    justifyContent: 'space-between',
-    gap: 10,
+  content: { padding: theme.spacing.md, paddingBottom: 90 },
+  headerWrap: { paddingBottom: theme.spacing.xs },
+  hero: {
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.11)',
+    borderRadius: theme.radius.lg,
+    padding: theme.spacing.md,
   },
+  heroTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 },
+  heroTitle: { color: theme.colors.text, fontSize: 20, fontWeight: '900', letterSpacing: 0.4 },
+  heroValue: { color: theme.colors.text, fontSize: 24, fontWeight: '900' },
+  kpiRow: { flexDirection: 'row', marginTop: theme.spacing.sm, gap: 8 },
+  statusRow: { marginTop: theme.spacing.sm, flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  statusChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  statusChipOk: { borderColor: 'rgba(114,255,182,0.5)', backgroundColor: 'rgba(114,255,182,0.15)' },
+  statusChipWarn: { borderColor: 'rgba(255,211,110,0.5)', backgroundColor: 'rgba(255,211,110,0.12)' },
+  statusChipText: { color: theme.colors.text, fontSize: 11, fontWeight: '800' },
+  controlPanel: {
+    marginTop: theme.spacing.sm,
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: 'rgba(255,255,255,0.03)',
+    padding: theme.spacing.xs,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  controlPanelTablet: { paddingHorizontal: theme.spacing.sm },
+  sectionTitle: { color: theme.colors.text, marginTop: theme.spacing.md, marginBottom: theme.spacing.sm, fontWeight: '900', fontSize: 15 },
+  kpiPill: {
+    flexGrow: 1,
+    minWidth: 120,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    borderRadius: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+  },
+  kpiLabel: { color: theme.colors.faint, fontSize: 11, fontWeight: '700', marginBottom: 2 },
+  kpiValue: { color: theme.colors.text, fontSize: 13, fontWeight: '900' },
+  gridRow: { justifyContent: 'space-between', gap: 10 },
   errorBanner: {
     backgroundColor: theme.colors.errorBg,
     borderColor: '#8A2A3C',
     borderWidth: 1,
     borderRadius: theme.radius.md,
     padding: theme.spacing.sm,
-    marginTop: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
   },
   errorText: { color: theme.colors.errorText, fontWeight: '900' },
   errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
   loader: { marginVertical: theme.spacing.md },
-  empty: { color: theme.colors.muted, marginTop: theme.spacing.md, marginBottom: theme.spacing.lg, fontWeight: '800' },
-  diagnosticsBlock: {
-    marginTop: theme.spacing.md,
+  empty: { color: theme.colors.muted, marginBottom: theme.spacing.sm, fontWeight: '800' },
+  diagList: { gap: 8, marginTop: 2 },
+  diagCard: {
+    borderRadius: theme.radius.md,
     borderWidth: 1,
     borderColor: theme.colors.border,
-    borderRadius: theme.radius.md,
-    padding: theme.spacing.sm,
     backgroundColor: 'rgba(255,255,255,0.03)',
+    padding: theme.spacing.sm,
   },
-  diagnosticsTitle: { color: theme.colors.text, fontWeight: '900', marginBottom: 4 },
-  diagnosticsText: { color: theme.colors.muted, fontSize: 11, marginTop: 2 },
-});
-
-const headerStyles = StyleSheet.create({
-  wrap: { paddingBottom: theme.spacing.md },
-  topRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
-  },
-  title: { color: theme.colors.text, fontSize: 26, fontWeight: '900', letterSpacing: 0.6 },
-  titleRight: { color: theme.colors.text, fontSize: 26, fontWeight: '900' },
-  chipsRow: {
-    flexDirection: 'row',
-    gap: theme.spacing.sm,
-    flexWrap: 'wrap',
-    marginBottom: theme.spacing.sm,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    borderRadius: 999,
+  diagHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8 },
+  diagTitle: { color: theme.colors.text, fontWeight: '900', flex: 1 },
+  diagActions: { flexDirection: 'row', gap: 6 },
+  actionBtn: {
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.16)',
     backgroundColor: 'rgba(255,255,255,0.06)',
-  },
-  chipValue: { color: theme.colors.text, fontSize: 14, fontWeight: '800' },
-  openRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline' },
-  openLine: { color: theme.colors.text, fontSize: 16, fontWeight: '900' },
-});
-
-const cardStyles = StyleSheet.create({
-  card: {
-    borderRadius: theme.radius.lg,
-    padding: theme.spacing.md,
-    marginBottom: theme.spacing.md,
-    borderWidth: 1.25,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-    marginBottom: theme.spacing.sm,
-  },
-  symWrap: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  symbol: { color: theme.colors.text, fontSize: 19, fontWeight: '900', letterSpacing: 0.8 },
-  qty: { color: theme.colors.muted, fontSize: 14, fontWeight: '800' },
-  pill: {
-    flexDirection: 'row',
-    gap: 6,
-    alignItems: 'center',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
     borderRadius: 999,
-    borderWidth: 1,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
   },
-  pillText: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
-  grid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'space-between',
-    gap: theme.spacing.sm,
-    marginBottom: theme.spacing.sm,
-  },
-  stat: {
-    minWidth: '48%',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 6,
-  },
-  statIcon: { color: theme.colors.muted, fontSize: 14, fontWeight: '900' },
-  statValue: { color: theme.colors.text, fontSize: 14, fontWeight: '900' },
-  bigRow: { marginBottom: theme.spacing.sm },
-  forensicsWrap: {
-    marginTop: theme.spacing.xs,
-    paddingTop: theme.spacing.xs,
+  actionText: { color: theme.colors.accent, fontSize: 11, fontWeight: '800' },
+  diagPreview: { color: theme.colors.muted, marginTop: 6, fontSize: 12 },
+  diagRaw: {
+    color: theme.colors.faint,
+    marginTop: 8,
+    fontSize: 11,
     borderTopWidth: 1,
     borderTopColor: theme.colors.border,
+    paddingTop: 8,
   },
-  forensicsTitle: { color: theme.colors.muted, fontWeight: '900', marginBottom: 6 },
-  forensicsDebug: { color: theme.colors.faint, fontSize: 11, marginTop: 2 },
 });
-
 
 const compactStyles = StyleSheet.create({
   tile: {
-    flex: 1,
     borderWidth: 1.1,
     borderRadius: theme.radius.md,
     paddingVertical: 10,
     paddingHorizontal: 12,
     marginBottom: 10,
     backgroundColor: 'rgba(255,255,255,0.04)',
-    minHeight: 0,
   },
   line1: {
     flexDirection: 'row',
