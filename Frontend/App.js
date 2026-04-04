@@ -5,14 +5,13 @@ import {
   Pressable,
   RefreshControl,
   SafeAreaView,
+  Share,
   StatusBar,
   StyleSheet,
   Text,
-  useWindowDimensions,
   View,
 } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
-import * as Clipboard from 'expo-clipboard';
+import LinearGradient from 'expo-linear-gradient';
 
 const theme = {
   colors: {
@@ -190,7 +189,7 @@ function KpiPill({ label, value, valueStyle }) {
   );
 }
 
-function CompactPositionRow({ position, tileWidth }) {
+function CompactPositionRow({ position }) {
   const symbol = position?.symbol || '—';
   const upnl = toNum(position?.unrealized_pl);
   const upnlPctRaw = toNum(position?.unrealized_plpc);
@@ -204,7 +203,7 @@ function CompactPositionRow({ position, tileWidth }) {
   const timeShort = ageLabelShort(position);
 
   return (
-    <View style={[compactStyles.tile, { width: tileWidth, borderColor: pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg }]}>
+    <View style={[compactStyles.tile, { borderColor: pnlPositive ? theme.colors.glowPos : theme.colors.glowNeg }]}>
       <View style={compactStyles.line1}>
         <Text style={compactStyles.sym} numberOfLines={1}>{symbol}</Text>
         <Text style={compactStyles.delta} numberOfLines={1}>Δ🎯 {distText}</Text>
@@ -219,34 +218,32 @@ function CompactPositionRow({ position, tileWidth }) {
   );
 }
 
-function DiagnosticsCard({ title, preview, raw, expanded, onToggle, onCopy, copied }) {
+function DiagnosticsCard({ title, preview, raw, expanded, onToggle, onShare }) {
   return (
     <View style={styles.diagCard}>
       <View style={styles.diagHead}>
         <Text style={styles.diagTitle}>{title}</Text>
         <View style={styles.diagActions}>
-          <Pressable onPress={onCopy} style={styles.actionBtn}>
-            <Text style={styles.actionText}>{copied ? 'Copied' : 'Copy'}</Text>
+          <Pressable onPress={onShare} style={styles.actionBtn}>
+            <Text style={styles.actionText}>Share</Text>
           </Pressable>
           <Pressable onPress={onToggle} style={styles.actionBtn}>
             <Text style={styles.actionText}>{expanded ? 'Hide' : 'Expand'}</Text>
           </Pressable>
         </View>
       </View>
-      <Text style={styles.diagPreview} numberOfLines={expanded ? 0 : 2}>{preview}</Text>
+      <Text style={styles.diagPreview} numberOfLines={1}>{preview}</Text>
       {expanded ? <Text style={styles.diagRaw}>{raw}</Text> : null}
     </View>
   );
 }
 
 export default function App() {
-  const { width } = useWindowDimensions();
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [expandedCards, setExpandedCards] = useState({});
-  const [copiedCardId, setCopiedCardId] = useState('');
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
@@ -531,27 +528,28 @@ export default function App() {
     },
   ];
 
-  const isTablet = width >= 768;
-  const numColumns = width >= 980 ? 4 : width >= 700 ? 3 : 2;
-  const gap = 10;
-  const horizontalPad = theme.spacing.md * 2;
-  const tileWidth = (width - horizontalPad - gap * (numColumns - 1)) / numColumns;
+  const numColumns = 2;
 
   const toggleCard = useCallback((id) => {
     setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
   }, []);
 
-  const copyCard = useCallback(async (id, raw) => {
+  const shareCard = useCallback(async (id, raw) => {
     const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
-    await Clipboard.setStringAsync(text);
-    setCopiedCardId(id);
-    setTimeout(() => setCopiedCardId((prev) => (prev === id ? '' : prev)), 1200);
+    try {
+      await Share.share({
+        title: `Magic diagnostics: ${id}`,
+        message: text,
+      });
+    } catch {
+      // ignore canceled share sheet or transient share errors
+    }
   }, []);
 
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <View style={styles.screen}>
+      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
         <FlatList
           data={positions}
           numColumns={numColumns}
@@ -590,7 +588,7 @@ export default function App() {
                 </View>
               </LinearGradient>
 
-              <View style={[styles.controlPanel, isTablet && styles.controlPanelTablet]}>
+              <View style={styles.controlPanel}>
                 <KpiPill label="Positions" value={String(positions.length)} />
                 <KpiPill
                   label="Last Scan"
@@ -636,18 +634,17 @@ export default function App() {
                       preview={card.preview}
                       raw={rawText}
                       expanded={expanded}
-                      copied={copiedCardId === card.id}
                       onToggle={() => toggleCard(card.id)}
-                      onCopy={() => copyCard(card.id, rawText)}
+                      onShare={() => shareCard(card.id, rawText)}
                     />
                   );
                 })}
               </View>
             </View>
           }
-          renderItem={({ item }) => <CompactPositionRow position={item} tileWidth={tileWidth} />}
+          renderItem={({ item }) => <CompactPositionRow position={item} />}
         />
-      </View>
+      </LinearGradient>
     </SafeAreaView>
   );
 }
@@ -655,19 +652,19 @@ export default function App() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
   screen: { flex: 1, backgroundColor: theme.colors.bg },
-  content: { padding: theme.spacing.md, paddingBottom: 90 },
+  content: { padding: theme.spacing.sm, paddingBottom: 72 },
   headerWrap: { paddingBottom: theme.spacing.xs },
   hero: {
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.11)',
     borderRadius: theme.radius.lg,
-    padding: theme.spacing.md,
+    padding: theme.spacing.sm,
   },
   heroTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 },
-  heroTitle: { color: theme.colors.text, fontSize: 20, fontWeight: '900', letterSpacing: 0.4 },
-  heroValue: { color: theme.colors.text, fontSize: 24, fontWeight: '900' },
-  kpiRow: { flexDirection: 'row', marginTop: theme.spacing.sm, gap: 8 },
-  statusRow: { marginTop: theme.spacing.sm, flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  heroTitle: { color: theme.colors.text, fontSize: 18, fontWeight: '900', letterSpacing: 0.3 },
+  heroValue: { color: theme.colors.text, fontSize: 22, fontWeight: '900' },
+  kpiRow: { flexDirection: 'row', marginTop: 8, gap: 6 },
+  statusRow: { marginTop: 8, flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   statusChip: {
     paddingHorizontal: 10,
     paddingVertical: 5,
@@ -688,21 +685,20 @@ const styles = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 8,
   },
-  controlPanelTablet: { paddingHorizontal: theme.spacing.sm },
-  sectionTitle: { color: theme.colors.text, marginTop: theme.spacing.md, marginBottom: theme.spacing.sm, fontWeight: '900', fontSize: 15 },
+  sectionTitle: { color: theme.colors.text, marginTop: theme.spacing.sm, marginBottom: 6, fontWeight: '900', fontSize: 14 },
   kpiPill: {
     flexGrow: 1,
-    minWidth: 120,
+    minWidth: 110,
     backgroundColor: 'rgba(255,255,255,0.05)',
     borderWidth: 1,
     borderColor: theme.colors.border,
     borderRadius: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 9,
   },
-  kpiLabel: { color: theme.colors.faint, fontSize: 11, fontWeight: '700', marginBottom: 2 },
-  kpiValue: { color: theme.colors.text, fontSize: 13, fontWeight: '900' },
-  gridRow: { justifyContent: 'space-between', gap: 10 },
+  kpiLabel: { color: theme.colors.faint, fontSize: 10, fontWeight: '700', marginBottom: 2 },
+  kpiValue: { color: theme.colors.text, fontSize: 12, fontWeight: '900' },
+  gridRow: { justifyContent: 'space-between', gap: 8 },
   errorBanner: {
     backgroundColor: theme.colors.errorBg,
     borderColor: '#8A2A3C',
@@ -713,9 +709,9 @@ const styles = StyleSheet.create({
   },
   errorText: { color: theme.colors.errorText, fontWeight: '900' },
   errorHint: { color: theme.colors.errorText, opacity: 0.85, marginTop: 6, fontWeight: '700', fontSize: 12 },
-  loader: { marginVertical: theme.spacing.md },
+  loader: { marginVertical: theme.spacing.sm },
   empty: { color: theme.colors.muted, marginBottom: theme.spacing.sm, fontWeight: '800' },
-  diagList: { gap: 8, marginTop: 2 },
+  diagList: { gap: 6, marginTop: 2 },
   diagCard: {
     borderRadius: theme.radius.md,
     borderWidth: 1,
@@ -735,7 +731,7 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   actionText: { color: theme.colors.accent, fontSize: 11, fontWeight: '800' },
-  diagPreview: { color: theme.colors.muted, marginTop: 6, fontSize: 12 },
+  diagPreview: { color: theme.colors.muted, marginTop: 5, fontSize: 11 },
   diagRaw: {
     color: theme.colors.faint,
     marginTop: 8,
