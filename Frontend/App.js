@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Clipboard,
   FlatList,
   Pressable,
   RefreshControl,
@@ -13,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Clipboard from 'expo-clipboard';
 
 const theme = {
   colors: {
@@ -543,7 +543,7 @@ export default function App() {
 
   const copyCard = useCallback(async (id, raw) => {
     const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
-    Clipboard.setString(text);
+    await Clipboard.setStringAsync(text);
     setCopiedCardId(id);
     setTimeout(() => setCopiedCardId((prev) => (prev === id ? '' : prev)), 1200);
   }, []);
