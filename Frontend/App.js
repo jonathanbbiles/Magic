@@ -11,7 +11,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
 
 const theme = {
   colors: {
@@ -549,7 +548,7 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
-      <LinearGradient colors={[theme.colors.bg, '#130A26']} style={styles.screen}>
+      <View style={styles.screen}>
         <FlatList
           data={positions}
           numColumns={numColumns}
@@ -562,12 +561,7 @@ export default function App() {
           }
           ListHeaderComponent={
             <View style={styles.headerWrap}>
-              <LinearGradient
-                colors={['#18213B', '#0E1529', '#0A1020']}
-                start={{ x: 0, y: 0 }}
-                end={{ x: 1, y: 1 }}
-                style={styles.hero}
-              >
+              <View style={styles.hero}>
                 <View style={styles.heroTopRow}>
                   <Text style={styles.heroTitle}>🎩 Magic Money</Text>
                   <Text style={styles.heroValue}>{usd(portfolioValue)}</Text>
@@ -586,7 +580,7 @@ export default function App() {
                   <StatusChip label={`Alpaca ${alpacaConnected ? 'ok' : 'off'}`} ok={alpacaConnected} />
                   <StatusChip label={`Backend ${backendReachable ? 'up' : 'down'}`} ok={backendReachable} />
                 </View>
-              </LinearGradient>
+              </View>
 
               <View style={styles.controlPanel}>
                 <KpiPill label="Positions" value={String(positions.length)} />
@@ -644,21 +638,27 @@ export default function App() {
           }
           renderItem={({ item }) => <CompactPositionRow position={item} />}
         />
-      </LinearGradient>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.colors.bg },
-  screen: { flex: 1, backgroundColor: theme.colors.bg },
+  screen: { flex: 1, backgroundColor: '#090E1A' },
   content: { padding: theme.spacing.sm, paddingBottom: 72 },
   headerWrap: { paddingBottom: theme.spacing.xs },
   hero: {
+    backgroundColor: '#101A31',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.11)',
     borderRadius: theme.radius.lg,
     padding: theme.spacing.sm,
+    shadowColor: '#000',
+    shadowOpacity: 0.28,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
   },
   heroTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 },
   heroTitle: { color: theme.colors.text, fontSize: 18, fontWeight: '900', letterSpacing: 0.3 },
