@@ -30,6 +30,11 @@ assert.ok(source.includes('signalBlockedByWarmupCount'));
 assert.ok(source.includes("reason: 'no_trustworthy_desired_target'"));
 assert.ok(source.includes('canExitProfitably = Number.isFinite(bid) && bid >= (state.profitabilityFloorPrice ?? state.trueBreakevenPrice ?? targetPrice)'));
 assert.ok(source.includes('locked_tp_loss_exit_blocked'));
+assert.ok(source.includes('const protectiveExitTriggerActive ='));
+assert.ok(source.includes("if (tacticDecision === 'take_profit_hold' && !protectiveExitTriggerActive)"));
+assert.ok(source.includes('locked_tp_override_release'));
+assert.ok(source.includes('if (openSellCount > 0 && !protectiveExitTriggerActive)'));
+assert.ok(source.includes('if (quoteStale && !protectiveExitTriggerActive)'));
 assert.ok(source.includes("exitMode: 'locked_tp'"));
 
 console.log('trade telemetry/exit tests passed');
