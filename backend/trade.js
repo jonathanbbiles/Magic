@@ -11342,6 +11342,35 @@ async function manageExitStates() {
           }
         }
 
+        const stopsEnabled = STOPS_ENABLED && STOPLOSS_ENABLED;
+        const canRunStopCheck = Number.isFinite(state.lastStopCheckAt)
+          ? now - state.lastStopCheckAt >= STOPLOSS_CHECK_INTERVAL_MS
+          : true;
+        const effectiveStopPreview = TRAILING_STOP_ENABLED
+          ? Math.max(Number(state.stopPrice) || -Infinity, Number(state.trailingStopPrice) || -Infinity)
+          : Number(state.stopPrice);
+        const stoplossTriggerActive =
+          Boolean(stopsEnabled && canRunStopCheck && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) &&
+          Number.isFinite(effectiveStopPreview) &&
+          bid <= effectiveStopPreview;
+        const slBps = STOP_LOSS_BPS;
+        const hardStopTriggerActive =
+          Boolean(EXIT_MARKET_EXITS_ENABLED && slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) &&
+          bid <= (state.entryPrice * (1 - slBps / 10000));
+        const canExitProfitablyForForce =
+          Number.isFinite(bid) && bid >= (state.profitabilityFloorPrice ?? state.trueBreakevenPrice ?? targetPrice);
+        const forceExitTriggerActive =
+          EXIT_MARKET_EXITS_ENABLED &&
+          FORCE_EXIT_SECONDS > 0 &&
+          heldSeconds >= FORCE_EXIT_SECONDS &&
+          (FORCE_EXIT_ALLOW_LOSS || canExitProfitablyForForce);
+        const tacticalProtectiveExit =
+          tacticDecision === 'thesis_break_exit' ||
+          tacticDecision === 'stale_trade_exit' ||
+          tacticDecision === 'time_stop_exit';
+        const protectiveExitTriggerActive =
+          tacticalProtectiveExit || stoplossTriggerActive || hardStopTriggerActive || forceExitTriggerActive;
+
         const lockedTpActive = state?.lockedTpEnabled === true || state?.exitMode === 'locked_tp';
         if (lockedTpActive && qtyNum > 0) {
           state.exitMode = 'locked_tp';
@@ -11411,13 +11440,34 @@ async function manageExitStates() {
               throw new Error(`locked_tp_reattach_failed:${symbol}:${replacement?.reason || 'unknown'}`);
             }
           }
-          console.log('locked_tp_loss_exit_blocked', {
-            symbol,
-            blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
-          });
-          actionTaken = 'hold_existing_order';
-          reasonCode = 'locked_tp_active';
-          continue;
+          if (tacticDecision === 'take_profit_hold' && !protectiveExitTriggerActive) {
+            console.log('locked_tp_loss_exit_blocked', {
+              symbol,
+              blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
+            });
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'locked_tp_active';
+            continue;
+          }
+          if (state.sellOrderId) {
+            console.log('locked_tp_override_release', {
+              symbol,
+              previousOrderId: state.sellOrderId,
+              tacticDecision,
+              reason: stoplossTriggerActive
+                ? 'stoploss'
+                : hardStopTriggerActive
+                  ? 'hard_stop'
+                  : forceExitTriggerActive
+                    ? 'force_exit'
+                    : tacticDecision,
+            });
+            await maybeCancelExitSell({
+              symbol,
+              orderId: state.sellOrderId,
+              reason: 'locked_tp_override_release',
+            });
+          }
         }
 
         const maxHoldMsForced =
@@ -11547,7 +11597,7 @@ async function manageExitStates() {
           continue;
         }
 
-        if (openSellCount > 0) {
+        if (openSellCount > 0 && !protectiveExitTriggerActive) {
           const existingAtDesired =
             Number.isFinite(currentLimit) && Number.isFinite(finalLimit)
               ? Math.abs(currentLimit - finalLimit) <= (tickSize || 0.00000001)
@@ -11982,7 +12032,7 @@ async function manageExitStates() {
           continue;
         }
 
-        if (quoteStale) {
+        if (quoteStale && !protectiveExitTriggerActive) {
           const lastKnownBid = Number.isFinite(state.lastBid) ? state.lastBid : null;
           const lastKnownAsk = Number.isFinite(state.lastAsk) ? state.lastAsk : null;
           const lastKnownMid = Number.isFinite(state.lastMid)
@@ -12451,10 +12501,6 @@ async function manageExitStates() {
           continue;
         }
 
-        const stopsEnabled = STOPS_ENABLED && STOPLOSS_ENABLED;
-        const canRunStopCheck = Number.isFinite(state.lastStopCheckAt)
-          ? now - state.lastStopCheckAt >= STOPLOSS_CHECK_INTERVAL_MS
-          : true;
         if (stopsEnabled && canRunStopCheck && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
           state.lastStopCheckAt = now;
           state.peakPriceSinceEntry = Number.isFinite(state.peakPriceSinceEntry)
@@ -12497,7 +12543,6 @@ async function manageExitStates() {
           }
         }
 
-        const slBps = STOP_LOSS_BPS;
         if (EXIT_MARKET_EXITS_ENABLED && slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
           const stopTrigger = state.entryPrice * (1 - slBps / 10000);
           if (bid <= stopTrigger) {
