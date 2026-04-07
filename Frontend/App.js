@@ -217,15 +217,12 @@ function CompactPositionRow({ position }) {
   );
 }
 
-function DiagnosticsCard({ title, preview, raw, expanded, onToggle, onShare }) {
+function DiagnosticsCard({ title, preview, raw, expanded, onToggle }) {
   return (
     <View style={styles.diagCard}>
       <View style={styles.diagHead}>
         <Text style={styles.diagTitle}>{title}</Text>
         <View style={styles.diagActions}>
-          <Pressable onPress={onShare} style={styles.actionBtn}>
-            <Text style={styles.actionText}>Share</Text>
-          </Pressable>
           <Pressable onPress={onToggle} style={styles.actionBtn}>
             <Text style={styles.actionText}>{expanded ? 'Hide' : 'Expand'}</Text>
           </Pressable>
@@ -527,23 +524,42 @@ export default function App() {
     },
   ];
 
+  const diagnosticsBundleRaw = {
+    snapshotAt: new Date().toISOString(),
+    portfolio: {
+      portfolioValue,
+      weeklyChangePct,
+      openPL,
+      openPLPct,
+      positionsCount: positions.length,
+    },
+    runtimeTruth: runtimeTruthRaw,
+    entryDiagnostics: entryDiagnosticsRaw,
+    scorecard: scorecardRaw,
+    sizingConcurrency: sizingConcurrencyRaw,
+    quoteGuards: quoteGuardsRaw,
+    universe: universeRaw,
+    predictorWarmup: warmupRaw,
+    positions,
+    error,
+  };
+
   const numColumns = 2;
 
   const toggleCard = useCallback((id) => {
     setExpandedCards((prev) => ({ ...prev, [id]: !prev[id] }));
   }, []);
 
-  const shareCard = useCallback(async (id, raw) => {
-    const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+  const shareAllDiagnostics = useCallback(async () => {
     try {
       await Share.share({
-        title: `Magic diagnostics: ${id}`,
-        message: text,
+        title: 'Magic diagnostics bundle',
+        message: JSON.stringify(diagnosticsBundleRaw, null, 2),
       });
     } catch {
       // ignore canceled share sheet or transient share errors
     }
-  }, []);
+  }, [diagnosticsBundleRaw]);
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -616,7 +632,19 @@ export default function App() {
               ) : null}
               {!loading && positions.length === 0 ? <Text style={styles.empty}>🎩 no positions</Text> : null}
 
-              <Text style={[styles.sectionTitle, { marginTop: theme.spacing.md }]}>Diagnostics</Text>
+            </View>
+          }
+          ListFooterComponent={
+            <View style={styles.footerWrap}>
+              <View style={styles.diagSectionHead}>
+                <Text style={styles.sectionTitle}>Diagnostics</Text>
+                <Pressable onPress={shareAllDiagnostics} style={styles.shareAllBtn}>
+                  <Text style={styles.shareAllText}>Share all</Text>
+                </Pressable>
+              </View>
+              <Text style={styles.diagSectionHint}>
+                Share includes full runtime, scan, universe, warmup, scorecard, quote-guard, and position bundle.
+              </Text>
               <View style={styles.diagList}>
                 {diagCards.map((card) => {
                   const expanded = Boolean(expandedCards[card.id]);
@@ -629,7 +657,6 @@ export default function App() {
                       raw={rawText}
                       expanded={expanded}
                       onToggle={() => toggleCard(card.id)}
-                      onShare={() => shareCard(card.id, rawText)}
                     />
                   );
                 })}
@@ -648,6 +675,7 @@ const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#090E1A' },
   content: { padding: theme.spacing.sm, paddingBottom: 72 },
   headerWrap: { paddingBottom: theme.spacing.xs },
+  footerWrap: { paddingTop: theme.spacing.sm, paddingBottom: theme.spacing.xs },
   hero: {
     backgroundColor: '#101A31',
     borderWidth: 1,
@@ -686,6 +714,17 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   sectionTitle: { color: theme.colors.text, marginTop: theme.spacing.sm, marginBottom: 6, fontWeight: '900', fontSize: 14 },
+  diagSectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 8 },
+  shareAllBtn: {
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.16)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  shareAllText: { color: theme.colors.accent, fontSize: 11, fontWeight: '800' },
+  diagSectionHint: { color: theme.colors.faint, marginBottom: 8, fontSize: 11, fontWeight: '700' },
   kpiPill: {
     flexGrow: 1,
     minWidth: 110,
