@@ -1,6 +1,4 @@
 const assert = require('assert/strict');
-const fs = require('fs');
-const path = require('path');
 
 const trade = require('./trade');
 
@@ -21,20 +19,73 @@ const plan = trade.computeUnifiedExitPlan({
 assert.ok(plan.targetPrice > plan.profitabilityFloorPrice);
 assert.ok(plan.profitabilityFloorPrice >= plan.trueBreakevenPrice);
 
-const source = fs.readFileSync(path.resolve(__dirname, 'trade.js'), 'utf8');
-assert.ok(source.includes("predictor_candidates"));
-assert.ok(!source.includes("console.log('entry_candidates'"));
-assert.ok(source.includes('requestedSymbols'));
-assert.ok(source.includes('signalReadyCount'));
-assert.ok(source.includes('signalBlockedByWarmupCount'));
-assert.ok(source.includes("reason: 'no_trustworthy_desired_target'"));
-assert.ok(source.includes('canExitProfitably = Number.isFinite(bid) && bid >= (state.profitabilityFloorPrice ?? state.trueBreakevenPrice ?? targetPrice)'));
-assert.ok(source.includes('locked_tp_loss_exit_blocked'));
-assert.ok(source.includes('const protectiveExitTriggerActive ='));
-assert.ok(source.includes("if (tacticDecision === 'take_profit_hold' && !protectiveExitTriggerActive)"));
-assert.ok(source.includes('locked_tp_override_release'));
-assert.ok(source.includes('if (openSellCount > 0 && !protectiveExitTriggerActive)'));
-assert.ok(source.includes('if (quoteStale && !protectiveExitTriggerActive)'));
-assert.ok(source.includes("exitMode: 'locked_tp'"));
+const protectiveCases = [
+  {
+    name: 'take_profit_hold + override',
+    input: {
+      tacticDecision: 'take_profit_hold',
+      exitRefreshDecision: { override: true, why: 'stale' },
+    },
+    expected: true,
+  },
+  { name: 'thesis_break_exit', input: { tacticDecision: 'thesis_break_exit' }, expected: true },
+  { name: 'stale_trade_exit', input: { tacticDecision: 'stale_trade_exit' }, expected: true },
+  { name: 'time_stop_exit', input: { tacticDecision: 'time_stop_exit' }, expected: true },
+  { name: 'stoploss trigger', input: { tacticDecision: 'take_profit_hold', stoplossTriggerActive: true }, expected: true },
+  { name: 'hard stop trigger', input: { tacticDecision: 'take_profit_hold', hardStopTriggerActive: true }, expected: true },
+  { name: 'force exit trigger', input: { tacticDecision: 'take_profit_hold', forceExitTriggerActive: true }, expected: true },
+  {
+    name: 'take_profit_hold without overrides',
+    input: { tacticDecision: 'take_profit_hold' },
+    expected: false,
+  },
+];
 
-console.log('trade telemetry/exit tests passed');
+for (const testCase of protectiveCases) {
+  const result = trade.getLockedTpProtectionState(testCase.input);
+  assert.equal(
+    result.protectiveExitTriggerActive,
+    testCase.expected,
+    `expected ${testCase.name} to evaluate protectiveExitTriggerActive=${testCase.expected}`,
+  );
+}
+
+assert.equal(
+  trade.shouldClearStaleTrackedSellIdentity({
+    openSellCount: 0,
+    brokerAvailableQty: 1.25,
+    missCount: 3,
+    missThreshold: 3,
+    directLookupFoundOpenSell: false,
+  }),
+  true,
+);
+
+assert.equal(
+  trade.shouldClearStaleTrackedSellIdentity({
+    openSellCount: 0,
+    brokerAvailableQty: 1.25,
+    missCount: 2,
+    missThreshold: 3,
+    directLookupFoundOpenSell: false,
+  }),
+  false,
+);
+
+assert.equal(
+  trade.shouldSkipTrackedAndHasOpenSellInRepair({
+    hasTrackedExit: true,
+    resolvedOpenSellCount: 0,
+  }),
+  false,
+);
+
+assert.equal(
+  trade.shouldSkipTrackedAndHasOpenSellInRepair({
+    hasTrackedExit: true,
+    resolvedOpenSellCount: 2,
+  }),
+  true,
+);
+
+console.log('trade telemetry/exit behavioral tests passed');

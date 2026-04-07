@@ -3796,9 +3796,14 @@ function updateTrackedSellIdentity(state, {
   const parsedSubmittedAt = typeof submittedAtRaw === 'string' ? Date.parse(submittedAtRaw) : Number(submittedAtRaw);
   const shouldClearIdentity = !resolvedOrderId && !resolvedClientOrderId && submittedAtMs === null;
   const resolvedSubmittedAt = shouldClearIdentity ? null : (Number.isFinite(parsedSubmittedAt) ? parsedSubmittedAt : Date.now());
-  const resolvedLimitPrice = Number.isFinite(Number(limitPrice))
-    ? Number(limitPrice)
-    : (shouldClearIdentity ? null : (normalizeOrderLimitPrice(order) ?? state.sellOrderLimit ?? null));
+  const explicitLimit = normalizeOrderLimitPrice({ limit_price: limitPrice });
+  const orderLimit = normalizeOrderLimitPrice(order);
+  const trackedLimit = Number.isFinite(Number(state.sellOrderLimit)) && Number(state.sellOrderLimit) > 0
+    ? Number(state.sellOrderLimit)
+    : null;
+  const resolvedLimitPrice = shouldClearIdentity
+    ? null
+    : (explicitLimit ?? orderLimit ?? trackedLimit ?? null);
 
   state.sellOrderId = resolvedOrderId;
   state.sellClientOrderId = resolvedClientOrderId;
@@ -7143,7 +7148,56 @@ function computeExitFloorBps({ exitFeeBps }) {
 function normalizeOrderLimitPrice(order) {
   const raw = order?.limit_price ?? order?.limitPrice ?? order?.price;
   const num = Number(raw);
-  return Number.isFinite(num) ? num : null;
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function getLockedTpProtectionState({
+  tacticDecision = null,
+  exitRefreshDecision = null,
+  tacticalProtectiveExit = false,
+  stoplossTriggerActive = false,
+  hardStopTriggerActive = false,
+  forceExitTriggerActive = false,
+} = {}) {
+  const exitRefreshOverrideActive = Boolean(exitRefreshDecision?.override);
+  const tacticProtective =
+    Boolean(tacticalProtectiveExit) ||
+    tacticDecision === 'thesis_break_exit' ||
+    tacticDecision === 'stale_trade_exit' ||
+    tacticDecision === 'time_stop_exit';
+  const protectiveExitTriggerActive =
+    exitRefreshOverrideActive ||
+    tacticProtective ||
+    Boolean(stoplossTriggerActive) ||
+    Boolean(hardStopTriggerActive) ||
+    Boolean(forceExitTriggerActive);
+  return {
+    exitRefreshOverrideActive,
+    tacticProtective,
+    protectiveExitTriggerActive,
+  };
+}
+
+function shouldClearStaleTrackedSellIdentity({
+  openSellCount = 0,
+  brokerAvailableQty = 0,
+  missCount = 0,
+  missThreshold = EXIT_RECON_MISS_THRESHOLD,
+  directLookupFoundOpenSell = false,
+} = {}) {
+  return (
+    !directLookupFoundOpenSell &&
+    Number(openSellCount) === 0 &&
+    Number(brokerAvailableQty) > 0 &&
+    Number(missCount) >= Number(missThreshold)
+  );
+}
+
+function shouldSkipTrackedAndHasOpenSellInRepair({
+  hasTrackedExit = false,
+  resolvedOpenSellCount = 0,
+} = {}) {
+  return Boolean(hasTrackedExit) && Number(resolvedOpenSellCount) > 0;
 }
 
 function normalizeOrderQty(order) {
@@ -7424,6 +7478,39 @@ async function resolveExitSellabilityFromBrokerTruth({
           status: null,
           limit_price: null,
           qty: null,
+        });
+      }
+      if (shouldClearStaleTrackedSellIdentity({
+        openSellCount: finalSellability.openSellCount,
+        brokerAvailableQty: finalSellability.brokerAvailableQty,
+        missCount: trackedState.openSellMissCount,
+        missThreshold: EXIT_RECON_MISS_THRESHOLD,
+        directLookupFoundOpenSell: Boolean(adoptedOpenSell),
+      })) {
+        updateTrackedSellIdentity(trackedState, {
+          symbol: canonicalSymbol,
+          orderId: null,
+          clientOrderId: null,
+          submittedAtMs: null,
+          limitPrice: null,
+          source: 'resolve_exit_sellability_stale_clear',
+        });
+        trackedState.expectedOpenSell = false;
+        trackedState.brokerOpenSellFound = false;
+        trackedState.brokerOpenSellQty = 0;
+        trackedState.lastSeenOpenSellAt = null;
+        trackedState.reconciliationState = 'open_sell_missing_cleared';
+        trackedState.lockedTpOrderId = null;
+        trackedState.lockedTpClientOrderId = null;
+        trackedState.exitVisibilityState = null;
+        trackedState.exitVisibilityStartedAt = null;
+        trackedState.exitVisibilityDeadlineAt = null;
+        console.log('open_sell_stale_identity_cleared', {
+          symbol: canonicalSymbol,
+          missCount: trackedState.openSellMissCount,
+          missThreshold: EXIT_RECON_MISS_THRESHOLD,
+          brokerAvailableQty: finalSellability.brokerAvailableQty,
+          openSellCount: finalSellability.openSellCount,
         });
       }
     }
@@ -10094,7 +10181,20 @@ async function repairOrphanExits() {
 
     let openSellOrders = openSellsBySymbol.get(symbol) || [];
     let hasOpenSell = openSellOrders.length > 0;
-    const hasTrackedExit = exitState.has(symbol);
+    const trackedState = exitState.get(symbol) || null;
+    const hasTrackedExit = Boolean(trackedState);
+    if (hasTrackedExit && !hasOpenSell) {
+      const brokerTruth = await resolveExitSellabilityFromBrokerTruth({
+        symbol,
+        openOrders: expandedOrders,
+        trackedSellOrderId: trackedState?.sellOrderId || null,
+        trackedSellClientOrderId: trackedState?.sellClientOrderId || null,
+        maxAttempts: 1,
+        retryMs: 0,
+      });
+      openSellOrders = Array.isArray(brokerTruth?.openSellOrders) ? brokerTruth.openSellOrders : [];
+      hasOpenSell = openSellOrders.length > 0 || Number(brokerTruth?.openSellCount || 0) > 0;
+    }
     let decision = 'SKIP:unknown';
     let targetPrice = null;
 
@@ -10233,7 +10333,10 @@ async function repairOrphanExits() {
     const postOnly = EXIT_POST_ONLY;
 
     if (hasTrackedExit) {
-      if (hasOpenSell) {
+      if (shouldSkipTrackedAndHasOpenSellInRepair({
+        hasTrackedExit,
+        resolvedOpenSellCount: openSellOrders.length,
+      })) {
         const trackedState = exitState.get(symbol) || {};
         exitState.set(symbol, {
           ...trackedState,
@@ -11368,8 +11471,17 @@ async function manageExitStates() {
           tacticDecision === 'thesis_break_exit' ||
           tacticDecision === 'stale_trade_exit' ||
           tacticDecision === 'time_stop_exit';
-        const protectiveExitTriggerActive =
-          tacticalProtectiveExit || stoplossTriggerActive || hardStopTriggerActive || forceExitTriggerActive;
+        const {
+          exitRefreshOverrideActive,
+          protectiveExitTriggerActive,
+        } = getLockedTpProtectionState({
+          tacticDecision,
+          exitRefreshDecision,
+          tacticalProtectiveExit,
+          stoplossTriggerActive,
+          hardStopTriggerActive,
+          forceExitTriggerActive,
+        });
 
         const lockedTpActive = state?.lockedTpEnabled === true || state?.exitMode === 'locked_tp';
         if (lockedTpActive && qtyNum > 0) {
@@ -11443,6 +11555,17 @@ async function manageExitStates() {
           if (tacticDecision === 'take_profit_hold' && !protectiveExitTriggerActive) {
             console.log('locked_tp_loss_exit_blocked', {
               symbol,
+              tacticDecision,
+              exitRefreshWhy: exitRefreshDecision?.why || null,
+              exitRefreshOverrideActive,
+              tacticalProtectiveExit,
+              stoplossTriggerActive,
+              hardStopTriggerActive,
+              forceExitTriggerActive,
+              protectiveExitTriggerActive,
+              existingSellOrderId: state.sellOrderId || null,
+              existingSellClientOrderId: state.sellClientOrderId || null,
+              existingTrackedSellLimit: Number.isFinite(state.sellOrderLimit) ? state.sellOrderLimit : null,
               blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
             });
             actionTaken = 'hold_existing_order';
@@ -11454,6 +11577,16 @@ async function manageExitStates() {
               symbol,
               previousOrderId: state.sellOrderId,
               tacticDecision,
+              exitRefreshWhy: exitRefreshDecision?.why || null,
+              exitRefreshOverrideActive,
+              tacticalProtectiveExit,
+              stoplossTriggerActive,
+              hardStopTriggerActive,
+              forceExitTriggerActive,
+              protectiveExitTriggerActive,
+              existingSellOrderId: state.sellOrderId || null,
+              existingSellClientOrderId: state.sellClientOrderId || null,
+              existingTrackedSellLimit: Number.isFinite(state.sellOrderLimit) ? state.sellOrderLimit : null,
               reason: stoplossTriggerActive
                 ? 'stoploss'
                 : hardStopTriggerActive
@@ -16915,6 +17048,9 @@ module.exports = {
   computeBookAnchoredSellLimit,
   computeTargetSellPrice,
   computeUnifiedExitPlan,
+  getLockedTpProtectionState,
+  shouldClearStaleTrackedSellIdentity,
+  shouldSkipTrackedAndHasOpenSellInRepair,
   resolveEntryBasis,
   computeAwayBps,
   shouldRefreshExitOrder,
