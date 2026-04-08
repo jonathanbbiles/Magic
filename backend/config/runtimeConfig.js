@@ -80,6 +80,10 @@ function getRuntimeConfig(env = process.env) {
       env.ENTRY_UNIVERSE_EXCLUDE_STABLES,
       parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, false),
     ),
+    entryUniverseMaxSymbols: parsePositiveInt(
+      env.ENTRY_UNIVERSE_MAX_SYMBOLS,
+      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, 18),
+    ),
     executionTier1Symbols,
     executionTier2Symbols,
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
@@ -128,6 +132,7 @@ function getRuntimeConfigSummary(env = process.env) {
     executionTier1Count: config.executionTier1Symbols.length,
     executionTier2Count: config.executionTier2Symbols.length,
     entryUniverseExcludeStables: config.entryUniverseExcludeStables,
+    entryUniverseMaxSymbols: config.entryUniverseMaxSymbols,
     entryScanIntervalMs: config.entryScanIntervalMs,
     entryPrefetchChunkSize: config.entryPrefetchChunkSize,
     entryPrefetchQuotes: config.entryPrefetchQuotes,

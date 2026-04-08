@@ -714,6 +714,7 @@ app.get('/dashboard', async (req, res) => {
 
       const botState = exitStateBySymbol[symbol] || null;
       const lifecycleState = lifecycleSnapshot?.bySymbol?.[symbol]?.state || null;
+      const lifecycleDiagnosticsState = lifecycleSnapshot?.bySymbol?.[symbol]?.diagnosticsState || null;
       const sellOrderLimitFromState = toFiniteNumberOrNull(botState?.sellOrderLimit);
       const activeSellLimit = Number.isFinite(activeSellLimitFromOrders)
         ? activeSellLimitFromOrders
@@ -734,6 +735,13 @@ app.get('/dashboard', async (req, res) => {
         : Number.isFinite(sellOrderLimitFromState)
           ? 'exit_state'
           : null;
+      if (!botState && lifecycleState === 'managing') {
+        console.warn('ambiguous_exit_state_detected', {
+          symbol,
+          lifecycleState,
+          diagnosticsState: lifecycleDiagnosticsState || null,
+        });
+      }
 
       return {
         symbol: rawSymbol || symbol,
@@ -756,13 +764,17 @@ app.get('/dashboard', async (req, res) => {
         entryIntentAgeMs: lifecycleSnapshot?.bySymbol?.[symbol]?.createdAt ? Math.max(0, nowMs - Date.parse(lifecycleSnapshot.bySymbol[symbol].createdAt)) : null,
         executionQuality: toFiniteNumberOrNull(latestForensicsBySymbol?.[symbol]?.executionQualityScore),
         bot: {
-          requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBps),
-          minNetProfitBps: toFiniteNumberOrNull(botState?.minNetProfitBps),
+          requiredExitBpsGross: toFiniteNumberOrNull(botState?.requiredExitBpsGross ?? botState?.requiredExitBps),
+          requiredExitBps: toFiniteNumberOrNull(botState?.requiredExitBpsGross ?? botState?.requiredExitBps),
+          expectedNetProfitBps: toFiniteNumberOrNull(botState?.expectedNetProfitBps ?? botState?.minNetProfitBps),
+          minNetProfitBps: toFiniteNumberOrNull(botState?.expectedNetProfitBps ?? botState?.minNetProfitBps),
+          desiredNetExitBps: toFiniteNumberOrNull(botState?.desiredNetExitBps),
           targetPrice: toFiniteNumberOrNull(botState?.targetPrice),
-          breakevenPrice: toFiniteNumberOrNull(botState?.breakevenPrice),
+          trueBreakevenPrice: toFiniteNumberOrNull(botState?.trueBreakevenPrice ?? botState?.breakevenPrice),
+          breakevenPrice: toFiniteNumberOrNull(botState?.trueBreakevenPrice ?? botState?.breakevenPrice),
+          profitabilityFloorPrice: toFiniteNumberOrNull(botState?.profitabilityFloorPrice),
           feeBpsRoundTrip: toFiniteNumberOrNull(botState?.feeBpsRoundTrip),
           entrySpreadBpsUsed: toFiniteNumberOrNull(botState?.entrySpreadBpsUsed),
-          desiredNetExitBps: toFiniteNumberOrNull(botState?.desiredNetExitBps),
           entryPriceUsed: toFiniteNumberOrNull(botState?.entryPriceUsed),
           sellOrderId: botState?.sellOrderId || null,
           sellOrderSubmittedAt: botState?.sellOrderSubmittedAt || null,
@@ -778,6 +790,7 @@ app.get('/dashboard', async (req, res) => {
           unresolvedManagedReason: !botState && lifecycleState === 'managing'
             ? 'lifecycle_managing_without_exit_state'
             : null,
+          lifecycleDiagnosticsState,
         },
       };
     });
@@ -801,12 +814,14 @@ app.get('/dashboard', async (req, res) => {
         dynamicUniverseActive,
         dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
         acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+        universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
           : [],
         fallbackOccurred,
         fallbackReason: universeDiagnostics?.fallbackReason || null,
         engineState: getEngineStateSnapshot(),
+        ratePressureState,
         predictorWarmupStatus: {
           inProgress: Boolean(predictorWarmup?.inProgress),
           symbolsCompleted: predictorWarmup?.symbolsCompleted ?? null,
@@ -829,6 +844,7 @@ app.get('/dashboard', async (req, res) => {
         executionHealth: {
           authoritativeCount: lifecycleSnapshot?.authoritativeCount || 0,
           failedEntries: governorSummary?.failedEntries || 0,
+          lifecycleDiagnostics: lifecycleSnapshot?.diagnostics || null,
         },
         sizing: managerStatus?.sizing || null,
         risk: managerStatus?.risk || null,

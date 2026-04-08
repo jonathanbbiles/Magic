@@ -72,6 +72,7 @@ withEnv({}, () => {
   assert.equal(cfg.sparseStaleToleranceMs, 30000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 10000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 30000);
+  assert.equal(cfg.entryUniverseMaxSymbols, 18);
 });
 
 withEnv({
