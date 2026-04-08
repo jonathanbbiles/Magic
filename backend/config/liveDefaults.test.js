@@ -56,6 +56,16 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
   assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS, '80');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS_TIER1, '90');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS_TIER2, '130');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '25');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER, '0.50');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER_TIER1, '0.52');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER_TIER2, '0.55');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '30');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '15');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EV_MIN_BPS, '10');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_MAX_AGE_MS, '30000');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '30000');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS, '10000');
@@ -80,7 +90,19 @@ withEnv({}, () => {
     assert.match(sourceText, /PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4/);
     assert.match(sourceText, /ENTRY_PREFETCH_QUOTES=true/);
     assert.match(sourceText, /ENTRY_PREFETCH_ORDERBOOKS=true/);
+    assert.match(sourceText, /ENTRY_TAKE_PROFIT_BPS=80/);
+    assert.match(sourceText, /ENTRY_TAKE_PROFIT_BPS_TIER1=90/);
+    assert.match(sourceText, /ENTRY_TAKE_PROFIT_BPS_TIER2=130/);
+    assert.match(sourceText, /STOP_LOSS_BPS=25/);
+    assert.match(sourceText, /MIN_PROB_TO_ENTER_TIER1=0.52/);
+    assert.match(sourceText, /MIN_PROB_TO_ENTER_TIER2=0.55/);
+    assert.match(sourceText, /EXIT_NET_PROFIT_AFTER_FEES_BPS=30/);
+    assert.match(sourceText, /PROFIT_BUFFER_BPS=15/);
+    assert.match(sourceText, /EV_MIN_BPS=10/);
   }
+  assert.match(envExample, /MIN_PROB_TO_ENTER=0.50/);
+  assert.match(envExample, /DESIRED_NET_PROFIT_BASIS_POINTS=100 # legacy/);
+  assert.match(envExample, /FEE_BPS_ROUND_TRIP=30/);
 });
 
 assert.throws(

@@ -344,7 +344,7 @@ const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', 50);
 const BOOK_EXIT_ANCHOR = String(process.env.BOOK_EXIT_ANCHOR || 'ask').trim().toLowerCase();
 const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', false);
 const EXIT_POLICY_LOCKED = readEnvFlag('EXIT_POLICY_LOCKED', true);
-const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 5);
+const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 30);
 const EXIT_FIXED_NET_PROFIT_BPS = readNumber('EXIT_FIXED_NET_PROFIT_BPS', 5);
 const EXIT_ENFORCE_ENTRY_FLOOR = readEnvFlag('EXIT_ENFORCE_ENTRY_FLOOR', false);
 const EXIT_POST_ONLY = readEnvFlag('EXIT_POST_ONLY', true);
@@ -1595,7 +1595,10 @@ function filterLiveOrders(orders) {
 const BPS = 10000;
 
 function feeBpsRoundTrip() {
-  return FEE_BPS_MAKER + (TAKER_EXIT_ON_TOUCH ? FEE_BPS_TAKER : FEE_BPS_MAKER);
+  return resolveRoundTripFeeBps({
+    entryFeeBps: FEE_BPS_MAKER,
+    takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+  });
 }
 
 function expectedValueBps({ pUp, winBps, loseBps, feeBps, spreadBps, slippageBps }) {
@@ -1620,6 +1623,39 @@ function requiredProfitBpsForSymbol({ slippageBps, feeBps, desiredNetExitBps }) 
     profitBufferBps: PROFIT_BUFFER_BPS,
     maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
   });
+}
+
+function resolveRoundTripFeeBps({ entryFeeBps, exitFeeBps, takerExitOnTouch } = {}) {
+  const entry = Number.isFinite(entryFeeBps) ? entryFeeBps : FEE_BPS_MAKER;
+  const exit = Number.isFinite(exitFeeBps)
+    ? exitFeeBps
+    : inferExitFeeBps({
+      takerExitOnTouch: Boolean(takerExitOnTouch),
+    });
+  return entry + exit;
+}
+
+function resolveEntryExitFeeBps({
+  symbol,
+  entryOrderType,
+  entryPostOnly,
+  takerExitOnTouch = TAKER_EXIT_ON_TOUCH,
+  fallbackRoundTripBps = FEE_BPS_ROUND_TRIP,
+} = {}) {
+  const entryFeeBps = inferEntryFeeBps({
+    symbol,
+    orderType: entryOrderType,
+    postOnly: entryPostOnly,
+  });
+  const exitFeeBps = inferExitFeeBps({ takerExitOnTouch });
+  const computedRoundTrip = resolveRoundTripFeeBps({ entryFeeBps, exitFeeBps, takerExitOnTouch });
+  const fallback = Number.isFinite(fallbackRoundTripBps) ? Math.max(0, fallbackRoundTripBps) : null;
+  const feeBpsRoundTrip = Number.isFinite(computedRoundTrip) ? computedRoundTrip : (fallback || 0);
+  return {
+    entryFeeBps,
+    exitFeeBps,
+    feeBpsRoundTrip,
+  };
 }
 
 /* 18) SIGNAL / ENTRY MATH */
@@ -2933,6 +2969,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   }
 
   const edgeRequirements = computeEntryEdgeRequirements({
+    symbol: asset.symbol,
     spreadBps,
     targetMoveBps: resolvedEntryTakeProfitBps,
     symbolTier,
@@ -2991,7 +3028,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   const edge = computeNetEdgeBps({
     expectedMoveBps: predictorTp?.signals?.expectedMoveBps,
     fillProbability,
-    feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+    feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
     entrySlippageBufferBps: resolvedEntrySlippageBufferBps,
     exitSlippageBufferBps: resolvedExitSlippageBufferBps,
     spreadPenaltyBps: spreadBps,
@@ -3257,17 +3294,22 @@ async function computeEntrySignal(symbol, opts = {}) {
   });
 
   if (EV_GUARD_ENABLED) {
-    const p = clamp(Number(predictorTp?.probability) || 0, 0, 1);
-    // Use the same fee model used everywhere else (maker-first unless taker-on-touch is enabled).
-    const feesRoundTripBps = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : 0;
-    const spreadCostBps = Number.isFinite(spreadBps) ? spreadBps : 0;
-    // Optional slippage cost (bps). Default 0 unless user sets SLIPPAGE_BPS.
-    const slipBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : 0;
-    const costBps = feesRoundTripBps + spreadCostBps + slipBps;
-    const grossWinBps = resolvedEntryTakeProfitBps;
-    const grossLossBps = STOP_LOSS_BPS;
-    const netWinBps = grossWinBps - costBps;
-    const netLossBps = grossLossBps + costBps;
+    const evModel = buildEntryEvModel({
+      symbol: asset.symbol,
+      entryPrice: mid,
+      spreadBps,
+      probability: predictorTp?.probability,
+      stopLossBps: STOP_LOSS_BPS,
+      marketDataEval,
+    });
+    const p = evModel.probability;
+    const feesRoundTripBps = evModel.exitPlan.feeBpsRoundTrip;
+    const grossWinBps = evModel.exitPlan.requiredExitBpsFinal;
+    const netWinBps = evModel.netWinBps;
+    const netLossBps = evModel.netLossBps;
+    const spreadBpsUsed = evModel.spreadBpsUsed;
+    const slippageBpsUsed = evModel.slippageBpsUsed;
+    const exitFloorCostBps = evModel.exitFloorCostBps;
     const minExpectedValueBps = effectiveMinExpectedValueBps;
 
     if (netWinBps <= 0) {
@@ -3280,8 +3322,12 @@ async function computeEntrySignal(symbol, opts = {}) {
         netWinBps,
         netLossBps,
         feeBpsRoundTrip: feesRoundTripBps,
-        slippageBps: slipBps,
-        costBps,
+        slippageBps: slippageBpsUsed,
+        spreadBpsUsed,
+        requiredExitBps: grossWinBps,
+        exitFloorCostBps,
+        entryOrderType: evModel.entryOrderType,
+        entryPostOnly: evModel.entryPostOnly,
         minExpectedValueBps,
         baseMinExpectedValueBps,
         timeOfDay: timeOfDayMeta,
@@ -3294,7 +3340,8 @@ async function computeEntrySignal(symbol, opts = {}) {
           p,
           netWinBps,
           netLossBps,
-          costBps,
+          exitFloorCostBps,
+          requiredExitBps: grossWinBps,
           minExpectedValueBps,
           baseMinExpectedValueBps,
           timeOfDay: timeOfDayMeta,
@@ -3303,7 +3350,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       };
     }
 
-    const evBps = (p * netWinBps) - ((1 - p) * netLossBps);
+    const evBps = evModel.evBps;
     const breakevenP = netLossBps / (netWinBps + netLossBps);
     console.log('entry_ev_gate', {
       symbol: asset.symbol,
@@ -3315,8 +3362,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       netWinBps,
       netLossBps,
       feeBpsRoundTrip: feesRoundTripBps,
-      slippageBps: slipBps,
-      costBps,
+      slippageBps: slippageBpsUsed,
+      spreadBpsUsed,
+      requiredExitBps: grossWinBps,
+      exitFloorCostBps,
+      entryOrderType: evModel.entryOrderType,
+      entryPostOnly: evModel.entryPostOnly,
       evBps,
       minExpectedValueBps,
       baseMinExpectedValueBps,
@@ -3335,8 +3386,12 @@ async function computeEntrySignal(symbol, opts = {}) {
         netWinBps,
         netLossBps,
         feeBpsRoundTrip: feesRoundTripBps,
-        slippageBps: slipBps,
-        costBps,
+        slippageBps: slippageBpsUsed,
+        spreadBpsUsed,
+        requiredExitBps: grossWinBps,
+        exitFloorCostBps,
+        entryOrderType: evModel.entryOrderType,
+        entryPostOnly: evModel.entryPostOnly,
         evBps,
         minExpectedValueBps,
         baseMinExpectedValueBps,
@@ -3351,7 +3406,8 @@ async function computeEntrySignal(symbol, opts = {}) {
           breakevenP,
           netWinBps,
           netLossBps,
-          costBps,
+          exitFloorCostBps,
+          requiredExitBps: grossWinBps,
           evBps,
           minExpectedValueBps,
           baseMinExpectedValueBps,
@@ -4454,6 +4510,7 @@ function computeRequiredEntryEdgeBps(symbolTier) {
 }
 
 function computeEntryEdgeRequirements({
+  symbol,
   spreadBps,
   targetMoveBps,
   minNetEdgeBps,
@@ -4461,7 +4518,13 @@ function computeEntryEdgeRequirements({
   symbolTier,
 } = {}) {
   const targetMoveBpsUsed = Number.isFinite(targetMoveBps) ? targetMoveBps : getConfiguredTargetProfitBpsForTier(symbolTier);
-  const feeBpsRoundTripUsed = Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : (Number(FEE_BPS_ROUND_TRIP) || 0);
+  const feeModel = resolveEntryExitFeeBps({
+    symbol,
+    entryOrderType: 'limit',
+    entryPostOnly: true,
+    takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+  });
+  const feeBpsRoundTripUsed = feeModel.feeBpsRoundTrip;
   const entrySlippageBpsUsed = Number(resolveEntrySlippageBufferBps(symbolTier)) || 0;
   const exitSlippageBpsUsed = Number(resolveExitSlippageBufferBps(symbolTier)) || 0;
   const spreadBpsUsed = Number.isFinite(spreadBps) ? Math.max(0, spreadBps) : 0;
@@ -4533,6 +4596,66 @@ function computeRequiredExitBpsNet({ feeBpsRoundTrip, minNetProfitBps, spreadBps
   const minNet = Number.isFinite(minNetProfitBps) ? minNetProfitBps : 0;
   const buffer = computeDynamicProfitBufferBps({ spreadBps, volatilityBps });
   return fee + minNet + buffer;
+}
+
+function buildEntryEvModel({
+  symbol,
+  entryPrice,
+  spreadBps,
+  probability,
+  stopLossBps = STOP_LOSS_BPS,
+  marketDataEval = null,
+} = {}) {
+  const entryExecutionContext = resolveEntryExecutionContext({
+    symbol,
+    spreadBps,
+    marketDataEval,
+  });
+  const feeModel = resolveEntryExitFeeBps({
+    symbol,
+    entryOrderType: entryExecutionContext.orderType,
+    entryPostOnly: entryExecutionContext.postOnly,
+    takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+  });
+  const spreadBpsUsed = Number.isFinite(spreadBps) ? spreadBps : 0;
+  const slippageBpsUsed = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : 0;
+  const spreadBufferBpsUsed = Number.isFinite(BUFFER_BPS) ? BUFFER_BPS : 0;
+  const profitBufferBpsUsed = computeDynamicProfitBufferBps({ spreadBps: spreadBpsUsed, volatilityBps: null });
+  const exitPlan = computeUnifiedExitPlan({
+    symbol,
+    entryPrice,
+    effectiveEntryPrice: entryPrice,
+    entryFeeBps: feeModel.entryFeeBps,
+    exitFeeBps: feeModel.exitFeeBps,
+    desiredNetExitBps: null,
+    slippageBps: slippageBpsUsed,
+    spreadBufferBps: spreadBufferBpsUsed,
+    profitBufferBps: profitBufferBpsUsed,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+    spreadBps: spreadBpsUsed,
+  });
+  const exitFloorCostBps = exitPlan.feeBpsRoundTrip + slippageBpsUsed + spreadBufferBpsUsed + profitBufferBpsUsed;
+  const netWinBps = exitPlan.requiredExitBpsFinal - exitFloorCostBps;
+  const netLossBps = (Number.isFinite(stopLossBps) ? stopLossBps : STOP_LOSS_BPS)
+    + exitPlan.feeBpsRoundTrip
+    + spreadBpsUsed
+    + slippageBpsUsed;
+  const p = clamp(Number(probability) || 0, 0, 1);
+  const evBps = (p * netWinBps) - ((1 - p) * netLossBps);
+  return {
+    probability: p,
+    entryOrderType: entryExecutionContext.orderType,
+    entryPostOnly: entryExecutionContext.postOnly,
+    exitPlan,
+    slippageBpsUsed,
+    spreadBpsUsed,
+    spreadBufferBpsUsed,
+    profitBufferBpsUsed,
+    exitFloorCostBps,
+    netWinBps,
+    netLossBps,
+    evBps,
+  };
 }
 
 function logEntryDecision({ symbol, spreadBps, requiredEdgeBps, targetProfitBps = null }) {
@@ -5512,7 +5635,7 @@ function computeKellyNotionalForEntry({
   const pRaw = Number(probability);
   const minP = clamp(Number(minProbToEnter) || 0, 0, 0.99);
   const p = clamp(pRaw || 0, 0, 1);
-  const feeBps = Math.max(0, Number(FEE_BPS_ROUND_TRIP) || 0);
+  const feeBps = Math.max(0, Number.isFinite(feeBpsRoundTrip()) ? feeBpsRoundTrip() : (Number(FEE_BPS_ROUND_TRIP) || 0));
   const slippageBps = Math.max(0, Number(ENTRY_SLIPPAGE_BUFFER_BPS) || 0)
     + Math.max(0, Number(EXIT_SLIPPAGE_BUFFER_BPS) || 0)
     + Math.max(0, Number(SLIPPAGE_BPS) || 0);
@@ -9581,14 +9704,16 @@ async function attachInitialExitLimit({
   }
   const entryPriceBasis = Number.isFinite(entryBasis) ? entryBasis : entryPriceNum;
   const notionalUsd = qtyNum * entryPriceBasis;
-  const entryFeeBps = inferEntryFeeBps({
+  const feeModel = resolveEntryExitFeeBps({
     symbol,
-    orderType: entryOrderType,
-    postOnly: entryPostOnly,
+    entryOrderType,
+    entryPostOnly,
+    takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
   });
-  const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
+  const entryFeeBps = feeModel.entryFeeBps;
+  const exitFeeBps = feeModel.exitFeeBps;
   const effectiveEntryPrice = entryPriceBasis;
-  const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+  const feeBpsRoundTrip = feeModel.feeBpsRoundTrip;
   let desiredNetExitBpsValue = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
     ? desiredExitBpsBySymbol.get(symbol)
     : null;
@@ -10375,9 +10500,15 @@ async function repairOrphanExits() {
     }
 
     const notionalUsd = qty * entryBasisValue;
-    const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
-    const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-    const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+    const feeModel = resolveEntryExitFeeBps({
+      symbol,
+      entryOrderType: orderType,
+      entryPostOnly: true,
+      takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+    });
+    const entryFeeBps = feeModel.entryFeeBps;
+    const exitFeeBps = feeModel.exitFeeBps;
+    const feeBpsRoundTrip = feeModel.feeBpsRoundTrip;
     const slippageBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : null;
     const trackedDesiredNetExitBps = Number.isFinite(exitState.get(symbol)?.desiredNetExitBps)
       ? Number(exitState.get(symbol)?.desiredNetExitBps)
@@ -11243,13 +11374,18 @@ async function manageExitStates() {
           Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
         const entryFeeBps = Number.isFinite(state.entryFeeBps)
           ? state.entryFeeBps
-          : inferEntryFeeBps({ symbol, orderType: 'limit', postOnly: true });
+          : resolveEntryExitFeeBps({
+            symbol,
+            entryOrderType: 'limit',
+            entryPostOnly: true,
+            takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+          }).entryFeeBps;
         const exitFeeBps = Number.isFinite(state.exitFeeBps)
           ? state.exitFeeBps
           : inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
         const feeBpsRoundTrip = Number.isFinite(state.feeBpsRoundTrip)
           ? state.feeBpsRoundTrip
-          : entryFeeBps + exitFeeBps;
+          : resolveRoundTripFeeBps({ entryFeeBps, exitFeeBps, takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
         const profitBufferBps = computeDynamicProfitBufferBps({ spreadBps, volatilityBps: state.volatilityBps });
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
@@ -17282,6 +17418,9 @@ module.exports = {
   computeBookAnchoredSellLimit,
   computeTargetSellPrice,
   computeUnifiedExitPlan,
+  buildEntryEvModel,
+  resolveEntryExitFeeBps,
+  resolveRoundTripFeeBps,
   getLockedTpProtectionState,
   shouldClearStaleTrackedSellIdentity,
   shouldSkipTrackedAndHasOpenSellInRepair,

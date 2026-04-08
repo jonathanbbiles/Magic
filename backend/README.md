@@ -42,7 +42,9 @@ Optional:
 - `HTTP_TIMEOUT_MS` (default `10000`)
 - `DATA_BASE` (defaults to Alpaca live data API base URL)
 - `DATASET_DIR` (default `./data`; set to a persistent disk on hosts like Render)
-- `DESIRED_NET_PROFIT_BASIS_POINTS` (default `100`, target net profit per trade after fees)
+- `DESIRED_NET_PROFIT_BASIS_POINTS` (legacy default `100`; used for non-locked/explicit desired exits, not locked `net_after_fees` live targets)
+- `EXIT_NET_PROFIT_AFTER_FEES_BPS` (default `30`; locked `EXIT_POLICY_LOCKED=true` live exit target and entry EV target family)
+- `PROFIT_BUFFER_BPS` (default `15`; additive buffer included in live exit target and EV gating)
 - `MAX_GROSS_TAKE_PROFIT_BASIS_POINTS` (default `220`, cap on gross take-profit distance above entry)
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
@@ -95,7 +97,9 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 ## Exit Policy
 
-- Exit targets are placed at **round-trip fees + `EXIT_FIXED_NET_PROFIT_BPS`** (default 5 bps net profit).
+- With `EXIT_POLICY_LOCKED=true`, `EXIT_MODE` is forced to `net_after_fees`; live exits and the entry EV gate both anchor to `EXIT_NET_PROFIT_AFTER_FEES_BPS` plus fees/slippage/spread/buffer floors.
+- `DESIRED_NET_PROFIT_BASIS_POINTS` remains for legacy/non-locked paths and explicit desired-target flows.
+- `FEE_BPS_ROUND_TRIP` is now a legacy fallback only; live fee economics infer maker/taker round trip from entry routing + exit mode.
 - Optional refresh repricing can cancel and replace stale exit orders when `EXIT_REFRESH_ENABLED=true` and the order age exceeds `EXIT_MAX_ORDER_AGE_MS`.
 - In `EXIT_REFRESH_MODE=material`, stale-thesis protection now forces refresh when a trade is beyond failed-trade age and below entry, even if `away_bps_small` would normally hold the GTC exit.
 - Live open-exit detection now uses Alpaca trading open orders (`GET /v2/orders?status=open&nested=true&direction=desc&limit=500`) as broker truth, with direct tracked order fallback via `GET /v2/orders/{order_id}` and `GET /v2/orders:by_client_order_id`.
