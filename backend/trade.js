@@ -972,7 +972,7 @@ const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
-const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 3);
+const MAX_CONCURRENT_POSITIONS = readNumber('MAX_CONCURRENT_POSITIONS', 68);
 
 function logRuntimeConfigEffective() {
   console.log('runtime_config_effective', {
