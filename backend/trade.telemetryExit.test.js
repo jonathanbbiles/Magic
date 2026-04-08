@@ -19,6 +19,63 @@ const plan = trade.computeUnifiedExitPlan({
 assert.ok(plan.targetPrice > plan.profitabilityFloorPrice);
 assert.ok(plan.profitabilityFloorPrice >= plan.trueBreakevenPrice);
 
+const evModelLocked = trade.buildEntryEvModel({
+  symbol: 'BTC/USD',
+  entryPrice: 100,
+  spreadBps: 12,
+  probability: 0.6,
+});
+assert.equal(evModelLocked.exitPlan.netAfterFeesBps, 30);
+const evEntryFeeModel = trade.resolveEntryExitFeeBps({
+  symbol: 'BTC/USD',
+  entryOrderType: evModelLocked.entryOrderType,
+  entryPostOnly: evModelLocked.entryPostOnly,
+  takerExitOnTouch: false,
+});
+const evModelReferenceExitPlan = trade.computeUnifiedExitPlan({
+  symbol: 'BTC/USD',
+  entryPrice: 100,
+  effectiveEntryPrice: 100,
+  entryFeeBps: evEntryFeeModel.entryFeeBps,
+  exitFeeBps: evEntryFeeModel.exitFeeBps,
+  desiredNetExitBps: null,
+  slippageBps: evModelLocked.slippageBpsUsed,
+  spreadBufferBps: evModelLocked.spreadBufferBpsUsed,
+  profitBufferBps: evModelLocked.profitBufferBpsUsed,
+  maxGrossTakeProfitBps: 150,
+  spreadBps: 12,
+});
+assert.equal(evModelLocked.exitPlan.requiredExitBpsFinal, evModelReferenceExitPlan.requiredExitBpsFinal);
+
+const cryptoIocFees = trade.resolveEntryExitFeeBps({
+  symbol: 'BTC/USD',
+  entryOrderType: 'limit',
+  entryPostOnly: false,
+  takerExitOnTouch: false,
+});
+assert.equal(cryptoIocFees.entryFeeBps, 20);
+assert.equal(cryptoIocFees.exitFeeBps, 10);
+assert.equal(cryptoIocFees.feeBpsRoundTrip, 30);
+
+const makerEntryFees = trade.resolveEntryExitFeeBps({
+  symbol: 'BTC/USD',
+  entryOrderType: 'limit',
+  entryPostOnly: true,
+  takerExitOnTouch: false,
+});
+assert.equal(makerEntryFees.entryFeeBps, 10);
+assert.equal(makerEntryFees.feeBpsRoundTrip, 20);
+assert.ok(cryptoIocFees.feeBpsRoundTrip > makerEntryFees.feeBpsRoundTrip);
+
+const evNegative = trade.buildEntryEvModel({
+  symbol: 'BTC/USD',
+  entryPrice: 100,
+  spreadBps: 12,
+  probability: 0.50,
+});
+assert.ok(evNegative.netWinBps > 0);
+assert.ok(evNegative.evBps < 0);
+
 const protectiveCases = [
   {
     name: 'take_profit_hold + override',
