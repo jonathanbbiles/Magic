@@ -1006,7 +1006,7 @@ assert.match(tradeSource, /const clamp01 = \(x\) => clamp\(Number\(x\), 0, 1\);/
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 8\);/);
-assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', false\);/);
+assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', true\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_1M = readNumber\('PREDICTOR_MIN_BARS_1M', 30\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_5M = readNumber\('PREDICTOR_MIN_BARS_5M', 30\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_15M = readNumber\('PREDICTOR_MIN_BARS_15M', 20\);/);

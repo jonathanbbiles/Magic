@@ -488,7 +488,7 @@ const PREDICTOR_WARMUP_MIN_15M_BARS = readNumber('PREDICTOR_WARMUP_MIN_15M_BARS'
 const PREDICTOR_MIN_BARS_1M = readNumber('PREDICTOR_MIN_BARS_1M', 30);
 const PREDICTOR_MIN_BARS_5M = readNumber('PREDICTOR_MIN_BARS_5M', 30);
 const PREDICTOR_MIN_BARS_15M = readNumber('PREDICTOR_MIN_BARS_15M', 20);
-const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', false);
+const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag('PREDICTOR_WARMUP_BLOCK_TRADES', true);
 const PREDICTOR_WARMUP_LOG_EVERY_MS = readNumber('PREDICTOR_WARMUP_LOG_EVERY_MS', 60000);
 const PREDICTOR_WARMUP_PREFETCH_CONCURRENCY = Math.max(1, runtimeLiveConfig.predictorWarmupPrefetchConcurrency);
 const BARS_PREFETCH_INTERVAL_MS = runtimeLiveConfig.barsPrefetchIntervalMs;
@@ -13820,13 +13820,19 @@ async function runEntryScanOnce() {
   entryManagerHeartbeat.running = true;
   entryManagerHeartbeat.lastHeartbeatAt = safeIso();
   const warmupSnapshot = getPredictorWarmupStatus();
+  const startMs = Date.now();
+  if (PREDICTOR_WARMUP_BLOCK_TRADES && warmupSnapshot?.inProgress === true) {
+    emitEntryScanNoopSummary({ startMs, reason: 'warmup_in_progress' });
+    clearEntryScanProgress({ state: 'idle' });
+    setEngineState('warming_up', { reason: 'warmup_in_progress' });
+    return;
+  }
   if (warmupSnapshot?.inProgress && !entryManagerHeartbeat.lastScanAt) {
     setEngineState('warming_up', { reason: 'warmup_active_before_first_scan' });
   } else {
     setEngineState('scanning', { reason: 'entry_scan_start' });
   }
   try {
-    const startMs = Date.now();
     const finalizeScan = (summary, heartbeatResult) => {
       const endMs = Number(summary?.endMs) || Date.now();
       lastEntryScanSummary = { ...(summary || {}), endMs };
