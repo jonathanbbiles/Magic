@@ -1733,13 +1733,14 @@ async function computeEntrySignal(symbol, opts = {}) {
   let quote;
   let obResult = null;
   let barsSnapshot = null;
+  let mdSnapshot = null;
   if (entryMdContext) {
-    const mdSnapshot = await getOrFetchSymbolMarketData({
+    mdSnapshot = await getOrFetchSymbolMarketData({
       context: entryMdContext,
       coordinator: entryMarketDataCoordinator,
       marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
-      fetchQuote: getLatestQuoteFromQuotesOnly,
+      fetchQuote: getLatestQuote,
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -1761,6 +1762,11 @@ async function computeEntrySignal(symbol, opts = {}) {
           symbol: asset.symbol,
           symbolTier,
           reason: 'stale_quote_primary',
+          quoteAgeMs: Number.isFinite(Number(mdSnapshot?.quoteResult?.value?.tsMs))
+            ? Math.max(0, Date.now() - Number(mdSnapshot.quoteResult.value.tsMs))
+            : null,
+          quoteTimestampSource: mdSnapshot?.quoteResult?.value?.source || null,
+          quoteDataSource: mdSnapshot?.quoteResult?.state || null,
           skippedOrderbookFetch: true,
           skippedTradeFetch: true,
           skippedSparseRetry: true,
@@ -1802,7 +1808,12 @@ async function computeEntrySignal(symbol, opts = {}) {
     return {
       entryReady: false,
       why: 'marketdata_unavailable',
-      meta: { symbol: asset.symbol, reason: 'quote_unavailable' },
+      meta: {
+        symbol: asset.symbol,
+        reason: 'quote_unavailable',
+        quoteDataSource: mdSnapshot?.quoteResult?.state || null,
+        quoteFetchReason: mdSnapshot?.quoteResult?.reason || null,
+      },
       record: baseRecord,
     };
   }
@@ -10388,6 +10399,10 @@ async function repairOrphanExits() {
           minNetProfitBps,
           netAfterFeesBps,
           targetPrice,
+          targetPriceSource: 'reconciled_exit_math',
+          reconciliationState: 'open_sell_found',
+          reconciliationReason: null,
+          lastReconciliationAction: 'refresh_tracked_open_sell',
         });
         decision = 'OK:tracked_and_has_open_sell';
         skipped += 1;
@@ -10410,7 +10425,23 @@ async function repairOrphanExits() {
         });
         continue;
       }
-      exitState.delete(symbol);
+      const trackedState = exitState.get(symbol) || {};
+      exitState.set(symbol, {
+        ...trackedState,
+        symbol,
+        qty,
+        entryPrice: entryBasisValue,
+        effectiveEntryPrice: entryBasisValue,
+        entryBasisType,
+        requiredExitBps,
+        minNetProfitBps,
+        netAfterFeesBps,
+        targetPrice,
+        targetPriceSource: 'reconciled_exit_math',
+        reconciliationState: 'reconstructing_target_pending_submit',
+        reconciliationReason: 'tracked_exit_missing_open_sell',
+        lastReconciliationAction: 'tracked_reset_missing_open_sell',
+      });
       decision = 'RESET:tracked_missing_open_sell';
       logExitRepairDecision({
         symbol,
@@ -10521,6 +10552,10 @@ async function repairOrphanExits() {
         sellOrderId: adoptedOrderId,
         sellOrderSubmittedAt: adoptedSubmittedAt,
         sellOrderLimit: Number.isFinite(adoptedLimit) ? adoptedLimit : targetPrice,
+        targetPriceSource: 'reconciled_exit_math',
+        reconciliationState: 'open_sell_found',
+        reconciliationReason: null,
+        lastReconciliationAction: 'adopt_broker_open_sell',
         takerAttempted: false,
         entryOrderId: trackedState.entryOrderId || null,
       });
