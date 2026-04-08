@@ -713,6 +713,7 @@ app.get('/dashboard', async (req, res) => {
       const activeSellLimitFromOrders = pickLowestSellLimit(symbolOpenSellOrders);
 
       const botState = exitStateBySymbol[symbol] || null;
+      const lifecycleState = lifecycleSnapshot?.bySymbol?.[symbol]?.state || null;
       const sellOrderLimitFromState = toFiniteNumberOrNull(botState?.sellOrderLimit);
       const activeSellLimit = Number.isFinite(activeSellLimitFromOrders)
         ? activeSellLimitFromOrders
@@ -750,7 +751,7 @@ app.get('/dashboard', async (req, res) => {
           source: sellSource,
         },
         forensics: getForensicsForPositionSymbol(latestForensicsBySymbol, rawSymbol),
-        state: lifecycleSnapshot?.bySymbol?.[symbol]?.state || null,
+        state: lifecycleState,
         targetProgressPct: Number.isFinite(expectedMovePct) ? expectedMovePct : null,
         entryIntentAgeMs: lifecycleSnapshot?.bySymbol?.[symbol]?.createdAt ? Math.max(0, nowMs - Date.parse(lifecycleSnapshot.bySymbol[symbol].createdAt)) : null,
         executionQuality: toFiniteNumberOrNull(latestForensicsBySymbol?.[symbol]?.executionQualityScore),
@@ -770,6 +771,13 @@ app.get('/dashboard', async (req, res) => {
           brokerOpenSellQty: toFiniteNumberOrNull(botState?.brokerOpenSellQty),
           lastSeenOpenSellAt: botState?.lastSeenOpenSellAt || null,
           reconciliationState: botState?.reconciliationState || null,
+          reconciliationReason: botState?.reconciliationReason || null,
+          lastReconciliationAction: botState?.lastReconciliationAction || null,
+          targetPriceSource: botState?.targetPriceSource || null,
+          unresolvedManagedState: Boolean(!botState && lifecycleState === 'managing'),
+          unresolvedManagedReason: !botState && lifecycleState === 'managing'
+            ? 'lifecycle_managing_without_exit_state'
+            : null,
         },
       };
     });
