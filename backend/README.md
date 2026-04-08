@@ -58,7 +58,8 @@ Optional:
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `false`; when `true`, excludes `USDC/USD`, `USDT/USD`, `BUSD/USD`, `DAI/USD` from scan symbols)
 - `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
-- `ENTRY_PREFETCH_ORDERBOOKS` (default `false`; when `true`, prefetch also batches orderbooks instead of quote+bars only)
+- `ENTRY_PREFETCH_QUOTES` (default `true`; when `true`, prefetch batches latest quotes before symbol evaluation)
+- `ENTRY_PREFETCH_ORDERBOOKS` (default `true`; when `true`, prefetch also batches orderbooks instead of bars-only prefetch)
 - `AUTO_SCAN_SYMBOLS` (optional hard override universe; when set it overrides both dynamic and configured modes)
 - `SUPPORTED_CRYPTO_PAIRS_REFRESH_MS` (default `3600000`, refresh interval for Alpaca tradable crypto asset universe cache)
 
@@ -263,7 +264,8 @@ After merging, manually copy these values into Render:
 - `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
-- `ENTRY_PREFETCH_ORDERBOOKS=false`
+- `ENTRY_PREFETCH_QUOTES=true`
+- `ENTRY_PREFETCH_ORDERBOOKS=true`
 - `ALPACA_MD_MAX_CONCURRENCY=1`
 - `BARS_MAX_CONCURRENT=1`
 - `BARS_PREFETCH_INTERVAL_MS=120000`
@@ -295,7 +297,8 @@ Intended live non-secret env values:
 - `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=3`
-- `ENTRY_PREFETCH_ORDERBOOKS=false`
+- `ENTRY_PREFETCH_QUOTES=true`
+- `ENTRY_PREFETCH_ORDERBOOKS=true`
 - `ALPACA_MD_MAX_CONCURRENCY=1`
 - `BARS_MAX_CONCURRENT=1`
 - `BARS_PREFETCH_INTERVAL_MS=120000`

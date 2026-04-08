@@ -64,6 +64,8 @@ withEnv({}, () => {
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
   assert.equal(cfg.entryQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.entryPrefetchQuotes, true);
+  assert.equal(cfg.entryPrefetchOrderbooks, true);
   assert.equal(cfg.normalEntryQuoteMaxAgeMs, 30000);
   assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 30000);
   assert.equal(cfg.sparseQuoteFreshMs, 10000);

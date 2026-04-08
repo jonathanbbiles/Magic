@@ -12,7 +12,8 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_SCAN_INTERVAL_MS: '12000',
   // Modest live default bump for broad-universe warmup throughput.
   ENTRY_PREFETCH_CHUNK_SIZE: '4',
-  ENTRY_PREFETCH_ORDERBOOKS: 'false',
+  ENTRY_PREFETCH_QUOTES: 'true',
+  ENTRY_PREFETCH_ORDERBOOKS: 'true',
   ALPACA_MD_MAX_CONCURRENCY: '2',
   BARS_MAX_CONCURRENT: '2',
   BARS_PREFETCH_INTERVAL_MS: '90000',

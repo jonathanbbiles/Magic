@@ -476,6 +476,7 @@ const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const runtimeLiveConfig = getRuntimeConfig(process.env);
 const ENTRY_SCAN_INTERVAL_MS = runtimeLiveConfig.entryScanIntervalMs;
 const ENTRY_PREFETCH_CHUNK_SIZE = Math.max(1, runtimeLiveConfig.entryPrefetchChunkSize);
+const ENTRY_PREFETCH_QUOTES = runtimeLiveConfig.entryPrefetchQuotes;
 const ENTRY_PREFETCH_ORDERBOOKS = runtimeLiveConfig.entryPrefetchOrderbooks;
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
@@ -13585,7 +13586,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
   if (!opts.force) {
     const cooldownBlockedEndpoints = [];
-    if (cooldownSnapshot.quote) cooldownBlockedEndpoints.push('quote');
+    if (ENTRY_PREFETCH_QUOTES && cooldownSnapshot.quote) cooldownBlockedEndpoints.push('quote');
     if (cooldownSnapshot.bars) cooldownBlockedEndpoints.push('bars');
     if (ENTRY_PREFETCH_ORDERBOOKS && cooldownSnapshot.orderbook) cooldownBlockedEndpoints.push('orderbook');
     if (cooldownBlockedEndpoints.length > 0) {
@@ -13593,6 +13594,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         reason: 'endpoint_cooldown',
         blockedEndpoints: cooldownBlockedEndpoints,
         cooldownSnapshot,
+        prefetchQuotes: ENTRY_PREFETCH_QUOTES,
         prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
       });
       return {
@@ -13601,6 +13603,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         skippedEndpoints: cooldownBlockedEndpoints,
         cooldownSnapshot,
         prefetchedBars: lastPrefetchedBars,
+        prefetchQuotes: ENTRY_PREFETCH_QUOTES,
         prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
       };
     }
@@ -13612,6 +13615,8 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   const bars1mBySymbol = new Map();
   const bars5mBySymbol = new Map();
   const bars15mBySymbol = new Map();
+  let prefetchedQuotes = 0;
+  let prefetchedOrderbooks = 0;
   const warmupLimits = getWarmupBarLimits();
   const ranges = {
     '1m': getBarsFetchRange({ timeframe: '1Min', limit: warmupLimits['1m'] }),
@@ -13635,6 +13640,22 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     '15Min': 0,
   };
   const processChunk = async (chunkSymbols) => {
+    if (ENTRY_PREFETCH_QUOTES) {
+      const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
+      warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+      const quoteSymbols = quotesResp?.quotes && typeof quotesResp.quotes === 'object'
+        ? Object.keys(quotesResp.quotes)
+        : [];
+      prefetchedQuotes += quoteSymbols.length;
+    }
+    if (ENTRY_PREFETCH_ORDERBOOKS) {
+      const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
+      warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
+      const orderbookSymbols = orderbooksResp?.orderbooks && typeof orderbooksResp.orderbooks === 'object'
+        ? Object.keys(orderbooksResp.orderbooks)
+        : [];
+      prefetchedOrderbooks += orderbookSymbols.length;
+    }
     const bars1mResp = await fetchCryptoBarsWarmupPaged({
       symbols: chunkSymbols,
       perSymbolLimit: warmupLimits['1m'],
@@ -13738,11 +13759,15 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     ok: true,
     prefetchedBars: lastPrefetchedBars,
     prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+    prefetchQuotes: ENTRY_PREFETCH_QUOTES,
     warmupPrefetchConcurrency,
     chunkSize,
     chunkSizeCap: 20,
     seededSymbols: seedSymbols.length,
     totalSymbolsObserved: symbols.length,
+    prefetchedQuotes,
+    prefetchedOrderbooks,
+    quotePrefetchState: ENTRY_PREFETCH_QUOTES ? 'enabled' : 'skipped_env_disabled',
     orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'enabled' : 'skipped_env_disabled',
   };
 }
@@ -13764,6 +13789,10 @@ function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
     marketDataBudget: {
       cacheHits: 0,
       freshFetches: 0,
+      usableCacheReuses: 0,
+      cacheFallbacksAfterFailure: 0,
+      prefetchedQuotes: 0,
+      prefetchedOrderbooks: 0,
       rateLimited: 0,
       cooldownBlocked: 0,
       endpointCooldowns: entryMarketDataCoordinator.getCooldownSnapshot(),
@@ -14164,6 +14193,7 @@ async function runEntryScanOnce() {
     const resolveSkipReason = (reason, meta) => resolveEntrySkipReason(reason, meta);
 
     let prefetchedBars = null;
+    let prefetchResult = null;
     const reusablePrefetch = getPrefetchedBarsIfReusable({ symbols: scanSymbols });
     if (reusablePrefetch?.bars) {
       prefetchedBars = reusablePrefetch.bars;
@@ -14188,7 +14218,7 @@ async function runEntryScanOnce() {
         });
       }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
       try {
-        const prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+        prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
         if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
           prefetchedBars = prefetchResult.prefetchedBars;
         }
@@ -14726,6 +14756,10 @@ async function runEntryScanOnce() {
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
+        usableCacheReuses: entryMarketDataContext.stats.usableCacheReuses,
+        cacheFallbacksAfterFailure: entryMarketDataContext.stats.cacheFallbacksAfterFailure,
+        prefetchedQuotes: Number(prefetchResult?.prefetchedQuotes || 0),
+        prefetchedOrderbooks: Number(prefetchResult?.prefetchedOrderbooks || 0),
         rateLimited: entryMarketDataContext.stats.rateLimited,
         cooldownBlocked: entryMarketDataContext.stats.cooldownBlocked,
         sparseFallbackAttempts: entryMarketDataContext.stats.sparseFallbackAttempts,
@@ -17106,5 +17140,8 @@ module.exports = {
   __testNoteStaleQuoteSkip: noteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState: getStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState: clearStaleQuoteSkipState,
+  __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
+  __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
+  __getScanMarketDataCacheForTests: () => scanMarketDataCache,
 
 };

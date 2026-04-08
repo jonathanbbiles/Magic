@@ -67,11 +67,27 @@ function createMarketDataCache(config = {}) {
     return { ok: true, value: { ...row.quote }, ageMs, fresh: ageMs <= quoteTtlMs };
   }
 
+  function getQuoteUsable(symbol, { nowMs = Date.now(), maxAgeMs } = {}) {
+    const quote = getQuote(symbol, nowMs);
+    if (!quote?.ok) return quote;
+    const normalizedMaxAgeMs = Number(maxAgeMs);
+    const usable = Number.isFinite(normalizedMaxAgeMs) ? quote.ageMs <= normalizedMaxAgeMs : quote.fresh;
+    return { ...quote, usable };
+  }
+
   function getOrderbook(symbol, nowMs = Date.now()) {
     const row = bySymbol.get(normalizePair(symbol));
     if (!row?.orderbook) return { ok: false, reason: 'orderbook_missing', value: null, ageMs: null };
     const ageMs = Math.max(0, nowMs - normalizeTsMs(row.orderbookTsMs, row.orderbookUpdatedAtMs));
     return { ok: true, value: { ...row.orderbook }, ageMs, fresh: ageMs <= orderbookTtlMs };
+  }
+
+  function getOrderbookUsable(symbol, { nowMs = Date.now(), maxAgeMs } = {}) {
+    const orderbook = getOrderbook(symbol, nowMs);
+    if (!orderbook?.ok) return orderbook;
+    const normalizedMaxAgeMs = Number(maxAgeMs);
+    const usable = Number.isFinite(normalizedMaxAgeMs) ? orderbook.ageMs <= normalizedMaxAgeMs : orderbook.fresh;
+    return { ...orderbook, usable };
   }
 
   function getBars(symbol, timeframe, nowMs = Date.now()) {
@@ -118,7 +134,9 @@ function createMarketDataCache(config = {}) {
     upsertOrderbook,
     upsertBars,
     getQuote,
+    getQuoteUsable,
     getOrderbook,
+    getOrderbookUsable,
     getBars,
     getReadiness,
   };

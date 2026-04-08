@@ -137,6 +137,28 @@ assert.ok(Object.prototype.hasOwnProperty.call(universeSnapshot, 'effectiveUnive
 const warmupSnapshot = tradeLifecycle.getPredictorWarmupSnapshot();
 assert.equal(typeof warmupSnapshot, 'object');
 assert.ok(Object.prototype.hasOwnProperty.call(warmupSnapshot, 'inProgress'));
+assert.equal(typeof tradeLifecycle.__warmQuoteCacheFromBatchForTests, 'function');
+assert.equal(typeof tradeLifecycle.__warmOrderbookCacheFromBatchForTests, 'function');
+const scanCache = tradeLifecycle.__getScanMarketDataCacheForTests();
+const nowTs = Date.now();
+tradeLifecycle.__warmQuoteCacheFromBatchForTests(['BTC/USD'], {
+  quotes: { 'BTC/USD': { bp: 100, ap: 101, t: new Date(nowTs).toISOString() } },
+});
+const warmedQuote = scanCache.getQuoteUsable('BTC/USD', { nowMs: nowTs + 1000, maxAgeMs: 30000 });
+assert.equal(warmedQuote.ok, true);
+assert.equal(warmedQuote.usable, true);
+tradeLifecycle.__warmOrderbookCacheFromBatchForTests(['BTC/USD'], {
+  orderbooks: {
+    'BTC/USD': {
+      a: [{ p: 101, s: 1 }],
+      b: [{ p: 100, s: 1 }],
+      t: new Date(nowTs).toISOString(),
+    },
+  },
+});
+const warmedOrderbook = scanCache.getOrderbookUsable('BTC/USD', { nowMs: nowTs + 1000, maxAgeMs: 30000 });
+assert.equal(warmedOrderbook.ok, true);
+assert.equal(warmedOrderbook.usable, true);
 
 const tradeManagers = loadTrade({ TRADING_ENABLED: '0' });
 tradeManagers.__resetManagerIntervalsForTests();
