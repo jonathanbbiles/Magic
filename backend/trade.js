@@ -772,8 +772,19 @@ function resolveEntrySkipReason(reason, meta) {
 }
 
 function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = ENTRY_QUOTE_MAX_AGE_MS } = {}) {
-  const quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
-  const quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
+  const rawQuoteTs = quote?.tsMs;
+  const quoteTsMs = normalizeQuoteTsMs(rawQuoteTs);
+  const rawQuoteAgeMs = Number.isFinite(quoteTsMs) ? nowMs - quoteTsMs : null;
+  const quoteAgeMs = Number.isFinite(rawQuoteAgeMs) ? Math.max(0, rawQuoteAgeMs) : null;
+  if (Number.isFinite(rawQuoteAgeMs) && (rawQuoteAgeMs < 0 || rawQuoteAgeMs > 3_600_000)) {
+    console.warn('entry_quote_age_out_of_bounds', {
+      symbol: normalizeSymbol(quote?.symbol) || null,
+      quoteAgeMs: rawQuoteAgeMs,
+      rawTimestamp: rawQuoteTs ?? null,
+      normalizedTimestampMs: quoteTsMs,
+      nowMs,
+    });
+  }
   if (!Number.isFinite(quoteAgeMs)) {
     return {
       ok: false,
@@ -1872,10 +1883,20 @@ async function computeEntrySignal(symbol, opts = {}) {
     symbolTier,
     sparseFallbackEnabled: ORDERBOOK_SPARSE_FALLBACK_ENABLED,
   });
-  let quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+  let quoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
   let quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
   let quoteSource = quote?.source || null;
-  let quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, nowMs - quoteTsMs) : null;
+  let quoteAgeMs = Number.isFinite(quoteTsMs) ? nowMs - quoteTsMs : null;
+  if (Number.isFinite(quoteAgeMs) && (quoteAgeMs < 0 || quoteAgeMs > 3_600_000)) {
+    console.warn('entry_quote_age_out_of_bounds', {
+      symbol: asset.symbol,
+      quoteAgeMs,
+      rawTimestamp: quote?.tsMs ?? null,
+      normalizedTimestampMs: quoteTsMs,
+      nowMs,
+    });
+  }
+  quoteAgeMs = Number.isFinite(quoteAgeMs) ? Math.max(0, quoteAgeMs) : null;
   let sparseRetryDetails = null;
   let sparseRejectCounted = false;
   const maybeCountSparseReject = ({ reason, marketDataEval = null }) => {
@@ -2059,10 +2080,20 @@ async function computeEntrySignal(symbol, opts = {}) {
     const priorQuoteReceivedAtMs = quoteReceivedAtMs;
     if (quoteRetry && shouldForceQuoteRefreshForSparseRetry) {
       quote = quoteRetry;
-      quoteTsMs = Number.isFinite(Number(quote?.tsMs)) ? Number(quote.tsMs) : null;
+      quoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
       quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
       quoteSource = quote?.source || null;
-      quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+      quoteAgeMs = Number.isFinite(quoteTsMs) ? Date.now() - quoteTsMs : null;
+      if (Number.isFinite(quoteAgeMs) && (quoteAgeMs < 0 || quoteAgeMs > 3_600_000)) {
+        console.warn('entry_quote_age_out_of_bounds', {
+          symbol: asset.symbol,
+          quoteAgeMs,
+          rawTimestamp: quote?.tsMs ?? null,
+          normalizedTimestampMs: quoteTsMs,
+          nowMs: Date.now(),
+        });
+      }
+      quoteAgeMs = Number.isFinite(quoteAgeMs) ? Math.max(0, quoteAgeMs) : null;
     }
     const providerAgeMs = computeProviderQuoteAgeMs(quoteReceivedAtMs, quoteTsMs);
     sparseRetryDetails = {
@@ -3577,6 +3608,7 @@ const lastExitRefreshAt = new Map();
 const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
+const lockedTpLossExitBlockedLogBySymbol = new Map();
 const positionMissingCountBySymbol = new Map();
 const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
 const exitStateFirstSeenAtBySymbol = new Map(); // symbol -> ms (bookkeeping fallback, not broker confirmation)
@@ -10391,6 +10423,35 @@ async function repairOrphanExits() {
         hasTrackedExit,
         resolvedOpenSellCount: openSellOrders.length,
       })) {
+        const openSellCandidates = openSellOrders.filter((order) => {
+          const orderQty = resolveOrderQty(order);
+          return Number.isFinite(orderQty) && orderQty > 0 && orderHasValidLimit(order);
+        });
+        const bestOrder = openSellCandidates.reduce((best, candidate) => {
+          const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
+          const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
+          const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
+          const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
+          const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
+          const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
+          return safeCandidateTs > safeBestTs ? candidate : best;
+        }, openSellCandidates[0] || null);
+        const refreshedSellOrderId = bestOrder?.id || bestOrder?.order_id || null;
+        const refreshedSellOrderLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
+        const refreshedSellOrderQty = resolveOrderQty(bestOrder);
+        const refreshedSubmittedAtRaw =
+          bestOrder?.submitted_at ||
+          bestOrder?.submittedAt ||
+          bestOrder?.created_at ||
+          bestOrder?.createdAt ||
+          null;
+        const refreshedSubmittedAtParsed =
+          typeof refreshedSubmittedAtRaw === 'number'
+            ? refreshedSubmittedAtRaw
+            : refreshedSubmittedAtRaw
+              ? Date.parse(refreshedSubmittedAtRaw)
+              : null;
+        const refreshedSubmittedAt = Number.isFinite(refreshedSubmittedAtParsed) ? refreshedSubmittedAtParsed : null;
         const trackedState = exitState.get(symbol) || {};
         exitState.set(symbol, {
           ...trackedState,
@@ -10400,6 +10461,16 @@ async function repairOrphanExits() {
           netAfterFeesBps,
           targetPrice,
           targetPriceSource: 'reconciled_exit_math',
+          sellOrderId: refreshedSellOrderId || trackedState.sellOrderId || null,
+          sellOrderLimit: Number.isFinite(refreshedSellOrderLimit)
+            ? refreshedSellOrderLimit
+            : (Number.isFinite(Number(trackedState.sellOrderLimit)) ? Number(trackedState.sellOrderLimit) : null),
+          sellOrderSubmittedAt: Number.isFinite(refreshedSubmittedAt)
+            ? refreshedSubmittedAt
+            : (Number.isFinite(Number(trackedState.sellOrderSubmittedAt)) ? Number(trackedState.sellOrderSubmittedAt) : null),
+          sellOrderQty: Number.isFinite(refreshedSellOrderQty)
+            ? refreshedSellOrderQty
+            : (Number.isFinite(Number(trackedState.sellOrderQty)) ? Number(trackedState.sellOrderQty) : null),
           reconciliationState: 'open_sell_found',
           reconciliationReason: null,
           lastReconciliationAction: 'refresh_tracked_open_sell',
@@ -11631,21 +11702,30 @@ async function manageExitStates() {
             }
           }
           if (tacticDecision === 'take_profit_hold' && !protectiveExitTriggerActive) {
-            console.log('locked_tp_loss_exit_blocked', {
-              symbol,
-              tacticDecision,
-              exitRefreshWhy: exitRefreshDecision?.why || null,
-              exitRefreshOverrideActive,
-              tacticalProtectiveExit,
-              stoplossTriggerActive,
-              hardStopTriggerActive,
-              forceExitTriggerActive,
-              protectiveExitTriggerActive,
-              existingSellOrderId: state.sellOrderId || null,
-              existingSellClientOrderId: state.sellClientOrderId || null,
-              existingTrackedSellLimit: Number.isFinite(state.sellOrderLimit) ? state.sellOrderLimit : null,
-              blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
-            });
+            const exitRefreshWhy = exitRefreshDecision?.why || null;
+            const nowLogMs = Date.now();
+            const lastLoggedAt = Number(lockedTpLossExitBlockedLogBySymbol.get(symbol) || 0);
+            const shouldLogBlockedHold = exitRefreshWhy !== 'too_fresh' || !Number.isFinite(lastLoggedAt) || (nowLogMs - lastLoggedAt) >= 60_000;
+            if (shouldLogBlockedHold) {
+              console.log('locked_tp_loss_exit_blocked', {
+                symbol,
+                tacticDecision,
+                exitRefreshWhy,
+                exitRefreshOverrideActive,
+                tacticalProtectiveExit,
+                stoplossTriggerActive,
+                hardStopTriggerActive,
+                forceExitTriggerActive,
+                protectiveExitTriggerActive,
+                existingSellOrderId: state.sellOrderId || null,
+                existingSellClientOrderId: state.sellClientOrderId || null,
+                existingTrackedSellLimit: Number.isFinite(state.sellOrderLimit) ? state.sellOrderLimit : null,
+                blockedBranches: ['thesis_break_exit', 'stale_trade_exit', 'time_stop_exit', 'stoploss', 'hard_stop', 'taker_before_target', 'force_exit', 'max_hold', 'ioc', 'market'],
+              });
+              if (exitRefreshWhy === 'too_fresh') {
+                lockedTpLossExitBlockedLogBySymbol.set(symbol, nowLogMs);
+              }
+            }
             actionTaken = 'hold_existing_order';
             reasonCode = 'locked_tp_active';
             continue;
