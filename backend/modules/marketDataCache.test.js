@@ -15,4 +15,13 @@ assert.equal(readiness.orderbook.ok, true);
 assert.equal(readiness.bars['1m'].count, 2);
 assert.equal(readiness.usableForPredictor, true);
 
+const tradingUsableQuote = cache.getQuoteUsable('BTC/USD', { nowMs: now + 5000, maxAgeMs: 30000 });
+assert.equal(tradingUsableQuote.ok, true);
+assert.equal(tradingUsableQuote.fresh, false, 'small TTL freshness remains strict');
+assert.equal(tradingUsableQuote.usable, true, 'trading usability can still be true within maxAge');
+
+const staleTradingQuote = cache.getQuoteUsable('BTC/USD', { nowMs: now + 35000, maxAgeMs: 30000 });
+assert.equal(staleTradingQuote.ok, true);
+assert.equal(staleTradingQuote.usable, false, 'cache accessor should not reuse data past requested trading max age');
+
 console.log('marketDataCache.test.js passed');

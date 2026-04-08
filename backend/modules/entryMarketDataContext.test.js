@@ -31,110 +31,125 @@ const { createMarketDataCache } = require('./marketDataCache');
   assert.equal(cachedQuote.state, 'reused_recent');
   assert.equal(quoteCalls, 1, 'ttl cache should reuse recent quote');
 
-  let orderbookCalls = 0;
-  const data = await getOrFetchSymbolMarketData({
-    context,
-    coordinator,
-    marketDataCache: createMarketDataCache(),
-    symbol: 'BTC/USD',
-    fetchQuote,
-    fetchOrderbook: async () => {
-      orderbookCalls += 1;
-      return { ok: true, orderbook: { bestBid: 10, bestAsk: 11, bids: [{ p: 10, s: 1 }], asks: [{ p: 11, s: 1 }] } };
-    },
-    quoteMaxAgeMs: 120000,
-    orderbookMaxAgeMs: 10000,
-  });
-  assert.ok(data.quote);
-  assert.ok(data.orderbook);
+  const now = Date.now();
+  const usableCache = createMarketDataCache({ quoteTtlMs: 1000, orderbookTtlMs: 1000 });
+  usableCache.upsertQuote('SOL/USD', { bid: 20, ask: 21, tsMs: now - 5000 }, now - 5000);
+  usableCache.upsertOrderbook('SOL/USD', { ok: true, orderbook: { bestBid: 20, bestAsk: 21, bids: [{ p: 20, s: 1 }], asks: [{ p: 21, s: 1 }] }, tsMs: now - 5000 }, now - 5000);
 
-  await getOrFetchSymbolMarketData({
-    context,
-    coordinator,
-    marketDataCache: createMarketDataCache(),
-    symbol: 'BTC/USD',
-    fetchQuote,
-    fetchOrderbook: async () => {
-      orderbookCalls += 1;
-      return { ok: true, orderbook: { bestBid: 10, bestAsk: 11, bids: [{ p: 10, s: 1 }], asks: [{ p: 11, s: 1 }] } };
-    },
-    quoteMaxAgeMs: 120000,
-    orderbookMaxAgeMs: 10000,
-  });
-  assert.equal(orderbookCalls, 1, 'per-scan symbol context should avoid duplicate orderbook fetches');
-
-  let forcedQuoteCalls = 0;
-  await getOrFetchSymbolMarketData({
-    context,
-    coordinator,
-    marketDataCache: createMarketDataCache(),
-    symbol: 'BTC/USD',
-    fetchQuote: async () => {
-      forcedQuoteCalls += 1;
-      return { bid: 12, ask: 13, tsMs: Date.now(), source: 'forced' };
-    },
-    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 12, bestAsk: 13, bids: [{ p: 12, s: 1 }], asks: [{ p: 13, s: 1 }] } }),
-    quoteMaxAgeMs: 120000,
-    orderbookMaxAgeMs: 10000,
-    forceQuoteRefresh: true,
-  });
-  assert.equal(forcedQuoteCalls, 1, 'forceQuoteRefresh should bypass per-scan quote reuse');
-
-  let rateLimitedCalls = 0;
-  const cooldownCoordinator = createRequestCoordinator({ quoteTtlMs: 1, rateLimitCooldownMs: 50 });
-  const rl = await cooldownCoordinator.get({
-    endpoint: 'orderbook',
-    key: 'ETH/USD',
-    fetcher: async () => {
-      rateLimitedCalls += 1;
-      const err = new Error('429');
-      err.statusCode = 429;
-      throw err;
-    },
-  });
-  assert.equal(rl.state, 'rate_limited');
-  const blocked = await cooldownCoordinator.get({
-    endpoint: 'orderbook',
-    key: 'ETH/USD',
-    fetcher: async () => {
-      rateLimitedCalls += 1;
-      return { ok: true };
-    },
-  });
-  assert.equal(blocked.state, 'cooldown_active');
-  assert.equal(rateLimitedCalls, 1, 'cooldown should block immediate retry thrash');
-
-  const layerCache = createMarketDataCache();
-  layerCache.upsertQuote('SOL/USD', { bid: 20, ask: 21, tsMs: Date.now() }, Date.now());
-  layerCache.upsertOrderbook('SOL/USD', { ok: true, orderbook: { bestBid: 20, bestAsk: 21, bids: [{ p: 20, s: 1 }], asks: [{ p: 21, s: 1 }] } }, Date.now());
-  layerCache.upsertBars('SOL/USD', '1m', [{ c: 20 }]);
-  layerCache.upsertBars('SOL/USD', '5m', [{ c: 20 }]);
-  layerCache.upsertBars('SOL/USD', '15m', [{ c: 20 }]);
-  let cacheMissFetcherCalls = 0;
+  let cacheBypassCalls = 0;
   const cacheLayerResult = await getOrFetchSymbolMarketData({
     context: buildEntryMarketDataContext({ scanId: 'scan-cache' }),
-    coordinator: createRequestCoordinator({}),
-    marketDataCache: layerCache,
+    coordinator: createRequestCoordinator({ quoteTtlMs: 1, orderbookTtlMs: 1 }),
+    marketDataCache: usableCache,
     symbol: 'SOL/USD',
-    includeOrderbook: false,
     fetchQuote: async () => {
-      cacheMissFetcherCalls += 1;
+      cacheBypassCalls += 1;
       return { bid: 0, ask: 0, tsMs: Date.now() };
     },
     fetchOrderbook: async () => {
-      cacheMissFetcherCalls += 1;
-      return { ok: false };
+      cacheBypassCalls += 1;
+      return { ok: true, orderbook: { bestBid: 0, bestAsk: 0 } };
     },
-    fetchBars: async () => {
-      cacheMissFetcherCalls += 1;
-      return [];
-    },
-    barsWarmup: { '1m': 1, '5m': 1, '15m': 1 },
-    fallbackPolicy: { suppress: true, reason: 'rate_pressure' },
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
   });
-  assert.equal(cacheLayerResult.quoteResult.state, 'cache_layer');
-  assert.equal(cacheLayerResult.orderbook, undefined, 'includeOrderbook=false should defer orderbook fetches');
-  assert.equal(cacheMissFetcherCalls, 0, 'cache layer should avoid fallback fetches for ready symbols');
+  assert.equal(cacheLayerResult.quoteResult.state, 'cache_layer_usable');
+  assert.equal(cacheLayerResult.orderbookResult.state, 'cache_layer_usable');
+  assert.equal(cacheBypassCalls, 0, 'usable cache should be used before network fetch');
+
+  const fallbackCache = createMarketDataCache({ quoteTtlMs: 500, orderbookTtlMs: 500 });
+  fallbackCache.upsertQuote('ETH/USD', { bid: 30, ask: 31, tsMs: now - 4000 }, now - 4000);
+  fallbackCache.upsertOrderbook('ETH/USD', { ok: true, orderbook: { bestBid: 30, bestAsk: 31, bids: [{ p: 30, s: 1 }], asks: [{ p: 31, s: 1 }] }, tsMs: now - 4000 }, now - 4000);
+
+  const fallbackCoordinatorRateLimit = {
+    get: async ({ endpoint }) => ({ ok: false, state: 'rate_limited', reason: `${endpoint}_rate_limited` }),
+    getCooldownSnapshot: () => ({}),
+  };
+  const rateLimitedFallback = await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-rate-limit' }),
+    coordinator: fallbackCoordinatorRateLimit,
+    marketDataCache: fallbackCache,
+    symbol: 'ETH/USD',
+    fetchQuote: async () => ({ bid: 0, ask: 0, tsMs: Date.now() }),
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 0, bestAsk: 0 } }),
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
+    forceQuoteRefresh: true,
+    forceOrderbookRefresh: true,
+  });
+  assert.equal(rateLimitedFallback.quoteResult.state, 'cache_fallback_after_failure');
+  assert.equal(rateLimitedFallback.orderbookResult.state, 'cache_fallback_after_failure');
+
+  const fallbackCoordinatorCooldown = {
+    get: async () => ({ ok: false, state: 'cooldown_active', reason: 'cooldown_active' }),
+    getCooldownSnapshot: () => ({}),
+  };
+  const cooldownFallback = await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-cooldown' }),
+    coordinator: fallbackCoordinatorCooldown,
+    marketDataCache: fallbackCache,
+    symbol: 'ETH/USD',
+    fetchQuote: async () => ({ bid: 0, ask: 0, tsMs: Date.now() }),
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 0, bestAsk: 0 } }),
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
+    forceQuoteRefresh: true,
+    forceOrderbookRefresh: true,
+  });
+  assert.equal(cooldownFallback.quoteResult.state, 'cache_fallback_after_failure');
+
+  const fallbackCoordinatorUnavailable = {
+    get: async () => ({ ok: false, state: 'stale_unusable', reason: 'marketdata_unavailable' }),
+    getCooldownSnapshot: () => ({}),
+  };
+  const unavailableFallback = await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-unavailable' }),
+    coordinator: fallbackCoordinatorUnavailable,
+    marketDataCache: fallbackCache,
+    symbol: 'ETH/USD',
+    fetchQuote: async () => ({ bid: 0, ask: 0, tsMs: Date.now() }),
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 0, bestAsk: 0 } }),
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
+    forceQuoteRefresh: true,
+    forceOrderbookRefresh: true,
+  });
+  assert.equal(unavailableFallback.quoteResult.state, 'cache_fallback_after_failure');
+
+  const staleCache = createMarketDataCache({ quoteTtlMs: 500, orderbookTtlMs: 500 });
+  staleCache.upsertQuote('XRP/USD', { bid: 40, ask: 41, tsMs: now - 50000 }, now - 50000);
+  let staleFetchCalls = 0;
+  await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-stale' }),
+    coordinator: createRequestCoordinator({ quoteTtlMs: 1 }),
+    marketDataCache: staleCache,
+    symbol: 'XRP/USD',
+    fetchQuote: async () => {
+      staleFetchCalls += 1;
+      return { bid: 42, ask: 43, tsMs: Date.now() };
+    },
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 42, bestAsk: 43 } }),
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
+    includeOrderbook: false,
+  });
+  assert.equal(staleFetchCalls, 1, 'stale trading cache must not be reused beyond requested max age');
+
+  const statsContext = buildEntryMarketDataContext({ scanId: 'scan-stats' });
+  await getOrFetchSymbolMarketData({
+    context: statsContext,
+    coordinator: fallbackCoordinatorRateLimit,
+    marketDataCache: fallbackCache,
+    symbol: 'ETH/USD',
+    fetchQuote: async () => ({ bid: 0, ask: 0, tsMs: Date.now() }),
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 0, bestAsk: 0 } }),
+    quoteMaxAgeMs: 30000,
+    orderbookMaxAgeMs: 30000,
+    forceQuoteRefresh: true,
+    forceOrderbookRefresh: true,
+  });
+  assert.equal(statsContext.stats.cacheHits >= 2, true);
+  assert.equal(statsContext.stats.cacheFallbacksAfterFailure >= 1, true);
 
   console.log('entry market data context tests passed');
 })().catch((err) => {

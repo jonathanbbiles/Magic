@@ -140,6 +140,8 @@ function buildEntryMarketDataContext({ scanId, prefetchedBars = null } = {}) {
     stats: {
       freshFetches: 0,
       cacheHits: 0,
+      usableCacheReuses: 0,
+      cacheFallbacksAfterFailure: 0,
       rateLimited: 0,
       cooldownBlocked: 0,
       sparseFallbackAttempts: 0,
@@ -171,6 +173,41 @@ async function getOrFetchSymbolMarketData({
   includeOrderbook = true,
   fallbackPolicy = null,
 }) {
+  function resolveTradingUsableCache(type, maxAgeMs) {
+    if (!marketDataCache) return null;
+    if (type === 'quote') {
+      if (typeof marketDataCache.getQuoteUsable === 'function') {
+        return marketDataCache.getQuoteUsable(normalizedSymbol, { nowMs, maxAgeMs });
+      }
+      if (typeof marketDataCache.getQuote === 'function') {
+        const quote = marketDataCache.getQuote(normalizedSymbol, nowMs);
+        if (!quote?.ok) return quote;
+        const usable = Number.isFinite(Number(maxAgeMs)) ? quote.ageMs <= Number(maxAgeMs) : Boolean(quote.fresh);
+        return { ...quote, usable };
+      }
+      return null;
+    }
+    if (type === 'orderbook') {
+      if (typeof marketDataCache.getOrderbookUsable === 'function') {
+        return marketDataCache.getOrderbookUsable(normalizedSymbol, { nowMs, maxAgeMs });
+      }
+      if (typeof marketDataCache.getOrderbook === 'function') {
+        const orderbook = marketDataCache.getOrderbook(normalizedSymbol, nowMs);
+        if (!orderbook?.ok) return orderbook;
+        const usable = Number.isFinite(Number(maxAgeMs)) ? orderbook.ageMs <= Number(maxAgeMs) : Boolean(orderbook.fresh);
+        return { ...orderbook, usable };
+      }
+      return null;
+    }
+    return null;
+  }
+
+  function shouldFallbackToUsableCache(response) {
+    const state = String(response?.state || '').toLowerCase();
+    return ['rate_limited', 'cooldown_active', 'stale_unusable'].includes(state)
+      || String(response?.reason || '').toLowerCase() === 'marketdata_unavailable';
+  }
+
   const normalizedSymbol = normalizePair(symbol);
   const existing = context.symbolData.get(normalizedSymbol) || {};
   const result = { ...existing };
@@ -184,11 +221,11 @@ async function getOrFetchSymbolMarketData({
     (!Number.isFinite(existingQuoteAgeMs) || existingQuoteAgeMs > quoteMaxAgeMs);
 
   if (!result.quote || forceQuoteRefresh || shouldRefreshForQuoteAge) {
-    const cachedQuote = !forceQuoteRefresh && marketDataCache?.getQuote
-      ? marketDataCache.getQuote(normalizedSymbol)
+    const cachedQuote = !forceQuoteRefresh
+      ? resolveTradingUsableCache('quote', quoteMaxAgeMs)
       : null;
-    if (cachedQuote?.ok && cachedQuote?.fresh) {
-      result.quoteResult = { ok: true, state: 'cache_layer', value: cachedQuote.value, ageMs: cachedQuote.ageMs };
+    if (cachedQuote?.ok && cachedQuote?.usable) {
+      result.quoteResult = { ok: true, state: 'cache_layer_usable', value: cachedQuote.value, ageMs: cachedQuote.ageMs };
       result.quote = cachedQuote.value;
     } else {
     const quoteResult = await coordinator.get({
@@ -204,16 +241,22 @@ async function getOrFetchSymbolMarketData({
         if (marketDataCache?.upsertQuote) {
           marketDataCache.upsertQuote(normalizedSymbol, quoteResult.value, quoteResult.value?.tsMs || Date.now());
         }
+      } else if (shouldFallbackToUsableCache(quoteResult)) {
+        const fallbackQuote = resolveTradingUsableCache('quote', quoteMaxAgeMs);
+        if (fallbackQuote?.ok && fallbackQuote?.usable) {
+          result.quoteResult = { ok: true, state: 'cache_fallback_after_failure', value: fallbackQuote.value, ageMs: fallbackQuote.ageMs };
+          result.quote = fallbackQuote.value;
+        }
       }
     }
   }
 
   if (includeOrderbook && (!result.orderbook || forceOrderbookRefresh)) {
-    const cachedOrderbook = !forceOrderbookRefresh && marketDataCache?.getOrderbook
-      ? marketDataCache.getOrderbook(normalizedSymbol)
+    const cachedOrderbook = !forceOrderbookRefresh
+      ? resolveTradingUsableCache('orderbook', orderbookMaxAgeMs)
       : null;
-    if (cachedOrderbook?.ok && cachedOrderbook?.fresh) {
-      result.orderbookResult = { ok: true, state: 'cache_layer', value: cachedOrderbook.value, ageMs: cachedOrderbook.ageMs };
+    if (cachedOrderbook?.ok && cachedOrderbook?.usable) {
+      result.orderbookResult = { ok: true, state: 'cache_layer_usable', value: cachedOrderbook.value, ageMs: cachedOrderbook.ageMs };
       result.orderbook = cachedOrderbook.value;
     } else {
     const orderbookResult = await coordinator.get({
@@ -228,6 +271,12 @@ async function getOrFetchSymbolMarketData({
         result.orderbook = orderbookResult.value;
         if (marketDataCache?.upsertOrderbook && orderbookResult.value?.orderbook) {
           marketDataCache.upsertOrderbook(normalizedSymbol, orderbookResult.value, orderbookResult.value?.tsMs || Date.now());
+        }
+      } else if (shouldFallbackToUsableCache(orderbookResult)) {
+        const fallbackOrderbook = resolveTradingUsableCache('orderbook', orderbookMaxAgeMs);
+        if (fallbackOrderbook?.ok && fallbackOrderbook?.usable) {
+          result.orderbookResult = { ok: true, state: 'cache_fallback_after_failure', value: fallbackOrderbook.value, ageMs: fallbackOrderbook.ageMs };
+          result.orderbook = fallbackOrderbook.value;
         }
       }
     }
@@ -280,7 +329,15 @@ async function getOrFetchSymbolMarketData({
   for (const response of [result.quoteResult, result.orderbookResult]) {
     if (!response) continue;
     if (response.state === 'fresh') context.stats.freshFetches += 1;
-    if (response.state === 'reused_recent' || response.state === 'rate_limited' || response.state === 'cache_layer') context.stats.cacheHits += 1;
+    if (
+      response.state === 'reused_recent'
+      || response.state === 'rate_limited'
+      || response.state === 'cache_layer'
+      || response.state === 'cache_layer_usable'
+      || response.state === 'cache_fallback_after_failure'
+    ) context.stats.cacheHits += 1;
+    if (response.state === 'cache_layer_usable') context.stats.usableCacheReuses += 1;
+    if (response.state === 'cache_fallback_after_failure') context.stats.cacheFallbacksAfterFailure += 1;
     if (response.state === 'rate_limited') context.stats.rateLimited += 1;
     if (response.state === 'cooldown_active') context.stats.cooldownBlocked += 1;
   }

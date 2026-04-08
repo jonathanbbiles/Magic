@@ -17,6 +17,8 @@ withEnv({}, () => {
   const summary = getRuntimeConfigSummary(process.env);
   assert.equal(summary.entryScanIntervalMs, Number(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS));
   assert.equal(summary.entryPrefetchChunkSize, Number(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE));
+  assert.equal(summary.entryPrefetchQuotes, true);
+  assert.equal(summary.entryPrefetchOrderbooks, true);
   assert.equal(summary.predictorWarmupPrefetchConcurrency, Number(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_PREFETCH_CONCURRENCY));
 
   delete require.cache[tradeModulePath];
@@ -30,7 +32,7 @@ withEnv({}, () => {
   assert.ok(tradeSource.includes('const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;'));
   assert.ok(tradeSource.includes('const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;'));
   assert.ok(tradeSource.includes('const MARKETDATA_RATE_LIMIT_COOLDOWN_MS = Math.max(1000, runtimeLiveConfig.marketdataRateLimitCooldownMs);'));
-  assert.ok(tradeSource.includes('const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.entryQuoteMaxAgeMs);'));
+  assert.ok(tradeSource.includes('const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.normalEntryQuoteMaxAgeMs);'));
   assert.ok(tradeSource.includes('const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = Math.max('));
   assert.ok(!tradeSource.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
@@ -49,6 +51,8 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_ALLOW_TIER3, 'false');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN, '8');
   assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, '4');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_QUOTES, 'true');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_ORDERBOOKS, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
   assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
@@ -74,6 +78,8 @@ withEnv({}, () => {
     assert.match(sourceText, /QUOTE_RETRY=2/);
     assert.match(sourceText, /ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8/);
     assert.match(sourceText, /PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4/);
+    assert.match(sourceText, /ENTRY_PREFETCH_QUOTES=true/);
+    assert.match(sourceText, /ENTRY_PREFETCH_ORDERBOOKS=true/);
   }
 });
 
