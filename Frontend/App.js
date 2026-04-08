@@ -291,7 +291,12 @@ export default function App() {
   const entryScan = entryDiagnostics?.entryScan || null;
   const predictorCandidates = entryDiagnostics?.predictorCandidates || null;
   const skipReasonsBySymbol = entryDiagnostics?.skipReasonsBySymbol || {};
-  const topCandidate = Array.isArray(predictorCandidates?.topCandidates) ? predictorCandidates.topCandidates[0] : null;
+  const candidateList = Array.isArray(predictorCandidates?.topCandidates)
+    ? predictorCandidates.topCandidates
+    : Array.isArray(predictorCandidates)
+      ? predictorCandidates
+      : null;
+  const topCandidate = candidateList ? candidateList[0] : null;
   const firstSkipSymbol = Object.keys(skipReasonsBySymbol)[0] || null;
   const firstSkip = firstSkipSymbol && Array.isArray(skipReasonsBySymbol[firstSkipSymbol])
     ? skipReasonsBySymbol[firstSkipSymbol][0]
@@ -390,7 +395,7 @@ export default function App() {
       blockedByWarmup: toNum(entryScan?.signalBlockedByWarmupCount) ?? 0,
       staleQuoteSkips: toNum(entryScan?.staleEntryQuoteSkips) ?? 0,
     },
-    predictorCandidates: predictorCandidates?.topCandidates ?? null,
+    predictorCandidates: candidateList ?? null,
     topCandidateDetail: topCandidate ? {
       symbol: topCandidate.symbol,
       requiredEdgeBps: topCandidate.requiredEdgeBps,
