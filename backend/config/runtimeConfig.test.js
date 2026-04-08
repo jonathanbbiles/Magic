@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
+const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig, emitConfigDriftWarnings } = require('./runtimeConfig');
 
 const BASE_ENV = {
   NODE_ENV: 'production',
@@ -46,6 +46,38 @@ withEnv({ ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 
 
 withEnv({ ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: '   ' }, () => {
   assert.throws(() => validateRuntimeConfig(), /requires at least one primary symbol/);
+});
+
+withEnv(
+  {
+    ENTRY_SCAN_INTERVAL_MS: '16000',
+    ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'true',
+  },
+  () => {
+    const driftLogs = [];
+    emitConfigDriftWarnings(process.env, {
+      logger: {
+        log: (event, payload) => driftLogs.push({ event, payload }),
+      },
+    });
+    const scanIntervalDrift = driftLogs.find((entry) => entry.payload?.key === 'ENTRY_SCAN_INTERVAL_MS');
+    const includeSecondaryDrift = driftLogs.find((entry) => entry.payload?.key === 'ENTRY_SYMBOLS_INCLUDE_SECONDARY');
+    assert.equal(scanIntervalDrift?.event, 'config_drift_warning');
+    assert.equal(includeSecondaryDrift?.event, 'config_drift_warning');
+    assert.equal(scanIntervalDrift?.payload?.valueType, 'number');
+    assert.ok(Number(scanIntervalDrift?.payload?.driftRatio) > 0.2);
+  },
+);
+
+withEnv({ ENTRY_SCAN_INTERVAL_MS: '13200' }, () => {
+  const driftLogs = [];
+  emitConfigDriftWarnings(process.env, {
+    logger: {
+      log: (event, payload) => driftLogs.push({ event, payload }),
+    },
+  });
+  const scanIntervalDrift = driftLogs.find((entry) => entry.payload?.key === 'ENTRY_SCAN_INTERVAL_MS');
+  assert.equal(scanIntervalDrift, undefined);
 });
 
 withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false' }, () => {

@@ -1,5 +1,5 @@
 const { normalizePair } = require('../symbolUtils');
-const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
+const { LIVE_CRITICAL_DEFAULTS, LIVE_CRITICAL_KEYS } = require('./liveDefaults');
 
 const BOOLEAN_TRUE = new Set(['true', '1', 'yes', 'y', 'on']);
 const BOOLEAN_FALSE = new Set(['false', '0', 'no', 'n', 'off']);
@@ -155,9 +155,52 @@ function getRuntimeConfigSummary(env = process.env) {
   };
 }
 
+const CONFIG_DRIFT_NUMERIC_TOLERANCE_RATIO = 0.20;
+
+function parseNumericLike(value) {
+  const parsed = Number(String(value ?? '').trim());
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function shouldWarnNumericDrift(running, baseline, toleranceRatio = CONFIG_DRIFT_NUMERIC_TOLERANCE_RATIO) {
+  if (!Number.isFinite(running) || !Number.isFinite(baseline)) return false;
+  if (baseline === 0) return running !== 0;
+  return Math.abs((running - baseline) / baseline) > toleranceRatio;
+}
+
+function emitConfigDriftWarnings(env = process.env, options = {}) {
+  const logger = options.logger || console;
+  const log = typeof logger.log === 'function' ? logger.log.bind(logger) : console.log.bind(console);
+  const toleranceRatio = Number.isFinite(Number(options.numericToleranceRatio))
+    ? Math.max(0, Number(options.numericToleranceRatio))
+    : CONFIG_DRIFT_NUMERIC_TOLERANCE_RATIO;
+  for (const key of LIVE_CRITICAL_KEYS) {
+    const defaultRaw = LIVE_CRITICAL_DEFAULTS[key];
+    const runningRaw = env[key] ?? defaultRaw;
+    const runningNumeric = parseNumericLike(runningRaw);
+    const defaultNumeric = parseNumericLike(defaultRaw);
+    const bothNumeric = Number.isFinite(runningNumeric) && Number.isFinite(defaultNumeric);
+    const drifted = bothNumeric
+      ? shouldWarnNumericDrift(runningNumeric, defaultNumeric, toleranceRatio)
+      : String(runningRaw) !== String(defaultRaw);
+    if (!drifted) continue;
+    log('config_drift_warning', {
+      key,
+      runningValue: String(runningRaw),
+      defaultValue: String(defaultRaw),
+      valueType: bothNumeric ? 'number' : typeof defaultRaw,
+      numericToleranceRatio: bothNumeric ? toleranceRatio : null,
+      driftRatio: bothNumeric && defaultNumeric !== 0
+        ? Math.abs((runningNumeric - defaultNumeric) / defaultNumeric)
+        : null,
+    });
+  }
+}
+
 function validateRuntimeConfig(env = process.env, options = {}) {
   const logger = options.logger || console;
   const summary = getRuntimeConfigSummary(env);
+  emitConfigDriftWarnings(env, options);
 
   if (summary.entryUniverseModeEffective === 'configured' && summary.configuredPrimaryCount === 0) {
     const reason = 'Configured universe mode requires at least one primary symbol.';
@@ -187,6 +230,7 @@ function validateRuntimeConfig(env = process.env, options = {}) {
 module.exports = {
   getRuntimeConfig,
   getRuntimeConfigSummary,
+  emitConfigDriftWarnings,
   validateRuntimeConfig,
   remediationText,
 };
