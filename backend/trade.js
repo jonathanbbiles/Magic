@@ -362,6 +362,8 @@ const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const ORDER_FETCH_THROTTLE_MS = 1000;
 const EXIT_RECON_MISS_THRESHOLD = Math.max(1, readNumber('EXIT_RECON_MISS_THRESHOLD', 2));
+const EXIT_RECON_LOW_CONFIDENCE_CYCLE_THRESHOLD = 3;
+const POSITION_UNIVERSE_MISMATCH_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
 const REPRICE_TTL_MS = readNumber('REPRICE_TTL_MS', SELL_ORDER_TTL_MS);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
@@ -3685,6 +3687,7 @@ const sessionGovernorState = {
   recentExecutionScores: [],
   lastReason: null,
 };
+let lastPositionUniverseMismatchCheckAt = 0;
 
 function updateIntentState(symbol, patch = {}) {
   const normalizedSymbol = normalizeSymbol(symbol);
@@ -7576,11 +7579,40 @@ async function resolveExitSellabilityFromBrokerTruth({
       openOrders: openList,
       trackedState,
     });
+    const reconciliationConfidence = finalSellability.openSellCount > 0
+      ? (finalSellability.totalPositionQty > 0 ? 'snapshot_confirmed' : 'order_list_only')
+      : null;
     trackedState.expectedOpenSell = Boolean(trackedOrderId || trackedClientOrderId);
     trackedState.brokerOpenSellFound = finalSellability.openSellCount > 0;
     trackedState.brokerOpenSellQty = finalSellability.openSellQty;
     trackedState.lastSeenOpenSellAt = finalSellability.openSellCount > 0 ? Date.now() : (trackedState.lastSeenOpenSellAt || null);
     trackedState.reconciliationState = finalSellability.openSellCount > 0 ? 'open_sell_found' : 'pending_lookup';
+    trackedState.reconciliationConfidence = reconciliationConfidence;
+    trackedState.orderListOnlyConsecutiveCount = reconciliationConfidence === 'order_list_only'
+      ? Number(trackedState.orderListOnlyConsecutiveCount || 0) + 1
+      : 0;
+    if (
+      reconciliationConfidence === 'order_list_only' &&
+      trackedState.orderListOnlyConsecutiveCount > EXIT_RECON_LOW_CONFIDENCE_CYCLE_THRESHOLD
+    ) {
+      const warningThresholdCrossed = Number(trackedState.lastConfidenceWarningAtCount || 0) < trackedState.orderListOnlyConsecutiveCount;
+      if (warningThresholdCrossed) {
+        trackedState.lastConfidenceWarningAtCount = trackedState.orderListOnlyConsecutiveCount;
+        console.log('exit_order_confidence_low', {
+          symbol: canonicalSymbol,
+          reconciliationState: trackedState.reconciliationState,
+          reconciliationConfidence: trackedState.reconciliationConfidence,
+          consecutiveCycles: trackedState.orderListOnlyConsecutiveCount,
+          orderId: trackedOrderId || null,
+          client_order_id: trackedClientOrderId || null,
+          openSellCount: finalSellability.openSellCount,
+          openSellQty: finalSellability.openSellQty,
+          brokerPositionQty: finalSellability.totalPositionQty,
+        });
+      }
+    } else {
+      trackedState.lastConfidenceWarningAtCount = 0;
+    }
 
     console.log('broker_truth_position_found', {
       symbol: canonicalSymbol,
@@ -7721,6 +7753,9 @@ async function resolveExitSellabilityFromBrokerTruth({
         trackedState.brokerOpenSellQty = 0;
         trackedState.lastSeenOpenSellAt = null;
         trackedState.reconciliationState = 'open_sell_missing_cleared';
+        trackedState.reconciliationConfidence = null;
+        trackedState.orderListOnlyConsecutiveCount = 0;
+        trackedState.lastConfidenceWarningAtCount = 0;
         trackedState.lockedTpOrderId = null;
         trackedState.lockedTpClientOrderId = null;
         trackedState.exitVisibilityState = null;
@@ -10694,6 +10729,7 @@ async function repairOrphanExits() {
             ? refreshedSellOrderQty
             : (Number.isFinite(Number(trackedState.sellOrderQty)) ? Number(trackedState.sellOrderQty) : null),
           reconciliationState: 'open_sell_found',
+          reconciliationConfidence: 'snapshot_confirmed',
           reconciliationReason: null,
           lastReconciliationAction: 'refresh_tracked_open_sell',
         });
@@ -10847,6 +10883,7 @@ async function repairOrphanExits() {
         sellOrderLimit: Number.isFinite(adoptedLimit) ? adoptedLimit : targetPrice,
         targetPriceSource: 'reconciled_exit_math',
         reconciliationState: 'open_sell_found',
+        reconciliationConfidence: 'snapshot_confirmed',
         reconciliationReason: null,
         lastReconciliationAction: 'adopt_broker_open_sell',
         takerAttempted: false,
@@ -14604,6 +14641,23 @@ async function runEntryScanOnce() {
         heldSymbols.add(normalizeSymbol(pos.symbol || pos.asset_id || pos.id || ''));
       }
     });
+    const shouldCheckUniverseMismatch = !lastPositionUniverseMismatchCheckAt ||
+      (Date.now() - lastPositionUniverseMismatchCheckAt) >= POSITION_UNIVERSE_MISMATCH_CHECK_INTERVAL_MS;
+    if (shouldCheckUniverseMismatch) {
+      lastPositionUniverseMismatchCheckAt = Date.now();
+      const configuredPrimaryUniverse = new Set((configuredUniverse.primary || []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean));
+      const orphanedHeldSymbols = Array.from(heldSymbols)
+        .filter((symbol) => symbol && !configuredPrimaryUniverse.has(symbol))
+        .sort();
+      if (orphanedHeldSymbols.length > 0) {
+        console.log('position_outside_scan_universe', {
+          orphanedSymbols: orphanedHeldSymbols,
+          orphanedCount: orphanedHeldSymbols.length,
+          configuredPrimaryCount: configuredPrimaryUniverse.size,
+          configuredPrimarySample: Array.from(configuredPrimaryUniverse).slice(0, 10),
+        });
+      }
+    }
     const heldPositionsCount = heldSymbols.size;
     let signalReadyCount = 0;
     let signalBlockedByWarmupCount = 0;
