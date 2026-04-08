@@ -1166,7 +1166,16 @@ let lastUniverseDiagnostics = {
   effectiveUniverseMode: null,
   dynamicUniverseActive: false,
   allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+  dynamicUniverseInitStartedAt: null,
+  dynamicUniverseInitCompletedAt: null,
+  dynamicUniverseInitFailedAt: null,
+  dynamicUniverseInitInProgress: false,
+  dynamicUniverseInitError: null,
   dynamicTradableSymbolsFound: null,
+  dynamicFetchedAssetsCount: null,
+  dynamicRejectedMalformedCount: 0,
+  dynamicRejectedUnsupportedCount: 0,
+  dynamicRejectedDuplicateCount: 0,
   acceptedSymbolsCount: 0,
   acceptedSymbolsSample: [],
   fallbackOccurred: false,
@@ -1177,6 +1186,8 @@ let lastUniverseDiagnostics = {
   barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
   alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
   lastUniverseRefreshAt: null,
+  entryScanBlockedBy: null,
+  universeZeroReason: null,
   fallbackReason: null,
 };
 
@@ -4659,6 +4670,13 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
     !supportedCryptoPairsState.lastUpdated ||
     nowMs - Date.parse(supportedCryptoPairsState.lastUpdated) > SUPPORTED_CRYPTO_PAIRS_REFRESH_MS;
   if (supportedCryptoPairsState.loaded && !force && !stale) return supportedCryptoPairsState.pairs;
+  const initStartedAt = new Date().toISOString();
+  lastUniverseDiagnostics = {
+    ...lastUniverseDiagnostics,
+    dynamicUniverseInitStartedAt: initStartedAt,
+    dynamicUniverseInitInProgress: true,
+    dynamicUniverseInitError: null,
+  };
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'assets',
@@ -4671,14 +4689,29 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       url,
       headers: alpacaHeaders(),
     });
+    const fetchedAssetsCount = Array.isArray(data) ? data.length : 0;
     const allowedSet = null;
     const dynamicUniverse = buildDynamicCryptoUniverseFromAssets(Array.isArray(data) ? data : [], { allowedSymbols: allowedSet });
     supportedCryptoPairsState.pairs = new Set(dynamicUniverse.symbols);
     supportedCryptoPairsState.loaded = true;
     supportedCryptoPairsState.lastUpdated = new Date().toISOString();
     supportedCryptoPairsState.stats = dynamicUniverse.stats;
+    lastUniverseDiagnostics = {
+      ...lastUniverseDiagnostics,
+      dynamicUniverseInitInProgress: false,
+      dynamicUniverseInitCompletedAt: supportedCryptoPairsState.lastUpdated,
+      dynamicUniverseInitFailedAt: null,
+      dynamicUniverseInitError: null,
+      dynamicTradableSymbolsFound: dynamicUniverse.stats.tradableCryptoCount,
+      dynamicFetchedAssetsCount: fetchedAssetsCount,
+      dynamicRejectedMalformedCount: dynamicUniverse.stats.malformedCount,
+      dynamicRejectedUnsupportedCount: dynamicUniverse.stats.unsupportedCount,
+      dynamicRejectedDuplicateCount: dynamicUniverse.stats.duplicateCount,
+      lastUniverseRefreshAt: supportedCryptoPairsState.lastUpdated,
+    };
     console.log('entry_universe_dynamic_sync', {
       mode: 'dynamic_full_universe',
+      fetchedAssetsCount,
       tradableCryptoSymbolsFound: dynamicUniverse.stats.tradableCryptoCount,
       acceptedSymbols: dynamicUniverse.stats.acceptedCount,
       malformedExcluded: dynamicUniverse.stats.malformedCount,
@@ -4690,9 +4723,18 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       loadedAt: supportedCryptoPairsState.lastUpdated,
     });
   } catch (err) {
+    const failedAt = new Date().toISOString();
+    const errorMessage = err?.errorMessage || err?.message || String(err);
+    lastUniverseDiagnostics = {
+      ...lastUniverseDiagnostics,
+      dynamicUniverseInitInProgress: false,
+      dynamicUniverseInitFailedAt: failedAt,
+      dynamicUniverseInitError: errorMessage,
+      dynamicFetchedAssetsCount: null,
+    };
     console.warn('supported_pairs_fetch_failed', {
       mode: 'dynamic_full_universe',
-      error: err?.errorMessage || err?.message || String(err),
+      error: errorMessage,
       fallback: 'configured_or_core',
     });
   }
@@ -13825,6 +13867,13 @@ async function runEntryScanOnce() {
     emitEntryScanNoopSummary({ startMs, reason: 'warmup_in_progress' });
     clearEntryScanProgress({ state: 'idle' });
     setEngineState('warming_up', { reason: 'warmup_in_progress' });
+    lastUniverseDiagnostics = {
+      ...lastUniverseDiagnostics,
+      entryScanBlockedBy: 'warmup_in_progress',
+    };
+    entryScanRunning = false;
+    entryManagerHeartbeat.running = Boolean(entryManagerIntervalId);
+    entryManagerHeartbeat.lastHeartbeatAt = safeIso();
     return;
   }
   if (warmupSnapshot?.inProgress && !entryManagerHeartbeat.lastScanAt) {
@@ -14017,7 +14066,16 @@ async function runEntryScanOnce() {
       effectiveUniverseMode: universeMode,
       dynamicUniverseActive: universeMode.startsWith('dynamic'),
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+      dynamicUniverseInitStartedAt: lastUniverseDiagnostics.dynamicUniverseInitStartedAt || null,
+      dynamicUniverseInitCompletedAt: lastUniverseDiagnostics.dynamicUniverseInitCompletedAt || null,
+      dynamicUniverseInitFailedAt: lastUniverseDiagnostics.dynamicUniverseInitFailedAt || null,
+      dynamicUniverseInitInProgress: Boolean(lastUniverseDiagnostics.dynamicUniverseInitInProgress),
+      dynamicUniverseInitError: lastUniverseDiagnostics.dynamicUniverseInitError || null,
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+      dynamicFetchedAssetsCount: lastUniverseDiagnostics.dynamicFetchedAssetsCount ?? null,
+      dynamicRejectedMalformedCount: dynamicUniverseStats?.malformedCount ?? 0,
+      dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
+      dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
       acceptedSymbolsCount: scanSymbols.length,
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
       fallbackOccurred: Boolean(fallbackReason),
@@ -14030,8 +14088,29 @@ async function runEntryScanOnce() {
       barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
       alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
       lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
+      entryScanBlockedBy: null,
+      universeZeroReason: null,
       fallbackReason,
     };
+    if (!scanSymbols.length) {
+      const universeZeroReason = lastUniverseDiagnostics.dynamicUniverseInitError
+        ? 'dynamic_universe_init_failed'
+        : fallbackReason || 'no_accepted_symbols_after_filters';
+      lastUniverseDiagnostics = {
+        ...lastUniverseDiagnostics,
+        entryScanBlockedBy: 'universe_empty',
+        universeZeroReason,
+      };
+      console.error('entry_universe_empty', {
+        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+        effectiveUniverseMode: universeMode,
+        dynamicUniverseInitError: lastUniverseDiagnostics.dynamicUniverseInitError,
+        dynamicTradableSymbolsFound: lastUniverseDiagnostics.dynamicTradableSymbolsFound,
+        lastUniverseRefreshAt: lastUniverseDiagnostics.lastUniverseRefreshAt,
+        fallbackReason,
+        universeZeroReason,
+      });
+    }
     console.log('entry_universe_selection', {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
       effectiveUniverseMode: universeMode,
