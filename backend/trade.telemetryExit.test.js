@@ -18,6 +18,7 @@ const plan = trade.computeUnifiedExitPlan({
 
 assert.ok(plan.targetPrice > plan.profitabilityFloorPrice);
 assert.ok(plan.profitabilityFloorPrice >= plan.trueBreakevenPrice);
+assert.ok(plan.requiredExitBpsFinal > plan.netAfterFeesBps);
 
 const evModelLocked = trade.buildEntryEvModel({
   symbol: 'BTC/USD',
@@ -76,6 +77,14 @@ const evNegative = trade.buildEntryEvModel({
 assert.ok(evNegative.netWinBps > 0);
 assert.ok(evNegative.evBps < 0);
 
+const evHighSpreadRejected = trade.buildEntryEvModel({
+  symbol: 'BTC/USD',
+  entryPrice: 100,
+  spreadBps: 90,
+  probability: 0.75,
+});
+assert.ok(evHighSpreadRejected.exitPlan.requiredExitBpsFinal > evModelLocked.exitPlan.requiredExitBpsFinal);
+
 const protectiveCases = [
   {
     name: 'take_profit_hold + override',
@@ -114,6 +123,21 @@ assert.equal(
     missCount: 3,
     missThreshold: 3,
     directLookupFoundOpenSell: false,
+    sellOrderSubmittedAt: Date.now() - 1000,
+    visibilityDeadlineAt: Date.now() + 1000,
+  }),
+  false,
+);
+
+assert.equal(
+  trade.shouldClearStaleTrackedSellIdentity({
+    openSellCount: 0,
+    brokerAvailableQty: 1.25,
+    missCount: 3,
+    missThreshold: 3,
+    directLookupFoundOpenSell: false,
+    sellOrderSubmittedAt: Date.now() - 20_000,
+    visibilityDeadlineAt: Date.now() - 1,
   }),
   true,
 );

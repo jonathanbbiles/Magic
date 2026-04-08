@@ -963,6 +963,7 @@ const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
+const ENTRY_UNIVERSE_MAX_SYMBOLS = Math.max(2, runtimeLiveConfig.entryUniverseMaxSymbols || 18);
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
 const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
@@ -7393,9 +7394,18 @@ function shouldClearStaleTrackedSellIdentity({
   missCount = 0,
   missThreshold = EXIT_RECON_MISS_THRESHOLD,
   directLookupFoundOpenSell = false,
+  sellOrderSubmittedAt = null,
+  visibilityDeadlineAt = null,
+  nowMs = Date.now(),
 } = {}) {
+  const submittedRecently = Number.isFinite(Number(sellOrderSubmittedAt))
+    ? (nowMs - Number(sellOrderSubmittedAt)) < Math.max(EXIT_REPLACE_VISIBILITY_GRACE_MS, 5000)
+    : false;
+  const visibilityGraceActive = Number.isFinite(Number(visibilityDeadlineAt)) && Number(visibilityDeadlineAt) > nowMs;
   return (
     !directLookupFoundOpenSell &&
+    !submittedRecently &&
+    !visibilityGraceActive &&
     Number(openSellCount) === 0 &&
     Number(brokerAvailableQty) > 0 &&
     Number(missCount) >= Number(missThreshold)
@@ -7695,6 +7705,8 @@ async function resolveExitSellabilityFromBrokerTruth({
         missCount: trackedState.openSellMissCount,
         missThreshold: EXIT_RECON_MISS_THRESHOLD,
         directLookupFoundOpenSell: Boolean(adoptedOpenSell),
+        sellOrderSubmittedAt: trackedState.sellOrderSubmittedAt,
+        visibilityDeadlineAt: trackedState.exitVisibilityDeadlineAt,
       })) {
         updateTrackedSellIdentity(trackedState, {
           symbol: canonicalSymbol,
@@ -9580,6 +9592,7 @@ async function submitIocLimitSell({
   limitPrice,
   reason,
   allowSellBelowMin = true,
+  bypassDisable = false,
 }) {
   const availableQty = await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
@@ -9604,8 +9617,10 @@ async function submitIocLimitSell({
   const finalQty = sizeGuard.qty ?? adjustedQty;
 
   if (DISABLE_IOC_EXITS) {
-    console.log('ioc_disabled_skip', { symbol, qty: finalQty, reason });
-    return { skipped: true, reason: 'ioc_disabled' };
+    if (!bypassDisable) {
+      console.log('ioc_disabled_skip', { symbol, qty: finalQty, reason });
+      return { skipped: true, reason: 'ioc_disabled' };
+    }
   }
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_exit_limit_sell' });
@@ -9631,6 +9646,69 @@ async function submitIocLimitSell({
   console.log('submit_exit_limit_sell', { symbol, qty: finalQty, limitPrice: roundedLimit, reason, orderId: response?.id });
 
   return { order: response, requestedQty: finalQty };
+}
+
+async function submitStopTriggeredExit({
+  state,
+  symbol,
+  qty,
+  bid,
+  reason,
+  nowMs = Date.now(),
+}) {
+  const stateRef = state && typeof state === 'object' ? state : {};
+  const iocLimit = roundDownToTick(Number(bid), symbol);
+  if (!Number.isFinite(iocLimit) || iocLimit <= 0) {
+    stateRef.exitExecutionState = 'exit_failed_needs_repair';
+    stateRef.reconciliationState = 'exit_failed_needs_repair';
+    stateRef.reconciliationReason = 'stop_trigger_price_invalid';
+    stateRef.lastReconciliationAction = 'stop_trigger_submit_invalid_price';
+    console.error('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, bid });
+    return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: null };
+  }
+
+  const iocResult = await submitIocLimitSell({
+    symbol,
+    qty,
+    limitPrice: iocLimit,
+    reason,
+    allowSellBelowMin: false,
+    bypassDisable: true,
+  });
+
+  const hasOrder = Boolean(iocResult?.order?.id || iocResult?.order?.order_id);
+  if (hasOrder) {
+    stateRef.exitExecutionState = 'exit_submitted';
+    stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
+    stateRef.stopTriggerReason = reason;
+    stateRef.reconciliationState = 'stop_triggered_exit_pending';
+    stateRef.reconciliationReason = 'stop_trigger_exit_submitted';
+    stateRef.lastReconciliationAction = 'submit_stop_trigger_exit';
+    updateIntentState(symbol, { state: 'stop_triggered_exit_pending', stopTriggeredAt: stateRef.stopTriggeredAt });
+    console.log('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, orderId: iocResult?.order?.id || iocResult?.order?.order_id || null });
+    return { ok: true, state: stateRef.exitExecutionState, submitted: true, result: iocResult };
+  }
+
+  stateRef.exitExecutionState = iocResult?.reason === 'ioc_disabled' ? 'exit_retry_pending' : 'exit_failed_needs_repair';
+  stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
+  stateRef.stopTriggerReason = reason;
+  stateRef.reconciliationState = stateRef.exitExecutionState;
+  stateRef.reconciliationReason = iocResult?.reason || 'stop_trigger_submit_failed';
+  stateRef.lastReconciliationAction = 'schedule_stop_trigger_retry';
+  updateIntentState(symbol, { state: stateRef.exitExecutionState });
+  console.warn('exit_retry_scheduled', {
+    symbol,
+    reason,
+    exitState: stateRef.exitExecutionState,
+    submitReason: iocResult?.reason || null,
+  });
+  console.warn('stop_trigger_submit_result', {
+    symbol,
+    reason,
+    state: stateRef.exitExecutionState,
+    submitReason: iocResult?.reason || null,
+  });
+  return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: iocResult };
 }
 
 async function attachInitialExitLimit({
@@ -9750,7 +9828,8 @@ async function attachInitialExitLimit({
   const requiredExitBpsPreCap = exitPlan.requiredExitBpsPreCap;
   const requiredExitBpsFinal = exitPlan.requiredExitBpsFinal;
   const netAfterFeesBps = exitPlan.netAfterFeesBps;
-  const minNetProfitBps = requiredExitBpsFinal;
+  const expectedNetProfitBps = netAfterFeesBps;
+  const minNetProfitBps = expectedNetProfitBps;
   const targetPrice = exitPlan.targetPrice;
   const trueBreakevenPrice = exitPlan.trueBreakevenPrice;
   const profitabilityFloorPrice = exitPlan.profitabilityFloorPrice;
@@ -9868,6 +9947,9 @@ async function attachInitialExitLimit({
     actualEntryFillPrice,
     entryTime: authoritativeEntryTimeMs,
     notionalUsd,
+    requiredExitBpsGross: requiredExitBpsFinal,
+    expectedNetProfitBps,
+    desiredNetExitBps: desiredNetExitBpsValue,
     minNetProfitBps,
     targetPrice,
     trueBreakevenPrice,
@@ -9898,6 +9980,12 @@ async function attachInitialExitLimit({
     entryMomentumState: entryMomentumState || null,
   };
   exitState.set(symbol, newState);
+  console.log('exit_state_bootstrapped', {
+    symbol,
+    reason: 'attach_initial_exit_limit',
+    sellOrderId: sellOrderId || null,
+    lifecycleState: 'managing',
+  });
   updateTrackedSellIdentity(newState, {
     symbol,
     order: sellOrder,
@@ -10543,7 +10631,8 @@ async function repairOrphanExits() {
       spreadBps: spreadBpsLocal,
     });
     const requiredExitBps = exitPlan.requiredExitBpsFinal;
-    const minNetProfitBps = requiredExitBps;
+    const expectedNetProfitBps = exitPlan.netAfterFeesBps;
+    const minNetProfitBps = expectedNetProfitBps;
     const netAfterFeesBps = exitPlan.netAfterFeesBps;
     const tickSize = exitPlan.tickSize;
     targetPrice = applyMakerGuard(exitPlan.targetPrice, bid, tickSize);
@@ -10587,6 +10676,8 @@ async function repairOrphanExits() {
         exitState.set(symbol, {
           ...trackedState,
           effectiveEntryPrice: entryBasisValue,
+          requiredExitBpsGross: requiredExitBps,
+          expectedNetProfitBps,
           requiredExitBps,
           minNetProfitBps,
           netAfterFeesBps,
@@ -11420,7 +11511,8 @@ async function manageExitStates() {
         });
         const baseRequiredExitBps = exitPlan.requiredExitBpsPreCap;
         const requiredExitBpsFinal = exitPlan.requiredExitBpsFinal;
-        const minNetProfitBps = requiredExitBpsFinal;
+        const expectedNetProfitBps = exitPlan.netAfterFeesBps;
+        const minNetProfitBps = expectedNetProfitBps;
         const tickSize = exitPlan.tickSize;
         const targetPrice = exitPlan.targetPrice;
         const entryPriceUsed = exitPlan.entryPriceUsed;
@@ -11429,11 +11521,13 @@ async function manageExitStates() {
         }
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
+        state.expectedNetProfitBps = expectedNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
         state.profitBufferBps = profitBufferBps;
         state.slippageBpsUsed = slippageBps;
         state.spreadBufferBps = spreadBufferBps;
         state.desiredNetExitBps = desiredNetExitBps;
+        state.requiredExitBpsGross = requiredExitBpsFinal;
         state.requiredExitBps = requiredExitBpsFinal;
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
@@ -12950,7 +13044,14 @@ async function manageExitStates() {
             if (state.sellOrderId) {
               await maybeCancelExitSell({ symbol, orderId: state.sellOrderId, reason: 'stoploss_trigger' });
             }
-            await submitIocLimitSell({ symbol, qty: state.qty, limitPrice: roundDownToTick(bid, symbol), reason: 'stoploss', allowSellBelowMin: false });
+            const stopSubmitResult = await submitStopTriggeredExit({
+              state,
+              symbol,
+              qty: state.qty,
+              bid,
+              reason: 'stoploss',
+              nowMs: now,
+            });
             const tradeId = tradeForensics.getLatestTradeIdForSymbol(symbol);
             if (tradeId) {
               tradeForensics.update(tradeId, {
@@ -12962,10 +13063,22 @@ async function manageExitStates() {
                   stopDistanceBps: state.stopDistanceBps || null,
                   triggeredAt: new Date().toISOString(),
                   type: stopType,
+                  submitState: stopSubmitResult?.state || null,
                 },
               });
             }
-            exitState.delete(symbol);
+            if (stopSubmitResult?.submitted) {
+              clearExitTracking(symbol, { reason: 'stoploss_exit_submitted' });
+              await logExitRealized({
+                symbol,
+                entryPrice: state.entryPrice,
+                feeBpsRoundTrip,
+                entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+                heldSeconds,
+                reasonCode: 'stoploss',
+                orderId: stopSubmitResult?.result?.order?.id || stopSubmitResult?.result?.order?.order_id || null,
+              });
+            }
             continue;
           }
         }
@@ -14302,9 +14415,34 @@ async function runEntryScanOnce() {
         filteredOutSample: filteredOut.slice(0, 10),
       });
     }
-    const scanSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
+    const filteredSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
+    const prioritizedSymbols = filteredSymbols.sort((a, b) => {
+      const aTier = EXECUTION_TIER1_SYMBOLS.has(a) ? 1 : EXECUTION_TIER2_SYMBOLS.has(a) ? 2 : 3;
+      const bTier = EXECUTION_TIER1_SYMBOLS.has(b) ? 1 : EXECUTION_TIER2_SYMBOLS.has(b) ? 2 : 3;
+      if (aTier !== bTier) return aTier - bTier;
+      return String(a).localeCompare(String(b));
+    });
+    const ratePressureActive = isUnderRatePressure();
+    const effectiveUniverseCap = ratePressureActive
+      ? Math.max(4, Math.floor(ENTRY_UNIVERSE_MAX_SYMBOLS * 0.5))
+      : ENTRY_UNIVERSE_MAX_SYMBOLS;
+    if (ratePressureActive) {
+      console.warn('universe_rate_pressure_backoff', {
+        configuredCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+        effectiveCap: effectiveUniverseCap,
+        ratePressureState: getRatePressureState(),
+      });
+    }
+    const scanSymbols = prioritizedSymbols.slice(0, effectiveUniverseCap);
+    if (prioritizedSymbols.length > effectiveUniverseCap) {
+      console.warn('dynamic_universe_capped', {
+        acceptedBeforeCap: prioritizedSymbols.length,
+        effectiveCap: effectiveUniverseCap,
+        droppedCount: prioritizedSymbols.length - effectiveUniverseCap,
+      });
+    }
     updateEntryScanProgress({
       startMs,
       symbolsProcessed: 0,
@@ -14328,6 +14466,7 @@ async function runEntryScanOnce() {
       dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
       dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
       acceptedSymbolsCount: scanSymbols.length,
+      universeSymbolCap: effectiveUniverseCap,
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
       fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
@@ -14371,7 +14510,7 @@ async function runEntryScanOnce() {
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       acceptedSymbols: scanSymbols.length,
       entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
-      stableSymbolsExcludedCount: normalizedUniverse.length - scanSymbols.length,
+      stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
@@ -14389,7 +14528,7 @@ async function runEntryScanOnce() {
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
-      stableSymbolsExcludedCount: normalizedUniverse.length - scanSymbols.length,
+      stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
       lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
@@ -17157,9 +17296,69 @@ function getLifecycleSnapshot() {
   for (const [symbol, state] of entryIntentState.entries()) {
     bySymbol[symbol] = { ...state };
   }
+  const diagnostics = {
+    exitMissingCount: 0,
+    repairingExitCount: 0,
+    orphanPositionCount: 0,
+    stopTriggeredExitPendingCount: 0,
+    managingWithoutExitCount: 0,
+  };
+  for (const [symbol, state] of exitState.entries()) {
+    const existing = bySymbol[symbol] || {};
+    const lifecycleState = String(existing.state || '').toLowerCase();
+    const hasTrackedExitPlan = Boolean(state && (state.sellOrderId || state.targetPrice || state.requiredExitBps || state.exitExecutionState));
+    if (lifecycleState === 'managing' && !hasTrackedExitPlan) {
+      diagnostics.managingWithoutExitCount += 1;
+      diagnostics.exitMissingCount += 1;
+      bySymbol[symbol] = {
+        ...existing,
+        state: 'exit_missing',
+        diagnosticsState: 'exit_missing',
+        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
+      };
+      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
+      continue;
+    }
+    if (state?.exitExecutionState === 'exit_retry_pending' || state?.exitExecutionState === 'exit_failed_needs_repair') {
+      diagnostics.repairingExitCount += 1;
+      bySymbol[symbol] = {
+        ...existing,
+        state: 'repairing_exit',
+        diagnosticsState: state?.exitExecutionState,
+      };
+    } else if (state?.exitExecutionState === 'exit_submitted') {
+      diagnostics.stopTriggeredExitPendingCount += 1;
+      bySymbol[symbol] = {
+        ...existing,
+        state: 'stop_triggered_exit_pending',
+        diagnosticsState: 'stop_triggered_exit_pending',
+      };
+    } else if (!bySymbol[symbol]) {
+      diagnostics.orphanPositionCount += 1;
+      bySymbol[symbol] = {
+        symbol,
+        state: 'orphan_position',
+        diagnosticsState: 'orphan_position',
+      };
+    }
+  }
+  for (const [symbol, state] of Object.entries(bySymbol)) {
+    if (String(state?.state || '').toLowerCase() === 'managing' && !exitState.has(symbol)) {
+      diagnostics.managingWithoutExitCount += 1;
+      diagnostics.exitMissingCount += 1;
+      bySymbol[symbol] = {
+        ...state,
+        state: 'exit_missing',
+        diagnosticsState: 'exit_missing',
+        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
+      };
+      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
+    }
+  }
   return {
     bySymbol,
     authoritativeCount: authoritativeTradeState.size,
+    diagnostics,
   };
 }
 
