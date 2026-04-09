@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+!.env.live.example
+!.env.production.example
+data
+coverage
+*.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
