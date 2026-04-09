@@ -43,7 +43,10 @@ function evaluatePredictorWarmupGate({ lengths, thresholds, enabled, blockTrades
 function createInitialWarmupStatus() {
   return {
     startedAt: null,
+    startedAtMs: null,
     finishedAt: null,
+    timeoutMs: null,
+    symbol: null,
     inProgress: false,
     totalSymbolsPlanned: 0,
     symbolsCompleted: 0,
@@ -62,10 +65,25 @@ function createInitialWarmupStatus() {
 }
 
 const warmupStatus = createInitialWarmupStatus();
+let warmupTimeoutTimer = null;
 
-function startPredictorWarmup({ totalSymbolsPlanned = 0, totalChunks = 0 } = {}) {
-  warmupStatus.startedAt = new Date().toISOString();
+function clearWarmupTimeoutTimer() {
+  if (warmupTimeoutTimer) {
+    clearTimeout(warmupTimeoutTimer);
+    warmupTimeoutTimer = null;
+  }
+}
+
+function startPredictorWarmup({ totalSymbolsPlanned = 0, totalChunks = 0, symbol = null } = {}) {
+  clearWarmupTimeoutTimer();
+  const startedAtMs = Date.now();
+  const timeoutMsRaw = Number(process.env.PREDICTOR_WARMUP_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(timeoutMsRaw) && timeoutMsRaw > 0 ? Math.floor(timeoutMsRaw) : 180000;
+  warmupStatus.startedAt = new Date(startedAtMs).toISOString();
+  warmupStatus.startedAtMs = startedAtMs;
   warmupStatus.finishedAt = null;
+  warmupStatus.timeoutMs = timeoutMs;
+  warmupStatus.symbol = typeof symbol === 'string' && symbol.trim() ? symbol.trim() : null;
   warmupStatus.inProgress = true;
   warmupStatus.totalSymbolsPlanned = Math.max(0, Number(totalSymbolsPlanned) || 0);
   warmupStatus.symbolsCompleted = 0;
@@ -78,6 +96,17 @@ function startPredictorWarmup({ totalSymbolsPlanned = 0, totalChunks = 0 } = {})
   };
   warmupStatus.lastBatchSummary = null;
   warmupStatus.lastError = null;
+
+  warmupTimeoutTimer = setTimeout(() => {
+    if (!warmupStatus.inProgress) return;
+    const elapsedMs = Date.now() - (warmupStatus.startedAtMs || Date.now());
+    setPredictorWarmupError({ reason: 'warmup_timeout' });
+    console.warn('predictor_warmup_timeout', {
+      symbol: warmupStatus.symbol,
+      elapsedMs,
+      timeoutMs,
+    });
+  }, timeoutMs);
 }
 
 function updatePredictorWarmupProgress({
@@ -115,6 +144,7 @@ function updatePredictorWarmupProgress({
 }
 
 function finishPredictorWarmup({ error = null } = {}) {
+  clearWarmupTimeoutTimer();
   warmupStatus.inProgress = false;
   warmupStatus.finishedAt = new Date().toISOString();
   warmupStatus.currentTimeframe = null;
@@ -122,6 +152,10 @@ function finishPredictorWarmup({ error = null } = {}) {
 }
 
 function setPredictorWarmupError(error) {
+  if (error && typeof error === 'object' && typeof error.reason === 'string' && error.reason.trim()) {
+    warmupStatus.lastError = error.reason.trim();
+    return;
+  }
   warmupStatus.lastError = error ? String(error?.message || error) : null;
 }
 
@@ -134,6 +168,7 @@ function getPredictorWarmupStatus() {
 }
 
 function resetPredictorWarmupStatus() {
+  clearWarmupTimeoutTimer();
   const next = createInitialWarmupStatus();
   Object.assign(warmupStatus, next);
 }
