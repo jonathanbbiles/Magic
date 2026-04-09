@@ -11,12 +11,23 @@
     "smoke": "node smoke.test.js",
     "check:runtime-env": "node scripts/check_runtime_env.js",
     "preflight": "node scripts/check_runtime_env.js && node smoke.test.js",
-    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js"
+    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "postinstall": "node ../scripts/install-git-hooks.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "express": "^4.22.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.14.0",
+    "@eslint/js": "^9.14.0",
+    "globals": "^15.12.0",
+    "prettier": "^3.3.3"
   }
 }

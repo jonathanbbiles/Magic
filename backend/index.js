@@ -2,6 +2,25 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 
+// Process-level safety nets. Without these, an unhandled async error in a
+// route or background job silently kills the server mid-trade. We log and,
+// for uncaught exceptions, exit so the platform restarts us in a clean state.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error('unhandled_rejection', {
+    message: err.message,
+    stack: err.stack,
+  });
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaught_exception', {
+    message: err?.message || String(err),
+    stack: err?.stack || null,
+  });
+  // Give logs a tick to flush, then exit so the supervisor restarts us.
+  setTimeout(() => process.exit(1), 100).unref();
+});
+
 const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
 const explicitDotenvPath = process.env.DOTENV_CONFIG_PATH ? path.resolve(process.env.DOTENV_CONFIG_PATH) : null;
 const localDevDotenvPath = path.resolve(__dirname, '.env');
@@ -237,6 +256,12 @@ function maskConfigValue(key, value) {
 function resolveGitCommit() {
   if (process.env.RENDER_GIT_COMMIT) return process.env.RENDER_GIT_COMMIT;
   if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+  // In production, rely on the platform to inject GIT_COMMIT at build time.
+  // Shelling out on every boot forks a child process and fails in containers
+  // that don't ship git. Dev-only fallback follows.
+  if (String(process.env.NODE_ENV || '').toLowerCase() === 'production') {
+    return null;
+  }
   try {
     return String(execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
   } catch (_) {
@@ -1492,7 +1517,24 @@ app.get('/market/stocks/bars', async (req, res) => {
   }
 });
 
- 
+// 404 handler for unmatched routes. Must come after all route definitions.
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'not_found', path: req.path });
+});
+
+// Global error handler. Catches anything thrown (sync or async) from a route
+// that wasn't caught locally, so we never leak raw stack traces and every
+// failure flows through serializeError.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, _next) => {
+  console.error('unhandled_route_error', {
+    method: req.method,
+    path: req.path,
+    message: err?.message || String(err),
+    stack: err?.stack || null,
+  });
+  return sendError(res, err, 'Internal server error');
+});
 
 const port = process.env.PORT || 3000;
 let bootstrapTradingStarted = false;

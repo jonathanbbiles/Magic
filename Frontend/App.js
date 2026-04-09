@@ -37,9 +37,18 @@ const theme = {
 
 const POLL_MS = 20000;
 
-const BASE_URL =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
-  'https://magic-lw8t.onrender.com';
+const FALLBACK_BASE_URL = 'https://magic-lw8t.onrender.com';
+const ENV_BASE_URL =
+  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
+const BASE_URL = ENV_BASE_URL || FALLBACK_BASE_URL;
+const BASE_URL_IS_FALLBACK = !ENV_BASE_URL;
+if (BASE_URL_IS_FALLBACK && typeof console !== 'undefined') {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[App] EXPO_PUBLIC_BACKEND_URL is not set — falling back to ${FALLBACK_BASE_URL}. ` +
+      'This is the deployed production instance; set EXPO_PUBLIC_BACKEND_URL for local dev.',
+  );
+}
 
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
@@ -234,7 +243,54 @@ function DiagnosticsCard({ title, preview, raw, expanded, onToggle }) {
   );
 }
 
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+    this.handleReset = this.handleReset.bind(this);
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    // eslint-disable-next-line no-console
+    console.error('[ErrorBoundary]', error, info?.componentStack);
+  }
+
+  handleReset() {
+    this.setState({ error: null });
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <SafeAreaView style={styles.errorBoundaryRoot}>
+          <StatusBar barStyle="light-content" />
+          <Text style={styles.errorBoundaryTitle}>Something went wrong</Text>
+          <Text style={styles.errorBoundaryMessage}>
+            {String(this.state.error?.message || this.state.error)}
+          </Text>
+          <Pressable style={styles.errorBoundaryButton} onPress={this.handleReset}>
+            <Text style={styles.errorBoundaryButtonText}>Try again</Text>
+          </Pressable>
+        </SafeAreaView>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
+
+function AppInner() {
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -829,5 +885,35 @@ const compactStyles = StyleSheet.create({
     color: theme.colors.muted,
     fontSize: 11,
     fontWeight: '800',
+  },
+  errorBoundaryRoot: {
+    flex: 1,
+    backgroundColor: theme.colors.bg,
+    padding: theme.spacing.xl,
+    justifyContent: 'center',
+  },
+  errorBoundaryTitle: {
+    color: theme.colors.negative,
+    fontSize: 22,
+    fontWeight: '900',
+    marginBottom: theme.spacing.md,
+  },
+  errorBoundaryMessage: {
+    color: theme.colors.text,
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: theme.spacing.xl,
+  },
+  errorBoundaryButton: {
+    alignSelf: 'flex-start',
+    backgroundColor: theme.colors.accent,
+    paddingHorizontal: theme.spacing.lg,
+    paddingVertical: theme.spacing.sm,
+    borderRadius: theme.radius.md,
+  },
+  errorBoundaryButtonText: {
+    color: theme.colors.bg,
+    fontSize: 14,
+    fontWeight: '900',
   },
 });

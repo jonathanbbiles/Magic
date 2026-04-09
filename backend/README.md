@@ -38,7 +38,9 @@ Optional:
 - `CORS_ALLOWED_ORIGIN_REGEX` (comma-separated regex patterns for allowed origins)
 - `CORS_ALLOW_LAN` (set `true` to allow common LAN origins like `http://192.168.x.x:port`)
 - `RATE_LIMIT_WINDOW_MS` (default `60000`)
-- `RATE_LIMIT_MAX` (default `120`)
+- `RATE_LIMIT_MAX` (default `120`) — **Note:** the rate-limiter state is
+  in-memory and per-process. Running multiple backend instances will not share
+  buckets; today's single-instance Render footprint is assumed.
 - `HTTP_TIMEOUT_MS` (default `10000`)
 - `DATA_BASE` (defaults to Alpaca live data API base URL)
 - `DATASET_DIR` (default `./data`; set to a persistent disk on hosts like Render)

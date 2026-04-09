@@ -1032,6 +1032,30 @@ function logTradingDisabledOnce() {
   }
 }
 
+// Parse an Alpaca-style JSON error snippet to extract the numeric `code`
+// field (e.g. 40310000). Returns null when the snippet isn't JSON or has no
+// numeric code. Used by error-classification helpers below.
+function extractHttpErrorCode({ error, snippet }) {
+  const direct = error?.code ?? error?.errorCode;
+  if (Number.isFinite(direct)) return direct;
+  const body = error?.response?.data;
+  if (body && Number.isFinite(body.code)) return body.code;
+  const text = typeof snippet === 'string' ? snippet : '';
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && Number.isFinite(parsed.code)) return parsed.code;
+  } catch (_) {
+    // Not JSON — fall through to regex fallback.
+  }
+  const match = text.match(/"code"\s*:\s*(\d+)/);
+  if (match) {
+    const n = Number(match[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 function isBrokerTradingDisabledError({ statusCode, errorCode, message, snippet }) {
   if (statusCode !== 403) return false;
   if (errorCode === 40310000) return true;
@@ -3278,8 +3302,8 @@ async function computeEntrySignal(symbol, opts = {}) {
 
 
 
-function safeIso(ts) {
-  if (!ts) return null;
+function safeIso(ts = Date.now()) {
+  if (ts === null || ts === undefined || ts === '') return null;
   if (typeof ts === 'string') {
     const ms = Date.parse(ts);
     return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
@@ -4230,10 +4254,6 @@ let lastRiskMetricsLogAt = 0;
 let tradingHaltedByGuard = false;
 let lastRiskSnapshot = null;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
-
-function safeIso(tsMs = Date.now()) {
-  return new Date(tsMs).toISOString();
-}
 
 function setEngineState(nextState, { reason = null, context = null } = {}) {
   const normalized = String(nextState || '').trim().toLowerCase();
@@ -6212,20 +6232,11 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     path: 'orders',
     label: 'orders_limit_buy',
   });
-  if (TWAP_ENABLED && amountToSpend >= TWAP_MIN_NOTIONAL_USD) {
-    const plannedSlices = planTwap({ totalQty: finalQty, slices: TWAP_SLICES });
-    tradeForensics.update(tradeId, {
-      twap: {
-        enabled: true,
-        totalQty: finalQty,
-        filledQty: null,
-        slices: plannedSlices.length,
-        sliceFills: [],
-        durationMs: 0,
-      },
-    });
-    console.log('twap_plan', { symbol: normalizedSymbol, slices: plannedSlices.length, mode: TWAP_PRICE_MODE, maxChaseBps: TWAP_MAX_CHASE_BPS });
-  }
+  // NOTE: A TWAP planning/telemetry stub used to live here, but it referenced
+  // `amountToSpend` and `tradeId` — neither of which exist in this function's
+  // scope — so it would have thrown at runtime whenever TWAP_ENABLED=true.
+  // The block was also a stub (logging only, no actual slicing). Removed to
+  // unblock lint; the real TWAP path lives in placeMarketBuyThenSell.
   const buyPayload = {
     symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
@@ -9794,7 +9805,6 @@ async function attachInitialExitLimit({
     profitabilityFloorPrice: profitabilityFloorEffective,
     feeBpsRoundTrip,
     profitBufferBps,
-    desiredNetExitBps: desiredNetExitBpsValue,
     entrySpreadBpsUsed,
     slippageBpsUsed,
     spreadBufferBps,
