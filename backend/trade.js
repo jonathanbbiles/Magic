@@ -2,6 +2,16 @@ const { randomUUID, randomBytes } = require('crypto');
 
 const { httpJson, buildHttpsUrl } = require('./httpClient');
 const { requestJson, logHttpError } = require('./modules/http');
+const {
+  placeOrderUnified,
+  alpacaHeaders,
+  alpacaJsonHeaders,
+  resolveAlpacaAuth,
+  requireAlpacaAuth,
+  normalizeTradeBase,
+  normalizeDataBase,
+  configureOrderExecutionRuntime,
+} = require('./modules/orderExecution');
 const { withAlpacaMdLimit, getRatePressureState, isUnderRatePressure } = require('./modules/alpacaRateLimiter');
 const {
   MARKET_DATA_TIMEOUT_MS,
@@ -71,40 +81,6 @@ const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
 const DEBUG_ALPACA_HTTP = String(process.env.DEBUG_ALPACA_HTTP || '').trim() === '1';
 const DEBUG_ALPACA_HTTP_OK = String(process.env.DEBUG_ALPACA_HTTP_OK || '').trim() === '1';
 
-function normalizeTradeBase(baseUrl) {
-  if (!baseUrl) return 'https://api.alpaca.markets';
-  const trimmed = baseUrl.replace(/\/+$/, '');
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.hostname.includes('data.alpaca.markets')) {
-      console.warn('trade_base_invalid_host', { host: parsed.hostname });
-      return 'https://api.alpaca.markets';
-    }
-  } catch (err) {
-    console.warn('trade_base_parse_failed', { baseUrl: trimmed });
-  }
-  return trimmed.replace(/\/v2$/, '');
-}
-
-function normalizeDataBase(baseUrl) {
-  if (!baseUrl) return 'https://data.alpaca.markets';
-  let trimmed = baseUrl.replace(/\/+$/, '');
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.hostname.includes('api.alpaca.markets') || parsed.hostname.includes('paper-api.alpaca.markets')) {
-      console.warn('data_base_invalid_host', { host: parsed.hostname });
-      return 'https://data.alpaca.markets';
-    }
-  } catch (err) {
-    console.warn('data_base_parse_failed', { baseUrl: trimmed });
-  }
-  trimmed = trimmed.replace(/\/v1beta2$/, '');
-  trimmed = trimmed.replace(/\/v1beta3$/, '');
-  trimmed = trimmed.replace(/\/v2\/stocks$/, '');
-  trimmed = trimmed.replace(/\/v2$/, '');
-  return trimmed;
-}
-
 const TRADE_BASE = normalizeTradeBase(RAW_TRADE_BASE);
 const DATA_BASE = normalizeDataBase(RAW_DATA_BASE);
 const ALPACA_BASE_URL = `${TRADE_BASE}/v2`;
@@ -112,183 +88,10 @@ const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
 
-const ALPACA_KEY_ENV_VARS = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY'];
-const ALPACA_SECRET_ENV_VARS = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
-
-let alpacaAuthWarned = false;
-
-function resolveAlpacaAuth() {
-  const keyId =
-    process.env.APCA_API_KEY_ID ||
-    process.env.ALPACA_KEY_ID ||
-    process.env.ALPACA_API_KEY_ID ||
-    process.env.ALPACA_API_KEY ||
-    '';
-  const secretKey =
-    process.env.APCA_API_SECRET_KEY ||
-    process.env.ALPACA_SECRET_KEY ||
-    process.env.ALPACA_API_SECRET_KEY ||
-    '';
-  const alpacaKeyIdPresent = Boolean(keyId);
-  const alpacaAuthOk = Boolean(keyId && secretKey);
-  const missing = [];
-  if (!keyId) missing.push('key id');
-  if (!secretKey) missing.push('secret key');
-  if (!alpacaAuthWarned && !alpacaAuthOk) {
-    console.warn('alpaca_auth_missing', {
-      missing,
-      checkedKeyVars: ALPACA_KEY_ENV_VARS,
-      checkedSecretVars: ALPACA_SECRET_ENV_VARS,
-    });
-    alpacaAuthWarned = true;
-  }
-  return {
-    keyId: keyId || null,
-    secretKey: secretKey || null,
-    alpacaAuthOk,
-    alpacaKeyIdPresent,
-    missing,
-    checkedKeyVars: ALPACA_KEY_ENV_VARS,
-    checkedSecretVars: ALPACA_SECRET_ENV_VARS,
-  };
-}
-
-function requireAlpacaAuth() {
-  const status = resolveAlpacaAuth();
-  if (!status.alpacaAuthOk) {
-    const err = new Error('alpaca_auth_missing');
-    err.code = 'ALPACA_AUTH_MISSING';
-    err.details = {
-      missing: status.missing,
-      checkedKeyVars: status.checkedKeyVars,
-      checkedSecretVars: status.checkedSecretVars,
-    };
-    throw err;
-  }
-  return status;
-}
-
-function alpacaHeaders() {
-  const auth = requireAlpacaAuth();
-  const headers = { Accept: 'application/json' };
-  headers['APCA-API-KEY-ID'] = auth.keyId;
-  headers['APCA-API-SECRET-KEY'] = auth.secretKey;
-  return headers;
-}
-
-function alpacaJsonHeaders() {
-  return {
-    'Content-Type': 'application/json',
-    Accept: 'application/json',
-    ...alpacaHeaders(),
-  };
-}
-
-async function placeOrderUnified({
-  symbol,
-  url,
-  payload,
-  label = 'orders_submit',
-  reason = null,
-  context = null,
-  intent = null,
-}) {
-  if (!url) throw new Error('placeOrderUnified: missing url');
-  if (!payload) throw new Error('placeOrderUnified: missing payload');
-
-  try {
-    const resp = await requestJson({
-      url,
-      method: 'POST',
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-
-    const order = resp?.json ?? resp;
-    console.log('order_submitted', {
-      symbol,
-      id: order?.id ?? null,
-      client_order_id: payload?.client_order_id ?? null,
-      label,
-      reason,
-      context,
-      intent,
-    });
-    if (String(intent || '').toLowerCase() === 'entry' && String(payload?.side || '').toLowerCase() === 'buy') {
-      setEngineState('waiting_for_fill', { reason: 'buy_submitted', context: { symbol } });
-      setLastActionTrace('lastBuySubmit', {
-        symbol,
-        orderId: order?.id ?? null,
-        clientOrderId: payload?.client_order_id ?? null,
-        type: payload?.type || null,
-      });
-    }
-    if (String(payload?.side || '').toLowerCase() === 'sell') {
-      setEngineState('placing_sell', { reason: 'sell_submitted', context: { symbol } });
-      setLastActionTrace('lastSellSubmit', {
-        symbol,
-        orderId: order?.id ?? null,
-        clientOrderId: payload?.client_order_id ?? null,
-        type: payload?.type || null,
-      });
-    }
-
-    return order;
-  } catch (err) {
-    const statusCode = err?.statusCode ?? err?.status ?? null;
-    const responseText = err?.responseText ?? err?.snippet ?? null;
-
-    if (typeof logHttpError === 'function') {
-      logHttpError({
-        context: 'placeOrderUnified',
-        url,
-        method: 'POST',
-        statusCode,
-        error: err?.message ?? String(err),
-        responseText,
-        responseHeaders: err?.responseHeaders ?? null,
-        extra: {
-          symbol,
-          label,
-          reason,
-          context,
-          intent,
-          payloadPreview: {
-            type: payload?.type,
-            side: payload?.side,
-            time_in_force: payload?.time_in_force,
-            qty: payload?.qty,
-            notional: payload?.notional,
-            limit_price: payload?.limit_price,
-            client_order_id: payload?.client_order_id,
-          },
-        },
-      });
-    } else {
-      console.log('order_submit_failed', {
-        symbol,
-        label,
-        reason,
-        context,
-        intent,
-        statusCode,
-        error: err?.message ?? String(err),
-        responseText,
-      });
-    }
-    setLastActionTrace('lastExecutionFailure', {
-      stage: 'order_submit',
-      symbol,
-      label,
-      reason: reason || null,
-      message: err?.message || String(err),
-      statusCode,
-    });
-    setEngineState('degraded', { reason: 'order_submit_failed', context: { symbol, statusCode } });
-
-    throw err;
-  }
-}
+configureOrderExecutionRuntime({
+  setEngineState,
+  setLastActionTrace,
+});
 
 const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0.10;
 const TRADE_PORTFOLIO_PCT_RAW = readNumber('TRADE_PORTFOLIO_PCT', MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT);
@@ -14264,6 +14067,15 @@ async function runEntryScanOnce() {
   entryManagerHeartbeat.lastHeartbeatAt = safeIso();
   const warmupSnapshot = getPredictorWarmupStatus();
   const startMs = Date.now();
+  if (String(warmupSnapshot?.lastError || '').toLowerCase() === 'warmup_timeout') {
+    emitEntryScanNoopSummary({ startMs, reason: 'predictor_warmup_timeout' });
+    clearEntryScanProgress({ state: 'idle' });
+    setEngineState('degraded', { reason: 'predictor_warmup_timeout' });
+    entryScanRunning = false;
+    entryManagerHeartbeat.running = Boolean(entryManagerIntervalId);
+    entryManagerHeartbeat.lastHeartbeatAt = safeIso();
+    return;
+  }
   if (PREDICTOR_WARMUP_BLOCK_TRADES && warmupSnapshot?.inProgress === true) {
     emitEntryScanNoopSummary({ startMs, reason: 'warmup_in_progress' });
     clearEntryScanProgress({ state: 'idle' });
