@@ -311,7 +311,7 @@ class ErrorBoundary extends React.Component {
 // ---------------------------------------------------------------------------
 // Logs panel
 // ---------------------------------------------------------------------------
-function LogsPanel({ baseUrl }) {
+function LogsPanel() {
   const [logs, setLogs] = useState([]);
   const [filter, setFilter] = useState('all');
   const lastTsRef = useRef(0);
