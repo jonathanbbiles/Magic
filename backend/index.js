@@ -21,6 +21,22 @@ process.on('uncaughtException', (err) => {
   setTimeout(() => process.exit(1), 100).unref();
 });
 
+// In-memory ring buffer that captures structured console output so the
+// frontend can display recent backend logs without needing Render access.
+const LOG_RING_MAX = Number(process.env.LOG_RING_MAX) || 500;
+const logRing = [];
+function pushLogEntry(level, args) {
+  const parts = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a)));
+  logRing.push({ ts: Date.now(), level, msg: parts.join(' ') });
+  if (logRing.length > LOG_RING_MAX) logRing.shift();
+}
+const origLog = console.log;
+const origWarn = console.warn;
+const origError = console.error;
+console.log = (...args) => { pushLogEntry('info', args); origLog.apply(console, args); };
+console.warn = (...args) => { pushLogEntry('warn', args); origWarn.apply(console, args); };
+console.error = (...args) => { pushLogEntry('error', args); origError.apply(console, args); };
+
 const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
 const explicitDotenvPath = process.env.DOTENV_CONFIG_PATH ? path.resolve(process.env.DOTENV_CONFIG_PATH) : null;
 const localDevDotenvPath = path.resolve(__dirname, '.env');
@@ -565,6 +581,16 @@ app.get('/debug/auth', (req, res) => {
     version: VERSION,
     serverTime: new Date().toISOString(),
   });
+});
+
+app.get('/debug/logs', (req, res) => {
+  const sinceMs = Number(req.query.since) || 0;
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), LOG_RING_MAX);
+  const level = req.query.level || null; // 'info', 'warn', 'error', or null for all
+  let entries = sinceMs ? logRing.filter((e) => e.ts > sinceMs) : logRing.slice();
+  if (level) entries = entries.filter((e) => e.level === level);
+  entries = entries.slice(-limit);
+  res.json({ ok: true, count: entries.length, entries });
 });
 
 app.get('/debug/runtime-config', (req, res) => {
