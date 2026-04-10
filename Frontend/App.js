@@ -13,7 +13,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
 
 // ---------------------------------------------------------------------------
 // Light colour palette
@@ -345,11 +344,7 @@ function LogsPanel({ baseUrl }) {
 
   const copyAll = useCallback(async () => {
     const text = filtered.map((e) => `[${fmtLogTime(e.ts)}] [${e.level}] ${e.msg}`).join('\n');
-    try {
-      await Clipboard.setStringAsync(text);
-    } catch {
-      try { await Share.share({ message: text }); } catch { /* ignore */ }
-    }
+    try { await Share.share({ message: text }); } catch { /* ignore */ }
   }, [filtered]);
 
   const levelColor = (lvl) =>
@@ -507,9 +502,7 @@ function AppInner() {
   const toggleCard = useCallback((id) => setExpandedCards((p) => ({ ...p, [id]: !p[id] })), []);
 
   const copyDiag = useCallback(async (text) => {
-    try { await Clipboard.setStringAsync(text); } catch {
-      try { await Share.share({ message: text }); } catch { /* ignore */ }
-    }
+    try { await Share.share({ message: text }); } catch { /* ignore */ }
   }, []);
 
   const managedCount = positions.filter((p) => p?.state === 'managing').length;
