@@ -7215,18 +7215,25 @@ function shouldClearStaleTrackedSellIdentity({
   visibilityDeadlineAt = null,
   nowMs = Date.now(),
 } = {}) {
+  if (directLookupFoundOpenSell) return false;
+  if (Number(openSellCount) !== 0) return false;
+  if (Number(brokerAvailableQty) <= 0) return false;
+  if (Number(missCount) < Number(missThreshold)) return false;
+
+  // Hard cap: if missCount reaches 10x the threshold (default 20), the order
+  // is unambiguously gone — override the recency/visibility guards that were
+  // only meant to tolerate transient Alpaca propagation delays, not permanent
+  // disappearance.  Without this, stale orders poll indefinitely.
+  const MISS_HARD_CAP = Math.max(Number(missThreshold) * 10, 20);
+  if (Number(missCount) >= MISS_HARD_CAP) {
+    return true;
+  }
+
   const submittedRecently = Number.isFinite(Number(sellOrderSubmittedAt))
     ? (nowMs - Number(sellOrderSubmittedAt)) < Math.max(EXIT_REPLACE_VISIBILITY_GRACE_MS, 5000)
     : false;
   const visibilityGraceActive = Number.isFinite(Number(visibilityDeadlineAt)) && Number(visibilityDeadlineAt) > nowMs;
-  return (
-    !directLookupFoundOpenSell &&
-    !submittedRecently &&
-    !visibilityGraceActive &&
-    Number(openSellCount) === 0 &&
-    Number(brokerAvailableQty) > 0 &&
-    Number(missCount) >= Number(missThreshold)
-  );
+  return !submittedRecently && !visibilityGraceActive;
 }
 
 function shouldSkipTrackedAndHasOpenSellInRepair({
@@ -11838,6 +11845,29 @@ async function manageExitStates() {
               orderId: state.sellOrderId,
               reason: 'locked_tp_override_release',
             });
+            // After cancelling the locked TP, clear tracked identity so the
+            // next exit-scan iteration can place a fresh order without hitting
+            // the reattach_pending_visibility grace gate.  Without this
+            // continue, the loop falls through to openSellCount===0 in the
+            // same tick and either (a) places another order immediately then
+            // gets stuck in visibility grace, or (b) wastes an API round-trip
+            // on a replacement that a concurrent thesis-break will cancel.
+            updateTrackedSellIdentity(state, {
+              symbol,
+              orderId: null,
+              clientOrderId: null,
+              submittedAtMs: null,
+              limitPrice: null,
+              source: 'locked_tp_override_release_clear',
+            });
+            state.lockedTpOrderId = null;
+            state.lockedTpClientOrderId = null;
+            state.exitVisibilityState = null;
+            state.exitVisibilityStartedAt = null;
+            state.exitVisibilityDeadlineAt = null;
+            actionTaken = 'cancel_replace_pending';
+            reasonCode = 'locked_tp_override_release';
+            continue;
           }
         }
 
@@ -12352,6 +12382,16 @@ async function manageExitStates() {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement.reason;
               updateSellabilityBlockCause(state, symbol, replacement.reason, { source: 'submit_limit_sell' });
+              // If the replacement was skipped because we're still inside a
+              // visibility grace that has already expired, resolve it so the
+              // next iteration can try fresh instead of looping forever.
+              if (
+                state.exitVisibilityState &&
+                Number.isFinite(state.exitVisibilityDeadlineAt) &&
+                state.exitVisibilityDeadlineAt <= now
+              ) {
+                resolveReplaceVisibilityGrace(state, { symbol, reason: 'grace_expired_replacement_skipped' });
+              }
             } else {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
