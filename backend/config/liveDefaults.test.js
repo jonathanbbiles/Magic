@@ -110,7 +110,7 @@ withEnv({}, () => {
 assert.throws(
   () => execFileSync('node', [path.resolve(__dirname, '..', 'scripts', 'check_runtime_env.js')], {
     cwd: path.resolve(__dirname, '..'),
-    env: { ...process.env, ENTRY_TAKE_PROFIT_BPS: '71' },
+    env: { ...process.env, ENTRY_TAKE_PROFIT_BPS: '71', CHECK_RUNTIME_ENV_TEMPLATE_ONLY: '' },
     stdio: 'pipe',
   }),
   /runtime_env_check_failed/,
