@@ -450,7 +450,7 @@ async function getRecentBuyFillLookup() {
     const result = await fetchActivities({
       activity_types: 'FILL',
       direction: 'desc',
-      page_size: '200',
+      page_size: '100',
     });
     const bySymbol = buildLatestBuyFillLookup(result?.items || []);
     activityFillsCache.bySymbol = bySymbol;

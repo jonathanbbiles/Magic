@@ -4259,6 +4259,7 @@ const lastActionTrace = {
 };
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
+const forbiddenExitCooldowns = new Map();
 let equityPeak = null;
 let equityTodayOpen = null;
 let equityTodayKey = null;
@@ -4266,6 +4267,7 @@ let lastRiskMetricsLogAt = 0;
 let tradingHaltedByGuard = false;
 let lastRiskSnapshot = null;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
+const FORBIDDEN_EXIT_COOLDOWN_MS = 15 * 60 * 1000;
 
 function setEngineState(nextState, { reason = null, context = null } = {}) {
   const normalized = String(nextState || '').trim().toLowerCase();
@@ -9387,6 +9389,26 @@ async function submitLimitSell({
         cooldownUntilMs: retryAt,
       };
     }
+    if (status === 403) {
+      const now = Date.now();
+      const retryAt = now + FORBIDDEN_EXIT_COOLDOWN_MS;
+      forbiddenExitCooldowns.set(normalizedSymbol, retryAt);
+      console.error('tp_attach_deferred_forbidden', {
+        symbol,
+        canonicalSymbol: normalizedSymbol,
+        reason: 'broker_forbidden',
+        brokerStatus: status,
+        brokerMessage: bodyText,
+        cooldownMs: FORBIDDEN_EXIT_COOLDOWN_MS,
+        retryAtMs: retryAt,
+        retryAtIso: new Date(retryAt).toISOString(),
+      });
+      return {
+        skipped: true,
+        reason: 'exit_forbidden_cooldown',
+        cooldownUntilMs: retryAt,
+      };
+    }
     console.error('tp_sell_error', { symbol, status, body: bodyText });
     throw err;
   }
@@ -11311,6 +11333,18 @@ async function manageExitStates() {
         }
         if (Number.isFinite(cooldownUntil) && cooldownUntil <= now) {
           insufficientBalanceExitCooldowns.delete(normalizePair(symbol));
+        }
+        const forbiddenUntil = forbiddenExitCooldowns.get(normalizePair(symbol));
+        if (Number.isFinite(forbiddenUntil) && forbiddenUntil > now) {
+          console.log('exit_manager_skip_orders', {
+            symbol,
+            reason: 'forbidden_exit_cooldown',
+            remainingMs: Math.max(0, forbiddenUntil - now),
+          });
+          continue;
+        }
+        if (Number.isFinite(forbiddenUntil) && forbiddenUntil <= now) {
+          forbiddenExitCooldowns.delete(normalizePair(symbol));
         }
 
         let bid = null;
