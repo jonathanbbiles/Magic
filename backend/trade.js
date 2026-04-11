@@ -14,6 +14,15 @@ const {
 } = require('./modules/orderExecution');
 const { withAlpacaMdLimit, getRatePressureState, isUnderRatePressure } = require('./modules/alpacaRateLimiter');
 const {
+  updateFromHeaders: updateTradingRateHeaders,
+  markThrottled: markTradingThrottled,
+  isTradingRateLimited,
+  isTradingRatePressured,
+  tradingCooldownRemainingMs,
+  getTradingRateState,
+  waitForTradingCooldown,
+} = require('./modules/tradingRateLimiter');
+const {
   MARKET_DATA_TIMEOUT_MS,
   MARKET_DATA_RETRIES,
   ORDERBOOK_RETRY_ATTEMPTS,
@@ -399,6 +408,7 @@ function getEntryDiagnosticsSnapshot() {
         return acc;
       }, {}),
     ratePressureState,
+    tradingRateState: getTradingRateState(),
     engineState: getEngineStateSnapshot(),
     engineStateDetail: {
       state: getEngineStateSnapshot(),
@@ -3495,6 +3505,8 @@ const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
 const lockedTpLossExitBlockedLogBySymbol = new Map();
+const lockedTpThesisBreakCancelAtBySymbol = new Map(); // symbol -> ms timestamp of last thesis_break cancel
+const LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS = 30_000; // don't reattach TP for 30s after thesis_break cancel
 const positionMissingCountBySymbol = new Map();
 const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
 const exitStateFirstSeenAtBySymbol = new Map(); // symbol -> ms (bookkeeping fallback, not broker confirmation)
@@ -6538,13 +6550,33 @@ async function fetchPositions() {
   if (positionsListCache.pending) {
     return positionsListCache.pending;
   }
+  // If rate limited, return stale cache if available
+  if (isTradingRateLimited() && positionsListCache.data) {
+    console.log('fetchPositions_rate_limited_using_cache', { cooldownMs: tradingCooldownRemainingMs() });
+    return positionsListCache.data;
+  }
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions' });
   positionsListCache.pending = (async () => {
-    const res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
+    let res;
+    try {
+      res = await requestJson({
+        method: 'GET',
+        url,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      if (err?.responseHeaders) {
+        updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'positions' });
+      }
+      if (err?.statusCode === 429) {
+        markTradingThrottled({ endpoint: 'positions' });
+        if (positionsListCache.data) {
+          console.warn('fetchPositions_429_returning_stale_cache');
+          return positionsListCache.data;
+        }
+      }
+      throw err;
+    }
     const positions = Array.isArray(res) ? res : [];
     const normalized = positions.map((pos) => ({
       ...pos,
@@ -6565,6 +6597,11 @@ async function fetchPositions() {
 }
 
 async function fetchPosition(symbol) {
+  // Skip API call entirely if rate limited — callers handle null gracefully
+  if (isTradingRateLimited()) {
+    console.log('fetchPosition_rate_limited_skip', { symbol, cooldownMs: tradingCooldownRemainingMs() });
+    return null;
+  }
   const normalized = normalizeSymbolForAlpaca(symbol);
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
@@ -6579,6 +6616,9 @@ async function fetchPosition(symbol) {
     });
   } catch (err) {
     const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode, endpoint: 'positions_single' });
+    }
     const axiosData = err?.response?.data;
     const axiosSnippet =
       typeof axiosData === 'string'
@@ -6592,6 +6632,7 @@ async function fetchPosition(symbol) {
       return null;
     }
     if (statusCode === 429) {
+      markTradingThrottled({ endpoint: 'positions_single' });
       logPositionError({
         symbol,
         statusCode,
@@ -7376,6 +7417,16 @@ async function resolveExitSellabilityFromBrokerTruth({
   const trackedClientOrderId = trackedSellClientOrderId || trackedState.sellClientOrderId || null;
   let currentOpenOrders = Array.isArray(openOrders) ? openOrders : null;
   let finalSellability = computeExitSellability({ symbol: canonicalSymbol, position: null, openOrders: [] });
+
+  // When under trading rate pressure, reduce attempts to 1 to avoid
+  // burning remaining API budget on redundant broker truth retries.
+  if (isTradingRateLimited() || isTradingRatePressured()) {
+    maxAttempts = 1;
+    console.log('broker_truth_rate_limited_single_attempt', {
+      symbol: canonicalSymbol,
+      cooldownMs: tradingCooldownRemainingMs(),
+    });
+  }
 
   for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt += 1) {
     if (!currentOpenOrders) {
@@ -8812,6 +8863,9 @@ async function fetchStockBars({ symbols, limit = 6, timeframe = '1Min' }) {
 }
 
 async function fetchOrderById(orderId) {
+  if (isTradingRateLimited()) {
+    await waitForTradingCooldown();
+  }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `orders/${orderId}`,
@@ -8825,6 +8879,12 @@ async function fetchOrderById(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_get' });
+    }
+    if (err?.statusCode === 429) {
+      markTradingThrottled({ endpoint: 'orders_get' });
+    }
     logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
@@ -11758,6 +11818,34 @@ async function manageExitStates() {
               orderLimit: Number.isFinite(liveLimit) ? liveLimit : null,
             });
           } else {
+            // Check thesis_break cooldown: if we recently cancelled the TP due
+            // to a protective exit (thesis_break, stale_trade, time_stop),
+            // don't reattach — let the defensive exit path handle it instead
+            // of burning API budget in a cancel→reattach→cancel loop.
+            const thesisBreakCancelAt = lockedTpThesisBreakCancelAtBySymbol.get(normalizePair(symbol));
+            const thesisBreakCooldownActive = Number.isFinite(thesisBreakCancelAt) &&
+              (Date.now() - thesisBreakCancelAt) < LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS;
+            if (thesisBreakCooldownActive && protectiveExitTriggerActive) {
+              const cooldownRemainingMs = LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS - (Date.now() - thesisBreakCancelAt);
+              console.log('locked_tp_reattach_blocked_thesis_break_cooldown', {
+                symbol,
+                tacticDecision,
+                cooldownRemainingMs,
+                thesisBreakCancelAt,
+              });
+              // Disable locked_tp so the code falls through to the
+              // defensive exit branches (stoploss, hard_stop, force_exit,
+              // ioc/market) which can actually close the position.
+              state.lockedTpEnabled = false;
+              state.exitMode = 'defensive';
+              actionTaken = 'thesis_break_cooldown_skip';
+              reasonCode = 'locked_tp_thesis_break_cooldown';
+              continue;
+            }
+            // Clear expired cooldown
+            if (Number.isFinite(thesisBreakCancelAt) && !thesisBreakCooldownActive) {
+              lockedTpThesisBreakCancelAtBySymbol.delete(normalizePair(symbol));
+            }
             console.log('locked_tp_missing_reattach', { symbol, intendedLockedTpLimit, lockedTpFloor: lockedTpFloor ?? null });
             const plannedQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty;
             const replacement = await submitLimitSell({
@@ -11865,6 +11953,17 @@ async function manageExitStates() {
             state.exitVisibilityState = null;
             state.exitVisibilityStartedAt = null;
             state.exitVisibilityDeadlineAt = null;
+            // Record thesis_break cancel timestamp to prevent reattach thrashing.
+            // Without this, the next scan immediately reattaches a TP that will
+            // be cancelled again on the following scan — burning API budget.
+            if (tacticalProtectiveExit) {
+              lockedTpThesisBreakCancelAtBySymbol.set(normalizePair(symbol), Date.now());
+              console.log('locked_tp_thesis_break_cooldown_set', {
+                symbol,
+                tacticDecision,
+                cooldownMs: LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS,
+              });
+            }
             actionTaken = 'cancel_replace_pending';
             reasonCode = 'locked_tp_override_release';
             continue;
@@ -16955,6 +17054,14 @@ async function fetchOrders(params = {}) {
     label: 'orders_list',
   });
   const fetcher = async () => {
+    if (isTradingRateLimited()) {
+      // If rate limited and we have cached data, return stale cache rather than wait
+      if (isOpenStatus && openOrdersCache.data) {
+        console.log('fetchOrders_rate_limited_using_cache', { cooldownMs: tradingCooldownRemainingMs() });
+        return openOrdersCache.data;
+      }
+      await waitForTradingCooldown();
+    }
     let response;
     try {
       response = await requestJson({
@@ -16963,6 +17070,17 @@ async function fetchOrders(params = {}) {
         headers: alpacaHeaders(),
       });
     } catch (err) {
+      if (err?.responseHeaders) {
+        updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_list' });
+      }
+      if (err?.statusCode === 429) {
+        markTradingThrottled({ endpoint: 'orders_list' });
+        // Return stale cache on 429 instead of crashing
+        if (isOpenStatus && openOrdersCache.data) {
+          console.warn('fetchOrders_429_returning_stale_cache');
+          return openOrdersCache.data;
+        }
+      }
       logHttpError({ label: 'orders', url, error: err });
       throw err;
     }
@@ -17368,6 +17486,9 @@ function getLastHttpError() {
 }
 
 async function cancelOrder(orderId) {
+  if (isTradingRateLimited()) {
+    await waitForTradingCooldown();
+  }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `orders/${orderId}`,
@@ -17381,6 +17502,12 @@ async function cancelOrder(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_cancel' });
+    }
+    if (err?.statusCode === 429) {
+      markTradingThrottled({ endpoint: 'orders_cancel' });
+    }
     logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
