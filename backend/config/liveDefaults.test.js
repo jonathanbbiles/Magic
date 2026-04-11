@@ -35,13 +35,13 @@ withEnv({}, () => {
   assert.ok(tradeSource.includes('const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.normalEntryQuoteMaxAgeMs);'));
   assert.ok(tradeSource.includes('const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = Math.max('));
   assert.ok(!tradeSource.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
   assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
   assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'false');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY, 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, 'true');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, '18');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, '50');
   assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER1_SYMBOLS, 'BTC/USD,ETH/USD');
   assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER2_SYMBOLS, 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD');
   assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, 'true');
@@ -79,8 +79,8 @@ withEnv({}, () => {
   const envLiveExample = fs.readFileSync(path.resolve(__dirname, '..', '.env.live.example'), 'utf8');
   const envExample = fs.readFileSync(path.resolve(__dirname, '..', '.env.example'), 'utf8');
   for (const sourceText of [envProduction, envLiveExample, envExample]) {
-    assert.match(sourceText, /ENTRY_UNIVERSE_MODE=configured/);
-    assert.match(sourceText, /ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false/);
+    assert.match(sourceText, /ENTRY_UNIVERSE_MODE=dynamic/);
+    assert.match(sourceText, /ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true/);
     assert.match(sourceText, /EXECUTION_TIER1_SYMBOLS=BTC\/USD,ETH\/USD/);
     assert.match(sourceText, /EXECUTION_TIER2_SYMBOLS=LINK\/USD,AVAX\/USD,SOL\/USD,UNI\/USD/);
     assert.match(sourceText, /EXECUTION_TIER3_DEFAULT=true/);
@@ -102,7 +102,7 @@ withEnv({}, () => {
     assert.match(sourceText, /EV_MIN_BPS=30/);
   }
   assert.match(envExample, /MIN_PROB_TO_ENTER=0.50/);
-  assert.match(envExample, /ENTRY_UNIVERSE_MAX_SYMBOLS=18/);
+  assert.match(envExample, /ENTRY_UNIVERSE_MAX_SYMBOLS=50/);
   assert.match(envExample, /DESIRED_NET_PROFIT_BASIS_POINTS=100 # legacy/);
   assert.match(envExample, /FEE_BPS_ROUND_TRIP=30/);
 });
