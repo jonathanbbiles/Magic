@@ -1,4 +1,10 @@
 const { requestJson, logHttpError } = require('./http');
+const {
+  updateFromHeaders: updateTradingRateHeaders,
+  markThrottled: markTradingThrottled,
+  isTradingRateLimited,
+  waitForTradingCooldown,
+} = require('./tradingRateLimiter');
 
 const ALPACA_KEY_ENV_VARS = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY'];
 const ALPACA_SECRET_ENV_VARS = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
@@ -136,7 +142,12 @@ async function placeOrderUnified({
   if (!url) throw new Error('placeOrderUnified: missing url');
   if (!payload) throw new Error('placeOrderUnified: missing payload');
 
-  const retryDelaysMs = [500, 1500];
+  // Wait for trading rate cooldown before submitting
+  if (isTradingRateLimited()) {
+    await waitForTradingCooldown();
+  }
+
+  const retryDelaysMs = [500, 1500, 4000];
   let resp;
 
   try {
@@ -151,7 +162,13 @@ async function placeOrderUnified({
         break;
       } catch (err) {
         const statusCode = err?.statusCode ?? err?.status ?? null;
+        if (err?.responseHeaders) {
+          updateTradingRateHeaders(err.responseHeaders, { statusCode, endpoint: label });
+        }
         const retryable = statusCode === 429 || statusCode === 503;
+        if (statusCode === 429) {
+          markTradingThrottled({ endpoint: label });
+        }
         if (!retryable || attempt >= retryDelaysMs.length) {
           throw err;
         }

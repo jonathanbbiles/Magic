@@ -13,7 +13,6 @@ import {
   Text,
   View,
 } from 'react-native';
-import * as Clipboard from 'expo-clipboard';
 
 // ---------------------------------------------------------------------------
 // Light colour palette
@@ -166,9 +165,16 @@ function minsSince(iso) {
 
 function distToTarget(pos) {
   const cur = toNum(pos?.current_price);
-  const lim = toNum(pos?.sell?.activeLimit) ?? toNum(pos?.bot?.sellOrderLimit);
+  const lim = toNum(pos?.sell?.activeLimit) ?? toNum(pos?.bot?.targetPrice);
   if (!Number.isFinite(cur) || !Number.isFinite(lim) || cur === 0) return null;
   return ((lim - cur) / cur) * 100;
+}
+
+function exitValue(pos) {
+  const qty = toNum(pos?.qty);
+  const lim = toNum(pos?.sell?.activeLimit) ?? toNum(pos?.bot?.targetPrice);
+  if (!Number.isFinite(qty) || !Number.isFinite(lim)) return null;
+  return qty * lim;
 }
 
 function fmtLogTime(ts) {
@@ -206,6 +212,7 @@ function PositionCard({ position }) {
   const upnlPct = Number.isFinite(upnlPctRaw) ? upnlPctRaw * 100 : null;
   const isUp = (upnl || 0) >= 0;
   const dist = distToTarget(position);
+  const exitVal = exitValue(position);
   const state = position?.state || position?.bot?.lifecycleDiagnosticsState || '—';
   const stateColor = state === 'managing' ? theme.colors.positive : state === 'exit_missing' ? theme.colors.negative : theme.colors.secondary;
 
@@ -235,6 +242,16 @@ function PositionCard({ position }) {
         <View style={s.posCol}>
           <Text style={s.posLabel}>Entry</Text>
           <Text style={s.posVal}>{usd(position?.avg_entry_price)}</Text>
+        </View>
+      </View>
+      <View style={s.posRow}>
+        <View style={s.posCol}>
+          <Text style={s.posLabel}>Exit value</Text>
+          <Text style={s.posVal}>{Number.isFinite(exitVal) ? usd(exitVal) : '—'}</Text>
+        </View>
+        <View style={s.posCol}>
+          <Text style={s.posLabel}>Target</Text>
+          <Text style={s.posVal}>{usd(toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.targetPrice))}</Text>
         </View>
       </View>
     </View>
@@ -312,11 +329,16 @@ class ErrorBoundary extends React.Component {
 // ---------------------------------------------------------------------------
 // Logs panel
 // ---------------------------------------------------------------------------
-function LogsPanel({ baseUrl }) {
+function LogsPanel({ logsRef }) {
   const [logs, setLogs] = useState([]);
   const [filter, setFilter] = useState('all');
   const lastTsRef = useRef(0);
   const scrollRef = useRef(null);
+
+  // Expose logs to parent via ref for the combined copy bundle
+  useEffect(() => {
+    if (logsRef) logsRef.current = logs;
+  }, [logs, logsRef]);
 
   const fetchLogs = useCallback(async () => {
     try {
@@ -345,11 +367,7 @@ function LogsPanel({ baseUrl }) {
 
   const copyAll = useCallback(async () => {
     const text = filtered.map((e) => `[${fmtLogTime(e.ts)}] [${e.level}] ${e.msg}`).join('\n');
-    try {
-      await Clipboard.setStringAsync(text);
-    } catch {
-      try { await Share.share({ message: text }); } catch { /* ignore */ }
-    }
+    try { await Share.share({ message: text }); } catch { /* ignore */ }
   }, [filtered]);
 
   const levelColor = (lvl) =>
@@ -358,7 +376,7 @@ function LogsPanel({ baseUrl }) {
         : theme.colors.logInfo;
 
   return (
-    <View style={s.logsContainer}>
+    <View style={s.logsInline}>
       <View style={s.logsToolbar}>
         {['all', 'info', 'warn', 'error'].map((f) => (
           <Pressable
@@ -372,17 +390,13 @@ function LogsPanel({ baseUrl }) {
           </Pressable>
         ))}
         <Pressable onPress={copyAll} style={[s.smallBtn, { marginLeft: 'auto' }]}>
-          <Text style={s.smallBtnText}>Copy all</Text>
+          <Text style={s.smallBtnText}>Copy logs</Text>
         </Pressable>
         <Pressable onPress={() => { setLogs([]); lastTsRef.current = 0; fetchLogs(); }} style={s.smallBtn}>
           <Text style={s.smallBtnText}>Refresh</Text>
         </Pressable>
       </View>
-      <ScrollView
-        ref={scrollRef}
-        style={s.logsScroll}
-        onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: false })}
-      >
+      <View style={s.logsScrollInline}>
         {filtered.length === 0 ? (
           <Text style={s.logsEmpty}>No logs yet. Waiting for backend...</Text>
         ) : (
@@ -394,7 +408,7 @@ function LogsPanel({ baseUrl }) {
             </Text>
           ))
         )}
-      </ScrollView>
+      </View>
     </View>
   );
 }
@@ -413,8 +427,7 @@ export default function App() {
 const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'positions', label: 'Positions' },
-  { id: 'diagnostics', label: 'Diagnostics' },
-  { id: 'logs', label: 'Logs' },
+  { id: 'diagnostics', label: 'Diag & Logs' },
 ];
 
 function AppInner() {
@@ -424,6 +437,8 @@ function AppInner() {
   const [error, setError] = useState(null);
   const [tab, setTab] = useState('overview');
   const [expandedCards, setExpandedCards] = useState({});
+  const prevPortfolioRef = useRef(null);
+  const logsDataRef = useRef([]);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (isRefresh) setRefreshing(true);
@@ -462,6 +477,19 @@ function AppInner() {
   }, [dashboard]);
 
   const portfolioValue = dashboard?.account?.portfolio_value ?? dashboard?.account?.equity;
+
+  // Balance trend: green if up, red if down, blue if stable
+  const balanceTrendColor = useMemo(() => {
+    const cur = toNum(portfolioValue);
+    const prev = prevPortfolioRef.current;
+    if (!Number.isFinite(cur)) return theme.colors.accent; // blue default
+    if (prev == null) { prevPortfolioRef.current = cur; return theme.colors.accent; }
+    const diff = cur - prev;
+    prevPortfolioRef.current = cur;
+    if (Math.abs(diff) < 0.01) return theme.colors.accent; // stable = blue
+    return diff > 0 ? theme.colors.positive : theme.colors.negative; // green / red
+  }, [portfolioValue]);
+
   const openPL = useMemo(() => positions.reduce((sum, p) => sum + (toNum(p?.unrealized_pl) || 0), 0), [positions]);
   const openPLPct = useMemo(() => {
     const mv = positions.reduce((sum, p) => sum + (toNum(p?.market_value) || 0), 0);
@@ -479,16 +507,23 @@ function AppInner() {
   const warmup = meta?.predictorWarmup || {};
   const warmupInProgress = Boolean(warmup?.inProgress);
 
-  // Full diagnostics bundle for copy
-  const diagBundle = useMemo(() => JSON.stringify({
-    snapshotAt: new Date().toISOString(),
-    portfolio: { portfolioValue, openPL, openPLPct, positionsCount: positions.length },
-    engineState,
-    positions,
-    diagnostics: dashboard?.diagnostics,
-    meta,
-    error,
-  }, null, 2), [dashboard, positions, portfolioValue, openPL, openPLPct, engineState, meta, error]);
+  // Full diagnostics + logs bundle for copy
+  const copyFullBundle = useCallback(async () => {
+    const logsText = (logsDataRef.current || [])
+      .map((e) => `[${fmtLogTime(e.ts)}] [${e.level}] ${e.msg}`)
+      .join('\n');
+    const bundle = JSON.stringify({
+      snapshotAt: new Date().toISOString(),
+      portfolio: { portfolioValue, openPL, openPLPct, positionsCount: positions.length },
+      engineState,
+      positions,
+      diagnostics: dashboard?.diagnostics,
+      meta,
+      error,
+    }, null, 2);
+    const fullText = `=== DIAGNOSTICS ===\n${bundle}\n\n=== LOGS (${(logsDataRef.current || []).length} entries) ===\n${logsText}`;
+    try { await Share.share({ message: fullText }); } catch { /* ignore */ }
+  }, [dashboard, positions, portfolioValue, openPL, openPLPct, engineState, meta, error]);
 
   const diagCards = useMemo(() => {
     const d = dashboard?.diagnostics || {};
@@ -507,9 +542,7 @@ function AppInner() {
   const toggleCard = useCallback((id) => setExpandedCards((p) => ({ ...p, [id]: !p[id] })), []);
 
   const copyDiag = useCallback(async (text) => {
-    try { await Clipboard.setStringAsync(text); } catch {
-      try { await Share.share({ message: text }); } catch { /* ignore */ }
-    }
+    try { await Share.share({ message: text }); } catch { /* ignore */ }
   }, []);
 
   const managedCount = positions.filter((p) => p?.state === 'managing').length;
@@ -521,8 +554,8 @@ function AppInner() {
 
       {/* Top header */}
       <View style={s.topBar}>
-        <Text style={s.appTitle}>Magic</Text>
-        <Text style={s.portfolioVal}>{usd(portfolioValue)}</Text>
+        <Text style={s.appTitle}>{'\uD83D\uDC07'} MM {'\uD83E\uDE84'}</Text>
+        <Text style={[s.portfolioVal, { color: balanceTrendColor }]}>{usd(portfolioValue)}</Text>
       </View>
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
@@ -571,7 +604,7 @@ function AppInner() {
           {positions.length > 0 ? (
             <View style={s.card}>
               <Text style={s.cardTitle}>Positions</Text>
-              {positions.slice(0, 4).map((p) => {
+              {positions.map((p) => {
                 const sym = (p?.symbol || '').replace('/USD', '');
                 const upnl = toNum(p?.unrealized_pl);
                 const isUp = (upnl || 0) >= 0;
@@ -585,9 +618,6 @@ function AppInner() {
                   </View>
                 );
               })}
-              {positions.length > 4 ? (
-                <Text style={s.miniPosMore}>+{positions.length - 4} more</Text>
-              ) : null}
             </View>
           ) : null}
 
@@ -623,7 +653,7 @@ function AppInner() {
           style={s.scrollBody}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} />}
         >
-          <Pressable onPress={() => copyDiag(diagBundle)} style={[s.smallBtn, { alignSelf: 'flex-start', marginBottom: 8 }]}>
+          <Pressable onPress={copyFullBundle} style={[s.smallBtn, { alignSelf: 'flex-start', marginBottom: 8 }]}>
             <Text style={s.smallBtnText}>Copy full bundle</Text>
           </Pressable>
 
@@ -642,11 +672,14 @@ function AppInner() {
               />
             );
           })}
+
+          {/* Live logs section */}
+          <Text style={[s.cardTitle, { marginTop: theme.spacing.md }]}>Live Logs</Text>
+          <LogsPanel logsRef={logsDataRef} />
+
           <View style={{ height: 32 }} />
         </ScrollView>
       ) : null}
-
-      {tab === 'logs' ? <LogsPanel /> : null}
     </SafeAreaView>
   );
 }
@@ -749,7 +782,6 @@ const s = StyleSheet.create({
   miniPosSym: { color: theme.colors.text, fontSize: 13, fontWeight: '700', width: 60 },
   miniPosPnl: { fontSize: 13, fontWeight: '700', flex: 1 },
   miniPosState: { color: theme.colors.muted, fontSize: 11, fontWeight: '600' },
-  miniPosMore: { color: theme.colors.muted, fontSize: 12, marginTop: 4 },
 
   // Diagnostics
   diagCard: {
@@ -785,8 +817,8 @@ const s = StyleSheet.create({
   },
   smallBtnText: { color: theme.colors.accent, fontSize: 11, fontWeight: '700' },
 
-  // Logs
-  logsContainer: { flex: 1, paddingHorizontal: theme.spacing.sm },
+  // Logs (inline within diagnostics tab)
+  logsInline: { marginBottom: theme.spacing.sm },
   logsToolbar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -805,14 +837,15 @@ const s = StyleSheet.create({
   filterChipActive: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
   filterChipText: { color: theme.colors.secondary, fontSize: 11, fontWeight: '700' },
   filterChipTextActive: { color: '#fff' },
-  logsScroll: {
-    flex: 1,
+  logsScrollInline: {
+    maxHeight: 400,
     backgroundColor: theme.colors.surface,
     borderRadius: theme.radius.md,
     borderWidth: 1,
     borderColor: theme.colors.border,
     padding: theme.spacing.sm,
     marginBottom: theme.spacing.sm,
+    overflow: 'scroll',
   },
   logsEmpty: { color: theme.colors.muted, fontSize: 12, padding: 16, textAlign: 'center' },
   logLine: { fontSize: 11, lineHeight: 16, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
