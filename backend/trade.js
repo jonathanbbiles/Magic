@@ -11313,8 +11313,12 @@ async function manageExitStates() {
       }
       symbolLocks.set(symbol, true);
       try {
-        const heldMs = Math.max(0, now - state.entryTime);
-        const heldSeconds = heldMs / 1000;
+        const entryTimeRef = Number.isFinite(state.entryTime)
+          ? state.entryTime
+          : (Number.isFinite(state.sellOrderSubmittedAt) ? state.sellOrderSubmittedAt : null);
+        const rawHeldMs = Number.isFinite(entryTimeRef) ? now - entryTimeRef : NaN;
+        const heldMs = Number.isFinite(rawHeldMs) ? Math.max(0, rawHeldMs) : NaN;
+        const heldSeconds = Number.isFinite(heldMs) ? heldMs / 1000 : NaN;
         const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
         const openBuyCount = symbolOrders.filter((order) => {
           const side = String(order.side || '').toLowerCase();
@@ -11514,7 +11518,7 @@ async function manageExitStates() {
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
         const quoteAgeMs = Number.isFinite(state.lastQuoteTsMs) ? Math.max(0, now - state.lastQuoteTsMs) : null;
-        const failedTradeStale = Number.isFinite(heldSeconds) && heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
+        const failedTradeStale = !Number.isFinite(heldSeconds) || heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
         const timeStopTriggered = Number.isFinite(EXIT_MAX_HOLD_SECONDS) && EXIT_MAX_HOLD_SECONDS > 0 && heldSeconds >= EXIT_MAX_HOLD_SECONDS;
         const thesisBrokenForRefresh =
           failedTradeStale &&
