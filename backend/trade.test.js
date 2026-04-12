@@ -1092,8 +1092,8 @@ withEnv({
 }, () => {
   delete require.cache[marketDataConfigPath];
   const cfg = require('./config/marketData');
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.35);
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.40);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.52);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.55);
 });
 
 withEnv({
