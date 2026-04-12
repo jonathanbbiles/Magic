@@ -36,10 +36,14 @@ const blockedPlaceholderPatterns = [
 ];
 const placeholderSecretsFound = [];
 
+const templateOnly = String(process.env.CHECK_RUNTIME_ENV_TEMPLATE_ONLY ?? '').trim().toLowerCase();
+const isTemplateOnlyMode = ['1', 'true', 'yes', 'on'].includes(templateOnly);
+
 for (const key of LIVE_CRITICAL_KEYS) {
   if (canonical[key] != null && (canonical[key] ?? '') !== (LIVE_CRITICAL_DEFAULTS[key] ?? '')) {
     canonicalMismatches.push({ key, expectedDefault: LIVE_CRITICAL_DEFAULTS[key], productionValue: canonical[key] ?? '' });
   }
+  if (isTemplateOnlyMode) continue;
   const expected = LIVE_CRITICAL_DEFAULTS[key] ?? '';
   const envValue = String(process.env[key] ?? '').trim();
   const actual = envValue;

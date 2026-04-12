@@ -114,7 +114,7 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 );
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
-const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', false);
+const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED === 'true');
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -12045,6 +12045,7 @@ async function manageExitStates() {
               limitPrice: forcedLimit,
               reason: 'max_hold_forced_exit',
               allowSellBelowMin: false,
+              bypassDisable: true,
             });
             if (!iocResult?.skipped) {
               requestedQty = iocResult.requestedQty;
@@ -12464,6 +12465,18 @@ async function manageExitStates() {
               allowSellBelowMin: false,
             });
             replacement = replacement?.order || replacement;
+            if (replacement?.skipped && replacement?.reason === 'ioc_disabled') {
+              replacement = await submitLimitSell({
+                symbol,
+                qty: plannedQty,
+                limitPrice: targetPrice,
+                reason: tacticDecision,
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                openOrders: symbolOrders,
+                availableQtyOverride,
+                allowSellBelowMin: false,
+              });
+            }
           } else {
             replacement = await submitLimitSell({
               symbol,

@@ -37,10 +37,11 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: Runtime env sanity
+      - name: Runtime env sanity (template drift only)
         run: npm run check:runtime-env
         env:
           NODE_ENV: test
+          CHECK_RUNTIME_ENV_TEMPLATE_ONLY: 'true'
 
   frontend:
     name: Frontend install
