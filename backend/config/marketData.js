@@ -1,3 +1,5 @@
+const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
+
 function readNumber(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) ? value : fallback;
@@ -9,17 +11,17 @@ const MARKET_DATA_RETRIES = Math.max(0, Math.floor(readNumber('MARKET_DATA_RETRI
 const ORDERBOOK_RETRY_ATTEMPTS = Math.max(1, Math.floor(readNumber('ORDERBOOK_RETRY_ATTEMPTS', 3)));
 const ORDERBOOK_RETRY_BACKOFF_MS = [200, 500, 1200];
 
-const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', 0.53);
+const MIN_PROB_TO_ENTER = readNumber('MIN_PROB_TO_ENTER', Number(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER) || 0.50);
 const hasGlobalMinProbEnv = String(process.env.MIN_PROB_TO_ENTER ?? '').trim().length > 0;
 const hasTier1MinProbEnv = String(process.env.MIN_PROB_TO_ENTER_TIER1 ?? '').trim().length > 0;
 const hasTier2MinProbEnv = String(process.env.MIN_PROB_TO_ENTER_TIER2 ?? '').trim().length > 0;
 const MIN_PROB_TO_ENTER_TIER1 = readNumber(
   'MIN_PROB_TO_ENTER_TIER1',
-  hasGlobalMinProbEnv && !hasTier1MinProbEnv ? MIN_PROB_TO_ENTER : 0.35,
+  hasGlobalMinProbEnv && !hasTier1MinProbEnv ? MIN_PROB_TO_ENTER : (Number(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER_TIER1) || 0.52),
 );
 const MIN_PROB_TO_ENTER_TIER2 = readNumber(
   'MIN_PROB_TO_ENTER_TIER2',
-  hasGlobalMinProbEnv && !hasTier2MinProbEnv ? MIN_PROB_TO_ENTER : 0.40,
+  hasGlobalMinProbEnv && !hasTier2MinProbEnv ? MIN_PROB_TO_ENTER : (Number(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER_TIER2) || 0.55),
 );
 const MIN_PROB_TO_ENTER_TP = readNumber('MIN_PROB_TO_ENTER_TP', MIN_PROB_TO_ENTER);
 // 0 disables the stretch gate entirely

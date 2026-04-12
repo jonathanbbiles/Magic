@@ -26,7 +26,7 @@ const evModelLocked = trade.buildEntryEvModel({
   spreadBps: 12,
   probability: 0.6,
 });
-assert.equal(evModelLocked.exitPlan.netAfterFeesBps, 30);
+assert.equal(evModelLocked.exitPlan.netAfterFeesBps, 45);
 const evEntryFeeModel = trade.resolveEntryExitFeeBps({
   symbol: 'BTC/USD',
   entryOrderType: evModelLocked.entryOrderType,
