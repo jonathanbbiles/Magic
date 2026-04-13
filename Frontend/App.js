@@ -343,6 +343,7 @@ function LogsPanel({ logsRef }) {
   }, [logs, logsRef]);
 
   const fetchLogs = useCallback(async () => {
+    if (!HAS_BACKEND_URL) return;
     try {
       const since = lastTsRef.current;
       const data = await apiFetch(`/debug/logs?since=${since}&limit=200`);
@@ -357,6 +358,9 @@ function LogsPanel({ logsRef }) {
   }, []);
 
   useEffect(() => {
+    if (!HAS_BACKEND_URL) {
+      return undefined;
+    }
     fetchLogs();
     const id = setInterval(fetchLogs, LOG_POLL_MS);
     return () => clearInterval(id);
@@ -560,18 +564,6 @@ function AppInner() {
   const managedCount = positions.filter((p) => p?.state === 'managing').length;
   const missingCount = positions.filter((p) => p?.state === 'exit_missing').length;
 
-  if (!HAS_BACKEND_URL) {
-    return (
-      <SafeAreaView style={s.safe}>
-        <StatusBar barStyle="dark-content" />
-        <View style={s.errorRoot}>
-          <Text style={s.errorTitle}>Backend URL not configured</Text>
-          <Text style={s.errorMsg}>{BACKEND_CONFIG_ERROR}</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
   return (
     <SafeAreaView style={s.safe}>
       <StatusBar barStyle="dark-content" />
@@ -583,6 +575,13 @@ function AppInner() {
       </View>
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
+      {!HAS_BACKEND_URL ? (
+        <View style={[s.errorBanner, { marginHorizontal: theme.spacing.lg, marginTop: theme.spacing.sm }]}>
+          <Text style={s.errorBannerText}>
+            EXPO_PUBLIC_BACKEND_URL is missing. Live backend data is unavailable until it is configured.
+          </Text>
+        </View>
+      ) : null}
 
       {tab === 'overview' ? (
         <ScrollView
