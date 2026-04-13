@@ -56,13 +56,7 @@ const theme = {
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
 
-const ENV_BASE_URL =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
-const BASE_URL = ENV_BASE_URL;
-const HAS_BACKEND_URL = Boolean(String(ENV_BASE_URL || '').trim());
-const BACKEND_CONFIG_ERROR = HAS_BACKEND_URL
-  ? null
-  : 'Configuration error: EXPO_PUBLIC_BACKEND_URL is required. Backend polling is disabled until it is set.';
+const BASE_URL = 'https://magic-lw8t.onrender.com';
 
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
@@ -83,11 +77,6 @@ function makeHeaders() {
 }
 
 async function apiFetch(path) {
-  if (!HAS_BACKEND_URL) {
-    const e = new Error(BACKEND_CONFIG_ERROR || 'Missing EXPO_PUBLIC_BACKEND_URL');
-    e.status = 503;
-    throw e;
-  }
   const url = `${String(BASE_URL).replace(/\/$/, '')}${path}`;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -343,7 +332,6 @@ function LogsPanel({ logsRef }) {
   }, [logs, logsRef]);
 
   const fetchLogs = useCallback(async () => {
-    if (!HAS_BACKEND_URL) return;
     try {
       const since = lastTsRef.current;
       const data = await apiFetch(`/debug/logs?since=${since}&limit=200`);
@@ -358,9 +346,6 @@ function LogsPanel({ logsRef }) {
   }, []);
 
   useEffect(() => {
-    if (!HAS_BACKEND_URL) {
-      return undefined;
-    }
     fetchLogs();
     const id = setInterval(fetchLogs, LOG_POLL_MS);
     return () => clearInterval(id);
@@ -447,13 +432,6 @@ function AppInner() {
   const logsDataRef = useRef([]);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
-    if (!HAS_BACKEND_URL) {
-      setDashboard(null);
-      setLoading(false);
-      setRefreshing(false);
-      setError(BACKEND_CONFIG_ERROR);
-      return;
-    }
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
@@ -471,9 +449,6 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
-    if (!HAS_BACKEND_URL) {
-      return undefined;
-    }
     load();
     const id = setInterval(() => load(), POLL_MS);
     return () => clearInterval(id);
@@ -575,13 +550,6 @@ function AppInner() {
       </View>
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
-      {!HAS_BACKEND_URL ? (
-        <View style={[s.errorBanner, { marginHorizontal: theme.spacing.lg, marginTop: theme.spacing.sm }]}>
-          <Text style={s.errorBannerText}>
-            EXPO_PUBLIC_BACKEND_URL is missing. Live backend data is unavailable until it is configured.
-          </Text>
-        </View>
-      ) : null}
 
       {tab === 'overview' ? (
         <ScrollView
