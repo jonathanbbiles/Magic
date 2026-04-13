@@ -786,6 +786,20 @@ app.get('/dashboard', async (req, res) => {
         : Number.isFinite(sellOrderLimitFromState)
           ? 'exit_state'
           : null;
+      const visibleOpenSell = Number.isFinite(activeSellLimitFromOrders);
+      const managingWithVisibleSell = lifecycleState === 'managing' && visibleOpenSell;
+      const inferredExpectedOpenSell = managingWithVisibleSell
+        ? true
+        : Boolean(botState?.expectedOpenSell);
+      const inferredBrokerOpenSellFound = managingWithVisibleSell
+        ? true
+        : Boolean(botState?.brokerOpenSellFound);
+      const inferredReconciliationState = botState?.reconciliationState
+        || (managingWithVisibleSell ? 'open_sell_found' : null);
+      const inferredLastReconciliationAction = botState?.lastReconciliationAction
+        || (managingWithVisibleSell ? 'dashboard_open_orders_visible' : null);
+      const inferredTargetPriceSource = botState?.targetPriceSource
+        || (Number.isFinite(activeSellLimit) ? 'open_orders' : null);
       if (!botState && lifecycleState === 'managing') {
         console.warn('ambiguous_exit_state_detected', {
           symbol,
@@ -829,14 +843,14 @@ app.get('/dashboard', async (req, res) => {
           entryPriceUsed: toFiniteNumberOrNull(botState?.entryPriceUsed),
           sellOrderId: botState?.sellOrderId || null,
           sellOrderSubmittedAt: botState?.sellOrderSubmittedAt || null,
-          expectedOpenSell: Boolean(botState?.expectedOpenSell),
-          brokerOpenSellFound: Boolean(botState?.brokerOpenSellFound),
+          expectedOpenSell: inferredExpectedOpenSell,
+          brokerOpenSellFound: inferredBrokerOpenSellFound,
           brokerOpenSellQty: toFiniteNumberOrNull(botState?.brokerOpenSellQty),
           lastSeenOpenSellAt: botState?.lastSeenOpenSellAt || null,
-          reconciliationState: botState?.reconciliationState || null,
+          reconciliationState: inferredReconciliationState,
           reconciliationReason: botState?.reconciliationReason || null,
-          lastReconciliationAction: botState?.lastReconciliationAction || null,
-          targetPriceSource: botState?.targetPriceSource || null,
+          lastReconciliationAction: inferredLastReconciliationAction,
+          targetPriceSource: inferredTargetPriceSource,
           unresolvedManagedState: Boolean(!botState && lifecycleState === 'managing'),
           unresolvedManagedReason: !botState && lifecycleState === 'managing'
             ? 'lifecycle_managing_without_exit_state'
@@ -935,6 +949,11 @@ app.get('/dashboard', async (req, res) => {
           dataRejectionCount: staleDataRejectionCount,
           staleDataRejectionCount,
           staleCooldownSuppressionCount,
+          symbolHealthCooldownCount: Number(lastEntryScanSummary?.symbolHealthCooldownCount || 0),
+          symbolHealthCooldownActive: Number(lastEntryScanSummary?.symbolHealthCooldownActive || 0),
+          symbolHealthCooldownSample: Array.isArray(lastEntryScanSummary?.symbolHealthCooldownSample)
+            ? lastEntryScanSummary.symbolHealthCooldownSample
+            : [],
           staleQuoteRejectionCount,
           insufficientBarsCount,
           warmupBlockedCount,
@@ -955,6 +974,7 @@ app.get('/dashboard', async (req, res) => {
             universeSize: Number(entryManagerState?.currentScanUniverseSize || 0),
             state: entryManagerState?.currentScanState || 'idle',
             staleQuoteCooldownCount: Number(entryManagerState?.currentScanStaleQuoteCooldownCount || 0),
+            currentScanSymbolHealthCooldownCount: Number(entryManagerState?.currentScanSymbolHealthCooldownCount || 0),
             stalePrimaryQuoteCount: Number(entryManagerState?.currentScanStalePrimaryQuoteCount || 0),
             dataUnavailableCount: Number(entryManagerState?.currentScanDataUnavailableCount || 0),
             marketRejectionCount: Number(entryManagerState?.currentScanMarketRejectionCount || 0),

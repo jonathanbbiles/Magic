@@ -82,6 +82,7 @@ const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolM
 const { createMarketDataCache } = require('./modules/marketDataCache');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
+const { evaluateEconomicEntryPrefilter } = require('./modules/economicEntryPrefilter');
 const {
   selectMostRecentSellOrder,
   buildLifecycleSnapshot,
@@ -404,6 +405,9 @@ function getEntryDiagnosticsSnapshot() {
     },
     staleQuoteCooldownSample: Array.isArray(lastEntryScanSummary?.staleQuoteCooldownSample)
       ? lastEntryScanSummary.staleQuoteCooldownSample
+      : [],
+    symbolHealthCooldownSample: Array.isArray(lastEntryScanSummary?.symbolHealthCooldownSample)
+      ? lastEntryScanSummary.symbolHealthCooldownSample
       : [],
     topSkipReasonsRolling: Array.from(entrySkipReasonTotals.entries())
       .sort((a, b) => b[1] - a[1])
@@ -1708,6 +1712,46 @@ async function computeEntrySignal(symbol, opts = {}) {
   const spreadBps = ((ask - bid) / mid) * BPS;
   baseRecord.refPrice = mid;
   baseRecord.spreadBps = spreadBps;
+  const economicEdgeRequirements = computeEntryEdgeRequirements({
+    symbol: asset.symbol,
+    spreadBps,
+    targetMoveBps: resolvedEntryTakeProfitBps,
+    symbolTier,
+  });
+  const economicPrefilter = evaluateEconomicEntryPrefilter({
+    spreadBps,
+    edgeRequirements: economicEdgeRequirements,
+  });
+  if (economicPrefilter.shouldSkip) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      symbolTier,
+      spreadBps,
+      requiredEdgeBps: economicEdgeRequirements.requiredEdgeBps,
+      reason: economicPrefilter.reason,
+      maxAffordableSpreadBps: economicPrefilter.maxAffordableSpreadBps,
+      targetMoveBps: economicPrefilter.targetMoveBps,
+      transactionCostBpsNoSpread: economicPrefilter.transactionCostBpsNoSpread,
+      minNetEdgeBps: economicPrefilter.minNetEdgeBps,
+    });
+    return {
+      entryReady: false,
+      why: economicPrefilter.reason,
+      meta: {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        requiredEdgeBps: economicEdgeRequirements.requiredEdgeBps,
+        maxAffordableSpreadBps: economicPrefilter.maxAffordableSpreadBps,
+        targetMoveBps: economicPrefilter.targetMoveBps,
+        feeBpsRoundTrip: economicEdgeRequirements.feeBpsRoundTrip,
+        slippageBps: economicEdgeRequirements.slippageBps,
+        minNetEdgeBps: economicPrefilter.minNetEdgeBps,
+        transactionCostBpsNoSpread: economicPrefilter.transactionCostBpsNoSpread,
+      },
+      record: baseRecord,
+    };
+  }
   const nowMs = Date.now();
   const spreadElasticityMeta = getSpreadElasticityMeta(asset.symbol, spreadBps, nowMs);
 
@@ -3751,6 +3795,17 @@ function updateTrackedSellIdentity(state, {
   state.sellClientOrderId = resolvedClientOrderId;
   state.sellOrderSubmittedAt = resolvedSubmittedAt;
   state.sellOrderLimit = resolvedLimitPrice;
+  state.expectedOpenSell = !shouldClearIdentity;
+
+  if (shouldClearIdentity) {
+    state.reconciliationState = state.reconciliationState || 'open_sell_identity_cleared';
+    state.reconciliationReason = state.reconciliationReason || 'tracked_sell_identity_cleared';
+    state.lastReconciliationAction = 'clear_tracked_sell_identity';
+  } else if (!state.brokerOpenSellFound) {
+    state.reconciliationState = 'open_sell_pending_visibility';
+    state.reconciliationReason = 'awaiting_open_orders_confirmation';
+    state.lastReconciliationAction = 'track_sell_identity_update';
+  }
 
   const sellQty = resolveOrderQty(order);
   if (Number.isFinite(sellQty) && sellQty > 0) {
@@ -4236,6 +4291,7 @@ const entryManagerHeartbeat = {
   currentScanUniverseSize: 0,
   currentScanState: 'idle',
   currentScanStaleQuoteCooldownCount: 0,
+  currentScanSymbolHealthCooldownCount: 0,
   currentScanStalePrimaryQuoteCount: 0,
   currentScanDataUnavailableCount: 0,
   currentScanMarketRejectionCount: 0,
@@ -4298,6 +4354,7 @@ function updateEntryScanProgress({
   universeSize = null,
   state = null,
   staleQuoteCooldownCount = null,
+  symbolHealthCooldownCount = null,
   stalePrimaryQuoteCount = null,
   dataUnavailableCount = null,
   marketRejectionCount = null,
@@ -4309,6 +4366,7 @@ function updateEntryScanProgress({
   if (Number.isFinite(universeSize)) entryManagerHeartbeat.currentScanUniverseSize = Math.max(0, Math.floor(universeSize));
   if (typeof state === 'string' && state.trim()) entryManagerHeartbeat.currentScanState = state.trim();
   if (Number.isFinite(staleQuoteCooldownCount)) entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = Math.max(0, Math.floor(staleQuoteCooldownCount));
+  if (Number.isFinite(symbolHealthCooldownCount)) entryManagerHeartbeat.currentScanSymbolHealthCooldownCount = Math.max(0, Math.floor(symbolHealthCooldownCount));
   if (Number.isFinite(stalePrimaryQuoteCount)) entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = Math.max(0, Math.floor(stalePrimaryQuoteCount));
   if (Number.isFinite(dataUnavailableCount)) entryManagerHeartbeat.currentScanDataUnavailableCount = Math.max(0, Math.floor(dataUnavailableCount));
   if (Number.isFinite(marketRejectionCount)) entryManagerHeartbeat.currentScanMarketRejectionCount = Math.max(0, Math.floor(marketRejectionCount));
@@ -4324,6 +4382,7 @@ function clearEntryScanProgress({ state = 'idle' } = {}) {
   entryManagerHeartbeat.currentScanUniverseSize = 0;
   entryManagerHeartbeat.currentScanState = state;
   entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = 0;
+  entryManagerHeartbeat.currentScanSymbolHealthCooldownCount = 0;
   entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = 0;
   entryManagerHeartbeat.currentScanDataUnavailableCount = 0;
   entryManagerHeartbeat.currentScanMarketRejectionCount = 0;
@@ -7457,6 +7516,13 @@ async function resolveExitSellabilityFromBrokerTruth({
     trackedState.brokerOpenSellQty = finalSellability.openSellQty;
     trackedState.lastSeenOpenSellAt = finalSellability.openSellCount > 0 ? Date.now() : (trackedState.lastSeenOpenSellAt || null);
     trackedState.reconciliationState = finalSellability.openSellCount > 0 ? 'open_sell_found' : 'pending_lookup';
+    trackedState.reconciliationReason = finalSellability.openSellCount > 0 ? null : 'open_sell_lookup_in_progress';
+    trackedState.lastReconciliationAction = finalSellability.openSellCount > 0
+      ? 'refresh_tracked_open_sell'
+      : 'check_open_orders_for_tracked_sell';
+    if (!trackedState.targetPriceSource && Number.isFinite(Number(trackedState.targetPrice))) {
+      trackedState.targetPriceSource = 'reconciled_exit_math';
+    }
     trackedState.reconciliationConfidence = reconciliationConfidence;
     trackedState.orderListOnlyConsecutiveCount = reconciliationConfidence === 'order_list_only'
       ? Number(trackedState.orderListOnlyConsecutiveCount || 0) + 1
@@ -7623,6 +7689,8 @@ async function resolveExitSellabilityFromBrokerTruth({
         trackedState.brokerOpenSellQty = 0;
         trackedState.lastSeenOpenSellAt = null;
         trackedState.reconciliationState = 'open_sell_missing_cleared';
+        trackedState.reconciliationReason = 'tracked_sell_identity_cleared_after_miss_threshold';
+        trackedState.lastReconciliationAction = 'clear_stale_tracked_sell_identity';
         trackedState.reconciliationConfidence = null;
         trackedState.orderListOnlyConsecutiveCount = 0;
         trackedState.lastConfidenceWarningAtCount = 0;
@@ -14771,6 +14839,7 @@ async function runEntryScanOnce() {
     const computeProgressCounters = () => {
       const skipCountsSoFar = buildSkipCountsSoFar();
       const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0) + Number(skipCountsSoFar.symbol_health_cooldown || 0);
+      const symbolHealthCooldownCount = staleQuoteCooldownCount;
       const stalePrimaryQuoteCount = Number(skipCountsSoFar.stale_quote_primary || 0);
       const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
       const marketRejectionCount = Object.entries(skipCountsSoFar)
@@ -14786,6 +14855,7 @@ async function runEntryScanOnce() {
       return {
         skipCountsSoFar,
         staleQuoteCooldownCount,
+        symbolHealthCooldownCount,
         stalePrimaryQuoteCount,
         dataUnavailableCount,
         marketRejectionCount,
@@ -14804,6 +14874,7 @@ async function runEntryScanOnce() {
         universeSize: scanSymbols.length,
         state: 'scanning_symbols',
         staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+        symbolHealthCooldownCount: progressCounters.symbolHealthCooldownCount,
         stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
         dataUnavailableCount: progressCounters.dataUnavailableCount,
         marketRejectionCount: progressCounters.marketRejectionCount,
@@ -14818,6 +14889,7 @@ async function runEntryScanOnce() {
           signalReadyCountSoFar: signalReadyCount,
           skipCountsSoFar: progressCounters.skipCountsSoFar,
           staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+          symbolHealthCooldownCount: progressCounters.symbolHealthCooldownCount,
           stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
           dataUnavailableCount: progressCounters.dataUnavailableCount,
           marketRejectionCount: progressCounters.marketRejectionCount,
@@ -15155,6 +15227,7 @@ async function runEntryScanOnce() {
       return acc;
     }, {});
     const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0) + Number(skipDetailCountsObj.symbol_health_cooldown || 0);
+    const symbolHealthCooldownCount = staleQuoteCooldownCount;
     const stalePrimaryQuoteCount = Number(skipDetailCountsObj.stale_quote_primary || 0);
     const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
     const marketRejectionCount = Object.entries(skipDetailCountsObj)
@@ -15271,11 +15344,14 @@ async function runEntryScanOnce() {
       entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,
       staleQuoteCooldownCount,
+      symbolHealthCooldownCount,
       stalePrimaryQuoteCount,
       dataUnavailableCount,
       marketRejectionCount,
       staleQuoteCooldownActive: staleQuoteCooldownSample.length,
       staleQuoteCooldownSample,
+      symbolHealthCooldownActive: staleQuoteCooldownSample.length,
+      symbolHealthCooldownSample: staleQuoteCooldownSample,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,

@@ -32,6 +32,7 @@ const source = fs.readFileSync(path.resolve(__dirname, 'index.js'), 'utf8');
   'lastEntryScanSummary',
   'currentEntryScanProgress',
   'staleQuoteCooldownCount',
+  'currentScanSymbolHealthCooldownCount',
   'stalePrimaryQuoteCount',
   'dataUnavailableCount',
   'lastSuccessfulAction',
@@ -40,6 +41,9 @@ const source = fs.readFileSync(path.resolve(__dirname, 'index.js'), 'utf8');
   'marketRejectionCount',
   'staleDataRejectionCount',
   'staleCooldownSuppressionCount',
+  'symbolHealthCooldownCount',
+  'symbolHealthCooldownActive',
+  'symbolHealthCooldownSample',
   'warmupBlockedCount',
   'concurrencyRiskGuardCount',
 ].forEach((token) => {
