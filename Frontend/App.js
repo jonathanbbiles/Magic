@@ -56,16 +56,13 @@ const theme = {
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
 
-const FALLBACK_BASE_URL = 'https://magic-lw8t.onrender.com';
 const ENV_BASE_URL =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
-const BASE_URL = ENV_BASE_URL || FALLBACK_BASE_URL;
-if (!ENV_BASE_URL && typeof console !== 'undefined') {
-  console.warn(
-    `[App] EXPO_PUBLIC_BACKEND_URL is not set — falling back to ${FALLBACK_BASE_URL}. ` +
-      'Set EXPO_PUBLIC_BACKEND_URL for local dev.',
-  );
-}
+const BASE_URL = ENV_BASE_URL;
+const HAS_BACKEND_URL = Boolean(String(ENV_BASE_URL || '').trim());
+const BACKEND_CONFIG_ERROR = HAS_BACKEND_URL
+  ? null
+  : 'Configuration error: EXPO_PUBLIC_BACKEND_URL is required. Backend polling is disabled until it is set.';
 
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
@@ -86,6 +83,11 @@ function makeHeaders() {
 }
 
 async function apiFetch(path) {
+  if (!HAS_BACKEND_URL) {
+    const e = new Error(BACKEND_CONFIG_ERROR || 'Missing EXPO_PUBLIC_BACKEND_URL');
+    e.status = 503;
+    throw e;
+  }
   const url = `${String(BASE_URL).replace(/\/$/, '')}${path}`;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -441,6 +443,13 @@ function AppInner() {
   const logsDataRef = useRef([]);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
+    if (!HAS_BACKEND_URL) {
+      setDashboard(null);
+      setLoading(false);
+      setRefreshing(false);
+      setError(BACKEND_CONFIG_ERROR);
+      return;
+    }
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
@@ -458,6 +467,9 @@ function AppInner() {
   }, []);
 
   useEffect(() => {
+    if (!HAS_BACKEND_URL) {
+      return undefined;
+    }
     load();
     const id = setInterval(() => load(), POLL_MS);
     return () => clearInterval(id);
@@ -547,6 +559,18 @@ function AppInner() {
 
   const managedCount = positions.filter((p) => p?.state === 'managing').length;
   const missingCount = positions.filter((p) => p?.state === 'exit_missing').length;
+
+  if (!HAS_BACKEND_URL) {
+    return (
+      <SafeAreaView style={s.safe}>
+        <StatusBar barStyle="dark-content" />
+        <View style={s.errorRoot}>
+          <Text style={s.errorTitle}>Backend URL not configured</Text>
+          <Text style={s.errorMsg}>{BACKEND_CONFIG_ERROR}</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={s.safe}>

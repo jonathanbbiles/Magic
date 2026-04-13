@@ -128,6 +128,48 @@ assert.equal(typeof tradeLifecycle.getPredictorWarmupSnapshot, 'function');
 const lifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
 assert.equal(typeof lifecycleSnapshot, 'object');
 assert.equal(typeof lifecycleSnapshot.authoritativeCount, 'number');
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+  trackedExitState: {
+    qty: 10,
+    entryPrice: 1.25,
+    desiredNetExitBps: 45,
+    sellOrderId: 'sell-123',
+    reconciliationState: 'open_sell_found',
+  },
+});
+const adoptableLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(adoptableLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'managing');
+assert.equal(adoptableLifecycleSnapshot.bySymbol['SKY/USD']?.diagnosticsState, undefined);
+
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+  trackedExitState: {
+    qty: 10,
+    entryPrice: 1.25,
+    requiredExitBps: 55,
+  },
+});
+const reconstructibleLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(reconstructibleLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'managing');
+assert.equal(reconstructibleLifecycleSnapshot.bySymbol['SKY/USD']?.diagnosticsState, undefined);
+
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+});
+const missingLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(missingLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'exit_missing');
+assert.equal(
+  missingLifecycleSnapshot.bySymbol['SKY/USD']?.lifecycleInvariantViolation,
+  'lifecycle_managing_without_exit_state',
+);
+tradeLifecycle.__clearLifecycleStateForTests();
 const governorSnapshot = tradeLifecycle.getSessionGovernorSummary();
 assert.equal(typeof governorSnapshot.coolDownActive, 'boolean');
 const universeSnapshot = tradeLifecycle.getUniverseDiagnosticsSnapshot();
