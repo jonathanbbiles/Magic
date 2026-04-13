@@ -996,7 +996,10 @@ let lastUniverseDiagnostics = {
   dynamicRejectedUnsupportedCount: 0,
   dynamicRejectedDuplicateCount: 0,
   acceptedSymbolsCount: 0,
+  scanSymbolsCount: 0,
   acceptedSymbolsSample: [],
+  dynamicAcceptedSymbolsCount: 0,
+  dynamicAcceptedSymbolsSample: [],
   fallbackOccurred: false,
   configuredPrimaryCount: 0,
   configuredSecondaryCount: 0,
@@ -4760,6 +4763,8 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
     supportedCryptoPairsState.stats = dynamicUniverse.stats;
     lastUniverseDiagnostics = {
       ...lastUniverseDiagnostics,
+      effectiveUniverseMode: lastUniverseDiagnostics.effectiveUniverseMode || 'dynamic_full_universe',
+      dynamicUniverseActive: true,
       dynamicUniverseInitInProgress: false,
       dynamicUniverseInitCompletedAt: supportedCryptoPairsState.lastUpdated,
       dynamicUniverseInitFailedAt: null,
@@ -4769,6 +4774,10 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       dynamicRejectedMalformedCount: dynamicUniverse.stats.malformedCount,
       dynamicRejectedUnsupportedCount: dynamicUniverse.stats.unsupportedCount,
       dynamicRejectedDuplicateCount: dynamicUniverse.stats.duplicateCount,
+      acceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
+      dynamicAcceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
+      acceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
+      dynamicAcceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
       lastUniverseRefreshAt: supportedCryptoPairsState.lastUpdated,
     };
     console.log('entry_universe_dynamic_sync', {
@@ -9677,8 +9686,43 @@ async function submitStopTriggeredExit({
     allowSellBelowMin: false,
     bypassDisable: true,
   });
+  let finalIocResult = iocResult;
+  if (iocResult?.skipped && iocResult?.reason === 'no_position_qty') {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const brokerTruth = await resolveExitSellabilityFromBrokerTruth({
+        symbol,
+        maxAttempts: 2,
+        retryMs: 300,
+      });
+      if (brokerTruth?.openSellCount > 0) break;
+      if (!(brokerTruth?.availableQty > 0)) {
+        await sleep(200);
+        continue;
+      }
+      const retryQty = Number.isFinite(Number(qty)) && Number(qty) > 0
+        ? Math.min(Number(qty), Number(brokerTruth.availableQty))
+        : Number(brokerTruth.availableQty);
+      console.log('stop_trigger_recheck_retry', {
+        symbol,
+        attempt,
+        availableQty: Number(brokerTruth.availableQty) || 0,
+        retryQty,
+      });
+      finalIocResult = await submitIocLimitSell({
+        symbol,
+        qty: retryQty,
+        limitPrice: iocLimit,
+        reason,
+        allowSellBelowMin: false,
+        bypassDisable: true,
+      });
+      if (finalIocResult?.order?.id || finalIocResult?.order?.order_id) break;
+      if (finalIocResult?.reason !== 'no_position_qty') break;
+      await sleep(200);
+    }
+  }
 
-  const hasOrder = Boolean(iocResult?.order?.id || iocResult?.order?.order_id);
+  const hasOrder = Boolean(finalIocResult?.order?.id || finalIocResult?.order?.order_id);
   if (hasOrder) {
     stateRef.exitExecutionState = 'exit_submitted';
     stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
@@ -9687,30 +9731,30 @@ async function submitStopTriggeredExit({
     stateRef.reconciliationReason = 'stop_trigger_exit_submitted';
     stateRef.lastReconciliationAction = 'submit_stop_trigger_exit';
     updateIntentState(symbol, { state: 'stop_triggered_exit_pending', stopTriggeredAt: stateRef.stopTriggeredAt });
-    console.log('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, orderId: iocResult?.order?.id || iocResult?.order?.order_id || null });
-    return { ok: true, state: stateRef.exitExecutionState, submitted: true, result: iocResult };
+    console.log('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, orderId: finalIocResult?.order?.id || finalIocResult?.order?.order_id || null });
+    return { ok: true, state: stateRef.exitExecutionState, submitted: true, result: finalIocResult };
   }
 
-  stateRef.exitExecutionState = iocResult?.reason === 'ioc_disabled' ? 'exit_retry_pending' : 'exit_failed_needs_repair';
+  stateRef.exitExecutionState = finalIocResult?.reason === 'ioc_disabled' ? 'exit_retry_pending' : 'exit_failed_needs_repair';
   stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
   stateRef.stopTriggerReason = reason;
   stateRef.reconciliationState = stateRef.exitExecutionState;
-  stateRef.reconciliationReason = iocResult?.reason || 'stop_trigger_submit_failed';
+  stateRef.reconciliationReason = finalIocResult?.reason || 'stop_trigger_submit_failed';
   stateRef.lastReconciliationAction = 'schedule_stop_trigger_retry';
   updateIntentState(symbol, { state: stateRef.exitExecutionState });
   console.warn('exit_retry_scheduled', {
     symbol,
     reason,
     exitState: stateRef.exitExecutionState,
-    submitReason: iocResult?.reason || null,
+    submitReason: finalIocResult?.reason || null,
   });
   console.warn('stop_trigger_submit_result', {
     symbol,
     reason,
     state: stateRef.exitExecutionState,
-    submitReason: iocResult?.reason || null,
+    submitReason: finalIocResult?.reason || null,
   });
-  return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: iocResult };
+  return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: finalIocResult };
 }
 
 async function attachInitialExitLimit({
@@ -10850,6 +10894,11 @@ async function repairOrphanExits() {
         adoptedLimit,
         positionQty: qty,
         orderQty: adoptedQty,
+      });
+      updateIntentState(symbol, {
+        state: 'managing',
+        exitOrderId: adoptedOrderId || null,
+        reservedQty: Number.isFinite(adoptedQty) ? adoptedQty : qty,
       });
 
       if (STOPS_ENABLED && STOPLOSS_ENABLED) {
@@ -13069,6 +13118,7 @@ async function manageExitStates() {
             limitPrice: roundDownToTick(bid, symbol),
             reason: 'failed_trade',
             allowSellBelowMin: false,
+            bypassDisable: true,
           });
           const requestedQty = ioc?.requestedQty;
           const filledQty = normalizeFilledQty(ioc?.order);
@@ -13085,6 +13135,7 @@ async function manageExitStates() {
             });
             realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
           }
+          const exitSubmitted = Boolean(realizedOrderId);
           console.log('exit_failed_trade', {
             symbol,
             ageSec: heldSeconds,
@@ -13093,20 +13144,31 @@ async function manageExitStates() {
             entryMomentumState: failedTradeDecision.entryMomentumState,
             currentMomentumState: failedTradeDecision.currentMomentumState,
             reason: failedTradeDecision.reason,
+            exitSubmitted,
+            submitReason: ioc?.reason || null,
+            orderId: realizedOrderId || null,
           });
-          exitState.delete(symbol);
-          actionTaken = 'failed_trade_exit';
-          reasonCode = 'failed_trade';
-          lastActionAt.set(symbol, now);
-          await logExitRealized({
-            symbol,
-            entryPrice: state.entryPrice,
-            feeBpsRoundTrip,
-            entrySpreadBpsUsed: state.entrySpreadBpsUsed,
-            heldSeconds,
-            reasonCode,
-            orderId: realizedOrderId,
-          });
+          if (exitSubmitted) {
+            exitState.delete(symbol);
+            actionTaken = 'failed_trade_exit';
+            reasonCode = 'failed_trade';
+            lastActionAt.set(symbol, now);
+            await logExitRealized({
+              symbol,
+              entryPrice: state.entryPrice,
+              feeBpsRoundTrip,
+              entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+              heldSeconds,
+              reasonCode,
+              orderId: realizedOrderId,
+            });
+          } else {
+            state.exitExecutionState = 'exit_retry_pending';
+            state.reconciliationState = 'exit_retry_pending';
+            state.reconciliationReason = ioc?.reason || 'failed_trade_exit_not_submitted';
+            state.lastReconciliationAction = 'failed_trade_exit_not_submitted';
+            updateIntentState(symbol, { state: 'exit_retry_pending' });
+          }
           continue;
         }
 
@@ -14325,11 +14387,25 @@ async function runEntryScanOnce() {
     return;
   }
   if (PREDICTOR_WARMUP_BLOCK_TRADES && warmupSnapshot?.inProgress === true) {
+    const supportedSnapshot = getSupportedCryptoPairsSnapshot();
+    const supportedStats = supportedSnapshot?.stats || null;
     emitEntryScanNoopSummary({ startMs, reason: 'warmup_in_progress' });
     clearEntryScanProgress({ state: 'idle' });
     setEngineState('warming_up', { reason: 'warmup_in_progress' });
     lastUniverseDiagnostics = {
       ...lastUniverseDiagnostics,
+      dynamicUniverseActive: supportedCryptoPairsState.loaded || lastUniverseDiagnostics.dynamicUniverseActive,
+      effectiveUniverseMode: lastUniverseDiagnostics.effectiveUniverseMode || 'dynamic_full_universe',
+      dynamicTradableSymbolsFound: supportedStats?.tradableCryptoCount ?? lastUniverseDiagnostics.dynamicTradableSymbolsFound,
+      acceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.acceptedSymbolsCount,
+      dynamicAcceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.dynamicAcceptedSymbolsCount,
+      acceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : lastUniverseDiagnostics.acceptedSymbolsSample,
+      dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : lastUniverseDiagnostics.dynamicAcceptedSymbolsSample,
+      lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || lastUniverseDiagnostics.lastUniverseRefreshAt,
       entryScanBlockedBy: 'warmup_in_progress',
     };
     entryScanRunning = false;
@@ -14562,9 +14638,14 @@ async function runEntryScanOnce() {
       dynamicRejectedMalformedCount: dynamicUniverseStats?.malformedCount ?? 0,
       dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
       dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
-      acceptedSymbolsCount: scanSymbols.length,
+      acceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? scanSymbols.length,
+      scanSymbolsCount: scanSymbols.length,
+      dynamicAcceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? 0,
       universeSymbolCap: effectiveUniverseCap,
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs)
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : [],
       fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
