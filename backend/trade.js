@@ -81,6 +81,10 @@ const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { createMarketDataCache } = require('./modules/marketDataCache');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
+const {
+  selectMostRecentSellOrder,
+  buildLifecycleSnapshot,
+} = require('./modules/exitLifecycle');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { resolveStoragePaths } = require('./modules/storagePaths');
@@ -10584,15 +10588,7 @@ async function repairOrphanExits() {
           const orderQty = resolveOrderQty(order);
           return Number.isFinite(orderQty) && orderQty > 0 && orderHasValidLimit(order);
         });
-        const bestOrder = openSellCandidates.reduce((best, candidate) => {
-          const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
-          const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
-          const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
-          const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
-          const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
-          const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
-          return safeCandidateTs > safeBestTs ? candidate : best;
-        }, openSellCandidates[0] || null);
+        const bestOrder = selectMostRecentSellOrder(openSellCandidates);
         const refreshedSellOrderId = bestOrder?.id || bestOrder?.order_id || null;
         const refreshedSellOrderLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
         const refreshedSellOrderQty = resolveOrderQty(bestOrder);
@@ -10720,15 +10716,7 @@ async function repairOrphanExits() {
         continue;
       }
 
-      const bestOrder = openSellCandidates.reduce((best, candidate) => {
-        const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
-        const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
-        const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
-        const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
-        const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
-        const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
-        return safeCandidateTs > safeBestTs ? candidate : best;
-      }, openSellCandidates[0]);
+      const bestOrder = selectMostRecentSellOrder(openSellCandidates);
 
       const adoptedOrderId = bestOrder?.id || bestOrder?.order_id || null;
       const adoptedLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
@@ -17377,74 +17365,12 @@ function getAlpacaBaseStatus() {
 
 
 function getLifecycleSnapshot() {
-  const bySymbol = {};
-  for (const [symbol, state] of entryIntentState.entries()) {
-    bySymbol[symbol] = { ...state };
-  }
-  const diagnostics = {
-    exitMissingCount: 0,
-    repairingExitCount: 0,
-    orphanPositionCount: 0,
-    stopTriggeredExitPendingCount: 0,
-    managingWithoutExitCount: 0,
-  };
-  for (const [symbol, state] of exitState.entries()) {
-    const existing = bySymbol[symbol] || {};
-    const lifecycleState = String(existing.state || '').toLowerCase();
-    const hasTrackedExitPlan = Boolean(state && (state.sellOrderId || state.targetPrice || state.requiredExitBps || state.exitExecutionState));
-    if (lifecycleState === 'managing' && !hasTrackedExitPlan) {
-      diagnostics.managingWithoutExitCount += 1;
-      diagnostics.exitMissingCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'exit_missing',
-        diagnosticsState: 'exit_missing',
-        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
-      };
-      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
-      continue;
-    }
-    if (state?.exitExecutionState === 'exit_retry_pending' || state?.exitExecutionState === 'exit_failed_needs_repair') {
-      diagnostics.repairingExitCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'repairing_exit',
-        diagnosticsState: state?.exitExecutionState,
-      };
-    } else if (state?.exitExecutionState === 'exit_submitted') {
-      diagnostics.stopTriggeredExitPendingCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'stop_triggered_exit_pending',
-        diagnosticsState: 'stop_triggered_exit_pending',
-      };
-    } else if (!bySymbol[symbol]) {
-      diagnostics.orphanPositionCount += 1;
-      bySymbol[symbol] = {
-        symbol,
-        state: 'orphan_position',
-        diagnosticsState: 'orphan_position',
-      };
-    }
-  }
-  for (const [symbol, state] of Object.entries(bySymbol)) {
-    if (String(state?.state || '').toLowerCase() === 'managing' && !exitState.has(symbol)) {
-      diagnostics.managingWithoutExitCount += 1;
-      diagnostics.exitMissingCount += 1;
-      bySymbol[symbol] = {
-        ...state,
-        state: 'exit_missing',
-        diagnosticsState: 'exit_missing',
-        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
-      };
-      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
-    }
-  }
-  return {
-    bySymbol,
+  return buildLifecycleSnapshot({
+    entryIntentState,
+    exitState,
     authoritativeCount: authoritativeTradeState.size,
-    diagnostics,
-  };
+    hasPendingExitAttach,
+  });
 }
 
 function getSessionGovernorSummary() {
@@ -17775,5 +17701,29 @@ module.exports = {
   __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
   __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
   __getScanMarketDataCacheForTests: () => scanMarketDataCache,
+  __setLifecycleStateForTests: ({ symbol, intentState = null, trackedExitState = null, pendingExitAttach = null }) => {
+    const normalized = normalizeSymbol(symbol);
+    if (!normalized) return;
+    if (intentState && typeof intentState === 'object') {
+      entryIntentState.set(normalized, { ...intentState, symbol: normalized });
+    } else {
+      entryIntentState.delete(normalized);
+    }
+    if (trackedExitState && typeof trackedExitState === 'object') {
+      exitState.set(normalized, { ...trackedExitState, symbol: normalized });
+    } else {
+      exitState.delete(normalized);
+    }
+    if (pendingExitAttach && typeof pendingExitAttach === 'object') {
+      pendingExitAttachBySymbol.set(normalized, { ...pendingExitAttach });
+    } else {
+      pendingExitAttachBySymbol.delete(normalized);
+    }
+  },
+  __clearLifecycleStateForTests: () => {
+    entryIntentState.clear();
+    exitState.clear();
+    pendingExitAttachBySymbol.clear();
+  },
 
 };
