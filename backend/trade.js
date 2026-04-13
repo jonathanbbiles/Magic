@@ -81,6 +81,7 @@ const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { createMarketDataCache } = require('./modules/marketDataCache');
 const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
+const { createSymbolHealthTracker } = require('./modules/symbolHealth');
 const {
   selectMostRecentSellOrder,
   buildLifecycleSnapshot,
@@ -336,7 +337,7 @@ function getQuoteFreshnessPolicy() {
 function classifyEntrySkipReason(reason) {
   const normalized = String(reason || '').toLowerCase();
   if (!normalized) return 'market';
-  if (normalized === 'stale_quote_cooldown') return 'cooldown';
+  if (normalized === 'stale_quote_cooldown' || normalized === 'symbol_health_cooldown') return 'cooldown';
   if (
     normalized.includes('stale') ||
     normalized.includes('quote') ||
@@ -473,61 +474,44 @@ function noteBarsFallbackAttempt(symbol, timeframe, { success = false } = {}) {
   });
 }
 
-function getStaleQuoteCooldownState(symbol) {
-  const key = normalizeSymbol(symbol);
-  const state = staleQuoteSkipStateBySymbol.get(key) || { attempts: 0, untilMs: 0, skipCount: 0, reason: null, quoteAgeMs: null };
-  const nowMs = Date.now();
-  return {
-    key,
-    attempts: Number(state.attempts) || 0,
-    skipCount: Number(state.skipCount) || 0,
-    untilMs: Number(state.untilMs) || 0,
-    reason: state.reason || null,
-    quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
-    active: Number(state.untilMs) > nowMs,
-    remainingMs: Number(state.untilMs) > nowMs ? Number(state.untilMs) - nowMs : 0,
-  };
-}
-
 function noteStaleQuoteSkip(symbol, options = {}) {
-  const prev = getStaleQuoteCooldownState(symbol);
-  const attempts = prev.attempts + 1;
   const quoteAgeMs = Number(options?.quoteAgeMs);
   const requestedCooldownMs = Number(options?.cooldownMs);
   const adaptiveHopelessCooldownMs = Number.isFinite(quoteAgeMs) && quoteAgeMs > 0
     ? Math.min(15 * 60 * 1000, Math.max(STALE_QUOTE_HOPELESS_COOLDOWN_MS, Math.floor(quoteAgeMs / 4)))
     : STALE_QUOTE_HOPELESS_COOLDOWN_MS;
   const requestedReason = String(options?.reason || '').toLowerCase();
+  const current = symbolHealthTracker.getCooldown(symbol);
+  const attempts = Math.max(1, Number(current.failures || 0) + 1);
   const baseCooldownMs = requestedReason === 'stale_quote_hopeless'
     ? adaptiveHopelessCooldownMs
-    : Math.min(
-      STALE_QUOTE_SCAN_COOLDOWN_MAX_MS,
-      STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * Math.max(1, 2 ** Math.max(0, attempts - 1)),
-    );
+    : Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * Math.max(1, attempts));
   const cooldownMs = Number.isFinite(requestedCooldownMs) && requestedCooldownMs > 0
     ? requestedCooldownMs
     : baseCooldownMs;
-  staleQuoteSkipStateBySymbol.set(prev.key, {
-    attempts,
-    skipCount: prev.skipCount + 1,
-    untilMs: Date.now() + cooldownMs,
-    reason: options?.reason || null,
+  symbolHealthTracker.recordFailure(symbol, 'stale_quote_primary', {
+    cooldownMs,
+    reason: options?.reason || 'stale_quote_primary',
     quoteAgeMs: Number.isFinite(quoteAgeMs) ? quoteAgeMs : null,
   });
 }
 
 function clearStaleQuoteSkipState(symbol) {
-  if (!symbol) return;
-  const key = normalizeSymbol(symbol);
-  if (!staleQuoteSkipStateBySymbol.has(key)) return;
-  const prev = staleQuoteSkipStateBySymbol.get(key);
-  staleQuoteSkipStateBySymbol.set(key, {
-    attempts: 0,
-    skipCount: Number(prev?.skipCount) || 0,
-    untilMs: 0,
-    reason: null,
-    quoteAgeMs: null,
-  });
+  symbolHealthTracker.clearFailure(symbol, 'stale_quote_primary');
+}
+
+function getStaleQuoteCooldownState(symbol) {
+  const cooldown = symbolHealthTracker.getCooldown(symbol);
+  return {
+    key: normalizeSymbol(symbol),
+    attempts: Number(cooldown.failures) || 0,
+    skipCount: Number(cooldown.failures) || 0,
+    untilMs: Number(cooldown.untilMs) || 0,
+    reason: cooldown.reason || null,
+    quoteAgeMs: Number.isFinite(Number(cooldown.quoteAgeMs)) ? Number(cooldown.quoteAgeMs) : null,
+    active: Boolean(cooldown.active && String(cooldown.reason || '').includes('stale_quote')),
+    remainingMs: Number(cooldown.remainingMs) || 0,
+  };
 }
 
 function incrementEntrySkipReasonTotal(reason) {
@@ -4027,11 +4011,19 @@ const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
-const staleQuoteSkipStateBySymbol = new Map();
 const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 20 * 60 * 1000;
 const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 30000);
 const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 4, 600000);
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
+const symbolHealthTracker = createSymbolHealthTracker({
+  reasonPolicies: {
+    stale_quote_primary: { threshold: 1, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS },
+    marketdata_unavailable: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS, 30000) },
+    ob_depth_insufficient: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 45000) },
+    predictor_warmup: { threshold: 3, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 60000) },
+    sparse_fallback_rejected: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 60000) },
+  },
+});
 const ENTRY_SCAN_PROGRESS_HEARTBEAT_MS = Math.max(2000, Math.min(ENTRY_SCAN_INTERVAL_MS, 5000));
 const ENTRY_SKIP_REASON_TOTALS_MAX_KEYS = 50;
 const entrySkipReasonTotals = new Map();
@@ -14778,7 +14770,7 @@ async function runEntryScanOnce() {
     }, {});
     const computeProgressCounters = () => {
       const skipCountsSoFar = buildSkipCountsSoFar();
-      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0);
+      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0) + Number(skipCountsSoFar.symbol_health_cooldown || 0);
       const stalePrimaryQuoteCount = Number(skipCountsSoFar.stale_quote_primary || 0);
       const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
       const marketRejectionCount = Object.entries(skipCountsSoFar)
@@ -14884,16 +14876,17 @@ async function runEntryScanOnce() {
           continue;
         }
       }
-      const staleCooldown = getStaleQuoteCooldownState(symbol);
-      if (staleCooldown.active) {
+      const symbolEligibility = symbolHealthTracker.evaluateEligibility(symbol);
+      if (!symbolEligibility.eligible) {
+        const cooldown = symbolEligibility.cooldown || {};
         skipped += 1;
-        recordSkip('stale_quote_cooldown', symbol, {
-          untilMs: staleCooldown.untilMs,
-          remainingMs: staleCooldown.remainingMs,
-          attempts: staleCooldown.attempts,
+        recordSkip('symbol_health_cooldown', symbol, {
+          untilMs: cooldown.untilMs || 0,
+          remainingMs: cooldown.remainingMs || 0,
+          attempts: cooldown.failures || 0,
           suppressed: true,
-          reason: staleCooldown.reason || null,
-          quoteAgeMs: staleCooldown.quoteAgeMs,
+          reason: cooldown.reason || null,
+          quoteAgeMs: Number.isFinite(Number(cooldown.quoteAgeMs)) ? Number(cooldown.quoteAgeMs) : null,
         });
         continue;
       }
@@ -14929,11 +14922,16 @@ async function runEntryScanOnce() {
         if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) {
           entryStaleQuoteSkipCount += 1;
           noteStaleQuoteSkip(symbol);
-        } else {
-          clearStaleQuoteSkipState(symbol);
         }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
+        if (['stale_quote_primary', 'marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(skipReason)) {
+          symbolHealthTracker.recordFailure(symbol, skipReason, signal.meta || {});
+        } else if (shouldCountSparseFallbackReject({ marketDataEval: signal.meta }) || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signal?.meta?.sparseRetry })) {
+          symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signal.meta || {});
+        } else {
+          symbolHealthTracker.noteHealthy(symbol);
+        }
         recordSkip(skipReason, symbol, signal.meta || null);
         if (recordBase) {
           recordBase.decision = 'skipped';
@@ -14947,7 +14945,7 @@ async function runEntryScanOnce() {
       }
 
       signalReadyCount += 1;
-      clearStaleQuoteSkipState(symbol);
+      symbolHealthTracker.noteHealthy(symbol);
       const riskGuard = await maybeUpdateRiskGuards();
       if (!riskGuard.ok || tradingHaltedReason || tradingHaltedByGuard) {
         skipped += 1;
@@ -15156,7 +15154,7 @@ async function runEntryScanOnce() {
       acc[reason] = count;
       return acc;
     }, {});
-    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0);
+    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0) + Number(skipDetailCountsObj.symbol_health_cooldown || 0);
     const stalePrimaryQuoteCount = Number(skipDetailCountsObj.stale_quote_primary || 0);
     const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
     const marketRejectionCount = Object.entries(skipDetailCountsObj)
@@ -15230,18 +15228,14 @@ async function runEntryScanOnce() {
         });
         return acc;
       }, {});
-    const staleQuoteCooldownSample = Array.from(staleQuoteSkipStateBySymbol.entries())
-      .filter(([, state]) => Number(state?.untilMs) > endMs)
-      .sort((a, b) => Number(b?.[1]?.untilMs || 0) - Number(a?.[1]?.untilMs || 0))
-      .slice(0, 8)
-      .map(([symbol, state]) => ({
-        symbol,
-        untilMs: Number(state?.untilMs) || 0,
-        remainingMs: Math.max(0, Number(state?.untilMs || 0) - endMs),
-        attempts: Number(state?.attempts) || 0,
-        reason: state?.reason || null,
-        quoteAgeMs: Number.isFinite(Number(state?.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
-      }));
+    const staleQuoteCooldownSample = symbolHealthTracker.listActiveCooldowns({ limit: 8 }).map((state) => ({
+      symbol: state.symbol,
+      untilMs: Number(state.untilMs) || 0,
+      remainingMs: Number(state.remainingMs) || 0,
+      attempts: Number(state.failures) || 0,
+      reason: state.reason || null,
+      quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
+    }));
     const completedSummary = {
       startMs,
       endMs,
