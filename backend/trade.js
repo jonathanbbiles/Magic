@@ -2085,6 +2085,9 @@ async function computeEntrySignal(symbol, opts = {}) {
     nowMs: Date.now(),
     maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
   });
+  if (primaryQuoteViabilityFinal.ok) {
+    clearStaleQuoteSkipState(asset.symbol);
+  }
   const quoteHopelesslyStale = Number.isFinite(primaryQuoteViabilityFinal.quoteAgeMs)
     && primaryQuoteViabilityFinal.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
   if (!primaryQuoteViabilityFinal.ok) {
@@ -4344,7 +4347,7 @@ const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
 const symbolHealthTracker = createSymbolHealthTracker({
   reasonPolicies: {
-    stale_quote_primary: { threshold: 1, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS },
+    stale_quote_primary: { threshold: 3, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS },
     marketdata_unavailable: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS, 30000) },
     ob_depth_insufficient: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 45000) },
     predictor_warmup: { threshold: 3, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 60000) },
@@ -15438,7 +15441,7 @@ async function runEntryScanOnce() {
         }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
-        if (['stale_quote_primary', 'marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(skipReason)) {
+        if (['marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(skipReason)) {
           symbolHealthTracker.recordFailure(symbol, skipReason, signal.meta || {});
         } else if (shouldCountSparseFallbackReject({ marketDataEval: signal.meta }) || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signal?.meta?.sparseRetry })) {
           symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signal.meta || {});

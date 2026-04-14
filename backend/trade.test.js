@@ -381,13 +381,22 @@ assert.equal(
 __testClearStaleQuoteSkipState('XRP/USD');
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
 const cooldown1 = __testGetStaleQuoteCooldownState('XRP/USD');
-assert.equal(cooldown1.active, true);
+assert.equal(cooldown1.active, false);
 const remaining1 = cooldown1.remainingMs;
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
 const cooldown2 = __testGetStaleQuoteCooldownState('XRP/USD');
-assert.equal(cooldown2.active, true);
-assert.ok(cooldown2.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
-assert.equal(cooldown2.quoteAgeMs, 90000);
+assert.equal(cooldown2.active, false);
+assert.equal(cooldown2.remainingMs, remaining1);
+__testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
+const cooldown3 = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(cooldown3.active, true);
+assert.ok(cooldown3.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
+assert.equal(cooldown3.quoteAgeMs, 90000);
+
+__testClearStaleQuoteSkipState('XRP/USD');
+const recoveredCooldown = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(recoveredCooldown.active, false);
+assert.equal(recoveredCooldown.attempts, 0);
 
 const recoveredStaleMeta = __testExtractStaleQuoteMeta({
   error: {
@@ -406,7 +415,11 @@ assert.equal(typeof recoveredStaleMeta.hopelesslyStale, 'boolean');
 
 __testClearStaleQuoteSkipState('ADA/USD');
 __testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
-const hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
+let hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
+assert.equal(hopelessCooldown.active, false);
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
 assert.equal(hopelessCooldown.active, true);
 assert.equal(hopelessCooldown.reason, 'stale_quote_primary');
 assert.equal(hopelessCooldown.quoteAgeMs, 160000);
@@ -423,6 +436,8 @@ assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetConfigured: ORDERBOOK_
 assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetEffective: sparseConfirmBudgetEffective'));
 assert.ok(tradeSourceEarly.includes('providerAgeMs: sparseRetryDetails.providerAgeMs'));
 assert.ok(tradeSourceEarly.includes('entryQuoteFreshness: getQuoteFreshnessPolicy()'));
+assert.ok(tradeSourceEarly.includes("stale_quote_primary: { threshold: 3, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS }"));
+assert.ok(tradeSourceEarly.includes('clearStaleQuoteSkipState(asset.symbol);'));
 assert.ok(!tradeSourceEarly.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
 assert.ok(!tradeSourceEarly.includes("const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);"));
 assert.ok(tradeSourceEarly.includes("console.log('engine_transition'"));
