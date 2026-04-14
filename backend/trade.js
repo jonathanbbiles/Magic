@@ -61,7 +61,6 @@ const {
 const { computeATR, atrToBps } = require('./modules/indicators');
 const { computeCorrelationMatrix, clusterSymbols } = require('./modules/correlation');
 const { planTwap, computeNextLimitPrice } = require('./modules/twap');
-const quoteRouter = require('./modules/quotes');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -131,8 +130,6 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 );
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
-const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED === 'true');
-const SECONDARY_QUOTE_ROUTER_CONFIG = quoteRouter.getSecondaryQuoteConfig();
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -1754,7 +1751,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       coordinator: entryMarketDataCoordinator,
       marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
-      fetchQuote: getEntryScanQuoteWithSecondaryRescue,
+      fetchQuote: getEntryScanQuoteWithPrimaryRetry,
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -1775,7 +1772,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       });
       if (!staleMeta.hopelesslyStale) {
-        const refreshedQuote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+        const refreshedQuote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
           maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
           forceRefresh: true,
           bypassCache: true,
@@ -1819,7 +1816,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   } else {
     try {
-      quote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+      quote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     } catch (err) {
       const quoteFetchReason = classifyQuoteFetchFailureReason(err, 'marketdata_unavailable');
       if (quoteFetchReason === 'stale_quote_primary') {
@@ -1830,7 +1827,7 @@ async function computeEntrySignal(symbol, opts = {}) {
           maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         });
         if (!staleMeta.hopelesslyStale) {
-          const refreshedQuote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+          const refreshedQuote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
             maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
             forceRefresh: true,
             bypassCache: true,
@@ -2015,7 +2012,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
 
   const forceRefreshStaleQuoteOnce = async () => {
-    const refreshed = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+    const refreshed = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
       maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       forceRefresh: true,
       bypassCache: true,
@@ -5926,97 +5923,38 @@ function computeNotionalForEntry({
 }
 
 async function getQuoteForTrading(symbol, opts = {}) {
-  if (!SECONDARY_QUOTE_ENABLED) {
-    return getLatestQuote(symbol, opts);
-  }
-  const best = await quoteRouter.getBestQuote(symbol, opts);
-  if (!best || !Number.isFinite(best.bid) || !Number.isFinite(best.ask)) {
-    throw new Error(`Quote unavailable for ${symbol}`);
-  }
-  const quoteAgeMs = Number.isFinite(best.ts) ? Math.max(0, Date.now() - best.ts) : null;
-  console.log('quote_source', {
-    symbol: normalizeSymbol(symbol),
-    source: best.source || 'unknown',
-    quoteAgeMs,
-    maxAgeMs: Number.isFinite(opts.maxAgeMs) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS,
-  });
-  return {
-    bid: best.bid,
-    ask: best.ask,
-    tsMs: Number.isFinite(best.ts) ? best.ts : Date.now(),
-    receivedAtMs: Number.isFinite(Number(best.receivedAtMs)) ? Number(best.receivedAtMs) : null,
-    source: best.source || 'best_quote',
-  };
+  return getLatestQuote(symbol, opts);
 }
 
-async function getEntryScanQuoteWithSecondaryRescue(rawSymbol, opts = {}) {
+async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
   const symbol = normalizeSymbol(rawSymbol);
   try {
     return await getLatestQuote(symbol, opts);
   } catch (primaryError) {
     const primaryFailureReason = classifyQuoteFetchFailureReason(primaryError, 'marketdata_unavailable');
-    if (!SECONDARY_QUOTE_ENABLED || primaryFailureReason !== 'stale_quote_primary') {
+    if (primaryFailureReason !== 'stale_quote_primary') {
       throw primaryError;
     }
 
-    const nowMs = Date.now();
-    const requestedMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS;
-    const effectiveMaxAgeMs = applyCryptoQuoteMaxAgeOverride({
-      symbol,
-      isCrypto: isCryptoSymbol(symbol),
-      effectiveMaxAgeMs: requestedMaxAgeMs,
-    });
-    const secondaryOutcome = await quoteRouter.getSecondaryQuoteDetailed(symbol, { maxAgeMs: effectiveMaxAgeMs });
-    if (!secondaryOutcome?.ok || !secondaryOutcome?.quote) {
-      console.warn('entry_scan_secondary_quote_rescue_failed', {
-        symbol,
-        reason: 'secondary_quote_rescue_failed',
-        secondaryFailureCategory: secondaryOutcome?.category || 'network_or_http_failure',
-        primaryFailureReason,
-        primaryError: primaryError?.message || String(primaryError),
-        secondarySource: secondaryOutcome?.source || null,
-        secondaryAgeMs: Number.isFinite(Number(secondaryOutcome?.quoteAgeMs)) ? Number(secondaryOutcome.quoteAgeMs) : null,
-        secondaryTsMs: Number.isFinite(Number(secondaryOutcome?.tsMs)) ? Number(secondaryOutcome.tsMs) : null,
-        secondaryReceivedAtMs: Number.isFinite(Number(secondaryOutcome?.receivedAtMs)) ? Number(secondaryOutcome.receivedAtMs) : null,
-        secondaryError: secondaryOutcome?.errorMessage || null,
-        secondaryDetails: secondaryOutcome?.details || null,
-        effectiveMaxAgeMs,
+    try {
+      const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
+        ...opts,
+        forceRefresh: true,
+        bypassCache: true,
       });
+      console.log('entry_scan_primary_quote_retried', {
+        symbol,
+        source: directQuote?.source || 'alpaca_direct',
+        quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
+      });
+      return directQuote;
+    } catch (retryError) {
+      const retryFailureReason = classifyQuoteFetchFailureReason(retryError, 'marketdata_unavailable');
+      if (retryFailureReason === 'stale_quote_primary') {
+        throw retryError;
+      }
       throw primaryError;
     }
-    const secondary = secondaryOutcome.quote;
-    const secondaryTsMs = Number.isFinite(Number(secondaryOutcome?.tsMs))
-      ? Number(secondaryOutcome.tsMs)
-      : Number.isFinite(Number(secondary?.ts))
-        ? Number(secondary.ts)
-        : null;
-    const secondaryAgeMs = Number.isFinite(Number(secondaryOutcome?.quoteAgeMs))
-      ? Number(secondaryOutcome.quoteAgeMs)
-      : Number.isFinite(secondaryTsMs)
-        ? Math.max(0, nowMs - secondaryTsMs)
-        : null;
-
-    const rescuedQuote = {
-      bid: Number(secondary.bid),
-      ask: Number(secondary.ask),
-      mid: (Number(secondary.bid) + Number(secondary.ask)) / 2,
-      tsMs: secondaryTsMs || nowMs,
-      receivedAtMs: Number.isFinite(Number(secondary?.receivedAtMs)) ? Number(secondary.receivedAtMs) : nowMs,
-      source: `secondary_rescue:${secondary.source || 'secondary'}`,
-    };
-    quoteCache.set(symbol, rescuedQuote);
-    scanMarketDataCache.upsertQuote(symbol, rescuedQuote, rescuedQuote.tsMs || nowMs);
-    recordLastQuoteAt(symbol, { tsMs: rescuedQuote.tsMs, source: rescuedQuote.source });
-    recordQuoteSuccess(symbol);
-    quotePassCache.set(symbol, { passId: marketDataPassId, quote: rescuedQuote });
-    console.log('entry_scan_secondary_quote_rescued', {
-      symbol,
-      source: rescuedQuote.source,
-      quoteAgeMs: secondaryAgeMs,
-      effectiveMaxAgeMs,
-      primaryFailureReason,
-    });
-    return rescuedQuote;
   }
 }
 
@@ -8675,8 +8613,6 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   return normalizedQuote;
 
 }
-
-quoteRouter.setPrimaryQuoteFetcher(async (symbol, opts = {}) => getLatestQuote(symbol, opts));
 
 async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   const symbol = normalizeSymbol(rawSymbol);
@@ -15132,9 +15068,9 @@ async function runEntryScanOnce() {
       warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       fallbackOccurred: Boolean(fallbackReason),
       fallbackReason,
-      secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
-      secondaryQuoteRouterEnabled: SECONDARY_QUOTE_ROUTER_CONFIG.enabled,
-      secondaryQuoteRouterProvider: SECONDARY_QUOTE_ROUTER_CONFIG.provider || null,
+      secondaryQuoteEnabled: false,
+      secondaryQuoteRouterEnabled: false,
+      secondaryQuoteRouterProvider: null,
     });
     if (fallbackReason) {
       console.warn('entry_universe_fallback_active', {
@@ -15844,9 +15780,9 @@ async function runEntryScanOnce() {
       sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
       warmupFallbackBudgetConfigured: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
       warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
-      secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
-      secondaryQuoteRouterEnabled: SECONDARY_QUOTE_ROUTER_CONFIG.enabled,
-      secondaryQuoteRouterProvider: SECONDARY_QUOTE_ROUTER_CONFIG.provider || null,
+      secondaryQuoteEnabled: false,
+      secondaryQuoteRouterEnabled: false,
+      secondaryQuoteRouterProvider: null,
       entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,

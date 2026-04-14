@@ -235,7 +235,6 @@ console.log('runtime_entry_engine_flags', {
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS_env: runtimeStrategyConfig.regimeStaleThresholdMs,
   regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
-  SECONDARY_QUOTE_ENABLED: readLiveBoolean('SECONDARY_QUOTE_ENABLED'),
   QUOTE_RETRY: readLiveNumber('QUOTE_RETRY'),
   ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS: runtimeStrategyConfig.sparseRequireStrongerEdgeBps,
   ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
@@ -291,7 +290,7 @@ function writeRunSnapshot() {
   const tracked = [
     'TRADING_ENABLED', 'STOPS_ENABLED', 'STOPLOSS_ENABLED', 'POSITION_SIZING_MODE', 'TWAP_ENABLED',
     'CORRELATION_GUARD_ENABLED', 'VOLATILITY_FILTER_ENABLED', 'LIQUIDITY_WINDOW_ENABLED',
-    'DRAWDOWN_GUARD_ENABLED', 'RISK_KILL_SWITCH_ENABLED', 'SECONDARY_QUOTE_ENABLED',
+    'DRAWDOWN_GUARD_ENABLED', 'RISK_KILL_SWITCH_ENABLED',
     'PREDICTOR_CALIBRATION_ENABLED',
   ];
   const config = {};

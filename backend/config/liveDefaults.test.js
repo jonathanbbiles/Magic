@@ -54,8 +54,6 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN, '4');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_QUOTES, 'true');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_ORDERBOOKS, 'true');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED, 'true');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER, 'cryptocompare');
   assert.equal(LIVE_CRITICAL_DEFAULTS.QUOTE_RETRY, '2');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS, '120');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS_TIER1, '130');
@@ -84,8 +82,7 @@ withEnv({}, () => {
     assert.match(sourceText, /EXECUTION_TIER1_SYMBOLS=BTC\/USD,ETH\/USD/);
     assert.match(sourceText, /EXECUTION_TIER2_SYMBOLS=LINK\/USD,AVAX\/USD,SOL\/USD,UNI\/USD/);
     assert.match(sourceText, /EXECUTION_TIER3_DEFAULT=false/);
-    assert.match(sourceText, /SECONDARY_QUOTE_ENABLED=true/);
-    assert.match(sourceText, /SECONDARY_QUOTE_PROVIDER=cryptocompare/);
+    assert.match(sourceText, /SECONDARY_QUOTE_ENABLED=false/);
     assert.match(sourceText, /QUOTE_RETRY=2/);
     assert.match(sourceText, /ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8/);
     assert.match(sourceText, /PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4/);
