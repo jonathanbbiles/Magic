@@ -296,6 +296,7 @@ const {
   __testSetEntryScanRunningForTests,
   __testSetEntryScanRerunRequestedForTests,
   __testGetEntryScanRerunRequestedForTests,
+  __testExtractStaleQuoteMeta,
 } = tradeEntryBasis;
 
 assert.equal(
@@ -372,6 +373,10 @@ assert.equal(freshPrimaryViability.ok, true);
 assert.equal(classifyQuoteFetchFailureReason(new Error('Quote stale for BTC/USD')), 'stale_quote_primary');
 assert.equal(classifyQuoteFetchFailureReason(new Error('Quote not available for BTC/USD')), 'marketdata_unavailable');
 assert.equal(classifyQuoteFetchFailureReason(new Error('socket timeout')), 'marketdata_unavailable');
+assert.equal(
+  classifyQuoteFetchFailureReason({ message: 'quote not available', staleReasonCode: 'stale_quote_primary' }),
+  'stale_quote_primary',
+);
 
 __testClearStaleQuoteSkipState('XRP/USD');
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
@@ -382,6 +387,29 @@ __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs:
 const cooldown2 = __testGetStaleQuoteCooldownState('XRP/USD');
 assert.equal(cooldown2.active, true);
 assert.ok(cooldown2.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
+assert.equal(cooldown2.quoteAgeMs, 90000);
+
+const recoveredStaleMeta = __testExtractStaleQuoteMeta({
+  error: {
+    staleReasonCode: 'stale_quote_primary',
+    quoteAgeMs: 123456,
+    quoteSource: 'alpaca',
+    quoteTsMs: 1700000000000,
+    quoteReceivedAtMs: 1700000123456,
+  },
+  maxAgeMs: 1000,
+});
+assert.equal(recoveredStaleMeta.quoteAgeMs, 123456);
+assert.equal(recoveredStaleMeta.quoteSource, 'alpaca');
+assert.equal(recoveredStaleMeta.staleReasonCode, 'stale_quote_primary');
+assert.equal(typeof recoveredStaleMeta.hopelesslyStale, 'boolean');
+
+__testClearStaleQuoteSkipState('ADA/USD');
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+const hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
+assert.equal(hopelessCooldown.active, true);
+assert.equal(hopelessCooldown.reason, 'stale_quote_primary');
+assert.equal(hopelessCooldown.quoteAgeMs, 160000);
 
 const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
 assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
@@ -414,6 +442,8 @@ assert.ok(tradeSourceEarly.includes("console.log('position_outside_scan_universe
 assert.ok(tradeSourceEarly.includes('POSITION_UNIVERSE_MISMATCH_CHECK_INTERVAL_MS'));
 assert.ok(tradeSourceEarly.includes("why: 'marketdata_unavailable'"));
 assert.ok(tradeSourceEarly.includes("reason: 'stale_quote_primary'"));
+assert.ok(tradeSourceEarly.includes('secondaryFailureCategory'));
+assert.ok(tradeSourceEarly.includes('getSecondaryQuoteDetailed(symbol, { maxAgeMs: effectiveMaxAgeMs })'));
 assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_trade_and_sparse'"));
 assert.ok(tradeSourceEarly.includes('skippedOrderbookFetch: true'));
 assert.ok(tradeSourceEarly.includes('skippedTradeFetch: true'));
@@ -421,6 +451,8 @@ assert.ok(tradeSourceEarly.includes('skippedSparseRetry: true'));
 assert.ok(tradeSourceEarly.includes("'predictor_gate'"));
 assert.ok(tradeSourceEarly.includes("'entry_regime_gate'"));
 assert.ok(tradeSourceEarly.includes("'net_edge_gate'"));
+assert.ok(tradeSourceEarly.includes('cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd'));
+assert.ok(tradeSourceEarly.includes('requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd'));
 assert.ok(tradeSourceEarly.includes('evaluateEconomicEntryPrefilter'));
 assert.ok(tradeSourceEarly.includes('staleQuoteCooldownCount'));
 assert.ok(tradeSourceEarly.includes('symbolHealthCooldownCount'));

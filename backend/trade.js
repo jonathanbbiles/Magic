@@ -633,9 +633,66 @@ function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = E
 function classifyQuoteFetchFailureReason(error, fallbackReason = 'marketdata_unavailable') {
   const normalizedFallback = String(fallbackReason || 'marketdata_unavailable');
   const message = String(error?.message || error || '').toLowerCase();
+  const staleReasonCode = String(error?.staleReasonCode || '').toLowerCase();
+  if (staleReasonCode.includes('stale_quote')) return 'stale_quote_primary';
   if (message.includes('quote stale') || message.includes('stale quote')) return 'stale_quote_primary';
   if (message.includes('quote not available')) return 'marketdata_unavailable';
   return normalizedFallback;
+}
+
+function extractStaleQuoteMeta({
+  error = null,
+  quote = null,
+  quoteResult = null,
+  fallback = null,
+  nowMs = Date.now(),
+  maxAgeMs = ENTRY_QUOTE_MAX_AGE_MS,
+} = {}) {
+  const staleError = error && typeof error === 'object' ? error : null;
+  const candidates = [quote, quoteResult?.value, quoteResult?.quote, fallback].filter(Boolean);
+  let selected = null;
+  for (const candidate of candidates) {
+    if (candidate && (Number.isFinite(Number(candidate.tsMs)) || Number.isFinite(Number(candidate.ts)) || Number.isFinite(Number(candidate.receivedAtMs)))) {
+      selected = candidate;
+      break;
+    }
+  }
+  const tsMs = Number.isFinite(Number(staleError?.quoteTsMs))
+    ? Number(staleError.quoteTsMs)
+    : Number.isFinite(Number(selected?.tsMs))
+      ? Number(selected.tsMs)
+      : Number.isFinite(Number(selected?.ts))
+        ? Number(selected.ts)
+        : null;
+  const receivedAtMs = Number.isFinite(Number(staleError?.quoteReceivedAtMs))
+    ? Number(staleError.quoteReceivedAtMs)
+    : Number.isFinite(Number(selected?.receivedAtMs))
+      ? Number(selected.receivedAtMs)
+      : null;
+  const source = staleError?.quoteSource || selected?.source || null;
+  const quoteTimestampSource = staleError?.quoteTimestampSource || source || null;
+  const quoteAgeMsRaw = Number.isFinite(Number(staleError?.quoteAgeMs))
+    ? Number(staleError.quoteAgeMs)
+    : Number.isFinite(tsMs)
+      ? nowMs - tsMs
+      : null;
+  const quoteAgeMs = Number.isFinite(quoteAgeMsRaw) ? Math.max(0, quoteAgeMsRaw) : null;
+  const staleReasonCode = staleError?.staleReasonCode || classifyQuoteFetchFailureReason(staleError, 'stale_quote_primary');
+  const hopelesslyStale = Number.isFinite(quoteAgeMs)
+    ? quoteAgeMs > (Number(maxAgeMs) * STALE_QUOTE_HOPELESS_MULTIPLIER)
+    : false;
+  return {
+    reason: hopelesslyStale ? 'stale_quote_hopeless' : staleReasonCode,
+    staleReasonCode,
+    quoteAgeMs,
+    quoteTsMs: tsMs,
+    quoteReceivedAtMs: receivedAtMs,
+    quoteSource: source,
+    quoteTimestampSource,
+    quoteDataSource: quoteResult?.state || staleError?.quoteDataSource || null,
+    hopelesslyStale,
+    cooldownMs: hopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null,
+  };
 }
 
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
@@ -1710,19 +1767,31 @@ async function computeEntrySignal(symbol, opts = {}) {
       mdSnapshot?.quoteResult?.reason || 'marketdata_unavailable',
     );
     if (!quote && quoteFetchReason === 'stale_quote_primary') {
-      noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+      const staleMeta = extractStaleQuoteMeta({
+        error: mdSnapshot?.quoteResult?.error,
+        quoteResult: mdSnapshot?.quoteResult,
+        nowMs: Date.now(),
+        maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      });
+      noteStaleQuoteSkip(asset.symbol, {
+        reason: staleMeta.reason,
+        quoteAgeMs: staleMeta.quoteAgeMs,
+        cooldownMs: staleMeta.cooldownMs,
+      });
       return {
         entryReady: false,
         why: 'marketdata_unavailable',
         meta: {
           symbol: asset.symbol,
           symbolTier,
-          reason: 'stale_quote_primary',
-          quoteAgeMs: Number.isFinite(Number(mdSnapshot?.quoteResult?.value?.tsMs))
-            ? Math.max(0, Date.now() - Number(mdSnapshot.quoteResult.value.tsMs))
-            : null,
-          quoteTimestampSource: mdSnapshot?.quoteResult?.value?.source || null,
-          quoteDataSource: mdSnapshot?.quoteResult?.state || null,
+          reason: staleMeta.staleReasonCode || 'stale_quote_primary',
+          quoteAgeMs: staleMeta.quoteAgeMs,
+          quoteTsMs: staleMeta.quoteTsMs,
+          quoteReceivedAtMs: staleMeta.quoteReceivedAtMs,
+          quoteSource: staleMeta.quoteSource,
+          quoteTimestampSource: staleMeta.quoteTimestampSource,
+          quoteDataSource: staleMeta.quoteDataSource,
+          staleQuoteHopeless: staleMeta.hopelesslyStale,
           skippedOrderbookFetch: true,
           skippedTradeFetch: true,
           skippedSparseRetry: true,
@@ -1736,14 +1805,30 @@ async function computeEntrySignal(symbol, opts = {}) {
     } catch (err) {
       const quoteFetchReason = classifyQuoteFetchFailureReason(err, 'marketdata_unavailable');
       if (quoteFetchReason === 'stale_quote_primary') {
-        noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+        const staleMeta = extractStaleQuoteMeta({
+          error: err,
+          quote: quoteCache.get(normalizeSymbol(asset.symbol)),
+          nowMs: Date.now(),
+          maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+        noteStaleQuoteSkip(asset.symbol, {
+          reason: staleMeta.reason,
+          quoteAgeMs: staleMeta.quoteAgeMs,
+          cooldownMs: staleMeta.cooldownMs,
+        });
         return {
           entryReady: false,
           why: 'marketdata_unavailable',
           meta: {
             symbol: asset.symbol,
             symbolTier,
-            reason: 'stale_quote_primary',
+            reason: staleMeta.staleReasonCode || 'stale_quote_primary',
+            quoteAgeMs: staleMeta.quoteAgeMs,
+            quoteTsMs: staleMeta.quoteTsMs,
+            quoteReceivedAtMs: staleMeta.quoteReceivedAtMs,
+            quoteSource: staleMeta.quoteSource,
+            quoteTimestampSource: staleMeta.quoteTimestampSource,
+            staleQuoteHopeless: staleMeta.hopelesslyStale,
             skippedOrderbookFetch: true,
             skippedTradeFetch: true,
             skippedSparseRetry: true,
@@ -3111,8 +3196,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     minNetEdgeBps: edgeRequirements.minNetEdgeBps,
     predictorProbability: predictorTp?.probability ?? null,
     weakLiquidity,
-    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
+    requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
     availableDepthUsd: availableDepthUsdForEval,
     orderbookMeta,
     policy: getEntryMarketDataPolicy(),
@@ -3150,8 +3235,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     sparseFallback: marketDataEval.sparseFallbackState,
     sparseRetry: sparseRetryDetails,
     dataQualityReason,
-    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
+    requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
     reason: marketDataEval.reason || dataQualityReason,
   });
   if (marketDataEval.dataQualityState !== 'ok') {
@@ -3163,9 +3248,9 @@ async function computeEntrySignal(symbol, opts = {}) {
         probability: predictorTp?.probability ?? null,
         netEdgeBps: edge.netEdgeBps,
         quoteAgeMs,
-        requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         availableDepthUsd: availableDepthUsdForEval,
-        cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
         sparseFallback: marketDataEval.sparseFallbackState,
         sparseRetry: sparseRetryDetails,
         dataQualityReason: dataQualityReason || marketDataEval.reason,
@@ -3252,9 +3337,9 @@ async function computeEntrySignal(symbol, opts = {}) {
       probability: predictorTp?.probability ?? null,
       netEdgeBps: edge.netEdgeBps,
       quoteAgeMs,
-      requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
       availableDepthUsd: availableDepthUsdForEval,
-      cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
       confidenceCap: marketDataEval.confidenceMultiplierCap,
       sparseFallback: marketDataEval.sparseFallbackState,
     });
@@ -5249,6 +5334,30 @@ function buildStaleQuoteLogMeta({
   };
 }
 
+function createStaleQuoteError(message, {
+  staleReasonCode = 'stale_quote_primary',
+  symbol = null,
+  source = null,
+  quoteTsMs = null,
+  quoteReceivedAtMs = null,
+  quoteAgeMs = null,
+  effectiveMaxAgeMs = null,
+  quoteTimestampSource = null,
+  quoteDataSource = null,
+} = {}) {
+  const err = new Error(message);
+  err.staleReasonCode = staleReasonCode;
+  err.symbol = symbol;
+  err.quoteSource = source || null;
+  err.quoteTsMs = Number.isFinite(Number(quoteTsMs)) ? Number(quoteTsMs) : null;
+  err.quoteReceivedAtMs = Number.isFinite(Number(quoteReceivedAtMs)) ? Number(quoteReceivedAtMs) : null;
+  err.quoteAgeMs = Number.isFinite(Number(quoteAgeMs)) ? Number(quoteAgeMs) : null;
+  err.effectiveMaxAgeMs = Number.isFinite(Number(effectiveMaxAgeMs)) ? Number(effectiveMaxAgeMs) : null;
+  err.quoteTimestampSource = quoteTimestampSource || source || null;
+  err.quoteDataSource = quoteDataSource || null;
+  return err;
+}
+
 async function withExpensiveMarketDataLimit(fn, dedupeKey = null) {
   if (dedupeKey && expensiveMdByKey.has(dedupeKey)) return expensiveMdByKey.get(dedupeKey);
 
@@ -5822,29 +5931,35 @@ async function getEntryScanQuoteWithSecondaryRescue(rawSymbol, opts = {}) {
       isCrypto: isCryptoSymbol(symbol),
       effectiveMaxAgeMs: requestedMaxAgeMs,
     });
-    const secondary = await quoteRouter.getSecondaryQuote(symbol).catch(() => null);
-    const secondaryTsMs = Number.isFinite(Number(secondary?.ts)) ? Number(secondary.ts) : null;
-    const secondaryAgeMs = Number.isFinite(secondaryTsMs) ? Math.max(0, nowMs - secondaryTsMs) : null;
-    const secondaryUsable = Boolean(
-      secondary
-      && Number.isFinite(Number(secondary?.bid))
-      && Number.isFinite(Number(secondary?.ask))
-      && Number(secondary.bid) > 0
-      && Number(secondary.ask) > 0
-      && (!Number.isFinite(secondaryAgeMs) || secondaryAgeMs <= effectiveMaxAgeMs)
-    );
-    if (!secondaryUsable) {
+    const secondaryOutcome = await quoteRouter.getSecondaryQuoteDetailed(symbol, { maxAgeMs: effectiveMaxAgeMs });
+    if (!secondaryOutcome?.ok || !secondaryOutcome?.quote) {
       console.warn('entry_scan_secondary_quote_rescue_failed', {
         symbol,
-        reason: 'secondary_unavailable_or_stale',
+        reason: 'secondary_quote_rescue_failed',
+        secondaryFailureCategory: secondaryOutcome?.category || 'network_or_http_failure',
         primaryFailureReason,
         primaryError: primaryError?.message || String(primaryError),
-        secondarySource: secondary?.source || null,
-        secondaryAgeMs,
+        secondarySource: secondaryOutcome?.source || null,
+        secondaryAgeMs: Number.isFinite(Number(secondaryOutcome?.quoteAgeMs)) ? Number(secondaryOutcome.quoteAgeMs) : null,
+        secondaryTsMs: Number.isFinite(Number(secondaryOutcome?.tsMs)) ? Number(secondaryOutcome.tsMs) : null,
+        secondaryReceivedAtMs: Number.isFinite(Number(secondaryOutcome?.receivedAtMs)) ? Number(secondaryOutcome.receivedAtMs) : null,
+        secondaryError: secondaryOutcome?.errorMessage || null,
+        secondaryDetails: secondaryOutcome?.details || null,
         effectiveMaxAgeMs,
       });
       throw primaryError;
     }
+    const secondary = secondaryOutcome.quote;
+    const secondaryTsMs = Number.isFinite(Number(secondaryOutcome?.tsMs))
+      ? Number(secondaryOutcome.tsMs)
+      : Number.isFinite(Number(secondary?.ts))
+        ? Number(secondary.ts)
+        : null;
+    const secondaryAgeMs = Number.isFinite(Number(secondaryOutcome?.quoteAgeMs))
+      ? Number(secondaryOutcome.quoteAgeMs)
+      : Number.isFinite(secondaryTsMs)
+        ? Math.max(0, nowMs - secondaryTsMs)
+        : null;
 
     const rescuedQuote = {
       bid: Number(secondary.bid),
@@ -8474,7 +8589,16 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     }));
     recordLastQuoteAt(symbol, { tsMs: null, source: 'stale', reason: 'absurd_age' });
     recordQuoteFailure(symbol, 'stale_quote');
-    throw new Error(`Quote age absurd for ${symbol}`);
+    throw createStaleQuoteError(`Quote age absurd for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: rawAgeMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote',
+    });
   }
 
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
@@ -8488,7 +8612,16 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     }));
     recordLastQuoteAt(symbol, { tsMs, source: 'stale', reason: 'stale_quote' });
     recordQuoteFailure(symbol, 'stale_quote');
-    throw new Error(`Quote stale for ${symbol}`);
+    throw createStaleQuoteError(`Quote stale for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: ageMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote',
+    });
   }
 
   const normalizedQuote = {
@@ -8565,11 +8698,29 @@ async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   }
 
   if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
-    throw new Error(`Quote age absurd for ${symbol}`);
+    throw createStaleQuoteError(`Quote age absurd for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca_direct',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: rawAgeMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote_direct',
+    });
   }
 
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
-    throw new Error(`Quote stale for ${symbol}`);
+    throw createStaleQuoteError(`Quote stale for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca_direct',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: ageMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote_direct',
+    });
   }
 
   const normalizedQuote = {
@@ -18062,6 +18213,7 @@ module.exports = {
   shouldAllowDynamicTier3,
   evaluatePrimaryQuoteViability,
   classifyQuoteFetchFailureReason,
+  extractStaleQuoteMeta,
   resolveEntryExecutionContext,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
@@ -18084,6 +18236,7 @@ module.exports = {
     entryScanRerunRequested = Boolean(value);
   },
   __testGetEntryScanRerunRequestedForTests: () => entryScanRerunRequested,
+  __testExtractStaleQuoteMeta: extractStaleQuoteMeta,
   __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
   __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
   __getScanMarketDataCacheForTests: () => scanMarketDataCache,

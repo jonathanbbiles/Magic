@@ -39,8 +39,8 @@ npm install
 EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ```
 
-If you forget to set `EXPO_PUBLIC_BACKEND_URL` the app falls back to the
-deployed production URL and logs a warning at startup.
+If you forget to set `EXPO_PUBLIC_BACKEND_URL` the app falls back to
+`http://127.0.0.1:3000` and logs a warning at startup.
 
 ## CI
 

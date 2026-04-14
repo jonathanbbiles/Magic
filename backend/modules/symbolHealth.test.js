@@ -14,13 +14,14 @@ const { createSymbolHealthTracker } = require('./symbolHealth');
     },
   });
 
-  tracker.recordFailure('BTC/USD', 'stale_quote_primary');
+  tracker.recordFailure('BTC/USD', 'stale_quote_primary', { quoteAgeMs: 88000 });
   assert.equal(tracker.evaluateEligibility('BTC/USD').eligible, true);
-  tracker.recordFailure('BTC/USD', 'stale_quote_primary');
+  tracker.recordFailure('BTC/USD', 'stale_quote_primary', { quoteAgeMs: 94000 });
   const staleBlocked = tracker.evaluateEligibility('BTC/USD');
   assert.equal(staleBlocked.eligible, false);
   assert.equal(staleBlocked.reason, 'symbol_health_cooldown');
   assert.equal(staleBlocked.cooldown.reason, 'stale_quote_primary');
+  assert.equal(staleBlocked.cooldown.quoteAgeMs, 94000);
 
   tracker.recordFailure('ETH/USD', 'ob_depth_insufficient');
   tracker.recordFailure('ETH/USD', 'ob_depth_insufficient');
