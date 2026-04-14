@@ -1774,6 +1774,20 @@ async function computeEntrySignal(symbol, opts = {}) {
         nowMs: Date.now(),
         maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       });
+      if (!staleMeta.hopelesslyStale) {
+        const refreshedQuote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+          maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+          forceRefresh: true,
+          bypassCache: true,
+        }).catch(() => null);
+        if (refreshedQuote) {
+          quote = refreshedQuote;
+        }
+      }
+      if (quote) {
+        // Continue through the normal entry flow (orderbook checks + sparse fallback path)
+        // when stale primary quotes are recoverable via forced refresh/secondary rescue.
+      } else {
       noteStaleQuoteSkip(asset.symbol, {
         reason: staleMeta.reason,
         quoteAgeMs: staleMeta.quoteAgeMs,
@@ -1793,12 +1807,15 @@ async function computeEntrySignal(symbol, opts = {}) {
           quoteTimestampSource: staleMeta.quoteTimestampSource,
           quoteDataSource: staleMeta.quoteDataSource,
           staleQuoteHopeless: staleMeta.hopelesslyStale,
+          staleRefreshAttempted: !staleMeta.hopelesslyStale,
+          staleRefreshRecovered: false,
           skippedOrderbookFetch: true,
           skippedTradeFetch: true,
-          skippedSparseRetry: true,
+          skippedSparseRetry: staleMeta.hopelesslyStale,
         },
         record: baseRecord,
       };
+      }
     }
   } else {
     try {
@@ -1812,6 +1829,19 @@ async function computeEntrySignal(symbol, opts = {}) {
           nowMs: Date.now(),
           maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         });
+        if (!staleMeta.hopelesslyStale) {
+          const refreshedQuote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+            maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+            forceRefresh: true,
+            bypassCache: true,
+          }).catch(() => null);
+          if (refreshedQuote) {
+            quote = refreshedQuote;
+          }
+        }
+        if (quote) {
+          // Continue through normal flow for recoverable stale primary quote cases.
+        } else {
         noteStaleQuoteSkip(asset.symbol, {
           reason: staleMeta.reason,
           quoteAgeMs: staleMeta.quoteAgeMs,
@@ -1830,12 +1860,15 @@ async function computeEntrySignal(symbol, opts = {}) {
             quoteSource: staleMeta.quoteSource,
             quoteTimestampSource: staleMeta.quoteTimestampSource,
             staleQuoteHopeless: staleMeta.hopelesslyStale,
+            staleRefreshAttempted: !staleMeta.hopelesslyStale,
+            staleRefreshRecovered: false,
             skippedOrderbookFetch: true,
             skippedTradeFetch: true,
-            skippedSparseRetry: true,
+            skippedSparseRetry: staleMeta.hopelesslyStale,
           },
           record: baseRecord,
         };
+        }
       }
       return {
         entryReady: false,
@@ -4502,6 +4535,7 @@ let lastPrefetchedBars = {
 };
 let lastPrefetchedBarsUpdatedAtMs = 0;
 let lastPrefetchedBarsSymbols = new Set();
+let entryScanPrefetchInFlightPromise = null;
 let predictorWarmupCompletedLogged = false;
 let engineState = 'booting';
 let engineStateUpdatedAt = null;
@@ -14439,6 +14473,20 @@ function buildBarsMapFromBatch(symbols, barsResp) {
 }
 
 async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
+  if (entryScanPrefetchInFlightPromise) {
+    if (opts.nonBlockingIfInFlight) {
+      return {
+        ok: true,
+        skipped: 'prefetch_inflight',
+        inFlight: true,
+        prefetchedBars: lastPrefetchedBars,
+        prefetchAgeMs: lastPrefetchedBarsUpdatedAtMs ? Date.now() - lastPrefetchedBarsUpdatedAtMs : null,
+      };
+    }
+    return entryScanPrefetchInFlightPromise;
+  }
+
+  entryScanPrefetchInFlightPromise = (async () => {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
   const seedSymbols = symbols.slice(0, maxSeedSymbolsPerPass);
@@ -14646,6 +14694,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     quotePrefetchState: ENTRY_PREFETCH_QUOTES ? 'enabled' : 'skipped_env_disabled',
     orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'enabled' : 'skipped_env_disabled',
   };
+  })().finally(() => {
+    entryScanPrefetchInFlightPromise = null;
+  });
+
+  return entryScanPrefetchInFlightPromise;
 }
 
 function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
@@ -15258,7 +15311,7 @@ async function runEntryScanOnce() {
         });
       }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
       try {
-        prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+        prefetchResult = await prefetchEntryScanMarketData(scanSymbols, { nonBlockingIfInFlight: true });
         if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
           prefetchedBars = prefetchResult.prefetchedBars;
         }
