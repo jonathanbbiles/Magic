@@ -40,6 +40,11 @@ const { createSymbolHealthTracker } = require('./symbolHealth');
   nowMs += 60001;
   const staleRecovered = tracker.evaluateEligibility('BTC/USD');
   assert.equal(staleRecovered.eligible, true);
+  tracker.recordFailure('BTC/USD', 'stale_quote_primary', { quoteAgeMs: 99000 });
+  tracker.recordFailure('BTC/USD', 'stale_quote_primary', { quoteAgeMs: 101000 });
+  assert.equal(tracker.evaluateEligibility('BTC/USD').eligible, false);
+  tracker.noteHealthy('BTC/USD');
+  assert.equal(tracker.evaluateEligibility('BTC/USD').eligible, true);
 
   tracker.noteHealthy('ETH/USD');
   assert.equal(tracker.evaluateEligibility('ETH/USD').eligible, true);
