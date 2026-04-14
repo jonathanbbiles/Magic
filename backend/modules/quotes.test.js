@@ -81,6 +81,83 @@ async function run() {
   assert.equal(secondary.source, 'cryptocompare');
   assert.equal(Number.isFinite(secondary.receivedAtMs), true);
 
+  const secondaryDisabled = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'false',
+  }, () => quotesWithSecondary.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryDisabled.ok, false);
+  assert.equal(secondaryDisabled.category, 'disabled');
+
+  const secondaryUnconfigured = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: '',
+  }, () => quotesWithSecondary.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryUnconfigured.ok, false);
+  assert.equal(secondaryUnconfigured.category, 'unconfigured');
+
+  const secondaryProviderUnsupported = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'example-provider',
+  }, () => quotesWithSecondary.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryProviderUnsupported.ok, false);
+  assert.equal(secondaryProviderUnsupported.category, 'provider_not_supported');
+
+  delete require.cache[quotesModulePath];
+  httpClient.httpJson = async () => { throw new Error('socket hang up'); };
+  const quotesSecondaryNetworkFailure = require('./quotes');
+  const secondaryNetworkFailure = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    QUOTE_RETRY: '0',
+  }, () => quotesSecondaryNetworkFailure.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryNetworkFailure.ok, false);
+  assert.equal(secondaryNetworkFailure.category, 'network_or_http_failure');
+
+  delete require.cache[quotesModulePath];
+  httpClient.httpJson = async () => ({
+    data: {
+      RAW: {
+        ETH: {
+          USD: {
+            BID: 'bad',
+            ASK: null,
+          },
+        },
+      },
+    },
+  });
+  const quotesSecondaryMalformed = require('./quotes');
+  const secondaryMalformed = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    QUOTE_RETRY: '0',
+  }, () => quotesSecondaryMalformed.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryMalformed.ok, false);
+  assert.equal(secondaryMalformed.category, 'malformed_payload');
+
+  delete require.cache[quotesModulePath];
+  httpClient.httpJson = async () => ({
+    data: {
+      RAW: {
+        ETH: {
+          USD: {
+            BID: 100,
+            ASK: 101,
+            LASTUPDATE: Math.floor((Date.now() - 61000) / 1000),
+          },
+        },
+      },
+    },
+  });
+  const quotesSecondaryStale = require('./quotes');
+  const secondaryStale = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    QUOTE_RETRY: '0',
+  }, () => quotesSecondaryStale.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryStale.ok, false);
+  assert.equal(secondaryStale.category, 'stale_secondary_quote');
+  assert.equal(Number.isFinite(secondaryStale.quoteAgeMs), true);
+
   delete require.cache[quotesModulePath];
   httpClient.httpJson = async () => ({
     data: {
