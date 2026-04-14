@@ -14956,10 +14956,22 @@ async function runEntryScanOnce() {
       requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
       requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
       quoteBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getQuoteUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS }).value || null]),
+        filteredSymbols.map((symbol) => {
+          const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
+            nowMs: Date.now(),
+            maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+          });
+          return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
+        }),
       ),
       orderbookBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getOrderbookUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS }).value || null]),
+        filteredSymbols.map((symbol) => {
+          const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
+            nowMs: Date.now(),
+            maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
+          });
+          return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
+        }),
       ),
       quoteMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
       nowMs: Date.now(),
@@ -15272,7 +15284,7 @@ async function runEntryScanOnce() {
         });
       }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
       try {
-        prefetchResult = await prefetchEntryScanMarketData(scanSymbols, { nonBlockingIfInFlight: true });
+        prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
         if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
           prefetchedBars = prefetchResult.prefetchedBars;
         }

@@ -237,6 +237,7 @@ async function getOrFetchSymbolMarketData({
       ? resolveTradingUsableCache('quote', normalizedQuoteReuseMaxAgeMs)
       : null;
     const cacheQuoteRejectedForReuse = Boolean(cachedQuote?.ok && !cachedQuote?.usable);
+    const enforceFreshQuoteFetch = Boolean(forceQuoteRefresh || shouldRefreshForQuoteAge || cacheQuoteRejectedForReuse);
     if (cachedQuote?.ok && cachedQuote?.usable) {
       result.quoteResult = {
         ok: true,
@@ -250,9 +251,13 @@ async function getOrFetchSymbolMarketData({
     const quoteResult = await coordinator.get({
       endpoint: 'quote',
       key: normalizedSymbol,
-      forceRefresh: forceQuoteRefresh,
+      forceRefresh: enforceFreshQuoteFetch,
       allowStaleOnRateLimit: true,
-      fetcher: () => fetchQuote(normalizedSymbol, { maxAgeMs: quoteMaxAgeMs, forceRefresh: forceQuoteRefresh, bypassCache: forceQuoteRefresh }),
+      fetcher: () => fetchQuote(normalizedSymbol, {
+        maxAgeMs: quoteMaxAgeMs,
+        forceRefresh: enforceFreshQuoteFetch,
+        bypassCache: enforceFreshQuoteFetch,
+      }),
     });
     result.quoteResult = quoteResult;
       if (quoteResult.ok) {
@@ -300,6 +305,9 @@ async function getOrFetchSymbolMarketData({
       ? resolveTradingUsableCache('orderbook', normalizedOrderbookReuseMaxAgeMs)
       : null;
     const cacheOrderbookRejectedForReuse = Boolean(cachedOrderbook?.ok && !cachedOrderbook?.usable);
+    const enforceFreshOrderbookFetch = Boolean(
+      forceOrderbookRefresh || shouldRefreshForOrderbookAge || cacheOrderbookRejectedForReuse
+    );
     if (cachedOrderbook?.ok && cachedOrderbook?.usable) {
       result.orderbookResult = {
         ok: true,
@@ -313,11 +321,11 @@ async function getOrFetchSymbolMarketData({
     const orderbookResult = await coordinator.get({
       endpoint: 'orderbook',
       key: normalizedSymbol,
-      forceRefresh: forceOrderbookRefresh,
+      forceRefresh: enforceFreshOrderbookFetch,
       allowStaleOnRateLimit: true,
       fetcher: () => fetchOrderbook(normalizedSymbol, {
         maxAgeMs: orderbookMaxAgeMs,
-        bypassCache: forceOrderbookRefresh,
+        bypassCache: enforceFreshOrderbookFetch,
         sameScanQuote: result.quote || null,
       }),
     });
