@@ -87,6 +87,23 @@ async function run() {
   assert.equal(secondaryDisabled.ok, false);
   assert.equal(secondaryDisabled.category, 'disabled');
 
+  const secondaryDefaultsConfig = await withEnv({}, async () => {
+    delete process.env.SECONDARY_QUOTE_ENABLED;
+    delete process.env.SECONDARY_QUOTE_PROVIDER;
+    return quotesWithSecondary.getSecondaryQuoteConfig();
+  });
+  assert.equal(secondaryDefaultsConfig.enabled, true);
+  assert.equal(secondaryDefaultsConfig.provider, 'cryptocompare');
+
+  const secondaryDefaultsHonored = await withEnv({ QUOTE_RETRY: '0' }, async () => {
+    delete process.env.SECONDARY_QUOTE_ENABLED;
+    delete process.env.SECONDARY_QUOTE_PROVIDER;
+    return quotesWithSecondary.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 });
+  });
+  assert.equal(secondaryDefaultsHonored.ok, true);
+  assert.notEqual(secondaryDefaultsHonored.category, 'disabled');
+  assert.notEqual(secondaryDefaultsHonored.category, 'unconfigured');
+
   const secondaryUnconfigured = await withEnv({
     SECONDARY_QUOTE_ENABLED: 'true',
     SECONDARY_QUOTE_PROVIDER: '',

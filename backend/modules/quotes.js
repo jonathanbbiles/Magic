@@ -1,5 +1,6 @@
 const { httpJson } = require('../httpClient');
 const { readEnvFlag } = require('./envFlags');
+const { LIVE_CRITICAL_DEFAULTS } = require('../config/liveDefaults');
 
 const lastFetchBySymbol = new Map();
 let primaryFetcher = null;
@@ -28,6 +29,23 @@ async function withRetry(fn, retry = 1) {
 async function getPrimaryQuote(symbol, opts = {}) {
   if (!primaryFetcher) throw new Error('primary_quote_fetcher_not_configured');
   return primaryFetcher(symbol, opts);
+}
+
+function getSecondaryQuoteConfig(env = process.env) {
+  const defaultEnabled = LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED === 'true';
+  const defaultProvider = String(LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER || '').trim().toLowerCase();
+  const enabled = readEnvFlag('SECONDARY_QUOTE_ENABLED', defaultEnabled);
+  const provider = String(env.SECONDARY_QUOTE_PROVIDER ?? defaultProvider).trim().toLowerCase();
+  return {
+    enabled,
+    provider,
+    source: {
+      envEnabledRaw: env.SECONDARY_QUOTE_ENABLED,
+      envProviderRaw: env.SECONDARY_QUOTE_PROVIDER,
+      defaultEnabledRaw: LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED,
+      defaultProviderRaw: LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_PROVIDER,
+    },
+  };
 }
 
 function normalizeSecondaryErrorCategory(error) {
@@ -74,9 +92,9 @@ function normalizeSecondaryQuotePayload(raw, { source = 'cryptocompare', nowMs =
 }
 
 async function getSecondaryQuoteDetailed(symbol, opts = {}) {
-  const enabled = readEnvFlag('SECONDARY_QUOTE_ENABLED', false);
-  if (!enabled) return { ok: false, category: 'disabled', source: null };
-  const provider = String(process.env.SECONDARY_QUOTE_PROVIDER || '').trim().toLowerCase();
+  const secondaryQuoteConfig = getSecondaryQuoteConfig();
+  const { enabled, provider } = secondaryQuoteConfig;
+  if (!enabled) return { ok: false, category: 'disabled', source: null, config: secondaryQuoteConfig };
   if (!provider) return { ok: false, category: 'unconfigured', source: null };
   if (provider !== 'cryptocompare') {
     return { ok: false, category: 'provider_not_supported', source: provider };
@@ -182,6 +200,7 @@ async function getBestQuote(symbol, opts = {}) {
 module.exports = {
   setPrimaryQuoteFetcher,
   getPrimaryQuote,
+  getSecondaryQuoteConfig,
   getSecondaryQuoteDetailed,
   getSecondaryQuote,
   getBestQuote,

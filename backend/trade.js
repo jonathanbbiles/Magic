@@ -132,6 +132,7 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
 const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', LIVE_CRITICAL_DEFAULTS.SECONDARY_QUOTE_ENABLED === 'true');
+const SECONDARY_QUOTE_ROUTER_CONFIG = quoteRouter.getSecondaryQuoteConfig();
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -8982,14 +8983,18 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
   }
 
   let quoteFallback = null;
+  const quoteFallbackMaxAgeMs = Number.isFinite(Number(maxAgeMs))
+    ? Math.max(Number(maxAgeMs), ENTRY_QUOTE_MAX_AGE_MS)
+    : ENTRY_QUOTE_MAX_AGE_MS;
   try {
-    quoteFallback = await getLatestQuote(symbol, { maxAgeMs });
+    quoteFallback = await getLatestQuote(symbol, { maxAgeMs: quoteFallbackMaxAgeMs });
   } catch (err) {
     lastFailure = {
       reason: 'ob_fallback_quotes_missing',
       details: {
         ...(lastFailure?.details || {}),
         symbol,
+        quoteFallbackMaxAgeMs,
         fallbackError: err?.message || String(err),
       },
     };
@@ -15074,6 +15079,9 @@ async function runEntryScanOnce() {
       warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       fallbackOccurred: Boolean(fallbackReason),
       fallbackReason,
+      secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
+      secondaryQuoteRouterEnabled: SECONDARY_QUOTE_ROUTER_CONFIG.enabled,
+      secondaryQuoteRouterProvider: SECONDARY_QUOTE_ROUTER_CONFIG.provider || null,
     });
     if (fallbackReason) {
       console.warn('entry_universe_fallback_active', {
@@ -15784,6 +15792,8 @@ async function runEntryScanOnce() {
       warmupFallbackBudgetConfigured: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
       warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
       secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
+      secondaryQuoteRouterEnabled: SECONDARY_QUOTE_ROUTER_CONFIG.enabled,
+      secondaryQuoteRouterProvider: SECONDARY_QUOTE_ROUTER_CONFIG.provider || null,
       entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,
