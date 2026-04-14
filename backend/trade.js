@@ -90,6 +90,12 @@ const {
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { resolveStoragePaths } = require('./modules/storagePaths');
+const {
+  createEntryManagerHeartbeat,
+  updateEntryScanProgress: applyEntryScanProgressUpdate,
+  clearEntryScanProgress: applyEntryScanProgressClear,
+  recordDeferredScanTick,
+} = require('./modules/entryScanHeartbeat');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
 const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
@@ -4280,29 +4286,7 @@ const ENGINE_STATE_ALLOWED = new Set([
   'rate_limited',
   'degraded',
 ]);
-const entryManagerHeartbeat = {
-  started: false,
-  startedAt: null,
-  running: false,
-  lastHeartbeatAt: null,
-  lastScanAt: null,
-  lastScanDurationMs: null,
-  lastScanResult: null,
-  currentScanStartedAt: null,
-  currentScanLastProgressAt: null,
-  currentScanSymbolsProcessed: 0,
-  currentScanUniverseSize: 0,
-  currentScanState: 'idle',
-  currentScanStaleQuoteCooldownCount: 0,
-  currentScanSymbolHealthCooldownCount: 0,
-  currentScanStalePrimaryQuoteCount: 0,
-  currentScanDataUnavailableCount: 0,
-  currentScanMarketRejectionCount: 0,
-  currentScanTopSkipReasons: {},
-  totalScans: 0,
-  lastWatchdogWarningAt: null,
-  lastWatchdogReason: null,
-};
+const entryManagerHeartbeat = createEntryManagerHeartbeat();
 const lastActionTrace = {
   lastWarmupBatch: null,
   lastEntryScan: null,
@@ -4351,45 +4335,12 @@ function setLastActionTrace(field, payload) {
   };
 }
 
-function updateEntryScanProgress({
-  startMs = null,
-  symbolsProcessed = null,
-  universeSize = null,
-  state = null,
-  staleQuoteCooldownCount = null,
-  symbolHealthCooldownCount = null,
-  stalePrimaryQuoteCount = null,
-  dataUnavailableCount = null,
-  marketRejectionCount = null,
-  topSkipReasons = null,
-} = {}) {
-  const nowIso = safeIso();
-  if (Number.isFinite(startMs)) entryManagerHeartbeat.currentScanStartedAt = safeIso(startMs);
-  if (Number.isFinite(symbolsProcessed)) entryManagerHeartbeat.currentScanSymbolsProcessed = Math.max(0, Math.floor(symbolsProcessed));
-  if (Number.isFinite(universeSize)) entryManagerHeartbeat.currentScanUniverseSize = Math.max(0, Math.floor(universeSize));
-  if (typeof state === 'string' && state.trim()) entryManagerHeartbeat.currentScanState = state.trim();
-  if (Number.isFinite(staleQuoteCooldownCount)) entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = Math.max(0, Math.floor(staleQuoteCooldownCount));
-  if (Number.isFinite(symbolHealthCooldownCount)) entryManagerHeartbeat.currentScanSymbolHealthCooldownCount = Math.max(0, Math.floor(symbolHealthCooldownCount));
-  if (Number.isFinite(stalePrimaryQuoteCount)) entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = Math.max(0, Math.floor(stalePrimaryQuoteCount));
-  if (Number.isFinite(dataUnavailableCount)) entryManagerHeartbeat.currentScanDataUnavailableCount = Math.max(0, Math.floor(dataUnavailableCount));
-  if (Number.isFinite(marketRejectionCount)) entryManagerHeartbeat.currentScanMarketRejectionCount = Math.max(0, Math.floor(marketRejectionCount));
-  if (topSkipReasons && typeof topSkipReasons === 'object') entryManagerHeartbeat.currentScanTopSkipReasons = { ...topSkipReasons };
-  entryManagerHeartbeat.currentScanLastProgressAt = nowIso;
-  entryManagerHeartbeat.lastHeartbeatAt = nowIso;
+function updateEntryScanProgress(options = {}) {
+  applyEntryScanProgressUpdate(entryManagerHeartbeat, safeIso, options);
 }
 
-function clearEntryScanProgress({ state = 'idle' } = {}) {
-  entryManagerHeartbeat.currentScanStartedAt = null;
-  entryManagerHeartbeat.currentScanLastProgressAt = null;
-  entryManagerHeartbeat.currentScanSymbolsProcessed = 0;
-  entryManagerHeartbeat.currentScanUniverseSize = 0;
-  entryManagerHeartbeat.currentScanState = state;
-  entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = 0;
-  entryManagerHeartbeat.currentScanSymbolHealthCooldownCount = 0;
-  entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = 0;
-  entryManagerHeartbeat.currentScanDataUnavailableCount = 0;
-  entryManagerHeartbeat.currentScanMarketRejectionCount = 0;
-  entryManagerHeartbeat.currentScanTopSkipReasons = {};
+function clearEntryScanProgress(options = {}) {
+  applyEntryScanProgressClear(entryManagerHeartbeat, options);
 }
 
  
@@ -14436,7 +14387,16 @@ function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
 
 async function runEntryScanOnce() {
   beginMarketDataPass();
-  if (entryScanRunning) return;
+  if (entryScanRunning) {
+    const deferred = recordDeferredScanTick(entryManagerHeartbeat, safeIso, {
+      reason: 'previous_scan_still_running',
+      currentScanStartedAt: entryManagerHeartbeat.currentScanStartedAt,
+      currentScanState: entryManagerHeartbeat.currentScanState,
+      lastScanDurationMs: entryManagerHeartbeat.lastScanDurationMs,
+    });
+    console.log('entry_scan_tick_skipped', deferred);
+    return;
+  }
   entryScanRunning = true;
   entryManagerHeartbeat.running = true;
   entryManagerHeartbeat.lastHeartbeatAt = safeIso();

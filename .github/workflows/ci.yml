@@ -44,7 +44,7 @@ jobs:
           CHECK_RUNTIME_ENV_TEMPLATE_ONLY: 'true'
 
   frontend:
-    name: Frontend install
+    name: Frontend validation
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -62,3 +62,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Check
+        run: npm run check
+
+      - name: Lint
+        run: npm run lint

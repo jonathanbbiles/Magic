@@ -99,15 +99,19 @@ async function expectStartupSuccessNoApiToken() {
     if (status.payload?.apiTokenSet !== false) {
       throw new Error(`Expected apiTokenSet=false, got ${JSON.stringify(status.payload)}`);
     }
+    if (status.payload?.alpacaAuthOk !== true) {
+      throw new Error(`Expected alpacaAuthOk=true from /debug/auth, got ${JSON.stringify(status.payload)}`);
+    }
+    if (status.payload?.effectiveTradeBase !== 'https://api.alpaca.markets') {
+      throw new Error(`Expected effectiveTradeBase in /debug/auth, got ${JSON.stringify(status.payload)}`);
+    }
+    if (status.payload?.effectiveDataBase !== 'https://data.alpaca.markets') {
+      throw new Error(`Expected effectiveDataBase in /debug/auth, got ${JSON.stringify(status.payload)}`);
+    }
+
     await delay(600);
     if (!state.stdout.includes('startup_truth_summary')) {
-      throw new Error(`Expected startup_truth_summary log. stdout=${state.stdout}`);
-    }
-    if (!state.stdout.includes("effectiveTradeBase: 'https://api.alpaca.markets'")) {
-      throw new Error(`Expected live TRADE_BASE in startup log. stdout=${state.stdout}`);
-    }
-    if (!state.stdout.includes("effectiveDataBase: 'https://data.alpaca.markets'")) {
-      throw new Error(`Expected live DATA_BASE in startup log. stdout=${state.stdout}`);
+      throw new Error(`Expected startup_truth_summary tag in logs. stdout=${state.stdout}`);
     }
   } finally {
     child.kill();
