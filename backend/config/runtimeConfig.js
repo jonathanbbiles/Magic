@@ -87,6 +87,22 @@ function getRuntimeConfig(env = process.env) {
     executionTier1Symbols,
     executionTier2Symbols,
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
+    entryTier3MinPortfolioUsd: parsePositiveInt(
+      env.ENTRY_TIER3_MIN_PORTFOLIO_USD,
+      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_TIER3_MIN_PORTFOLIO_USD, 500),
+    ),
+    entryDynamicAllowTier3Override: parseBoolean(
+      env.ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
+      parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE, false),
+    ),
+    entryDynamicRequireFreshQuote: parseBoolean(
+      env.ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+      parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE, true),
+    ),
+    entryDynamicRequireOrderbookForTier3: parseBoolean(
+      env.ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+      parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3, true),
+    ),
     entryScanIntervalMs: parsePositiveInt(env.ENTRY_SCAN_INTERVAL_MS, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS, 10000)),
     entryPrefetchChunkSize: parsePositiveInt(env.ENTRY_PREFETCH_CHUNK_SIZE, parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE, 5)),
     entryPrefetchQuotes: parseBoolean(env.ENTRY_PREFETCH_QUOTES, parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_QUOTES, true)),
@@ -131,6 +147,10 @@ function getRuntimeConfigSummary(env = process.env) {
     executionTier2Symbols: config.executionTier2Symbols,
     executionTier1Count: config.executionTier1Symbols.length,
     executionTier2Count: config.executionTier2Symbols.length,
+    entryTier3MinPortfolioUsd: config.entryTier3MinPortfolioUsd,
+    entryDynamicAllowTier3Override: config.entryDynamicAllowTier3Override,
+    entryDynamicRequireFreshQuote: config.entryDynamicRequireFreshQuote,
+    entryDynamicRequireOrderbookForTier3: config.entryDynamicRequireOrderbookForTier3,
     entryUniverseExcludeStables: config.entryUniverseExcludeStables,
     entryUniverseMaxSymbols: config.entryUniverseMaxSymbols,
     entryScanIntervalMs: config.entryScanIntervalMs,

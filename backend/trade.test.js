@@ -286,11 +286,16 @@ const {
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeProviderQuoteAgeMs,
   computeEffectivePerScanBudget,
+  computeAdaptiveOrderbookThresholds,
+  shouldAllowDynamicTier3,
   evaluatePrimaryQuoteViability,
   classifyQuoteFetchFailureReason,
   __testNoteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState,
+  __testSetEntryScanRunningForTests,
+  __testSetEntryScanRerunRequestedForTests,
+  __testGetEntryScanRerunRequestedForTests,
 } = tradeEntryBasis;
 
 assert.equal(
@@ -317,6 +322,46 @@ const stalePrimaryViability = evaluatePrimaryQuoteViability({
 });
 assert.equal(stalePrimaryViability.ok, false);
 assert.equal(stalePrimaryViability.reason, 'stale_quote_primary');
+const adaptiveThresholdsSmall = computeAdaptiveOrderbookThresholds({
+  symbol: 'UNI/USD',
+  portfolioValue: 107.51,
+  buyingPower: 50,
+  quoteMid: 10,
+});
+assert.ok(Math.abs(adaptiveThresholdsSmall.minDepthUsd - 64.506) < 1e-9);
+assert.ok(Math.abs(adaptiveThresholdsSmall.impactNotionalUsd - 10.751) < 1e-9);
+
+const adaptiveThresholdsFloor = computeAdaptiveOrderbookThresholds({
+  symbol: 'UNI/USD',
+  portfolioValue: 20,
+  buyingPower: 20,
+  quoteMid: 10,
+});
+assert.equal(adaptiveThresholdsFloor.minDepthUsd, 25);
+assert.equal(adaptiveThresholdsFloor.impactNotionalUsd, 10);
+
+const adaptiveThresholdsCeil = computeAdaptiveOrderbookThresholds({
+  symbol: 'BTC/USD',
+  portfolioValue: 4000,
+  buyingPower: 5000,
+  quoteMid: 50000,
+});
+assert.equal(adaptiveThresholdsCeil.minDepthUsd, 175);
+assert.equal(adaptiveThresholdsCeil.impactNotionalUsd, 400);
+
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, executionTier3Default: true }), false);
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 600, minPortfolioUsd: 500, executionTier3Default: true }), true);
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, allowOverride: true, executionTier3Default: true }), true);
+
+__testSetEntryScanRunningForTests(false);
+__testSetEntryScanRerunRequestedForTests(false);
+assert.equal(__testGetEntryScanRerunRequestedForTests(), false);
+__testSetEntryScanRunningForTests(true);
+tradeEntryBasis.runEntryScanOnce();
+tradeEntryBasis.runEntryScanOnce();
+assert.equal(__testGetEntryScanRerunRequestedForTests(), true);
+__testSetEntryScanRunningForTests(false);
+__testSetEntryScanRerunRequestedForTests(false);
 
 const freshPrimaryViability = evaluatePrimaryQuoteViability({
   quote: { tsMs: Date.now() - 5000 },
@@ -1059,9 +1104,9 @@ assert.match(
   /const sellClientOrderId = sellOrder\?\.client_order_id \|\| sellOrder\?\.clientOrderId \|\| null;[\s\S]*sellClientOrderId,/,
 );
 assert.match(tradeSource, /const clamp01 = \(x\) => clamp\(Number\(x\), 0, 1\);/);
-assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
+assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 10\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
-assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 8\);/);
+assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 6\);/);
 assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', true\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_1M = readNumber\('PREDICTOR_MIN_BARS_1M', 30\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_5M = readNumber\('PREDICTOR_MIN_BARS_5M', 30\);/);
@@ -1139,8 +1184,8 @@ withEnv({
 }, () => {
   delete require.cache[marketDataConfigPath];
   const cfg = require('./config/marketData');
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.52);
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.55);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.50);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.52);
 });
 
 withEnv({
