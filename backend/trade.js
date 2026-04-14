@@ -80,7 +80,12 @@ const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { createMarketDataCache } = require('./modules/marketDataCache');
-const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
+const {
+  buildEntryUniverse,
+  buildDynamicCryptoUniverseFromAssets,
+  filterDynamicUniverseByExecutionPolicy,
+  rankDynamicUniverseByExecutionQuality,
+} = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
 const { evaluateEconomicEntryPrefilter } = require('./modules/economicEntryPrefilter');
 const {
@@ -240,9 +245,9 @@ const LIQUIDITY_WINDOW_UTC_END = readNumber('LIQUIDITY_WINDOW_UTC_END', 16);
 const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
 const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
-const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
+const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 10);
 const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 4);
-const REGIME_MIN_VOL_BPS_TIER2 = readNumber('REGIME_MIN_VOL_BPS_TIER2', 8);
+const REGIME_MIN_VOL_BPS_TIER2 = readNumber('REGIME_MIN_VOL_BPS_TIER2', 6);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -740,8 +745,13 @@ const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
 const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 10000);
 const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 60);
 const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 175);
+const ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL = readNumber('ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL', 6);
+const ORDERBOOK_MIN_DEPTH_USD_FLOOR = readNumber('ORDERBOOK_MIN_DEPTH_USD_FLOOR', 25);
+const ORDERBOOK_MIN_DEPTH_USD_CEIL = readNumber('ORDERBOOK_MIN_DEPTH_USD_CEIL', 175);
 const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN', 0.25);
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
+const ORDERBOOK_IMPACT_NOTIONAL_MODE = String(process.env.ORDERBOOK_IMPACT_NOTIONAL_MODE || 'entry_notional').trim().toLowerCase();
+const ORDERBOOK_IMPACT_NOTIONAL_MIN_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_MIN_USD', 10);
 const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
 const ORDERBOOK_MIN_LEVELS_PER_SIDE = Math.max(1, Math.floor(readNumber('ORDERBOOK_MIN_LEVELS_PER_SIDE', 2)));
@@ -781,6 +791,10 @@ const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
 const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
 const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;
+const ENTRY_TIER3_MIN_PORTFOLIO_USD = runtimeLiveConfig.entryTier3MinPortfolioUsd;
+const ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE = runtimeLiveConfig.entryDynamicAllowTier3Override;
+const ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE = runtimeLiveConfig.entryDynamicRequireFreshQuote;
+const ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3 = runtimeLiveConfig.entryDynamicRequireOrderbookForTier3;
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
@@ -888,6 +902,59 @@ function computeCappedEntryNotional({
     requestedNotionalUsd,
     cappedNotionalUsd,
   };
+}
+
+function computeAdaptiveOrderbookThresholds({
+  symbol,
+  portfolioValue,
+  buyingPower,
+  quoteMid,
+}) {
+  const baseNotionalUsd = Math.max(0, Number(portfolioValue) * TRADE_PORTFOLIO_PCT);
+  const { cappedNotionalUsd } = computeCappedEntryNotional({
+    symbol,
+    portfolioValue,
+    buyingPower,
+    baseNotionalUsd,
+    context: 'orderbook_gate_estimate',
+  });
+  const entryNotionalUsd = Math.max(0, Number(cappedNotionalUsd) || 0);
+  const minDepthFromNotional = entryNotionalUsd * Math.max(0, ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL);
+  const adaptiveMinDepthUsd = clamp(
+    Number.isFinite(minDepthFromNotional) ? minDepthFromNotional : 0,
+    ORDERBOOK_MIN_DEPTH_USD_FLOOR,
+    ORDERBOOK_MIN_DEPTH_USD_CEIL,
+  );
+  const impactNotionalUsd = ORDERBOOK_IMPACT_NOTIONAL_MODE === 'entry_notional'
+    ? Math.max(ORDERBOOK_IMPACT_NOTIONAL_MIN_USD, entryNotionalUsd)
+    : Math.max(ORDERBOOK_IMPACT_NOTIONAL_MIN_USD, ORDERBOOK_IMPACT_NOTIONAL_USD);
+  const summary = {
+    symbol,
+    portfolioValue: Number.isFinite(Number(portfolioValue)) ? Number(portfolioValue) : null,
+    buyingPower: Number.isFinite(Number(buyingPower)) ? Number(buyingPower) : null,
+    quoteMid: Number.isFinite(Number(quoteMid)) ? Number(quoteMid) : null,
+    entryNotionalUsd,
+    minDepthUsd: adaptiveMinDepthUsd,
+    minDepthFloorUsd: ORDERBOOK_MIN_DEPTH_USD_FLOOR,
+    minDepthCeilUsd: ORDERBOOK_MIN_DEPTH_USD_CEIL,
+    minDepthMultOfNotional: ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL,
+    impactNotionalMode: ORDERBOOK_IMPACT_NOTIONAL_MODE,
+    impactNotionalMinUsd: ORDERBOOK_IMPACT_NOTIONAL_MIN_USD,
+    impactNotionalUsd,
+  };
+  console.log('entry_orderbook_adaptive_thresholds', summary);
+  return summary;
+}
+
+function shouldAllowDynamicTier3({
+  portfolioValue,
+  minPortfolioUsd = ENTRY_TIER3_MIN_PORTFOLIO_USD,
+  allowOverride = ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
+  executionTier3Default = EXECUTION_TIER3_DEFAULT,
+} = {}) {
+  if (!executionTier3Default) return false;
+  if (allowOverride) return true;
+  return Number(portfolioValue || 0) >= Number(minPortfolioUsd || 0);
 }
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
@@ -1592,6 +1659,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     orderbookBandBps: ORDERBOOK_BAND_BPS,
     orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
     orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+    orderbookDepthMultOfNotional: ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL,
     orderbookLiquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
     volumeTrendMin: VOLUME_TREND_MIN,
     timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
@@ -1816,6 +1884,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   quoteAgeMs = Number.isFinite(quoteAgeMs) ? Math.max(0, quoteAgeMs) : null;
   let sparseRetryDetails = null;
   let sparseRejectCounted = false;
+  let staleQuoteRecoveredByForcedRefresh = false;
   const maybeCountSparseReject = ({ reason, marketDataEval = null }) => {
     const shouldCount = shouldCountSparseFallbackReject({ marketDataEval }) ||
       shouldCountSparseRetryFailureReject({ reason, sparseRetryDetails });
@@ -1826,25 +1895,94 @@ async function computeEntrySignal(symbol, opts = {}) {
     return shouldCount;
   };
 
+  const forceRefreshStaleQuoteOnce = async () => {
+    const refreshed = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, {
+      maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      forceRefresh: true,
+      bypassCache: true,
+    }).catch(() => null);
+    if (!refreshed) return false;
+    quote = refreshed;
+    quoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
+    quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+    quoteSource = quote?.source || quoteSource;
+    quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+    return true;
+  };
+
   const primaryQuoteViability = evaluatePrimaryQuoteViability({
     quote,
     nowMs,
     maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
   });
-  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViability.quoteAgeMs)
-    && primaryQuoteViability.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
   if (!primaryQuoteViability.ok) {
+    const refreshed = await forceRefreshStaleQuoteOnce();
+    if (refreshed) {
+      const refreshedViability = evaluatePrimaryQuoteViability({
+        quote,
+        nowMs: Date.now(),
+        maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      });
+      if (refreshedViability.ok) {
+        staleQuoteRecoveredByForcedRefresh = true;
+        console.log('entry_stale_quote_recovered', {
+          symbol: asset.symbol,
+          symbolTier,
+          source: quoteSource,
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+          thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+      } else {
+        noteStaleQuoteSkip(asset.symbol, {
+          reason: refreshedViability.reason || 'stale_quote_primary',
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+        });
+        console.log('entry_stale_quote_refresh_failed', {
+          symbol: asset.symbol,
+          symbolTier,
+          reason: refreshedViability.staleReasonCode || refreshedViability.reason,
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+          source: quoteSource,
+          thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+        return {
+          entryReady: false,
+          why: 'marketdata_unavailable',
+          meta: {
+            symbol: asset.symbol,
+            symbolTier,
+            reason: refreshedViability.staleReasonCode || refreshedViability.reason || 'stale_quote_primary',
+            quoteAgeMs: refreshedViability.quoteAgeMs,
+            staleRefreshAttempted: true,
+            staleRefreshRecovered: false,
+            skippedOrderbookFetch: true,
+            skippedTradeFetch: true,
+            skippedSparseRetry: true,
+          },
+          record: baseRecord,
+        };
+      }
+    }
+  }
+  const primaryQuoteViabilityFinal = evaluatePrimaryQuoteViability({
+    quote,
+    nowMs: Date.now(),
+    maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+  });
+  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViabilityFinal.quoteAgeMs)
+    && primaryQuoteViabilityFinal.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
+  if (!primaryQuoteViabilityFinal.ok) {
     const cooldownMs = quoteHopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null;
     noteStaleQuoteSkip(asset.symbol, {
       cooldownMs,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.reason,
-      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.reason,
+      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
     });
     console.log('entry_quote_viability_skip', {
       symbol: asset.symbol,
       symbolTier,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.staleReasonCode,
-      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.staleReasonCode,
+      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
       quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
       thresholdName: 'normalEntryQuoteMaxAgeMs',
       thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
@@ -1858,10 +1996,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       meta: {
         symbol: asset.symbol,
         symbolTier,
-        reason: primaryQuoteViability.staleReasonCode,
-        quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+        reason: primaryQuoteViabilityFinal.staleReasonCode,
+        quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
         thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
         staleQuoteHopeless: quoteHopelesslyStale,
+        staleRefreshAttempted: true,
+        staleRefreshRecovered: false,
         skippedOrderbookFetch: true,
         skippedTradeFetch: true,
         skippedSparseRetry: true,
@@ -1888,6 +2028,13 @@ async function computeEntrySignal(symbol, opts = {}) {
       obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
     }
   }
+  const accountInfo = opts?.accountInfo || {};
+  const adaptiveLiquidityThresholds = computeAdaptiveOrderbookThresholds({
+    symbol: asset.symbol,
+    portfolioValue: Number(accountInfo.portfolioValue || 0),
+    buyingPower: Number(accountInfo.buyingPower || 0),
+    quoteMid: mid,
+  });
   if (!obResult.ok) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
     return {
@@ -1908,7 +2055,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
       },
       record: baseRecord,
@@ -1924,9 +2071,9 @@ async function computeEntrySignal(symbol, opts = {}) {
       },
       {
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
-        impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        impactNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
         imbalanceBiasScale: ORDERBOOK_IMBALANCE_BIAS_SCALE,
         minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
       },
@@ -2113,7 +2260,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         askDepthUsd: orderbookMeta.askDepthUsd,
         totalDepthUsd: orderbookMeta.totalDepthUsd,
         actualDepthUsd: orderbookMeta.actualDepthUsd,
-        minDepthThreshold: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthThreshold: adaptiveLiquidityThresholds.minDepthUsd,
         orderbookLevelCounts: orderbookMeta.orderbookLevelCounts,
       });
     }
@@ -2130,7 +2277,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
       },
       record: baseRecord,
@@ -2151,7 +2298,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
         liquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
       },
@@ -3670,7 +3817,7 @@ async function confirmEntryIntent(intent, options = {}) {
     const orderbookMeta = orderbook?.ok
       ? computeOrderbookMetrics(orderbook.orderbook, { bid, ask }, {
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
         impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
         minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
@@ -4242,6 +4389,7 @@ const positionsListCache = {
 };
 let entryManagerRunning = false;
 let entryScanRunning = false;
+let entryScanRerunRequested = false;
 let entryManagerIntervalId = null;
 let entryWatchdogIntervalId = null;
 const openPositionsCache = {
@@ -14388,15 +14536,18 @@ function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
 async function runEntryScanOnce() {
   beginMarketDataPass();
   if (entryScanRunning) {
+    entryScanRerunRequested = true;
     const deferred = recordDeferredScanTick(entryManagerHeartbeat, safeIso, {
       reason: 'previous_scan_still_running',
       currentScanStartedAt: entryManagerHeartbeat.currentScanStartedAt,
       currentScanState: entryManagerHeartbeat.currentScanState,
       lastScanDurationMs: entryManagerHeartbeat.lastScanDurationMs,
+      rerunQueued: true,
     });
     console.log('entry_scan_tick_skipped', deferred);
     return;
   }
+  entryScanRerunRequested = false;
   entryScanRunning = true;
   entryManagerHeartbeat.running = true;
   entryManagerHeartbeat.lastHeartbeatAt = safeIso();
@@ -14594,34 +14745,63 @@ async function runEntryScanOnce() {
     const normalizedUniverse = universe
       .map((sym) => normalizeSymbol(sym))
       .filter(Boolean);
+    let accountInfoForUniverse = { portfolioValue: 0, buyingPower: 0 };
+    try {
+      accountInfoForUniverse = await getAccountInfo();
+    } catch (accountErr) {
+      console.warn('entry_universe_account_info_unavailable', { error: accountErr?.message || String(accountErr) });
+    }
+    const tier3Allowed = shouldAllowDynamicTier3({
+      portfolioValue: accountInfoForUniverse.portfolioValue,
+    });
+    const tier3SuppressedByPortfolio = EXECUTION_TIER3_DEFAULT && !tier3Allowed;
     let tierFilteredUniverse = normalizedUniverse;
-    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && !EXECUTION_TIER3_DEFAULT) {
-      const allowedExecutionSymbols = new Set([...EXECUTION_TIER1_SYMBOLS, ...EXECUTION_TIER2_SYMBOLS]);
-      tierFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
+    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic')) {
+      const executionFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
         executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
         executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-        executionTier3Default: EXECUTION_TIER3_DEFAULT,
+        executionTier3Default: tier3Allowed,
       });
-      const filteredOut = normalizedUniverse.filter((symbol) => !allowedExecutionSymbols.has(symbol));
+      tierFilteredUniverse = executionFilteredUniverse;
       console.log('entry_universe_tier_filter', {
         rawDynamicCount: normalizedUniverse.length,
         filteredCount: tierFilteredUniverse.length,
-        filteredOutCount: filteredOut.length,
+        filteredOutCount: Math.max(0, normalizedUniverse.length - tierFilteredUniverse.length),
         tier1Count: EXECUTION_TIER1_SYMBOLS.size,
         tier2Count: EXECUTION_TIER2_SYMBOLS.size,
         tier3Default: EXECUTION_TIER3_DEFAULT,
-        filteredOutSample: filteredOut.slice(0, 10),
+        tier3SuppressedByPortfolio,
+        tier3MinPortfolioUsd: ENTRY_TIER3_MIN_PORTFOLIO_USD,
+        portfolioValueUsd: Number(accountInfoForUniverse.portfolioValue || 0),
+        entryDynamicAllowTier3Override: ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
       });
     }
     const filteredSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
-    const prioritizedSymbols = filteredSymbols.sort((a, b) => {
-      const aTier = EXECUTION_TIER1_SYMBOLS.has(a) ? 1 : EXECUTION_TIER2_SYMBOLS.has(a) ? 2 : 3;
-      const bTier = EXECUTION_TIER1_SYMBOLS.has(b) ? 1 : EXECUTION_TIER2_SYMBOLS.has(b) ? 2 : 3;
-      if (aTier !== bTier) return aTier - bTier;
-      return String(a).localeCompare(String(b));
+    const rankedDynamicUniverse = rankDynamicUniverseByExecutionQuality(filteredSymbols, {
+      executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+      executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+      maxSymbols: filteredSymbols.length,
+      requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+      requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+      quoteBySymbol: Object.fromEntries(
+        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getQuoteUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS }).value || null]),
+      ),
+      orderbookBySymbol: Object.fromEntries(
+        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getOrderbookUsable(symbol, { nowMs: Date.now(), maxAgeMs: ORDERBOOK_MAX_AGE_MS }).value || null]),
+      ),
+      quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      nowMs: Date.now(),
     });
+    const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
+      ? rankedDynamicUniverse.symbols
+      : filteredSymbols.sort((a, b) => {
+        const aTier = EXECUTION_TIER1_SYMBOLS.has(a) ? 1 : EXECUTION_TIER2_SYMBOLS.has(a) ? 2 : 3;
+        const bTier = EXECUTION_TIER1_SYMBOLS.has(b) ? 1 : EXECUTION_TIER2_SYMBOLS.has(b) ? 2 : 3;
+        if (aTier !== bTier) return aTier - bTier;
+        return String(a).localeCompare(String(b));
+      });
     const ratePressureActive = isUnderRatePressure();
     const effectiveUniverseCap = ratePressureActive
       ? Math.max(4, Math.floor(ENTRY_UNIVERSE_MAX_SYMBOLS * 0.5))
@@ -14719,6 +14899,12 @@ async function runEntryScanOnce() {
       configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
       configuredSecondarySample: configuredUniverse.secondary.slice(0, 6),
       acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      dynamicRankingSample: rankedDynamicUniverse.diagnostics.slice(0, 5),
+      dynamicRequireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+      dynamicRequireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+      tier3SuppressedByPortfolio,
+      tier3MinPortfolioUsd: ENTRY_TIER3_MIN_PORTFOLIO_USD,
+      portfolioValueUsd: Number(accountInfoForUniverse.portfolioValue || 0),
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
       nodeEnv: NODE_ENV,
     });
@@ -15074,6 +15260,7 @@ async function runEntryScanOnce() {
         fallbackBudgetState,
         entryMarketDataContext,
         sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
+        accountInfo: accountInfoForUniverse,
       });
       const recordBase = signal?.record ? { ...signal.record } : null;
       const candidateMeta = signal?.meta || {};
@@ -15536,6 +15723,18 @@ async function runEntryScanOnce() {
     entryManagerHeartbeat.lastHeartbeatAt = safeIso();
     if (!entryScanRunning && !entryManagerHeartbeat.currentScanStartedAt && entryManagerHeartbeat.currentScanState !== 'aborted') {
       clearEntryScanProgress({ state: 'idle' });
+    }
+    if (entryScanRerunRequested) {
+      entryScanRerunRequested = false;
+      console.log('entry_scan_rerun_execute', {
+        reason: 'deferred_scan_tick',
+        queuedAt: safeIso(),
+      });
+      setTimeout(() => {
+        runEntryScanOnce().catch((err) => {
+          console.error('entry_scan_rerun_failed', err?.message || err);
+        });
+      }, 0);
     }
   }
 }
@@ -17629,6 +17828,8 @@ function __resetManagerIntervalsForTests() {
   exitRepairIntervalId = null;
   exitRepairBootstrapTimeoutId = null;
   entryManagerRunning = false;
+  entryScanRunning = false;
+  entryScanRerunRequested = false;
   exitManagerRunning = false;
   entryManagerHeartbeat.running = false;
   clearEntryScanProgress({ state: 'idle' });
@@ -17857,6 +18058,8 @@ module.exports = {
   computeProviderQuoteAgeMs,
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeEffectivePerScanBudget,
+  computeAdaptiveOrderbookThresholds,
+  shouldAllowDynamicTier3,
   evaluatePrimaryQuoteViability,
   classifyQuoteFetchFailureReason,
   resolveEntryExecutionContext,
@@ -17874,6 +18077,13 @@ module.exports = {
   __testNoteStaleQuoteSkip: noteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState: getStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState: clearStaleQuoteSkipState,
+  __testSetEntryScanRunningForTests: (value) => {
+    entryScanRunning = Boolean(value);
+  },
+  __testSetEntryScanRerunRequestedForTests: (value) => {
+    entryScanRerunRequested = Boolean(value);
+  },
+  __testGetEntryScanRerunRequestedForTests: () => entryScanRerunRequested,
   __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
   __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
   __getScanMarketDataCacheForTests: () => scanMarketDataCache,

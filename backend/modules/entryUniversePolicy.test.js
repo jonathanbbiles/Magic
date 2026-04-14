@@ -1,5 +1,10 @@
 const assert = require('assert/strict');
-const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./entryUniversePolicy');
+const {
+  buildEntryUniverse,
+  buildDynamicCryptoUniverseFromAssets,
+  filterDynamicUniverseByExecutionPolicy,
+  rankDynamicUniverseByExecutionQuality,
+} = require('./entryUniversePolicy');
 
 const uniPrimaryOnly = buildEntryUniverse({
   primaryRaw: 'BTC/USD,ETH/USD, btc/usd ',
@@ -59,5 +64,31 @@ assert.deepEqual(
   }),
   rawDynamicSymbols,
 );
+
+const rankedUniverse = rankDynamicUniverseByExecutionQuality(
+  ['UNI/USD', 'ETH/USD', 'BTC/USD', 'LOW/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    executionTier2Symbols: ['UNI/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: true,
+    quoteMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.05, tsMs: 1700000010000 },
+      'ETH/USD': { bid: 50, ask: 50.02, tsMs: 1700000011000 },
+      'UNI/USD': { bid: 5, ask: 5.02, tsMs: 1700000005000 },
+      'LOW/USD': { bid: 1, ask: 1.4, tsMs: 1700000010000 },
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+      'UNI/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+      'LOW/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+    },
+  },
+);
+assert.deepEqual(rankedUniverse.symbols, ['ETH/USD', 'BTC/USD', 'UNI/USD']);
+assert.equal(rankedUniverse.droppedCount, 1);
 
 console.log('entry universe policy tests passed');
