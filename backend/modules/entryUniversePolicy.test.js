@@ -90,5 +90,26 @@ const rankedUniverse = rankDynamicUniverseByExecutionQuality(
 );
 assert.deepEqual(rankedUniverse.symbols, ['ETH/USD', 'BTC/USD', 'UNI/USD']);
 assert.equal(rankedUniverse.droppedCount, 1);
+assert.equal(rankedUniverse.diagnostics.find((row) => row.symbol === 'UNI/USD')?.hasFreshQuote, true);
+
+const reuseHeadroomRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    requireFreshQuote: true,
+    quoteMaxAgeMs: 5000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.05, tsMs: 1700000004000 }, // 11s old -> stale for reuse headroom
+      'ETH/USD': { bid: 50, ask: 50.02, tsMs: 1700000013000 }, // 2s old
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+    },
+  },
+);
+assert.deepEqual(reuseHeadroomRank.symbols, ['ETH/USD']);
+assert.equal(reuseHeadroomRank.diagnostics[0].quoteAgeMs <= 5000, true);
 
 console.log('entry universe policy tests passed');
