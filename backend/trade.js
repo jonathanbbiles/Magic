@@ -1622,7 +1622,7 @@ async function computeEntrySignal(symbol, opts = {}) {
       coordinator: entryMarketDataCoordinator,
       marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
-      fetchQuote: getLatestQuote,
+      fetchQuote: getEntryScanQuoteWithSecondaryRescue,
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -1658,7 +1658,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     }
   } else {
     try {
-      quote = await getLatestQuoteFromQuotesOnly(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+      quote = await getEntryScanQuoteWithSecondaryRescue(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     } catch (err) {
       const quoteFetchReason = classifyQuoteFetchFailureReason(err, 'marketdata_unavailable');
       if (quoteFetchReason === 'stale_quote_primary') {
@@ -5704,6 +5704,71 @@ async function getQuoteForTrading(symbol, opts = {}) {
     receivedAtMs: Number.isFinite(Number(best.receivedAtMs)) ? Number(best.receivedAtMs) : null,
     source: best.source || 'best_quote',
   };
+}
+
+async function getEntryScanQuoteWithSecondaryRescue(rawSymbol, opts = {}) {
+  const symbol = normalizeSymbol(rawSymbol);
+  try {
+    return await getLatestQuote(symbol, opts);
+  } catch (primaryError) {
+    const primaryFailureReason = classifyQuoteFetchFailureReason(primaryError, 'marketdata_unavailable');
+    if (!SECONDARY_QUOTE_ENABLED || primaryFailureReason !== 'stale_quote_primary') {
+      throw primaryError;
+    }
+
+    const nowMs = Date.now();
+    const requestedMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS;
+    const effectiveMaxAgeMs = applyCryptoQuoteMaxAgeOverride({
+      symbol,
+      isCrypto: isCryptoSymbol(symbol),
+      effectiveMaxAgeMs: requestedMaxAgeMs,
+    });
+    const secondary = await quoteRouter.getSecondaryQuote(symbol).catch(() => null);
+    const secondaryTsMs = Number.isFinite(Number(secondary?.ts)) ? Number(secondary.ts) : null;
+    const secondaryAgeMs = Number.isFinite(secondaryTsMs) ? Math.max(0, nowMs - secondaryTsMs) : null;
+    const secondaryUsable = Boolean(
+      secondary
+      && Number.isFinite(Number(secondary?.bid))
+      && Number.isFinite(Number(secondary?.ask))
+      && Number(secondary.bid) > 0
+      && Number(secondary.ask) > 0
+      && (!Number.isFinite(secondaryAgeMs) || secondaryAgeMs <= effectiveMaxAgeMs)
+    );
+    if (!secondaryUsable) {
+      console.warn('entry_scan_secondary_quote_rescue_failed', {
+        symbol,
+        reason: 'secondary_unavailable_or_stale',
+        primaryFailureReason,
+        primaryError: primaryError?.message || String(primaryError),
+        secondarySource: secondary?.source || null,
+        secondaryAgeMs,
+        effectiveMaxAgeMs,
+      });
+      throw primaryError;
+    }
+
+    const rescuedQuote = {
+      bid: Number(secondary.bid),
+      ask: Number(secondary.ask),
+      mid: (Number(secondary.bid) + Number(secondary.ask)) / 2,
+      tsMs: secondaryTsMs || nowMs,
+      receivedAtMs: Number.isFinite(Number(secondary?.receivedAtMs)) ? Number(secondary.receivedAtMs) : nowMs,
+      source: `secondary_rescue:${secondary.source || 'secondary'}`,
+    };
+    quoteCache.set(symbol, rescuedQuote);
+    scanMarketDataCache.upsertQuote(symbol, rescuedQuote, rescuedQuote.tsMs || nowMs);
+    recordLastQuoteAt(symbol, { tsMs: rescuedQuote.tsMs, source: rescuedQuote.source });
+    recordQuoteSuccess(symbol);
+    quotePassCache.set(symbol, { passId: marketDataPassId, quote: rescuedQuote });
+    console.log('entry_scan_secondary_quote_rescued', {
+      symbol,
+      source: rescuedQuote.source,
+      quoteAgeMs: secondaryAgeMs,
+      effectiveMaxAgeMs,
+      primaryFailureReason,
+    });
+    return rescuedQuote;
+  }
 }
 
 function computeStopDistanceBps({ atr, price }) {
