@@ -56,12 +56,32 @@ const theme = {
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
 
-const BASE_URL =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) ||
-  'https://magic-lw8t.onrender.com';
-
+const RAW_BACKEND_URL =
+  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
+const DEFAULT_DEV_BACKEND_URL = 'http://127.0.0.1:3000';
+
+function resolveBackendConfig() {
+  const trimmed = String(RAW_BACKEND_URL || '').trim();
+  if (trimmed) {
+    return {
+      baseUrl: trimmed,
+      warning: null,
+      usingFallback: false,
+      missing: false,
+    };
+  }
+  return {
+    baseUrl: DEFAULT_DEV_BACKEND_URL,
+    warning: `EXPO_PUBLIC_BACKEND_URL is not set. Using dev fallback ${DEFAULT_DEV_BACKEND_URL}.`,
+    usingFallback: true,
+    missing: true,
+  };
+}
+
+const BACKEND_CONFIG = resolveBackendConfig();
+const BASE_URL = BACKEND_CONFIG.baseUrl;
 const FETCH_TIMEOUT_MS = 20000;
 
 // ---------------------------------------------------------------------------
@@ -553,6 +573,12 @@ function AppInner() {
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
 
+      {BACKEND_CONFIG.warning ? (
+        <View style={s.configBanner}>
+          <Text style={s.configBannerText}>{BACKEND_CONFIG.warning}</Text>
+        </View>
+      ) : null}
+
       {tab === 'overview' ? (
         <ScrollView
           style={s.scrollBody}
@@ -571,6 +597,7 @@ function AppInner() {
             <Chip label={`Engine: ${engineState}`} ok={String(engineState).toLowerCase() !== 'degraded'} />
             <Chip label={`Alpaca: ${alpacaOk ? 'OK' : 'off'}`} ok={alpacaOk} />
             <Chip label={`Backend: ${backendOk ? 'up' : 'down'}`} ok={backendOk} />
+            {BACKEND_CONFIG.usingFallback ? <Chip label="Config: fallback" ok={false} /> : null}
           </View>
 
           {/* Portfolio card */}
@@ -844,6 +871,18 @@ const s = StyleSheet.create({
   logLine: { fontSize: 11, lineHeight: 16, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
   logTs: { color: theme.colors.muted },
   logLevel: { fontWeight: '700' },
+
+  configBanner: {
+    marginHorizontal: theme.spacing.lg,
+    marginTop: theme.spacing.sm,
+    backgroundColor: theme.colors.chipWarn,
+    borderWidth: 1,
+    borderColor: theme.colors.chipWarnBorder,
+    borderRadius: theme.radius.md,
+    paddingVertical: theme.spacing.sm,
+    paddingHorizontal: theme.spacing.md,
+  },
+  configBannerText: { color: theme.colors.chipWarnText, fontWeight: '700', fontSize: 12 },
 
   // Error states
   errorBanner: {

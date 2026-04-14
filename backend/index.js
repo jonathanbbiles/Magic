@@ -82,6 +82,8 @@ const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeC
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { preflightStoragePaths, resolveStoragePaths, logOnce } = require('./modules/storagePaths');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
+const { emitStartupTruthSummary } = require('./modules/startupTruthSummary');
+const { shapeEntryManagerTelemetry } = require('./modules/entryTelemetryShape');
 
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -575,11 +577,16 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/debug/auth', (req, res) => {
+  const authStatus = getAlpacaAuthStatus();
+  const baseStatus = getAlpacaBaseStatus();
   res.json({
     ok: true,
     apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
     version: VERSION,
     serverTime: new Date().toISOString(),
+    alpacaAuthOk: Boolean(authStatus?.alpacaAuthOk),
+    effectiveTradeBase: baseStatus?.tradeBase || null,
+    effectiveDataBase: baseStatus?.dataBase || null,
   });
 });
 
@@ -748,6 +755,7 @@ app.get('/dashboard', async (req, res) => {
     const concurrencyRiskGuardCount = Number(entryDiagnostics?.gating?.concurrencyRiskGuardCount || 0);
     const lastEntryScanSummary = entryDiagnostics?.entryScan || null;
     const entryManagerState = entryDiagnostics?.entryManager || managerStatus?.entryManagerHeartbeat || {};
+    const entryManagerTelemetry = shapeEntryManagerTelemetry(entryManagerState);
     const lastSuccessfulAction = entryDiagnostics?.lastSuccessfulAction || null;
     const lastExecutionFailure = entryDiagnostics?.lastExecutionFailure || null;
 
@@ -1010,7 +1018,7 @@ app.get('/dashboard', async (req, res) => {
             currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
           },
           ratePressureState,
-          entryManager: entryManagerState,
+          entryManager: { ...entryManagerState, telemetry: entryManagerTelemetry },
           lastSuccessfulAction,
           lastExecutionFailure,
         },
@@ -1020,6 +1028,7 @@ app.get('/dashboard', async (req, res) => {
         entryScan: entryDiagnostics?.entryScan || null,
         predictorCandidates: entryDiagnostics?.predictorCandidates || null,
         skipReasonsBySymbol: entryDiagnostics?.skipReasonsBySymbol || {},
+        entryTelemetry: entryManagerTelemetry,
       },
       events: Object.values(lifecycleSnapshot?.bySymbol || {}).slice(-25).map((item) => ({
         ts: item.updatedAt || item.createdAt || null,
@@ -1383,6 +1392,7 @@ app.get('/debug/status', async (req, res) => {
         capEnabled: guardStatus.capEnabled,
         lastScanAt: guardStatus.lastScanAt,
         lastQuoteAt,
+        entryTelemetry: shapeEntryManagerTelemetry(tradingStatus?.entryManagerHeartbeat || {}),
       },
     });
   } catch (error) {
@@ -1607,23 +1617,14 @@ async function bootstrapTrading() {
     const baseStatus = getAlpacaBaseStatus();
     const universeDiagnostics = getUniverseDiagnosticsSnapshot();
     const warmup = getPredictorWarmupSnapshot();
-    console.log('startup_truth_summary', {
-      alpacaCredentialsPresent: Boolean(authStatus?.alpacaAuthOk),
-      effectiveTradeBase: baseStatus?.tradeBase || null,
-      effectiveDataBase: baseStatus?.dataBase || null,
-      dynamicUniverseActive: Boolean(universeDiagnostics?.dynamicUniverseActive),
-      requestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeConfig.entryUniverseModeRaw || null,
-      effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
-      acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
-      warmupSettings: {
-        enabled: Boolean(process.env.PREDICTOR_WARMUP_ENABLED ? String(process.env.PREDICTOR_WARMUP_ENABLED) !== 'false' : true),
-        inProgress: Boolean(warmup?.inProgress),
-        chunkSize: runtimeConfig.entryPrefetchChunkSize,
-        prefetchConcurrency: runtimeConfig.predictorWarmupPrefetchConcurrency,
-      },
-      apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
-      fallbackOccurred: Boolean(universeDiagnostics?.fallbackOccurred),
-      fallbackReason: universeDiagnostics?.fallbackReason || null,
+    emitStartupTruthSummary(console.log, {
+      authStatus,
+      baseStatus,
+      universeDiagnostics,
+      warmup,
+      runtimeConfig,
+      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
+      env: process.env,
     });
     startupTruthLogged = true;
   }
