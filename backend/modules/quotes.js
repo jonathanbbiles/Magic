@@ -91,6 +91,41 @@ function normalizeSecondaryQuotePayload(raw, { source = 'cryptocompare', nowMs =
   };
 }
 
+function summarizeCryptoCompareEnvelope(result) {
+  const response = typeof result?.Response === 'string' ? result.Response : null;
+  const message = typeof result?.Message === 'string' ? result.Message : null;
+  const type = Number.isFinite(Number(result?.Type)) ? Number(result.Type) : null;
+  const hasWarning = typeof result?.HasWarning === 'boolean' ? result.HasWarning : null;
+  const hasData = result?.Data != null;
+  return {
+    response,
+    message,
+    type,
+    hasWarning,
+    hasData,
+  };
+}
+
+function classifyCryptoCompareEnvelope(result) {
+  const summary = summarizeCryptoCompareEnvelope(result);
+  const normalizedResponse = String(summary.response || '').toLowerCase();
+  const normalizedMessage = String(summary.message || '').toLowerCase();
+  const signal = `${normalizedResponse} ${normalizedMessage}`;
+  if (signal.includes('api key') || signal.includes('auth') || signal.includes('unauthorized') || signal.includes('forbidden')) {
+    return { category: 'provider_auth_or_plan_error', details: summary };
+  }
+  if (signal.includes('rate limit') || signal.includes('too many requests') || signal.includes('throttle')) {
+    return { category: 'provider_rate_limited', details: summary };
+  }
+  if (signal.includes('invalid symbol') || signal.includes('not found') || signal.includes('market does not exist')) {
+    return { category: 'provider_symbol_unavailable', details: summary };
+  }
+  if (summary.response || summary.message || summary.type != null || summary.hasWarning != null || summary.hasData) {
+    return { category: 'provider_error_envelope', details: summary };
+  }
+  return null;
+}
+
 async function getSecondaryQuoteDetailed(symbol, opts = {}) {
   const secondaryQuoteConfig = getSecondaryQuoteConfig();
   const { enabled, provider } = secondaryQuoteConfig;
@@ -103,7 +138,13 @@ async function getSecondaryQuoteDetailed(symbol, opts = {}) {
   const fsym = normalized.endsWith('USD') ? normalized.slice(0, -3) : normalized;
   if (!fsym) return { ok: false, category: 'malformed_payload', source: provider, details: { symbol } };
   const timeoutMs = readNumber('QUOTE_TIMEOUT_MS', 2500);
-  const url = `https://min-api.cryptocompare.com/data/pricemultifull?fsyms=${encodeURIComponent(fsym)}&tsyms=USD`;
+  const query = new URLSearchParams({
+    fsyms: fsym,
+    tsyms: 'USD',
+  });
+  const cryptoCompareApiKey = String(process.env.CRYPTOCOMPARE_API_KEY || '').trim();
+  if (cryptoCompareApiKey) query.set('api_key', cryptoCompareApiKey);
+  const url = `https://min-api.cryptocompare.com/data/pricemultifull?${query.toString()}`;
   const maxAgeMs = Number.isFinite(Number(opts?.maxAgeMs)) ? Number(opts.maxAgeMs) : null;
   try {
     const result = await withRetry(
@@ -115,6 +156,17 @@ async function getSecondaryQuoteDetailed(symbol, opts = {}) {
       Math.max(0, readNumber('QUOTE_RETRY', 1)),
     );
     const raw = result?.RAW?.[fsym]?.USD;
+    if (!raw) {
+      const envelopeError = classifyCryptoCompareEnvelope(result);
+      if (envelopeError) {
+        return {
+          ok: false,
+          category: envelopeError.category,
+          source: provider,
+          details: envelopeError.details,
+        };
+      }
+    }
     const parsed = normalizeSecondaryQuotePayload(raw, { source: provider, nowMs: Date.now() });
     if (!parsed.ok) return parsed;
     const secondaryTsMs = Number(parsed.quote.ts);

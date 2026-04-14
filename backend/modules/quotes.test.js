@@ -30,6 +30,7 @@ async function run() {
   assert.equal(Number.isFinite(primary.receivedAtMs), true);
 
   delete require.cache[quotesModulePath];
+  let capturedRequestUrl = null;
   httpClient.httpJson = async () => ({
     data: {
       RAW: {
@@ -80,6 +81,61 @@ async function run() {
   }, () => quotesWithSecondary.getBestQuote('ETH/USD'));
   assert.equal(secondary.source, 'cryptocompare');
   assert.equal(Number.isFinite(secondary.receivedAtMs), true);
+
+  delete require.cache[quotesModulePath];
+  capturedRequestUrl = null;
+  httpClient.httpJson = async (req) => {
+    capturedRequestUrl = req?.url || null;
+    return {
+      data: {
+        RAW: {
+          ETH: {
+            USD: {
+              BID: 100,
+              ASK: 101,
+              LASTUPDATE: Math.floor(Date.now() / 1000),
+            },
+          },
+        },
+      },
+    };
+  };
+  const quotesWithApiKey = require('./quotes');
+  await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    CRYPTOCOMPARE_API_KEY: 'abc123',
+    QUOTE_RETRY: '0',
+  }, () => quotesWithApiKey.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.match(capturedRequestUrl, /api_key=abc123/);
+
+  delete require.cache[quotesModulePath];
+  capturedRequestUrl = null;
+  httpClient.httpJson = async (req) => {
+    capturedRequestUrl = req?.url || null;
+    return {
+      data: {
+        RAW: {
+          ETH: {
+            USD: {
+              BID: 100,
+              ASK: 101,
+              LASTUPDATE: Math.floor(Date.now() / 1000),
+            },
+          },
+        },
+      },
+    };
+  };
+  const quotesWithoutApiKey = require('./quotes');
+  const noKeyResult = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    CRYPTOCOMPARE_API_KEY: '',
+    QUOTE_RETRY: '0',
+  }, () => quotesWithoutApiKey.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(noKeyResult.ok, true);
+  assert.ok(capturedRequestUrl && !capturedRequestUrl.includes('api_key='));
 
   const secondaryDisabled = await withEnv({
     SECONDARY_QUOTE_ENABLED: 'false',
@@ -150,6 +206,26 @@ async function run() {
   }, () => quotesSecondaryMalformed.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
   assert.equal(secondaryMalformed.ok, false);
   assert.equal(secondaryMalformed.category, 'malformed_payload');
+
+  delete require.cache[quotesModulePath];
+  httpClient.httpJson = async () => ({
+    data: {
+      Response: 'Error',
+      Message: 'You are over your rate limit please upgrade your account.',
+      HasWarning: true,
+      Type: 99,
+    },
+  });
+  const quotesSecondaryRateLimited = require('./quotes');
+  const secondaryRateLimited = await withEnv({
+    SECONDARY_QUOTE_ENABLED: 'true',
+    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
+    QUOTE_RETRY: '0',
+  }, () => quotesSecondaryRateLimited.getSecondaryQuoteDetailed('ETH/USD', { maxAgeMs: 30000 }));
+  assert.equal(secondaryRateLimited.ok, false);
+  assert.equal(secondaryRateLimited.category, 'provider_rate_limited');
+  assert.equal(secondaryRateLimited.details.response, 'Error');
+  assert.equal(Boolean(secondaryRateLimited.details.message), true);
 
   delete require.cache[quotesModulePath];
   httpClient.httpJson = async () => ({
