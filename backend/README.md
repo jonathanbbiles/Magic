@@ -189,6 +189,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 - `SECONDARY_QUOTE_ENABLED=true`
 - `SECONDARY_QUOTE_PROVIDER=cryptocompare`
+- `CRYPTOCOMPARE_API_KEY` (optional locally, but production secondary quote rescue may require a valid CryptoCompare API key depending on account limits/plan)
 - `MAX_QUOTE_AGE_MS=8000`
 - `QUOTE_TIMEOUT_MS=2500`
 - `QUOTE_RETRY=2`
@@ -287,6 +288,7 @@ After merging, manually copy these values into Render:
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
 - `SECONDARY_QUOTE_ENABLED=true`
 - `SECONDARY_QUOTE_PROVIDER=cryptocompare`
+- `CRYPTOCOMPARE_API_KEY` (optional locally, but production secondary quote rescue may require a valid CryptoCompare API key depending on account limits/plan)
 - `QUOTE_RETRY=2`
 
 If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
