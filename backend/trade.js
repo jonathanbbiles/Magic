@@ -340,6 +340,8 @@ function getQuoteFreshnessPolicy() {
     entryRegimeStaleQuoteMaxAgeMs: ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS,
     sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
     sparseRequireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+    entryScanQuoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+    entryScanOrderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
     sparseStaleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
   };
 }
@@ -1067,6 +1069,8 @@ const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9
 const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
 const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.normalEntryQuoteMaxAgeMs);
 const ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS = Math.max(ENTRY_QUOTE_MAX_AGE_MS, runtimeLiveConfig.entryRegimeStaleQuoteMaxAgeMs);
+const ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS = Math.max(1000, Math.min(ENTRY_QUOTE_MAX_AGE_MS, ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS));
+const ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS = Math.max(1000, Math.min(ORDERBOOK_MAX_AGE_MS, ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS));
 const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
 const CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED = readEnvFlag('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED', false);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
@@ -1755,6 +1759,8 @@ async function computeEntrySignal(symbol, opts = {}) {
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+      orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
       includeOrderbook: false,
     });
     quote = mdSnapshot?.quote || null;
@@ -2140,6 +2146,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         fetchOrderbook: getLatestOrderbook,
         quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+        orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
         includeOrderbook: true,
       });
       obResult = obSnapshot?.orderbook || null;
@@ -8790,7 +8798,7 @@ async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   return withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') }), `ORDERBOOK:${location}:${dataSymbols.join(',')}`);
 }
 
-async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}) {
+async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false, sameScanQuote = null } = {}) {
   const now = Date.now();
   const passCached = orderbookPassCache.get(symbol);
   if (!bypassCache && passCached?.passId === marketDataPassId && passCached?.orderbook) {
@@ -8959,8 +8967,18 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
   const quoteFallbackMaxAgeMs = Number.isFinite(Number(maxAgeMs))
     ? Math.max(Number(maxAgeMs), ENTRY_QUOTE_MAX_AGE_MS)
     : ENTRY_QUOTE_MAX_AGE_MS;
+  const sameScanQuoteViability = evaluatePrimaryQuoteViability({
+    quote: sameScanQuote,
+    nowMs: Date.now(),
+    maxAgeMs: quoteFallbackMaxAgeMs,
+  });
+  if (sameScanQuoteViability.ok) {
+    quoteFallback = sameScanQuote;
+  }
   try {
-    quoteFallback = await getLatestQuote(symbol, { maxAgeMs: quoteFallbackMaxAgeMs });
+    if (!quoteFallback) {
+      quoteFallback = await getLatestQuote(symbol, { maxAgeMs: quoteFallbackMaxAgeMs });
+    }
   } catch (err) {
     lastFailure = {
       reason: 'ob_fallback_quotes_missing',
@@ -8968,6 +8986,8 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
         ...(lastFailure?.details || {}),
         symbol,
         quoteFallbackMaxAgeMs,
+        sameScanQuoteAvailable: Boolean(sameScanQuote),
+        sameScanQuoteUsable: Boolean(sameScanQuoteViability.ok),
         fallbackError: err?.message || String(err),
       },
     };
@@ -8982,7 +9002,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
       tsFallbackUsed: true,
       receivedAtMs: Date.now(),
       synthetic: true,
-      source: 'quote_fallback',
+      source: sameScanQuoteViability.ok ? 'same_scan_quote_fallback' : 'quote_fallback',
     };
     orderbookCache.set(symbol, syntheticOrderbook);
     scanMarketDataCache.upsertOrderbook(symbol, { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' }, syntheticOrderbook?.tsMs || Date.now());
@@ -8999,6 +9019,8 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
       symbol,
       fallback: 'quotes',
       fallbackStatus: 'missing',
+      sameScanQuoteAvailable: Boolean(sameScanQuote),
+      sameScanQuoteUsable: Boolean(sameScanQuoteViability.ok),
     },
   };
 }
@@ -14934,12 +14956,12 @@ async function runEntryScanOnce() {
       requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
       requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
       quoteBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getQuoteUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS }).value || null]),
+        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getQuoteUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS }).value || null]),
       ),
       orderbookBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getOrderbookUsable(symbol, { nowMs: Date.now(), maxAgeMs: ORDERBOOK_MAX_AGE_MS }).value || null]),
+        filteredSymbols.map((symbol) => [symbol, scanMarketDataCache.getOrderbookUsable(symbol, { nowMs: Date.now(), maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS }).value || null]),
       ),
-      quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      quoteMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
       nowMs: Date.now(),
     });
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))

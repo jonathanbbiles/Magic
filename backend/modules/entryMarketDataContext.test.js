@@ -57,9 +57,10 @@ const { createMarketDataCache } = require('./marketDataCache');
   assert.equal(cacheLayerResult.orderbookResult.state, 'cache_layer_usable');
   assert.equal(cacheBypassCalls, 0, 'usable cache should be used before network fetch');
 
+  const fallbackNow = Date.now();
   const fallbackCache = createMarketDataCache({ quoteTtlMs: 500, orderbookTtlMs: 500 });
-  fallbackCache.upsertQuote('ETH/USD', { bid: 30, ask: 31, tsMs: now - 4000 }, now - 4000);
-  fallbackCache.upsertOrderbook('ETH/USD', { ok: true, orderbook: { bestBid: 30, bestAsk: 31, bids: [{ p: 30, s: 1 }], asks: [{ p: 31, s: 1 }] }, tsMs: now - 4000 }, now - 4000);
+  fallbackCache.upsertQuote('ETH/USD', { bid: 30, ask: 31, tsMs: fallbackNow - 4000 }, fallbackNow - 4000);
+  fallbackCache.upsertOrderbook('ETH/USD', { ok: true, orderbook: { bestBid: 30, bestAsk: 31, bids: [{ p: 30, s: 1 }], asks: [{ p: 31, s: 1 }] }, tsMs: fallbackNow - 4000 }, fallbackNow - 4000);
 
   const fallbackCoordinatorRateLimit = {
     get: async ({ endpoint }) => ({ ok: false, state: 'rate_limited', reason: `${endpoint}_rate_limited` }),
@@ -116,8 +117,9 @@ const { createMarketDataCache } = require('./marketDataCache');
   });
   assert.equal(unavailableFallback.quoteResult.state, 'cache_fallback_after_failure');
 
+  const staleNow = Date.now();
   const staleCache = createMarketDataCache({ quoteTtlMs: 500, orderbookTtlMs: 500 });
-  staleCache.upsertQuote('XRP/USD', { bid: 40, ask: 41, tsMs: now - 50000 }, now - 50000);
+  staleCache.upsertQuote('XRP/USD', { bid: 40, ask: 41, tsMs: staleNow - 50000 }, staleNow - 50000);
   let staleFetchCalls = 0;
   await getOrFetchSymbolMarketData({
     context: buildEntryMarketDataContext({ scanId: 'scan-stale' }),
@@ -134,6 +136,49 @@ const { createMarketDataCache } = require('./marketDataCache');
     includeOrderbook: false,
   });
   assert.equal(staleFetchCalls, 1, 'stale trading cache must not be reused beyond requested max age');
+
+  const nearExpiryNow = Date.now();
+  const nearExpiryCache = createMarketDataCache({ quoteTtlMs: 500, orderbookTtlMs: 500 });
+  nearExpiryCache.upsertQuote('ADA/USD', { bid: 1, ask: 1.01, tsMs: nearExpiryNow - 12000 }, nearExpiryNow - 12000);
+  let nearExpiryFetchCalls = 0;
+  const nearExpiryResult = await getOrFetchSymbolMarketData({
+    context: buildEntryMarketDataContext({ scanId: 'scan-near-expiry' }),
+    coordinator: createRequestCoordinator({ quoteTtlMs: 1 }),
+    marketDataCache: nearExpiryCache,
+    symbol: 'ADA/USD',
+    fetchQuote: async () => {
+      nearExpiryFetchCalls += 1;
+      return { bid: 1.1, ask: 1.2, tsMs: Date.now() };
+    },
+    fetchOrderbook: async () => ({ ok: true, orderbook: { bestBid: 1.1, bestAsk: 1.2 } }),
+    quoteMaxAgeMs: 15000,
+    quoteReuseMaxAgeMs: 8000,
+    orderbookMaxAgeMs: 10000,
+    includeOrderbook: false,
+  });
+  assert.equal(nearExpiryFetchCalls, 1, 'entry scan should refresh near-expiry quote cache before symbol evaluation');
+  assert.equal(nearExpiryResult.quoteResult.reuseRefreshForced, true);
+  assert.equal(nearExpiryResult.quoteResult.reuseRefreshReason, 'quote_reuse_headroom');
+
+  const sameScanQuoteContext = buildEntryMarketDataContext({ scanId: 'scan-same-scan-fallback' });
+  let orderbookSameScanQuoteSeen = false;
+  const sameScanQuoteResult = await getOrFetchSymbolMarketData({
+    context: sameScanQuoteContext,
+    coordinator: createRequestCoordinator({ quoteTtlMs: 1, orderbookTtlMs: 1 }),
+    symbol: 'AVAX/USD',
+    fetchQuote: async () => ({ bid: 31, ask: 31.1, tsMs: Date.now() }),
+    fetchOrderbook: async (_symbol, opts) => {
+      orderbookSameScanQuoteSeen = Boolean(opts?.sameScanQuote?.bid);
+      return { ok: true, orderbook: { bestBid: opts?.sameScanQuote?.bid || 0, bestAsk: opts?.sameScanQuote?.ask || 0 }, source: 'same_scan_quote_fallback' };
+    },
+    quoteMaxAgeMs: 15000,
+    quoteReuseMaxAgeMs: 5000,
+    orderbookMaxAgeMs: 10000,
+    orderbookReuseMaxAgeMs: 5000,
+    includeOrderbook: true,
+  });
+  assert.equal(orderbookSameScanQuoteSeen, true, 'orderbook fetcher should receive same-scan quote for fallback use');
+  assert.equal(sameScanQuoteResult.orderbook?.source, 'same_scan_quote_fallback');
 
   const statsContext = buildEntryMarketDataContext({ scanId: 'scan-stats' });
   await getOrFetchSymbolMarketData({
