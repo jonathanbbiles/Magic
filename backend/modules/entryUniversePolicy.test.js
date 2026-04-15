@@ -111,5 +111,56 @@ const reuseHeadroomRank = rankDynamicUniverseByExecutionQuality(
 );
 assert.deepEqual(reuseHeadroomRank.symbols, ['ETH/USD']);
 assert.equal(reuseHeadroomRank.diagnostics[0].quoteAgeMs <= 5000, true);
+assert.equal(reuseHeadroomRank.eligibilityCounts.totalCount, 2);
+assert.equal(reuseHeadroomRank.eligibilityCounts.freshQuoteCount, 1);
+assert.equal(reuseHeadroomRank.droppedDiagnostics.length, 1);
+
+const coldCacheRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD', 'LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    executionTier2Symbols: ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: true,
+    quoteMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {},
+    orderbookBySymbol: {},
+  },
+);
+assert.deepEqual(coldCacheRank.symbols, []);
+assert.equal(coldCacheRank.eligibilityCounts.totalCount, 6);
+assert.equal(coldCacheRank.eligibilityCounts.freshQuoteCount, 0);
+assert.equal(coldCacheRank.droppedDiagnostics.length, 6);
+
+const hydratedRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD', 'LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    executionTier2Symbols: ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: true,
+    quoteMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.04, tsMs: 1700000014000 },
+      'ETH/USD': { bid: 50, ask: 50.03, tsMs: 1700000013500 },
+      'LINK/USD': { bid: 7, ask: 7.01, tsMs: 1700000014200 },
+      'AVAX/USD': { bid: 20, ask: 20.03, tsMs: 1700000014300 },
+      'SOL/USD': { bid: 30, ask: 30.03, tsMs: 1700000014100 },
+      'UNI/USD': { bid: 5, ask: 5.01, tsMs: 1700000014050 },
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'LINK/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'AVAX/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'SOL/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'UNI/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+    },
+  },
+);
+assert.equal(hydratedRank.symbols.length, 6);
+assert.equal(hydratedRank.eligibilityCounts.eligibleCount, 6);
 
 console.log('entry universe policy tests passed');

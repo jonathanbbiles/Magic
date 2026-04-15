@@ -446,6 +446,11 @@ assert.ok(tradeSourceEarly.includes('if (activeScanProgress || activeScanWithout
 assert.ok(tradeSourceEarly.includes("console.log('entry_scan_progress'"));
 assert.ok(tradeSourceEarly.includes('currentScanLastProgressAt'));
 assert.ok(tradeSourceEarly.includes("state: 'prefetching_market_data'"));
+assert.ok(tradeSourceEarly.includes('hydrateEntryEligibilityMarketData(filteredSymbols)'));
+assert.ok(tradeSourceEarly.includes("reason: 'universe_empty'"));
+assert.ok(tradeSourceEarly.includes("setEngineState('ready', { reason: 'universe_empty' })"));
+assert.ok(tradeSourceEarly.includes('stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - filteredSymbols.length)'));
+assert.ok(!tradeSourceEarly.includes('stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - scanSymbols.length)'));
 assert.ok(tradeSourceEarly.includes('includeOrderbook: false'));
 assert.ok(tradeSourceEarly.includes("fetchQuote: getLatestQuoteFromQuotesOnly"));
 assert.ok(tradeSourceEarly.includes("console.log('exit_order_confidence_low'"));
