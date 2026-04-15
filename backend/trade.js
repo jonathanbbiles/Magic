@@ -116,6 +116,32 @@ const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
 
+function detectTradeBaseTier(baseUrl) {
+  const raw = String(baseUrl || '').toLowerCase();
+  if (raw.includes('paper-api.alpaca.markets')) return 'paper';
+  if (raw.includes('api.alpaca.markets')) return 'live';
+  return 'unknown';
+}
+
+function validateAlpacaCredentialBaseAlignment() {
+  const auth = resolveAlpacaAuth();
+  const credentialTier = tradeBaseResolution.credentialTier || 'unknown';
+  const baseTier = detectTradeBaseTier(TRADE_BASE);
+  const aligned = credentialTier === 'unknown' || baseTier === 'unknown' || credentialTier === baseTier;
+  if (!aligned) {
+    console.error('alpaca_trade_base_key_tier_mismatch', {
+      credentialTier,
+      tradeBase: TRADE_BASE,
+      baseTier,
+      source: tradeBaseResolution.source,
+      keyPresent: auth.alpacaKeyIdPresent,
+      recommendation: credentialTier === 'paper'
+        ? 'set TRADE_BASE to https://paper-api.alpaca.markets or rotate to live AK key'
+        : 'set TRADE_BASE to https://api.alpaca.markets or rotate to paper PK key',
+    });
+  }
+}
+
 if (!RAW_TRADE_BASE) {
   console.warn('trade_base_autoselected', {
     source: tradeBaseResolution.source,
@@ -123,6 +149,8 @@ if (!RAW_TRADE_BASE) {
     tradeBase: TRADE_BASE,
   });
 }
+
+validateAlpacaCredentialBaseAlignment();
 
 configureOrderExecutionRuntime({
   setEngineState,
@@ -1124,6 +1152,17 @@ let tradingBlockedUntilMs = 0;
 let lastTradingDisabledLogMs = 0;
 let lastBrokerTradingDisabledLogMs = 0;
 let lastBrokerTradingDisabledExitLogMs = 0;
+const ALPACA_AUTH_FAILURE_LOG_COOLDOWN_MS = 60_000;
+const alpacaAuthFailureState = {
+  failed: false,
+  statusCode: null,
+  lastFailedAt: null,
+  lastRecoveredAt: null,
+  lastErrorMessage: null,
+  lastRequestId: null,
+  lastEndpoint: null,
+  lastLoggedAt: 0,
+};
 let lastEntryScanSummary = null;
 let lastPredictorCandidatesSummary = null;
 let lastEntrySkipReasonsBySymbol = {};
@@ -1167,6 +1206,59 @@ let lastUniverseDiagnostics = {
 
 function isTradingBlockedNow() {
   return Date.now() < tradingBlockedUntilMs;
+}
+
+function isAlpacaUnauthorizedError(err) {
+  const statusCode = Number(err?.statusCode ?? err?.status ?? err?.response?.status ?? null);
+  return statusCode === 401;
+}
+
+function markAlpacaAuthFailure(err, context = {}) {
+  if (!isAlpacaUnauthorizedError(err)) return false;
+  const nowIso = safeIso();
+  const nowMs = Date.now();
+  alpacaAuthFailureState.failed = true;
+  alpacaAuthFailureState.statusCode = 401;
+  alpacaAuthFailureState.lastFailedAt = nowIso;
+  alpacaAuthFailureState.lastErrorMessage = err?.errorMessage || err?.message || String(err);
+  alpacaAuthFailureState.lastRequestId = err?.requestId || null;
+  alpacaAuthFailureState.lastEndpoint = context?.endpoint || null;
+  setEngineState('degraded', {
+    reason: 'alpaca_auth_failed',
+    context: {
+      endpoint: context?.endpoint || null,
+      statusCode: 401,
+      requestId: alpacaAuthFailureState.lastRequestId,
+    },
+  });
+  if (!alpacaAuthFailureState.lastLoggedAt || (nowMs - alpacaAuthFailureState.lastLoggedAt) >= ALPACA_AUTH_FAILURE_LOG_COOLDOWN_MS) {
+    alpacaAuthFailureState.lastLoggedAt = nowMs;
+    console.error('alpaca_auth_failed', {
+      endpoint: context?.endpoint || null,
+      statusCode: 401,
+      requestId: alpacaAuthFailureState.lastRequestId,
+      error: alpacaAuthFailureState.lastErrorMessage,
+      action: 'pause_entry_exit_loops',
+      failedAt: nowIso,
+    });
+  }
+  return true;
+}
+
+function clearAlpacaAuthFailure({ endpoint = null } = {}) {
+  if (!alpacaAuthFailureState.failed) return;
+  alpacaAuthFailureState.failed = false;
+  alpacaAuthFailureState.statusCode = null;
+  alpacaAuthFailureState.lastRecoveredAt = safeIso();
+  console.log('alpaca_auth_recovered', {
+    endpoint,
+    recoveredAt: alpacaAuthFailureState.lastRecoveredAt,
+    previousFailedAt: alpacaAuthFailureState.lastFailedAt,
+  });
+}
+
+function isAlpacaAuthFailureActive() {
+  return alpacaAuthFailureState.failed;
 }
 
 function shouldSkipTradeActionBecauseTradingOff(reasonContext, options = {}) {
@@ -5003,6 +5095,7 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       url,
       headers: alpacaHeaders(),
     });
+    clearAlpacaAuthFailure({ endpoint: 'assets' });
     const fetchedAssetsCount = Array.isArray(data) ? data.length : 0;
     const allowedSet = null;
     const dynamicUniverse = buildDynamicCryptoUniverseFromAssets(Array.isArray(data) ? data : [], { allowedSymbols: allowedSet });
@@ -5043,6 +5136,7 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       loadedAt: supportedCryptoPairsState.lastUpdated,
     });
   } catch (err) {
+    markAlpacaAuthFailure(err, { endpoint: 'assets' });
     const failedAt = new Date().toISOString();
     const errorMessage = err?.errorMessage || err?.message || String(err);
     lastUniverseDiagnostics = {
@@ -6936,7 +7030,9 @@ async function fetchPositions() {
         url,
         headers: alpacaHeaders(),
       });
+      clearAlpacaAuthFailure({ endpoint: 'positions' });
     } catch (err) {
+      markAlpacaAuthFailure(err, { endpoint: 'positions' });
       if (err?.responseHeaders) {
         updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'positions' });
       }
@@ -11558,6 +11654,14 @@ async function manageExitStates() {
   exitManagerRunning = true;
 
   try {
+    if (isAlpacaAuthFailureActive()) {
+      console.warn('exit_manager_paused_auth_failed', {
+        failedAt: alpacaAuthFailureState.lastFailedAt,
+        lastEndpoint: alpacaAuthFailureState.lastEndpoint,
+      });
+      setEngineState('degraded', { reason: 'alpaca_auth_failed', context: { manager: 'exit' } });
+      return;
+    }
     const nowMs = Date.now();
     if (nowMs - lastExitRepairAtMs >= EXIT_REPAIR_INTERVAL_MS) {
       await repairOrphanExitsSafe();
@@ -14956,6 +15060,16 @@ async function runEntryScanOnce() {
       setEngineState('degraded', { reason: 'trading_disabled_by_env' });
       return;
     }
+    if (isAlpacaAuthFailureActive()) {
+      console.warn('entry_scan_paused_auth_failed', {
+        failedAt: alpacaAuthFailureState.lastFailedAt,
+        lastEndpoint: alpacaAuthFailureState.lastEndpoint,
+      });
+      emitEntryScanNoopSummary({ startMs, reason: 'alpaca_auth_failed' });
+      clearEntryScanProgress({ state: 'idle' });
+      setEngineState('degraded', { reason: 'alpaca_auth_failed', context: { manager: 'entry' } });
+      return;
+    }
     const standdown = getStanddownStatus(Date.now());
     if (standdown.active) {
       console.warn('entry_standdown_active', {
@@ -15328,6 +15442,21 @@ async function runEntryScanOnce() {
       const rankingDroppedSample = Array.isArray(rankedDynamicUniverse?.droppedDiagnostics)
         ? rankedDynamicUniverse.droppedDiagnostics.slice(0, 5)
         : [];
+      const rankingMissingFreshDataSample = Array.isArray(rankedDynamicUniverse?.droppedDiagnostics)
+        ? rankedDynamicUniverse.droppedDiagnostics
+          .filter((row) => (row?.quoteAgeMs == null || row?.orderbookAgeMs == null) && (row?.failedFreshness || row?.failedOrderbookRecency))
+          .slice(0, 5)
+          .map((row) => ({
+            symbol: row.symbol,
+            tier: row.tier,
+            hasFreshQuote: Boolean(row.hasFreshQuote),
+            hasOrderbook: Boolean(row.hasOrderbook),
+            quoteAgeMs: Number.isFinite(row.quoteAgeMs) ? row.quoteAgeMs : null,
+            orderbookAgeMs: Number.isFinite(row.orderbookAgeMs) ? row.orderbookAgeMs : null,
+            failedFreshness: Boolean(row.failedFreshness),
+            failedOrderbookRecency: Boolean(row.failedOrderbookRecency),
+          }))
+        : [];
       const rankingFilteredOut = filteredSymbols.length > 0
         && rankedDynamicUniverse?.symbols?.length === 0
         && ENTRY_UNIVERSE_MODE === 'dynamic'
@@ -15379,6 +15508,16 @@ async function runEntryScanOnce() {
         recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
         eligibleCount: Number(rankingEligibleCounts.eligibleCount || 0),
         rankingFailureCounts: lastUniverseDiagnostics.rankingFailureCounts,
+        rankingMissingFreshDataSample,
+        marketDataLastError: lastHttpError ? {
+          ts: lastHttpError.ts || null,
+          type: lastHttpError.type || null,
+          statusCode: Number.isFinite(Number(lastHttpError.statusCode)) ? Number(lastHttpError.statusCode) : null,
+          errorType: lastHttpError.errorType || null,
+          errorMessage: lastHttpError.errorMessage || null,
+          requestId: lastHttpError.requestId || null,
+          urlPath: lastHttpError.urlPath || null,
+        } : null,
         rankingFreshnessWindowsMs: lastUniverseDiagnostics.rankingFreshnessWindowsMs,
         entryFreshnessWindowsMs: lastUniverseDiagnostics.entryFreshnessWindowsMs,
         rankingHydrationRetry: lastUniverseDiagnostics.rankingHydrationRetry,
@@ -15508,6 +15647,7 @@ async function runEntryScanOnce() {
       const ordersStatus = SIMPLE_SCALPER_ENABLED ? 'all' : 'open';
       [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: ordersStatus })]);
     } catch (err) {
+      markAlpacaAuthFailure(err, { endpoint: 'entry_scan_fetch' });
       console.warn('entry_scan_fetch_failed', err?.message || err);
       return;
     }
@@ -18014,7 +18154,9 @@ async function fetchOrders(params = {}) {
         url,
         headers: alpacaHeaders(),
       });
+      clearAlpacaAuthFailure({ endpoint: 'orders_list' });
     } catch (err) {
+      markAlpacaAuthFailure(err, { endpoint: 'orders_list' });
       if (err?.responseHeaders) {
         updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_list' });
       }
@@ -18079,6 +18221,11 @@ async function fetchLiveOrders({ force = false } = {}) {
       liveOrdersCache.tsMs = Date.now();
       return normalized;
     } catch (err) {
+      const statusCode = Number(err?.statusCode ?? err?.status ?? err?.response?.status ?? null);
+      const retryable = statusCode === 429 || statusCode === 503;
+      if (!retryable) {
+        throw err;
+      }
       const fallback = await fetchOrders({ status: 'open', nested: true, direction: 'desc', limit: 500 });
       const normalized = (Array.isArray(fallback) ? fallback : []).map((order) => normalizeBrokerOrder(order));
       liveOrdersCache.data = normalized;
