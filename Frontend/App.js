@@ -554,6 +554,16 @@ function AppInner() {
   const topSkipReasons = entryScan?.topSkipReasons || meta?.topSkipReasons || {};
   const netEdgeGateSkips = toNum(topSkipReasons?.net_edge_gate) ?? 0;
   const backendAuthIssue = typeof error === 'string' && /http\s+(401|403)/i.test(error);
+  const currentEntryScanProgress = meta?.currentEntryScanProgress ?? truth?.currentEntryScanProgress ?? {};
+  const scanInProgress = ['scanning_symbols', 'starting'].includes(
+    String(currentEntryScanProgress?.state || '').toLowerCase(),
+  );
+  const lastEntryScanSummary = meta?.lastEntryScanSummary ?? truth?.lastEntryScanSummary ?? {};
+  const lastCompletedUniverseReason = String(
+    lastEntryScanSummary?.extra?.universeZeroReason
+    || lastEntryScanSummary?.extra?.reasonDetail
+    || '',
+  ).toLowerCase();
   const hasRealUniverseCount = Number.isFinite(acceptedSymbolsCount) && acceptedSymbolsCount > 0;
   const hasScanCount = Number.isFinite(scanSymbolsCount) && scanSymbolsCount >= 0;
   const hasPlaceholderUniverseCounts = (scanSymbolsCount == null || scanSymbolsCount === 0)
@@ -576,6 +586,14 @@ function AppInner() {
           universeZeroReason.includes('fresh_marketdata')
             ? 'Waiting for fresh market data'
             : 'Universe empty after hydration'
+        )
+      : scanInProgress && lastCompletedUniverseReason && netEdgeGateSkips <= 0
+        ? (
+          lastCompletedUniverseReason.includes('fresh_marketdata')
+            ? 'Waiting for fresh market data'
+            : lastCompletedUniverseReason.includes('healthy_spread')
+              ? 'Waiting for healthy spread'
+              : 'Scanning in progress'
         )
       : netEdgeGateSkips > 0
         ? 'Strategy skipped entry (net edge gate)'
