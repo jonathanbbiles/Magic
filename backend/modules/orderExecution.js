@@ -8,6 +8,8 @@ const {
 
 const ALPACA_KEY_ENV_VARS = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY'];
 const ALPACA_SECRET_ENV_VARS = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
+const ALPACA_TRADE_BASE_LIVE = 'https://api.alpaca.markets';
+const ALPACA_TRADE_BASE_PAPER = 'https://paper-api.alpaca.markets';
 
 let alpacaAuthWarned = false;
 
@@ -30,13 +32,13 @@ function configureOrderExecutionRuntime({ setEngineState, setLastActionTrace, sl
 }
 
 function normalizeTradeBase(baseUrl) {
-  if (!baseUrl) return 'https://api.alpaca.markets';
+  if (!baseUrl) return ALPACA_TRADE_BASE_LIVE;
   const trimmed = baseUrl.replace(/\/+$/, '');
   try {
     const parsed = new URL(trimmed);
     if (parsed.hostname.includes('data.alpaca.markets')) {
       console.warn('trade_base_invalid_host', { host: parsed.hostname });
-      return 'https://api.alpaca.markets';
+      return ALPACA_TRADE_BASE_LIVE;
     }
   } catch (err) {
     console.warn('trade_base_parse_failed', { baseUrl: trimmed });
@@ -61,6 +63,41 @@ function normalizeDataBase(baseUrl) {
   trimmed = trimmed.replace(/\/v2\/stocks$/, '');
   trimmed = trimmed.replace(/\/v2$/, '');
   return trimmed;
+}
+
+function inferAlpacaCredentialTier(keyId) {
+  const raw = String(keyId || '').trim().toUpperCase();
+  if (!raw) return 'unknown';
+  if (raw.startsWith('PK')) return 'paper';
+  if (raw.startsWith('AK')) return 'live';
+  return 'unknown';
+}
+
+function resolveDefaultTradeBase({ env = process.env, rawTradeBase } = {}) {
+  const explicit = String(rawTradeBase || '').trim();
+  if (explicit) {
+    return {
+      tradeBase: normalizeTradeBase(explicit),
+      source: 'explicit',
+      credentialTier: inferAlpacaCredentialTier(
+        env.APCA_API_KEY_ID || env.ALPACA_KEY_ID || env.ALPACA_API_KEY_ID || env.ALPACA_API_KEY || '',
+      ),
+    };
+  }
+
+  const keyId =
+    env.APCA_API_KEY_ID ||
+    env.ALPACA_KEY_ID ||
+    env.ALPACA_API_KEY_ID ||
+    env.ALPACA_API_KEY ||
+    '';
+  const credentialTier = inferAlpacaCredentialTier(keyId);
+  const inferredTradeBase = credentialTier === 'paper' ? ALPACA_TRADE_BASE_PAPER : ALPACA_TRADE_BASE_LIVE;
+  return {
+    tradeBase: inferredTradeBase,
+    source: credentialTier === 'paper' ? 'inferred_from_key' : 'default',
+    credentialTier,
+  };
 }
 
 function resolveAlpacaAuth() {
@@ -277,5 +314,7 @@ module.exports = {
   requireAlpacaAuth,
   normalizeTradeBase,
   normalizeDataBase,
+  inferAlpacaCredentialTier,
+  resolveDefaultTradeBase,
   configureOrderExecutionRuntime,
 };
