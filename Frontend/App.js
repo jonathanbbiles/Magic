@@ -519,6 +519,11 @@ function AppInner() {
   const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
   const warmup = meta?.predictorWarmup || {};
   const warmupInProgress = Boolean(warmup?.inProgress);
+  const scanSymbolsCount = toNum(meta?.scanSymbolsCount ?? runtime?.scanSymbolsCount ?? truth?.scanSymbolsCount);
+  const acceptedSymbolsCount = toNum(meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount);
+  const universeSummary = Number.isFinite(scanSymbolsCount) && Number.isFinite(acceptedSymbolsCount)
+    ? `Scanning ${scanSymbolsCount} of ${acceptedSymbolsCount}`
+    : '—';
 
   // Full diagnostics + logs bundle for copy
   const copyFullBundle = useCallback(async () => {
@@ -617,6 +622,9 @@ function AppInner() {
               <Stat label="Last scan" value={lastScanAt ? `${minsSince(lastScanAt)} ago` : '—'} />
               <Stat label="Stale quotes"
                 value={String(toNum(entryScan?.stalePrimaryQuoteCount) ?? toNum(truth?.staleQuoteRejectionCount) ?? 0)} />
+            </View>
+            <View style={s.statRow}>
+              <Stat label="Universe" value={universeSummary} />
             </View>
           </View>
 
