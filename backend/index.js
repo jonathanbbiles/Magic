@@ -886,9 +886,13 @@ app.get('/dashboard', async (req, res) => {
         dynamicUniverseActive,
         dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
         acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+        scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
         universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+          : [],
+        scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+          ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
           : [],
         fallbackOccurred,
         fallbackReason: universeDiagnostics?.fallbackReason || null,
@@ -939,8 +943,12 @@ app.get('/dashboard', async (req, res) => {
           authConfigured: Boolean(process.env.API_TOKEN),
           dynamicUniverseActive,
           acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
+          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
             : [],
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
@@ -1002,8 +1010,12 @@ app.get('/dashboard', async (req, res) => {
           dynamicUniverseActive,
           dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
           acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
+          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
             : [],
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,

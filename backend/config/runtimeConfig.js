@@ -22,6 +22,16 @@ const parsePositiveInt = (value, fallback) => {
   return Math.floor(parsed);
 };
 
+const parseOptionalPositiveInt = (value, fallback = null) => {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Expected positive integer but received "${value}"`);
+  }
+  return Math.floor(parsed);
+};
+
 const parseSymbols = (raw) =>
   String(raw ?? '')
     .split(',')
@@ -80,9 +90,9 @@ function getRuntimeConfig(env = process.env) {
       env.ENTRY_UNIVERSE_EXCLUDE_STABLES,
       parseBoolean(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_EXCLUDE_STABLES, false),
     ),
-    entryUniverseMaxSymbols: parsePositiveInt(
+    entryUniverseMaxSymbols: parseOptionalPositiveInt(
       env.ENTRY_UNIVERSE_MAX_SYMBOLS,
-      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, 18),
+      parseOptionalPositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, null),
     ),
     executionTier1Symbols,
     executionTier2Symbols,

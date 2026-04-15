@@ -843,7 +843,9 @@ const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
-const ENTRY_UNIVERSE_MAX_SYMBOLS = Math.max(2, runtimeLiveConfig.entryUniverseMaxSymbols || 18);
+const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
+  ? Math.max(2, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
+  : null;
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
 const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
@@ -1813,7 +1815,7 @@ async function computeEntrySignal(symbol, opts = {}) {
           staleRefreshAttempted: !staleMeta.hopelesslyStale,
           staleRefreshRecovered: false,
           skippedOrderbookFetch: true,
-          skippedTradeFetch: true,
+          skippedTradeFetch: false,
           skippedSparseRetry: staleMeta.hopelesslyStale,
         },
         record: baseRecord,
@@ -1866,7 +1868,7 @@ async function computeEntrySignal(symbol, opts = {}) {
             staleRefreshAttempted: !staleMeta.hopelesslyStale,
             staleRefreshRecovered: false,
             skippedOrderbookFetch: true,
-            skippedTradeFetch: true,
+            skippedTradeFetch: false,
             skippedSparseRetry: staleMeta.hopelesslyStale,
           },
           record: baseRecord,
@@ -2078,7 +2080,7 @@ async function computeEntrySignal(symbol, opts = {}) {
             staleRefreshAttempted: true,
             staleRefreshRecovered: false,
             skippedOrderbookFetch: true,
-            skippedTradeFetch: true,
+            skippedTradeFetch: false,
             skippedSparseRetry: true,
           },
           record: baseRecord,
@@ -2128,7 +2130,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         staleRefreshAttempted: true,
         staleRefreshRecovered: false,
         skippedOrderbookFetch: true,
-        skippedTradeFetch: true,
+        skippedTradeFetch: false,
         skippedSparseRetry: true,
       },
       record: baseRecord,
@@ -5949,6 +5951,35 @@ async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
       throw primaryError;
     }
 
+    const effectiveMaxAgeMs = Number.isFinite(Number(opts?.maxAgeMs)) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS;
+    const nowMs = Date.now();
+    const cachedQuote = scanMarketDataCache.getQuoteUsable(symbol, {
+      nowMs,
+      maxAgeMs: effectiveMaxAgeMs,
+    });
+    if (cachedQuote?.ok && cachedQuote?.usable && cachedQuote?.value) {
+      console.log('entry_scan_stale_quote_recovered', {
+        symbol,
+        recoveryPath: 'scan_marketdata_cache',
+        quoteAgeMs: cachedQuote.ageMs,
+      });
+      return cachedQuote.value;
+    }
+
+    const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });
+    if (tradeFallback) {
+      quoteCache.set(symbol, tradeFallback);
+      scanMarketDataCache.upsertQuote(symbol, tradeFallback, tradeFallback?.tsMs || Date.now());
+      recordLastQuoteAt(symbol, { tsMs: tradeFallback.tsMs, source: tradeFallback.source || 'trade_fallback' });
+      recordQuoteSuccess(symbol);
+      console.log('entry_scan_stale_quote_recovered', {
+        symbol,
+        recoveryPath: 'trade_fallback',
+        quoteAgeMs: Number.isFinite(Number(tradeFallback?.tsMs)) ? Math.max(0, Date.now() - Number(tradeFallback.tsMs)) : null,
+      });
+      return tradeFallback;
+    }
+
     try {
       const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
         ...opts,
@@ -5962,11 +5993,7 @@ async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
       });
       return directQuote;
     } catch (retryError) {
-      const retryFailureReason = classifyQuoteFetchFailureReason(retryError, 'marketdata_unavailable');
-      if (retryFailureReason === 'stale_quote_primary') {
-        throw retryError;
-      }
-      throw primaryError;
+      throw retryError;
     }
   }
 }
@@ -15018,18 +15045,26 @@ async function runEntryScanOnce() {
         return String(a).localeCompare(String(b));
       });
     const ratePressureActive = isUnderRatePressure();
+    const configuredUniverseCap = Number.isFinite(ENTRY_UNIVERSE_MAX_SYMBOLS) ? ENTRY_UNIVERSE_MAX_SYMBOLS : null;
     const effectiveUniverseCap = ratePressureActive
-      ? Math.max(4, Math.floor(ENTRY_UNIVERSE_MAX_SYMBOLS * 0.5))
-      : ENTRY_UNIVERSE_MAX_SYMBOLS;
+      ? Math.max(
+        4,
+        configuredUniverseCap != null
+          ? Math.floor(configuredUniverseCap * 0.5)
+          : Math.floor(prioritizedSymbols.length * 0.5),
+      )
+      : configuredUniverseCap;
     if (ratePressureActive) {
       console.warn('universe_rate_pressure_backoff', {
-        configuredCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+        configuredCap: configuredUniverseCap,
         effectiveCap: effectiveUniverseCap,
         ratePressureState: getRatePressureState(),
       });
     }
-    const scanSymbols = prioritizedSymbols.slice(0, effectiveUniverseCap);
-    if (prioritizedSymbols.length > effectiveUniverseCap) {
+    const scanSymbols = Number.isFinite(effectiveUniverseCap)
+      ? prioritizedSymbols.slice(0, effectiveUniverseCap)
+      : prioritizedSymbols.slice();
+    if (Number.isFinite(effectiveUniverseCap) && prioritizedSymbols.length > effectiveUniverseCap) {
       console.warn('dynamic_universe_capped', {
         acceptedBeforeCap: prioritizedSymbols.length,
         effectiveCap: effectiveUniverseCap,
@@ -15058,11 +15093,12 @@ async function runEntryScanOnce() {
       dynamicRejectedMalformedCount: dynamicUniverseStats?.malformedCount ?? 0,
       dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
       dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
-      acceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? scanSymbols.length,
+      acceptedSymbolsCount: prioritizedSymbols.length,
       scanSymbolsCount: scanSymbols.length,
       dynamicAcceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? 0,
       universeSymbolCap: effectiveUniverseCap,
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs)
         ? supportedSnapshot.pairs.slice(0, 10)
         : [],
@@ -15106,14 +15142,16 @@ async function runEntryScanOnce() {
       overrideActive: universeIsOverride,
       configuredOverrideActive: ENTRY_UNIVERSE_MODE === 'configured',
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
-      acceptedSymbols: scanSymbols.length,
+      acceptedSymbols: prioritizedSymbols.length,
+      scanSymbols: scanSymbols.length,
       entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
       stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
       configuredSecondarySample: configuredUniverse.secondary.slice(0, 6),
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicRankingSample: rankedDynamicUniverse.diagnostics.slice(0, 5),
       dynamicRequireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
       dynamicRequireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
@@ -15126,9 +15164,11 @@ async function runEntryScanOnce() {
     console.log('entry_universe_startup_summary', {
       requestedMode: ENTRY_UNIVERSE_MODE,
       effectiveMode: universeMode,
-      acceptedSymbolsCount: scanSymbols.length,
+      acceptedSymbolsCount: prioritizedSymbols.length,
+      scanSymbolsCount: scanSymbols.length,
       dynamicUniverseActive: universeMode.startsWith('dynamic'),
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
