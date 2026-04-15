@@ -8,13 +8,19 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 2. Create a `.env` file with your Alpaca API credentials (required for trading). `API_TOKEN` is optional route protection.
 3. `npm start`
 
+## Test ergonomics and quality gates
+
+- `npm test` now runs grouped suites (`test:core`, `test:modules`, `test:config`, `test:telemetry`) with concise logging enabled by default (`TEST_LOG_LEVEL=quiet`).
+- For full debug output during investigation, run any test command with `TEST_LOG_LEVEL=normal`.
+- `npm run check:complexity` enforces a line-count budget on `backend/trade.js` (default max: `19000`, override with `TRADE_JS_MAX_LINES`).
+
 ## Production environment source of truth
 
 - Managed-host production (Render/Fly/etc.) must use real platform environment variables as source of truth.
 - Checked-in env files are templates only: `backend/.env.example`, `backend/.env.live.example`, and `backend/.env.production.example`.
 - `backend/config/liveDefaults.js` defines non-secret live-critical defaults used by runtime parsing, checks, and engine fallbacks.
 - `backend/index.js` does **not** auto-load a production dotenv file by default. Production file loading is local-only and explicit (`LOAD_LOCAL_PRODUCTION_DOTENV=true` with `.env.production.local`).
-- Default production posture is now curated: `ENTRY_UNIVERSE_MODE=configured`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`, and a capped liquid-symbol universe.
+- Default production posture is configured universe mode: `ENTRY_UNIVERSE_MODE=configured`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`, and `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`.
 
 ## Node 22 requirement
 
@@ -38,7 +44,9 @@ Optional:
 - `CORS_ALLOWED_ORIGIN_REGEX` (comma-separated regex patterns for allowed origins)
 - `CORS_ALLOW_LAN` (set `true` to allow common LAN origins like `http://192.168.x.x:port`)
 - `RATE_LIMIT_WINDOW_MS` (default `60000`)
-- `RATE_LIMIT_MAX` (default `120`)
+- `RATE_LIMIT_MAX` (default `120`) — **Note:** the rate-limiter state is
+  in-memory and per-process. Running multiple backend instances will not share
+  buckets; today's single-instance Render footprint is assumed.
 - `HTTP_TIMEOUT_MS` (default `10000`)
 - `DATA_BASE` (defaults to Alpaca live data API base URL)
 - `DATASET_DIR` (default `./data`; set to a persistent disk on hosts like Render)
@@ -49,17 +57,16 @@ Optional:
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
-- `ENTRY_UNIVERSE_MODE` (`dynamic` scans Alpaca tradable pairs at runtime; `configured` uses only symbols you provide via `ENTRY_SYMBOLS_PRIMARY` and optional `ENTRY_SYMBOLS_SECONDARY`)
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; set `true` only to explicitly opt in to dynamic universe mode in production)
+- `ENTRY_UNIVERSE_MODE` (`configured` uses only symbols you provide via `ENTRY_SYMBOLS_PRIMARY`; `dynamic` is available only with explicit production opt-in)
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` (default `false`; set `true` only if you intentionally want dynamic universe mode in production)
 - `ENTRY_QUOTE_MAX_AGE_MS` (runtime-configured entry quote freshness window; default `30000`)
 - `ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS` (runtime-configured regime stale gate; default `30000`)
 - `ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS` (runtime-configured sparse-path fresh quote target; default `10000`)
 - `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS` (runtime-configured sparse stale tolerance cap; default `30000`)
 - `ENTRY_SYMBOLS_PRIMARY` (required when `ENTRY_UNIVERSE_MODE=configured`; provide at least one symbol such as `BTC/USD`)
-- `ENTRY_SYMBOLS_SECONDARY` (optional secondary symbols when `ENTRY_UNIVERSE_MODE=configured` and secondary inclusion is enabled)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `true`; excludes `USDC/USD`, `USDT/USD`, `BUSD/USD`, `DAI/USD` from scan symbols)
-- `ENTRY_UNIVERSE_MAX_SYMBOLS` (default `18`; hard cap for accepted scan symbols, with additional backoff under rate pressure)
+- `ENTRY_UNIVERSE_MAX_SYMBOLS` (default `12`; hard cap for accepted scan symbols, with additional backoff under rate pressure)
 - `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
 - `ENTRY_PREFETCH_QUOTES` (default `true`; when `true`, prefetch batches latest quotes before symbol evaluation)
 - `ENTRY_PREFETCH_ORDERBOOKS` (default `true`; when `true`, prefetch also batches orderbooks instead of bars-only prefetch)
@@ -121,7 +128,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - Repeated stale-symbol failures now escalate per-symbol cooldown suppression and expose active cooldown samples in scan diagnostics (`stale_quote_cooldown`, `staleQuoteCooldownCount`, `staleQuoteCooldownSample`).
 - `entry_scan_progress`/`lastEntryScanSummary` now expose `staleQuoteCooldownCount`, `stalePrimaryQuoteCount`, `dataUnavailableCount`, and `marketRejectionCount` so stale-symbol suppression is visible in-flight and post-scan.
 - Entry scanning is cache-first: rolling in-memory quote/orderbook/bar caches are reused between scans, broad warmup is now bounded seeding, and per-symbol bars fallback is budgeted/cooldown-gated under rate pressure.
-- Alpaca **live** execution/account/orders/positions behavior remains unchanged; dynamic full-universe scanning remains unchanged.
+- Alpaca **live** execution/account/orders/positions behavior remains unchanged; strategy math and configured six-symbol universe remain unchanged.
 - Entry quote freshness is unified under runtime config (no hidden entry-path fallback literals), stale-data protection remains active, and market-condition rejections remain distinct from data-quality rejections.
 - Quote freshness policy names are explicit in diagnostics/logs: `normalEntryQuoteMaxAgeMs`, `sparseQuoteFreshMs`, and `sparseStaleToleranceMs`.
 
@@ -185,8 +192,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `RISK_KILL_SWITCH_FILE=./data/KILL_SWITCH`
 - `RISK_METRICS_LOG_INTERVAL_MS=60000`
 
-- `SECONDARY_QUOTE_ENABLED=true`
-- `SECONDARY_QUOTE_PROVIDER=cryptocompare`
+- `SECONDARY_QUOTE_ENABLED=false` (deprecated; secondary quote providers are disabled in the live entry path)
 - `MAX_QUOTE_AGE_MS=8000`
 - `QUOTE_TIMEOUT_MS=2500`
 - `QUOTE_RETRY=2`
@@ -220,7 +226,7 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 - `BARS_PREFETCH_INTERVAL_MS=60000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=false`
 - `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4`
 - `ALPACA_BARS_USE_TIME_RANGE=true`
 - `ALPACA_MD_MAX_CONCURRENCY=2`
 - `ALPACA_MD_MIN_DELAY_MS=200`
@@ -229,14 +235,14 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 ## Entry universe modes (dynamic vs configured)
 
-- **dynamic**: backend discovers tradable symbols from Alpaca assets at runtime (`dynamic_full_universe`). This is the intended live/production mode.
-- **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY` (plus optional `ENTRY_SYMBOLS_SECONDARY`).
+- **dynamic**: backend discovers tradable symbols from Alpaca assets at runtime (`dynamic_full_universe`). This is optional and requires explicit production opt-in.
+- **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY`.
 - With dynamic full-universe scanning, symbols not explicitly listed in `EXECUTION_TIER1_SYMBOLS` or `EXECUTION_TIER2_SYMBOLS` are treated as tier3 when `EXECUTION_TIER3_DEFAULT=true`.
 - When `EXECUTION_TIER3_DEFAULT=false`, dynamic scanning is filtered to `EXECUTION_TIER1_SYMBOLS + EXECUTION_TIER2_SYMBOLS` only.
 
 Production safety rule:
-- Keep `ENTRY_UNIVERSE_MODE=dynamic` **and** `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true` for full live universe scanning, or
-- set `ENTRY_UNIVERSE_MODE=configured` with at least one `ENTRY_SYMBOLS_PRIMARY` symbol only when intentionally narrowing scope.
+- Keep `ENTRY_UNIVERSE_MODE=configured` with at least one `ENTRY_SYMBOLS_PRIMARY` symbol for normal live operation, or
+- set `ENTRY_UNIVERSE_MODE=dynamic` **and** `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true` only when intentionally enabling dynamic scanning.
 
 For stable live deployments, also set:
 - `TRADE_BASE=https://api.alpaca.markets`
@@ -247,11 +253,13 @@ For stable live deployments, also set:
 ## Live example profile
 
 `backend/.env.live.example` now reflects production intent:
-- configured liquid-symbol universe (`ENTRY_UNIVERSE_MODE=configured`)
-- dynamic universe disabled in production by default (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
+- configured universe scanning (`ENTRY_UNIVERSE_MODE=configured`)
+- dynamic universe blocked in production by default (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
 - stablecoin exclusion enabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=true`)
 - if enabled (`ENTRY_UNIVERSE_EXCLUDE_STABLES=true`), exclusions are surfaced in runtime diagnostics (`stableExclusionEnabled`, `stableSymbolsExcludedCount`) and universe-selection logs
-- configured primary symbols are set to a liquid curated set by default
+- `EXECUTION_TIER3_DEFAULT=false` to keep configured mode behavior deterministic
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=12` aligns with the configured production profile
+- `ENTRY_SYMBOLS_PRIMARY` is the active production universe list
 - conservative scan cadence/prefetch/rate-limit settings remain unchanged
 
 ## Render deployment sync
@@ -264,25 +272,24 @@ After merging, manually copy these values into Render:
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=true`
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=18`
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=12`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
 - `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
-- `EXECUTION_TIER3_DEFAULT=true`
+- `EXECUTION_TIER3_DEFAULT=false`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
-- `ENTRY_PREFETCH_CHUNK_SIZE=3`
+- `ENTRY_PREFETCH_CHUNK_SIZE=8`
 - `ENTRY_PREFETCH_QUOTES=true`
 - `ENTRY_PREFETCH_ORDERBOOKS=true`
-- `ALPACA_MD_MAX_CONCURRENCY=1`
-- `BARS_MAX_CONCURRENT=1`
-- `BARS_PREFETCH_INTERVAL_MS=120000`
+- `ALPACA_MD_MAX_CONCURRENCY=4`
+- `BARS_MAX_CONCURRENT=4`
+- `BARS_PREFETCH_INTERVAL_MS=90000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
 - `ORDERBOOK_SPARSE_CONFIRM_MAX_PER_SCAN=8`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
-- `SECONDARY_QUOTE_ENABLED=true`
-- `SECONDARY_QUOTE_PROVIDER=cryptocompare`
+- `SECONDARY_QUOTE_ENABLED=false` (deprecated; secondary quote providers are disabled in the live entry path)
 - `QUOTE_RETRY=2`
 
 If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
@@ -298,19 +305,19 @@ Intended live non-secret env values:
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=true`
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=18`
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=12`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
 - `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
-- `EXECUTION_TIER3_DEFAULT=true`
+- `EXECUTION_TIER3_DEFAULT=false`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
-- `ENTRY_PREFETCH_CHUNK_SIZE=3`
+- `ENTRY_PREFETCH_CHUNK_SIZE=8`
 - `ENTRY_PREFETCH_QUOTES=true`
 - `ENTRY_PREFETCH_ORDERBOOKS=true`
-- `ALPACA_MD_MAX_CONCURRENCY=1`
-- `BARS_MAX_CONCURRENT=1`
-- `BARS_PREFETCH_INTERVAL_MS=120000`
+- `ALPACA_MD_MAX_CONCURRENCY=4`
+- `BARS_MAX_CONCURRENT=4`
+- `BARS_PREFETCH_INTERVAL_MS=90000`
 - `ALLOW_PER_SYMBOL_BARS_FALLBACK=true`
-- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=8`
+- `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
 - `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`

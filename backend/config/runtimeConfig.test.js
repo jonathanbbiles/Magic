@@ -95,16 +95,28 @@ withEnv({}, () => {
   assert.equal(cfg.predictorWarmupMinBars1m, 35);
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
-  assert.equal(cfg.entryQuoteMaxAgeMs, 30000);
+  assert.equal(cfg.entryQuoteMaxAgeMs, 15000);
   assert.equal(cfg.entryPrefetchQuotes, true);
   assert.equal(cfg.entryPrefetchOrderbooks, true);
-  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 30000);
-  assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 30000);
-  assert.equal(cfg.sparseQuoteFreshMs, 10000);
-  assert.equal(cfg.sparseStaleToleranceMs, 30000);
-  assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 10000);
-  assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 30000);
-  assert.equal(cfg.entryUniverseMaxSymbols, 18);
+  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 15000);
+  assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 15000);
+  assert.equal(cfg.sparseQuoteFreshMs, 5000);
+  assert.equal(cfg.sparseStaleToleranceMs, 15000);
+  assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 5000);
+  assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 15000);
+  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
+  assert.equal(cfg.allowDynamicUniverseInProduction, true);
+  assert.equal(cfg.entryUniverseMaxSymbols, null);
+  assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
+  assert.equal(cfg.entryTier3MinPortfolioUsd, 500);
+  assert.equal(cfg.entryDynamicRequireFreshQuote, true);
+  assert.equal(cfg.entryDynamicRequireOrderbookForTier3, true);
+});
+
+withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: '24' }, () => {
+  const cfg = getRuntimeConfig();
+  assert.equal(cfg.entryUniverseMaxSymbols, 24);
+  assert.equal(cfg.entryUniverseMaxSymbolsSource, 'env');
 });
 
 withEnv({

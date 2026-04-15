@@ -56,8 +56,8 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
-  assert.equal(guardrails.entryUniverse.modeEffective, 'configured');
-  assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, false);
+  assert.equal(guardrails.entryUniverse.modeEffective, 'dynamic');
+  assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, true);
   assert.equal(guardrails.engineV2.enabled, false);
   assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);
 });
@@ -201,6 +201,32 @@ withEnv({ ENTRY_CONFIRMATION_SAMPLES: '0' }, () => {
 
 withEnv({ ROUTING_IOC_URGENCY_SCORE: '1.2' }, () => {
   assert.throws(() => validateEnv(), /ROUTING_IOC_URGENCY_SCORE must be between 0 and 1/);
+});
+
+withEnv({ TRADE_BASE: '', ALPACA_API_BASE: '', APCA_API_KEY_ID: 'PK_FAKE' }, () => {
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...args) => logs.push(args);
+  try {
+    validateEnv();
+  } finally {
+    console.log = originalLog;
+  }
+  const configSummary = logs.find((entry) => entry[0] === 'config_summary')?.[1];
+  assert.equal(configSummary?.effectiveTradeBase, 'https://paper-api.alpaca.markets');
+});
+
+withEnv({ TRADE_BASE: '', ALPACA_API_BASE: '', APCA_API_KEY_ID: 'AK_FAKE' }, () => {
+  const originalLog = console.log;
+  const logs = [];
+  console.log = (...args) => logs.push(args);
+  try {
+    validateEnv();
+  } finally {
+    console.log = originalLog;
+  }
+  const configSummary = logs.find((entry) => entry[0] === 'config_summary')?.[1];
+  assert.equal(configSummary?.effectiveTradeBase, 'https://api.alpaca.markets');
 });
 
 console.log('validate env tests passed');

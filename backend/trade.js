@@ -10,9 +10,19 @@ const {
   requireAlpacaAuth,
   normalizeTradeBase,
   normalizeDataBase,
+  resolveDefaultTradeBase,
   configureOrderExecutionRuntime,
 } = require('./modules/orderExecution');
 const { withAlpacaMdLimit, getRatePressureState, isUnderRatePressure } = require('./modules/alpacaRateLimiter');
+const {
+  updateFromHeaders: updateTradingRateHeaders,
+  markThrottled: markTradingThrottled,
+  isTradingRateLimited,
+  isTradingRatePressured,
+  tradingCooldownRemainingMs,
+  getTradingRateState,
+  waitForTradingCooldown,
+} = require('./modules/tradingRateLimiter');
 const {
   MARKET_DATA_TIMEOUT_MS,
   MARKET_DATA_RETRIES,
@@ -52,7 +62,6 @@ const {
 const { computeATR, atrToBps } = require('./modules/indicators');
 const { computeCorrelationMatrix, clusterSymbols } = require('./modules/correlation');
 const { planTwap, computeNextLimitPrice } = require('./modules/twap');
-const quoteRouter = require('./modules/quotes');
 const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -71,22 +80,49 @@ const { computeOrderbookMetrics } = require('./modules/orderbookMetrics');
 const { parseSymbolSet, resolveSymbolTier, evaluateEntryMarketData } = require('./modules/entryMarketDataEval');
 const { createRequestCoordinator, buildEntryMarketDataContext, getOrFetchSymbolMarketData } = require('./modules/entryMarketDataContext');
 const { createMarketDataCache } = require('./modules/marketDataCache');
-const { buildEntryUniverse, buildDynamicCryptoUniverseFromAssets, filterDynamicUniverseByExecutionPolicy } = require('./modules/entryUniversePolicy');
+const {
+  buildEntryUniverse,
+  buildDynamicCryptoUniverseFromAssets,
+  filterDynamicUniverseByExecutionPolicy,
+  resolveDynamicUniverseRankingWithHydration,
+  deriveDynamicUniverseEmptyReason,
+} = require('./modules/entryUniversePolicy');
+const { createSymbolHealthTracker } = require('./modules/symbolHealth');
+const { evaluateEconomicEntryPrefilter } = require('./modules/economicEntryPrefilter');
+const {
+  selectMostRecentSellOrder,
+  buildLifecycleSnapshot,
+} = require('./modules/exitLifecycle');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { resolveStoragePaths } = require('./modules/storagePaths');
+const {
+  createEntryManagerHeartbeat,
+  updateEntryScanProgress: applyEntryScanProgressUpdate,
+  clearEntryScanProgress: applyEntryScanProgressClear,
+  recordDeferredScanTick,
+} = require('./modules/entryScanHeartbeat');
 
-const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || '';
 const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
 const DEBUG_ALPACA_HTTP = String(process.env.DEBUG_ALPACA_HTTP || '').trim() === '1';
 const DEBUG_ALPACA_HTTP_OK = String(process.env.DEBUG_ALPACA_HTTP_OK || '').trim() === '1';
 
-const TRADE_BASE = normalizeTradeBase(RAW_TRADE_BASE);
+const tradeBaseResolution = resolveDefaultTradeBase({ rawTradeBase: RAW_TRADE_BASE });
+const TRADE_BASE = normalizeTradeBase(tradeBaseResolution.tradeBase);
 const DATA_BASE = normalizeDataBase(RAW_DATA_BASE);
 const ALPACA_BASE_URL = `${TRADE_BASE}/v2`;
 const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
+
+if (!RAW_TRADE_BASE) {
+  console.warn('trade_base_autoselected', {
+    source: tradeBaseResolution.source,
+    credentialTier: tradeBaseResolution.credentialTier,
+    tradeBase: TRADE_BASE,
+  });
+}
 
 configureOrderExecutionRuntime({
   setEngineState,
@@ -105,7 +141,6 @@ const BROKER_TRADING_DISABLED_BACKOFF_MS = readNumber(
 );
 const MIN_POSITION_NOTIONAL_USD = readNumber('MIN_POSITION_NOTIONAL_USD', 1.0);
 const TRADING_ENABLED = readEnvFlag('TRADING_ENABLED', true);
-const SECONDARY_QUOTE_ENABLED = readEnvFlag('SECONDARY_QUOTE_ENABLED', false);
 const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
@@ -129,25 +164,25 @@ const ENTRY_PROFIT_BUFFER_BPS = readNumber('ENTRY_PROFIT_BUFFER_BPS', 5);
 const FEE_BPS_ROUND_TRIP = readNumber('FEE_BPS_ROUND_TRIP', 20);
 const ENTRY_SLIPPAGE_BUFFER_BPS = readNumber('ENTRY_SLIPPAGE_BUFFER_BPS', 10);
 const EXIT_SLIPPAGE_BUFFER_BPS = readNumber('EXIT_SLIPPAGE_BUFFER_BPS', 10);
-const ENTRY_TAKE_PROFIT_BPS_TIER1 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER1);
-const ENTRY_TAKE_PROFIT_BPS_TIER2 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER2);
-const ENTRY_STRETCH_MOVE_BPS_TIER1 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER1);
-const ENTRY_STRETCH_MOVE_BPS_TIER2 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER2);
-const ENTRY_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER1);
-const ENTRY_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER2);
-const EXIT_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER1);
-const EXIT_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER2);
+const ENTRY_TAKE_PROFIT_BPS_TIER1 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER1 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS_TIER1);
+const ENTRY_TAKE_PROFIT_BPS_TIER2 = Number(process.env.ENTRY_TAKE_PROFIT_BPS_TIER2 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS_TIER2);
+const ENTRY_STRETCH_MOVE_BPS_TIER1 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER1 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_STRETCH_MOVE_BPS_TIER1);
+const ENTRY_STRETCH_MOVE_BPS_TIER2 = Number(process.env.ENTRY_STRETCH_MOVE_BPS_TIER2 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_STRETCH_MOVE_BPS_TIER2);
+const ENTRY_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER1 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SLIPPAGE_BUFFER_BPS_TIER1);
+const ENTRY_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.ENTRY_SLIPPAGE_BUFFER_BPS_TIER2 ?? LIVE_CRITICAL_DEFAULTS.ENTRY_SLIPPAGE_BUFFER_BPS_TIER2);
+const EXIT_SLIPPAGE_BUFFER_BPS_TIER1 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER1 ?? LIVE_CRITICAL_DEFAULTS.EXIT_SLIPPAGE_BUFFER_BPS_TIER1);
+const EXIT_SLIPPAGE_BUFFER_BPS_TIER2 = Number(process.env.EXIT_SLIPPAGE_BUFFER_BPS_TIER2 ?? LIVE_CRITICAL_DEFAULTS.EXIT_SLIPPAGE_BUFFER_BPS_TIER2);
 const ENTRY_TAKE_PROFIT_BPS_RAW = Number(process.env.ENTRY_TAKE_PROFIT_BPS);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
 const FORENSICS_POST_WINDOW_MS = readNumber('FORENSICS_POST_WINDOW_MS', 600000);
 const FORENSICS_POST_INTERVAL_MS = readNumber('FORENSICS_POST_INTERVAL_MS', 15000);
-const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', 50);
+const PROFIT_BUFFER_BPS = readNumber('PROFIT_BUFFER_BPS', Number(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS) || 20);
 const BOOK_EXIT_ANCHOR = String(process.env.BOOK_EXIT_ANCHOR || 'ask').trim().toLowerCase();
 const BOOK_EXIT_ENABLED = readEnvFlag('BOOK_EXIT_ENABLED', false);
 const EXIT_POLICY_LOCKED = readEnvFlag('EXIT_POLICY_LOCKED', true);
-const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 30);
+const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', Number(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS) || 45);
 const EXIT_FIXED_NET_PROFIT_BPS = readNumber('EXIT_FIXED_NET_PROFIT_BPS', 5);
 const EXIT_ENFORCE_ENTRY_FLOOR = readEnvFlag('EXIT_ENFORCE_ENTRY_FLOOR', false);
 const EXIT_POST_ONLY = readEnvFlag('EXIT_POST_ONLY', true);
@@ -175,7 +210,7 @@ const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 // You can always override via STOP_LOSS_BPS in the environment.
 const STOP_LOSS_BPS = readNumber(
   'STOP_LOSS_BPS',
-  Math.max(30, Math.round((Number.isFinite(ENTRY_TAKE_PROFIT_BPS_RAW) ? ENTRY_TAKE_PROFIT_BPS_RAW : TARGET_PROFIT_BPS) * 0.5)),
+  Number(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS) || Math.max(30, Math.round((Number.isFinite(ENTRY_TAKE_PROFIT_BPS_RAW) ? ENTRY_TAKE_PROFIT_BPS_RAW : TARGET_PROFIT_BPS) * 0.5)),
 );
 const STOPS_ENABLED = readEnvFlag('STOPS_ENABLED', true);
 const STOPLOSS_ENABLED = readEnvFlag('STOPLOSS_ENABLED', true);
@@ -219,9 +254,9 @@ const LIQUIDITY_WINDOW_UTC_END = readNumber('LIQUIDITY_WINDOW_UTC_END', 16);
 const OUTSIDE_WINDOW_SIZE_MULT = readNumber('OUTSIDE_WINDOW_SIZE_MULT', 0.5);
 const OUTSIDE_WINDOW_MODE = String(process.env.OUTSIDE_WINDOW_MODE || 'shrink').trim().toLowerCase();
 const REGIME_MAX_SPREAD_BPS = readNumber('REGIME_MAX_SPREAD_BPS', 40);
-const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 15);
+const REGIME_MIN_VOL_BPS = readNumber('REGIME_MIN_VOL_BPS', 10);
 const REGIME_MIN_VOL_BPS_TIER1 = readNumber('REGIME_MIN_VOL_BPS_TIER1', 4);
-const REGIME_MIN_VOL_BPS_TIER2 = readNumber('REGIME_MIN_VOL_BPS_TIER2', 8);
+const REGIME_MIN_VOL_BPS_TIER2 = readNumber('REGIME_MIN_VOL_BPS_TIER2', 6);
 const REGIME_MAX_VOL_BPS = readNumber('REGIME_MAX_VOL_BPS', 250);
 const REGIME_REQUIRE_MOMENTUM = readEnvFlag('REGIME_REQUIRE_MOMENTUM', true);
 const REGIME_BLOCK_WEAK_LIQUIDITY = readEnvFlag('REGIME_BLOCK_WEAK_LIQUIDITY', true);
@@ -274,7 +309,7 @@ const VOL_HALF_LIFE_MIN = readNumber('VOL_HALF_LIFE_MIN', 6);
 const STOP_VOL_MULT = readNumber('STOP_VOL_MULT', 2.5);
 const TP_VOL_SCALE = readNumber('TP_VOL_SCALE', 1.0);
 const EV_GUARD_ENABLED = readFlag('EV_GUARD_ENABLED', true);
-const EV_MIN_BPS = readNumber('EV_MIN_BPS', 5);
+const EV_MIN_BPS = readNumber('EV_MIN_BPS', Number(LIVE_CRITICAL_DEFAULTS.EV_MIN_BPS) || 30);
 const PUP_MIN = readNumber('PUP_MIN', 0.65);
 const MAX_REQUIRED_GROSS_EXIT_BPS = readNumber('MAX_REQUIRED_GROSS_EXIT_BPS', 160);
 const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
@@ -316,6 +351,8 @@ function getQuoteFreshnessPolicy() {
     entryRegimeStaleQuoteMaxAgeMs: ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS,
     sparseQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
     sparseRequireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
+    entryScanQuoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+    entryScanOrderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
     sparseStaleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
   };
 }
@@ -323,7 +360,7 @@ function getQuoteFreshnessPolicy() {
 function classifyEntrySkipReason(reason) {
   const normalized = String(reason || '').toLowerCase();
   if (!normalized) return 'market';
-  if (normalized === 'stale_quote_cooldown') return 'cooldown';
+  if (normalized === 'stale_quote_cooldown' || normalized === 'symbol_health_cooldown') return 'cooldown';
   if (
     normalized.includes('stale') ||
     normalized.includes('quote') ||
@@ -391,6 +428,9 @@ function getEntryDiagnosticsSnapshot() {
     staleQuoteCooldownSample: Array.isArray(lastEntryScanSummary?.staleQuoteCooldownSample)
       ? lastEntryScanSummary.staleQuoteCooldownSample
       : [],
+    symbolHealthCooldownSample: Array.isArray(lastEntryScanSummary?.symbolHealthCooldownSample)
+      ? lastEntryScanSummary.symbolHealthCooldownSample
+      : [],
     topSkipReasonsRolling: Array.from(entrySkipReasonTotals.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 8)
@@ -399,6 +439,7 @@ function getEntryDiagnosticsSnapshot() {
         return acc;
       }, {}),
     ratePressureState,
+    tradingRateState: getTradingRateState(),
     engineState: getEngineStateSnapshot(),
     engineStateDetail: {
       state: getEngineStateSnapshot(),
@@ -459,61 +500,44 @@ function noteBarsFallbackAttempt(symbol, timeframe, { success = false } = {}) {
   });
 }
 
-function getStaleQuoteCooldownState(symbol) {
-  const key = normalizeSymbol(symbol);
-  const state = staleQuoteSkipStateBySymbol.get(key) || { attempts: 0, untilMs: 0, skipCount: 0, reason: null, quoteAgeMs: null };
-  const nowMs = Date.now();
-  return {
-    key,
-    attempts: Number(state.attempts) || 0,
-    skipCount: Number(state.skipCount) || 0,
-    untilMs: Number(state.untilMs) || 0,
-    reason: state.reason || null,
-    quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
-    active: Number(state.untilMs) > nowMs,
-    remainingMs: Number(state.untilMs) > nowMs ? Number(state.untilMs) - nowMs : 0,
-  };
-}
-
 function noteStaleQuoteSkip(symbol, options = {}) {
-  const prev = getStaleQuoteCooldownState(symbol);
-  const attempts = prev.attempts + 1;
   const quoteAgeMs = Number(options?.quoteAgeMs);
   const requestedCooldownMs = Number(options?.cooldownMs);
   const adaptiveHopelessCooldownMs = Number.isFinite(quoteAgeMs) && quoteAgeMs > 0
     ? Math.min(15 * 60 * 1000, Math.max(STALE_QUOTE_HOPELESS_COOLDOWN_MS, Math.floor(quoteAgeMs / 4)))
     : STALE_QUOTE_HOPELESS_COOLDOWN_MS;
   const requestedReason = String(options?.reason || '').toLowerCase();
+  const current = symbolHealthTracker.getCooldown(symbol);
+  const attempts = Math.max(1, Number(current.failures || 0) + 1);
   const baseCooldownMs = requestedReason === 'stale_quote_hopeless'
     ? adaptiveHopelessCooldownMs
-    : Math.min(
-      STALE_QUOTE_SCAN_COOLDOWN_MAX_MS,
-      STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * Math.max(1, 2 ** Math.max(0, attempts - 1)),
-    );
+    : Math.min(STALE_QUOTE_SCAN_COOLDOWN_MAX_MS, STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * Math.max(1, attempts));
   const cooldownMs = Number.isFinite(requestedCooldownMs) && requestedCooldownMs > 0
     ? requestedCooldownMs
     : baseCooldownMs;
-  staleQuoteSkipStateBySymbol.set(prev.key, {
-    attempts,
-    skipCount: prev.skipCount + 1,
-    untilMs: Date.now() + cooldownMs,
-    reason: options?.reason || null,
+  symbolHealthTracker.recordFailure(symbol, 'stale_quote_primary', {
+    cooldownMs,
+    reason: options?.reason || 'stale_quote_primary',
     quoteAgeMs: Number.isFinite(quoteAgeMs) ? quoteAgeMs : null,
   });
 }
 
 function clearStaleQuoteSkipState(symbol) {
-  if (!symbol) return;
-  const key = normalizeSymbol(symbol);
-  if (!staleQuoteSkipStateBySymbol.has(key)) return;
-  const prev = staleQuoteSkipStateBySymbol.get(key);
-  staleQuoteSkipStateBySymbol.set(key, {
-    attempts: 0,
-    skipCount: Number(prev?.skipCount) || 0,
-    untilMs: 0,
-    reason: null,
-    quoteAgeMs: null,
-  });
+  symbolHealthTracker.clearFailure(symbol, 'stale_quote_primary');
+}
+
+function getStaleQuoteCooldownState(symbol) {
+  const cooldown = symbolHealthTracker.getCooldown(symbol);
+  return {
+    key: normalizeSymbol(symbol),
+    attempts: Number(cooldown.failures) || 0,
+    skipCount: Number(cooldown.failures) || 0,
+    untilMs: Number(cooldown.untilMs) || 0,
+    reason: cooldown.reason || null,
+    quoteAgeMs: Number.isFinite(Number(cooldown.quoteAgeMs)) ? Number(cooldown.quoteAgeMs) : null,
+    active: Boolean(cooldown.active && String(cooldown.reason || '').includes('stale_quote')),
+    remainingMs: Number(cooldown.remainingMs) || 0,
+  };
 }
 
 function incrementEntrySkipReasonTotal(reason) {
@@ -620,9 +644,66 @@ function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = E
 function classifyQuoteFetchFailureReason(error, fallbackReason = 'marketdata_unavailable') {
   const normalizedFallback = String(fallbackReason || 'marketdata_unavailable');
   const message = String(error?.message || error || '').toLowerCase();
+  const staleReasonCode = String(error?.staleReasonCode || '').toLowerCase();
+  if (staleReasonCode.includes('stale_quote')) return 'stale_quote_primary';
   if (message.includes('quote stale') || message.includes('stale quote')) return 'stale_quote_primary';
   if (message.includes('quote not available')) return 'marketdata_unavailable';
   return normalizedFallback;
+}
+
+function extractStaleQuoteMeta({
+  error = null,
+  quote = null,
+  quoteResult = null,
+  fallback = null,
+  nowMs = Date.now(),
+  maxAgeMs = ENTRY_QUOTE_MAX_AGE_MS,
+} = {}) {
+  const staleError = error && typeof error === 'object' ? error : null;
+  const candidates = [quote, quoteResult?.value, quoteResult?.quote, fallback].filter(Boolean);
+  let selected = null;
+  for (const candidate of candidates) {
+    if (candidate && (Number.isFinite(Number(candidate.tsMs)) || Number.isFinite(Number(candidate.ts)) || Number.isFinite(Number(candidate.receivedAtMs)))) {
+      selected = candidate;
+      break;
+    }
+  }
+  const tsMs = Number.isFinite(Number(staleError?.quoteTsMs))
+    ? Number(staleError.quoteTsMs)
+    : Number.isFinite(Number(selected?.tsMs))
+      ? Number(selected.tsMs)
+      : Number.isFinite(Number(selected?.ts))
+        ? Number(selected.ts)
+        : null;
+  const receivedAtMs = Number.isFinite(Number(staleError?.quoteReceivedAtMs))
+    ? Number(staleError.quoteReceivedAtMs)
+    : Number.isFinite(Number(selected?.receivedAtMs))
+      ? Number(selected.receivedAtMs)
+      : null;
+  const source = staleError?.quoteSource || selected?.source || null;
+  const quoteTimestampSource = staleError?.quoteTimestampSource || source || null;
+  const quoteAgeMsRaw = Number.isFinite(Number(staleError?.quoteAgeMs))
+    ? Number(staleError.quoteAgeMs)
+    : Number.isFinite(tsMs)
+      ? nowMs - tsMs
+      : null;
+  const quoteAgeMs = Number.isFinite(quoteAgeMsRaw) ? Math.max(0, quoteAgeMsRaw) : null;
+  const staleReasonCode = staleError?.staleReasonCode || classifyQuoteFetchFailureReason(staleError, 'stale_quote_primary');
+  const hopelesslyStale = Number.isFinite(quoteAgeMs)
+    ? quoteAgeMs > (Number(maxAgeMs) * STALE_QUOTE_HOPELESS_MULTIPLIER)
+    : false;
+  return {
+    reason: hopelesslyStale ? 'stale_quote_hopeless' : staleReasonCode,
+    staleReasonCode,
+    quoteAgeMs,
+    quoteTsMs: tsMs,
+    quoteReceivedAtMs: receivedAtMs,
+    quoteSource: source,
+    quoteTimestampSource,
+    quoteDataSource: quoteResult?.state || staleError?.quoteDataSource || null,
+    hopelesslyStale,
+    cooldownMs: hopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null,
+  };
 }
 
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
@@ -732,8 +813,13 @@ const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
 const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 10000);
 const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 60);
 const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 175);
+const ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL = readNumber('ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL', 6);
+const ORDERBOOK_MIN_DEPTH_USD_FLOOR = readNumber('ORDERBOOK_MIN_DEPTH_USD_FLOOR', 25);
+const ORDERBOOK_MIN_DEPTH_USD_CEIL = readNumber('ORDERBOOK_MIN_DEPTH_USD_CEIL', 175);
 const ORDERBOOK_LIQUIDITY_SCORE_MIN = readNumber('ORDERBOOK_LIQUIDITY_SCORE_MIN', 0.25);
 const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
+const ORDERBOOK_IMPACT_NOTIONAL_MODE = String(process.env.ORDERBOOK_IMPACT_NOTIONAL_MODE || 'entry_notional').trim().toLowerCase();
+const ORDERBOOK_IMPACT_NOTIONAL_MIN_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_MIN_USD', 10);
 const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 15);
 const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
 const ORDERBOOK_MIN_LEVELS_PER_SIDE = Math.max(1, Math.floor(readNumber('ORDERBOOK_MIN_LEVELS_PER_SIDE', 2)));
@@ -768,11 +854,18 @@ const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
-const ENTRY_UNIVERSE_MAX_SYMBOLS = Math.max(2, runtimeLiveConfig.entryUniverseMaxSymbols || 18);
+const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
+  ? Math.max(2, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
+  : null;
+const ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE = String(runtimeLiveConfig.entryUniverseMaxSymbolsSource || 'uncapped');
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
 const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
 const EXECUTION_TIER3_DEFAULT = runtimeLiveConfig.executionTier3Default;
+const ENTRY_TIER3_MIN_PORTFOLIO_USD = runtimeLiveConfig.entryTier3MinPortfolioUsd;
+const ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE = runtimeLiveConfig.entryDynamicAllowTier3Override;
+const ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE = runtimeLiveConfig.entryDynamicRequireFreshQuote;
+const ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3 = runtimeLiveConfig.entryDynamicRequireOrderbookForTier3;
 const VOLUME_TREND_MIN = readNumber('VOLUME_TREND_MIN', 1.02);
 const TIMEFRAME_CONFIRMATIONS = readNumber('TIMEFRAME_CONFIRMATIONS', 1);
 const REGIME_ZSCORE_THRESHOLD = readNumber('REGIME_ZSCORE_THRESHOLD', 2);
@@ -780,11 +873,11 @@ const TARGET_MOVE_BPS = readNumber('TARGET_MOVE_BPS', 100);
 const TARGET_HORIZON_MINUTES = readNumber('TARGET_HORIZON_MINUTES', 30);
 // Entry gating should be aligned to the REAL take-profit you actually execute.
 // This is the "take OK profit" target.
-const ENTRY_TAKE_PROFIT_BPS = readNumber('ENTRY_TAKE_PROFIT_BPS', TARGET_PROFIT_BPS);
+const ENTRY_TAKE_PROFIT_BPS = readNumber('ENTRY_TAKE_PROFIT_BPS', Number(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKE_PROFIT_BPS) || TARGET_PROFIT_BPS);
 
 // This is the "stretch confidence" target (predict bigger than you take).
 // Default keeps existing behavior (TARGET_MOVE_BPS).
-const ENTRY_STRETCH_MOVE_BPS = readNumber('ENTRY_STRETCH_MOVE_BPS', TARGET_MOVE_BPS);
+const ENTRY_STRETCH_MOVE_BPS = readNumber('ENTRY_STRETCH_MOVE_BPS', Number(LIVE_CRITICAL_DEFAULTS.ENTRY_STRETCH_MOVE_BPS) || TARGET_MOVE_BPS);
 const MIN_EXPECTED_VALUE_BPS = readNumber('MIN_EXPECTED_VALUE_BPS', 5);
 const EV_BUFFER_BPS = readNumber('EV_BUFFER_BPS', 0);
 const MAX_SPREAD_BPS_TO_ENTER = readNumber('MAX_SPREAD_BPS_TO_ENTER', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
@@ -816,6 +909,8 @@ function logRuntimeConfigEffective() {
     entrySymbolsPrimary: ENTRY_SYMBOLS_PRIMARY,
     entrySymbolsSecondary: ENTRY_SYMBOLS_SECONDARY,
     entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+    entryUniverseMaxSymbolsConfigured: ENTRY_UNIVERSE_MAX_SYMBOLS,
+    entryUniverseMaxSymbolsSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
     quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
   });
@@ -881,6 +976,59 @@ function computeCappedEntryNotional({
     cappedNotionalUsd,
   };
 }
+
+function computeAdaptiveOrderbookThresholds({
+  symbol,
+  portfolioValue,
+  buyingPower,
+  quoteMid,
+}) {
+  const baseNotionalUsd = Math.max(0, Number(portfolioValue) * TRADE_PORTFOLIO_PCT);
+  const { cappedNotionalUsd } = computeCappedEntryNotional({
+    symbol,
+    portfolioValue,
+    buyingPower,
+    baseNotionalUsd,
+    context: 'orderbook_gate_estimate',
+  });
+  const entryNotionalUsd = Math.max(0, Number(cappedNotionalUsd) || 0);
+  const minDepthFromNotional = entryNotionalUsd * Math.max(0, ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL);
+  const adaptiveMinDepthUsd = clamp(
+    Number.isFinite(minDepthFromNotional) ? minDepthFromNotional : 0,
+    ORDERBOOK_MIN_DEPTH_USD_FLOOR,
+    ORDERBOOK_MIN_DEPTH_USD_CEIL,
+  );
+  const impactNotionalUsd = ORDERBOOK_IMPACT_NOTIONAL_MODE === 'entry_notional'
+    ? Math.max(ORDERBOOK_IMPACT_NOTIONAL_MIN_USD, entryNotionalUsd)
+    : Math.max(ORDERBOOK_IMPACT_NOTIONAL_MIN_USD, ORDERBOOK_IMPACT_NOTIONAL_USD);
+  const summary = {
+    symbol,
+    portfolioValue: Number.isFinite(Number(portfolioValue)) ? Number(portfolioValue) : null,
+    buyingPower: Number.isFinite(Number(buyingPower)) ? Number(buyingPower) : null,
+    quoteMid: Number.isFinite(Number(quoteMid)) ? Number(quoteMid) : null,
+    entryNotionalUsd,
+    minDepthUsd: adaptiveMinDepthUsd,
+    minDepthFloorUsd: ORDERBOOK_MIN_DEPTH_USD_FLOOR,
+    minDepthCeilUsd: ORDERBOOK_MIN_DEPTH_USD_CEIL,
+    minDepthMultOfNotional: ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL,
+    impactNotionalMode: ORDERBOOK_IMPACT_NOTIONAL_MODE,
+    impactNotionalMinUsd: ORDERBOOK_IMPACT_NOTIONAL_MIN_USD,
+    impactNotionalUsd,
+  };
+  console.log('entry_orderbook_adaptive_thresholds', summary);
+  return summary;
+}
+
+function shouldAllowDynamicTier3({
+  portfolioValue,
+  minPortfolioUsd = ENTRY_TIER3_MIN_PORTFOLIO_USD,
+  allowOverride = ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
+  executionTier3Default = EXECUTION_TIER3_DEFAULT,
+} = {}) {
+  if (!executionTier3Default) return false;
+  if (allowOverride) return true;
+  return Number(portfolioValue || 0) >= Number(minPortfolioUsd || 0);
+}
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
 const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
@@ -937,6 +1085,8 @@ const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9
 const EXIT_REPLACE_VISIBILITY_GRACE_MS = Math.max(500, readNumber('EXIT_REPLACE_VISIBILITY_GRACE_MS', 3500));
 const ENTRY_QUOTE_MAX_AGE_MS = Math.max(1000, runtimeLiveConfig.normalEntryQuoteMaxAgeMs);
 const ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS = Math.max(ENTRY_QUOTE_MAX_AGE_MS, runtimeLiveConfig.entryRegimeStaleQuoteMaxAgeMs);
+const ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS = Math.max(1000, Math.min(ENTRY_QUOTE_MAX_AGE_MS, ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS));
+const ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS = Math.max(1000, Math.min(ORDERBOOK_MAX_AGE_MS, ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS));
 const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
 const CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED = readEnvFlag('CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED', false);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
@@ -993,9 +1143,16 @@ let lastUniverseDiagnostics = {
   dynamicRejectedMalformedCount: 0,
   dynamicRejectedUnsupportedCount: 0,
   dynamicRejectedDuplicateCount: 0,
-  acceptedSymbolsCount: 0,
+  acceptedSymbolsCount: null,
+  scanSymbolsCount: null,
   acceptedSymbolsSample: [],
+  dynamicAcceptedSymbolsCount: 0,
+  dynamicAcceptedSymbolsSample: [],
   fallbackOccurred: false,
+  universeSymbolCap: null,
+  configuredUniverseCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+  configuredUniverseCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+  universeCapDiagnostics: null,
   configuredPrimaryCount: 0,
   configuredSecondaryCount: 0,
   warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
@@ -1030,6 +1187,30 @@ function logTradingDisabledOnce() {
     lastTradingDisabledLogMs = nowMs;
     console.warn('TRADING_DISABLED_BY_ENV', { enabled: TRADING_ENABLED });
   }
+}
+
+// Parse an Alpaca-style JSON error snippet to extract the numeric `code`
+// field (e.g. 40310000). Returns null when the snippet isn't JSON or has no
+// numeric code. Used by error-classification helpers below.
+function extractHttpErrorCode({ error, snippet }) {
+  const direct = error?.code ?? error?.errorCode;
+  if (Number.isFinite(direct)) return direct;
+  const body = error?.response?.data;
+  if (body && Number.isFinite(body.code)) return body.code;
+  const text = typeof snippet === 'string' ? snippet : '';
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && Number.isFinite(parsed.code)) return parsed.code;
+  } catch (_) {
+    // Not JSON — fall through to regex fallback.
+  }
+  const match = text.match(/"code"\s*:\s*(\d+)/);
+  if (match) {
+    const n = Number(match[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
 }
 
 function isBrokerTradingDisabledError({ statusCode, errorCode, message, snippet }) {
@@ -1557,6 +1738,7 @@ async function computeEntrySignal(symbol, opts = {}) {
     orderbookBandBps: ORDERBOOK_BAND_BPS,
     orderbookMinDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
     orderbookMaxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
+    orderbookDepthMultOfNotional: ORDERBOOK_MIN_DEPTH_MULT_OF_NOTIONAL,
     orderbookLiquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
     volumeTrendMin: VOLUME_TREND_MIN,
     timeframeConfirmations: TIMEFRAME_CONFIRMATIONS,
@@ -1593,10 +1775,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       coordinator: entryMarketDataCoordinator,
       marketDataCache: scanMarketDataCache,
       symbol: asset.symbol,
-      fetchQuote: getLatestQuote,
+      fetchQuote: getEntryScanQuoteWithPrimaryRetry,
       fetchOrderbook: getLatestOrderbook,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+      orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
       includeOrderbook: false,
     });
     quote = mdSnapshot?.quote || null;
@@ -1607,46 +1791,107 @@ async function computeEntrySignal(symbol, opts = {}) {
       mdSnapshot?.quoteResult?.reason || 'marketdata_unavailable',
     );
     if (!quote && quoteFetchReason === 'stale_quote_primary') {
-      noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+      const staleMeta = extractStaleQuoteMeta({
+        error: mdSnapshot?.quoteResult?.error,
+        quoteResult: mdSnapshot?.quoteResult,
+        nowMs: Date.now(),
+        maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      });
+      if (!staleMeta.hopelesslyStale) {
+        const refreshedQuote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
+          maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+          forceRefresh: true,
+          bypassCache: true,
+        }).catch(() => null);
+        if (refreshedQuote) {
+          quote = refreshedQuote;
+        }
+      }
+      if (quote) {
+        // Continue through the normal entry flow (orderbook checks + sparse fallback path)
+        // when stale primary quotes are recoverable via forced refresh/secondary rescue.
+      } else {
+      noteStaleQuoteSkip(asset.symbol, {
+        reason: staleMeta.reason,
+        quoteAgeMs: staleMeta.quoteAgeMs,
+        cooldownMs: staleMeta.cooldownMs,
+      });
       return {
         entryReady: false,
         why: 'marketdata_unavailable',
         meta: {
           symbol: asset.symbol,
           symbolTier,
-          reason: 'stale_quote_primary',
-          quoteAgeMs: Number.isFinite(Number(mdSnapshot?.quoteResult?.value?.tsMs))
-            ? Math.max(0, Date.now() - Number(mdSnapshot.quoteResult.value.tsMs))
-            : null,
-          quoteTimestampSource: mdSnapshot?.quoteResult?.value?.source || null,
-          quoteDataSource: mdSnapshot?.quoteResult?.state || null,
+          reason: staleMeta.staleReasonCode || 'stale_quote_primary',
+          quoteAgeMs: staleMeta.quoteAgeMs,
+          quoteTsMs: staleMeta.quoteTsMs,
+          quoteReceivedAtMs: staleMeta.quoteReceivedAtMs,
+          quoteSource: staleMeta.quoteSource,
+          quoteTimestampSource: staleMeta.quoteTimestampSource,
+          quoteDataSource: staleMeta.quoteDataSource,
+          staleQuoteHopeless: staleMeta.hopelesslyStale,
+          staleRefreshAttempted: !staleMeta.hopelesslyStale,
+          staleRefreshRecovered: false,
           skippedOrderbookFetch: true,
-          skippedTradeFetch: true,
-          skippedSparseRetry: true,
+          skippedTradeFetch: false,
+          skippedSparseRetry: staleMeta.hopelesslyStale,
         },
         record: baseRecord,
       };
+      }
     }
   } else {
     try {
-      quote = await getLatestQuoteFromQuotesOnly(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+      quote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     } catch (err) {
       const quoteFetchReason = classifyQuoteFetchFailureReason(err, 'marketdata_unavailable');
       if (quoteFetchReason === 'stale_quote_primary') {
-        noteStaleQuoteSkip(asset.symbol, { reason: 'stale_quote_primary' });
+        const staleMeta = extractStaleQuoteMeta({
+          error: err,
+          quote: quoteCache.get(normalizeSymbol(asset.symbol)),
+          nowMs: Date.now(),
+          maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+        if (!staleMeta.hopelesslyStale) {
+          const refreshedQuote = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
+            maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+            forceRefresh: true,
+            bypassCache: true,
+          }).catch(() => null);
+          if (refreshedQuote) {
+            quote = refreshedQuote;
+          }
+        }
+        if (quote) {
+          // Continue through normal flow for recoverable stale primary quote cases.
+        } else {
+        noteStaleQuoteSkip(asset.symbol, {
+          reason: staleMeta.reason,
+          quoteAgeMs: staleMeta.quoteAgeMs,
+          cooldownMs: staleMeta.cooldownMs,
+        });
         return {
           entryReady: false,
           why: 'marketdata_unavailable',
           meta: {
             symbol: asset.symbol,
             symbolTier,
-            reason: 'stale_quote_primary',
+            reason: staleMeta.staleReasonCode || 'stale_quote_primary',
+            quoteAgeMs: staleMeta.quoteAgeMs,
+            quoteTsMs: staleMeta.quoteTsMs,
+            quoteReceivedAtMs: staleMeta.quoteReceivedAtMs,
+            quoteSource: staleMeta.quoteSource,
+            quoteTimestampSource: staleMeta.quoteTimestampSource,
+            staleQuoteHopeless: staleMeta.hopelesslyStale,
+            staleRefreshAttempted: !staleMeta.hopelesslyStale,
+            staleRefreshRecovered: false,
             skippedOrderbookFetch: true,
-            skippedTradeFetch: true,
-            skippedSparseRetry: true,
+            skippedTradeFetch: false,
+            skippedSparseRetry: staleMeta.hopelesslyStale,
           },
           record: baseRecord,
         };
+        }
       }
       return {
         entryReady: false,
@@ -1686,6 +1931,46 @@ async function computeEntrySignal(symbol, opts = {}) {
   const spreadBps = ((ask - bid) / mid) * BPS;
   baseRecord.refPrice = mid;
   baseRecord.spreadBps = spreadBps;
+  const economicEdgeRequirements = computeEntryEdgeRequirements({
+    symbol: asset.symbol,
+    spreadBps,
+    targetMoveBps: resolvedEntryTakeProfitBps,
+    symbolTier,
+  });
+  const economicPrefilter = evaluateEconomicEntryPrefilter({
+    spreadBps,
+    edgeRequirements: economicEdgeRequirements,
+  });
+  if (economicPrefilter.shouldSkip) {
+    logEntrySkip({
+      symbol: asset.symbol,
+      symbolTier,
+      spreadBps,
+      requiredEdgeBps: economicEdgeRequirements.requiredEdgeBps,
+      reason: economicPrefilter.reason,
+      maxAffordableSpreadBps: economicPrefilter.maxAffordableSpreadBps,
+      targetMoveBps: economicPrefilter.targetMoveBps,
+      transactionCostBpsNoSpread: economicPrefilter.transactionCostBpsNoSpread,
+      minNetEdgeBps: economicPrefilter.minNetEdgeBps,
+    });
+    return {
+      entryReady: false,
+      why: economicPrefilter.reason,
+      meta: {
+        symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        requiredEdgeBps: economicEdgeRequirements.requiredEdgeBps,
+        maxAffordableSpreadBps: economicPrefilter.maxAffordableSpreadBps,
+        targetMoveBps: economicPrefilter.targetMoveBps,
+        feeBpsRoundTrip: economicEdgeRequirements.feeBpsRoundTrip,
+        slippageBps: economicEdgeRequirements.slippageBps,
+        minNetEdgeBps: economicPrefilter.minNetEdgeBps,
+        transactionCostBpsNoSpread: economicPrefilter.transactionCostBpsNoSpread,
+      },
+      record: baseRecord,
+    };
+  }
   const nowMs = Date.now();
   const spreadElasticityMeta = getSpreadElasticityMeta(asset.symbol, spreadBps, nowMs);
 
@@ -1741,6 +2026,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   quoteAgeMs = Number.isFinite(quoteAgeMs) ? Math.max(0, quoteAgeMs) : null;
   let sparseRetryDetails = null;
   let sparseRejectCounted = false;
+  let staleQuoteRecoveredByForcedRefresh = false;
   const maybeCountSparseReject = ({ reason, marketDataEval = null }) => {
     const shouldCount = shouldCountSparseFallbackReject({ marketDataEval }) ||
       shouldCountSparseRetryFailureReject({ reason, sparseRetryDetails });
@@ -1751,25 +2037,97 @@ async function computeEntrySignal(symbol, opts = {}) {
     return shouldCount;
   };
 
+  const forceRefreshStaleQuoteOnce = async () => {
+    const refreshed = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
+      maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      forceRefresh: true,
+      bypassCache: true,
+    }).catch(() => null);
+    if (!refreshed) return false;
+    quote = refreshed;
+    quoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
+    quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+    quoteSource = quote?.source || quoteSource;
+    quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+    return true;
+  };
+
   const primaryQuoteViability = evaluatePrimaryQuoteViability({
     quote,
     nowMs,
     maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
   });
-  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViability.quoteAgeMs)
-    && primaryQuoteViability.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
   if (!primaryQuoteViability.ok) {
+    const refreshed = await forceRefreshStaleQuoteOnce();
+    if (refreshed) {
+      const refreshedViability = evaluatePrimaryQuoteViability({
+        quote,
+        nowMs: Date.now(),
+        maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      });
+      if (refreshedViability.ok) {
+        staleQuoteRecoveredByForcedRefresh = true;
+        console.log('entry_stale_quote_recovered', {
+          symbol: asset.symbol,
+          symbolTier,
+          source: quoteSource,
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+          thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+      } else {
+        noteStaleQuoteSkip(asset.symbol, {
+          reason: refreshedViability.reason || 'stale_quote_primary',
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+        });
+        console.log('entry_stale_quote_refresh_failed', {
+          symbol: asset.symbol,
+          symbolTier,
+          reason: refreshedViability.staleReasonCode || refreshedViability.reason,
+          quoteAgeMs: refreshedViability.quoteAgeMs,
+          source: quoteSource,
+          thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+        return {
+          entryReady: false,
+          why: 'marketdata_unavailable',
+          meta: {
+            symbol: asset.symbol,
+            symbolTier,
+            reason: refreshedViability.staleReasonCode || refreshedViability.reason || 'stale_quote_primary',
+            quoteAgeMs: refreshedViability.quoteAgeMs,
+            staleRefreshAttempted: true,
+            staleRefreshRecovered: false,
+            skippedOrderbookFetch: true,
+            skippedTradeFetch: false,
+            skippedSparseRetry: true,
+          },
+          record: baseRecord,
+        };
+      }
+    }
+  }
+  const primaryQuoteViabilityFinal = evaluatePrimaryQuoteViability({
+    quote,
+    nowMs: Date.now(),
+    maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+  });
+  if (primaryQuoteViabilityFinal.ok) {
+    clearStaleQuoteSkipState(asset.symbol);
+  }
+  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViabilityFinal.quoteAgeMs)
+    && primaryQuoteViabilityFinal.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
+  if (!primaryQuoteViabilityFinal.ok) {
     const cooldownMs = quoteHopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null;
     noteStaleQuoteSkip(asset.symbol, {
       cooldownMs,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.reason,
-      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.reason,
+      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
     });
     console.log('entry_quote_viability_skip', {
       symbol: asset.symbol,
       symbolTier,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViability.staleReasonCode,
-      quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.staleReasonCode,
+      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
       quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
       thresholdName: 'normalEntryQuoteMaxAgeMs',
       thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
@@ -1783,12 +2141,14 @@ async function computeEntrySignal(symbol, opts = {}) {
       meta: {
         symbol: asset.symbol,
         symbolTier,
-        reason: primaryQuoteViability.staleReasonCode,
-        quoteAgeMs: primaryQuoteViability.quoteAgeMs,
+        reason: primaryQuoteViabilityFinal.staleReasonCode,
+        quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
         thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
         staleQuoteHopeless: quoteHopelesslyStale,
+        staleRefreshAttempted: true,
+        staleRefreshRecovered: false,
         skippedOrderbookFetch: true,
-        skippedTradeFetch: true,
+        skippedTradeFetch: false,
         skippedSparseRetry: true,
       },
       record: baseRecord,
@@ -1806,6 +2166,8 @@ async function computeEntrySignal(symbol, opts = {}) {
         fetchOrderbook: getLatestOrderbook,
         quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
         orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+        quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+        orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
         includeOrderbook: true,
       });
       obResult = obSnapshot?.orderbook || null;
@@ -1813,6 +2175,13 @@ async function computeEntrySignal(symbol, opts = {}) {
       obResult = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
     }
   }
+  const accountInfo = opts?.accountInfo || {};
+  const adaptiveLiquidityThresholds = computeAdaptiveOrderbookThresholds({
+    symbol: asset.symbol,
+    portfolioValue: Number(accountInfo.portfolioValue || 0),
+    buyingPower: Number(accountInfo.buyingPower || 0),
+    quoteMid: mid,
+  });
   if (!obResult.ok) {
     baseRecord.orderbookUnavailableReason = obResult.reason;
     return {
@@ -1833,7 +2202,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
       },
       record: baseRecord,
@@ -1849,9 +2218,9 @@ async function computeEntrySignal(symbol, opts = {}) {
       },
       {
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
-        impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        impactNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
         imbalanceBiasScale: ORDERBOOK_IMBALANCE_BIAS_SCALE,
         minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
       },
@@ -2038,7 +2407,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         askDepthUsd: orderbookMeta.askDepthUsd,
         totalDepthUsd: orderbookMeta.totalDepthUsd,
         actualDepthUsd: orderbookMeta.actualDepthUsd,
-        minDepthThreshold: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthThreshold: adaptiveLiquidityThresholds.minDepthUsd,
         orderbookLevelCounts: orderbookMeta.orderbookLevelCounts,
       });
     }
@@ -2055,7 +2424,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
       },
       record: baseRecord,
@@ -2076,7 +2445,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         quoteAsk: ask,
         quoteBid: bid,
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
+        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
         liquidityScoreMin: ORDERBOOK_LIQUIDITY_SCORE_MIN,
       },
@@ -2889,8 +3258,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     minNetEdgeBps: edgeRequirements.minNetEdgeBps,
     predictorProbability: predictorTp?.probability ?? null,
     weakLiquidity,
-    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
+    requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
     availableDepthUsd: availableDepthUsdForEval,
     orderbookMeta,
     policy: getEntryMarketDataPolicy(),
@@ -2928,8 +3297,8 @@ async function computeEntrySignal(symbol, opts = {}) {
     sparseFallback: marketDataEval.sparseFallbackState,
     sparseRetry: sparseRetryDetails,
     dataQualityReason,
-    cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
-    requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+    cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
+    requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
     reason: marketDataEval.reason || dataQualityReason,
   });
   if (marketDataEval.dataQualityState !== 'ok') {
@@ -2941,9 +3310,9 @@ async function computeEntrySignal(symbol, opts = {}) {
         probability: predictorTp?.probability ?? null,
         netEdgeBps: edge.netEdgeBps,
         quoteAgeMs,
-        requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
         availableDepthUsd: availableDepthUsdForEval,
-        cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+        cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
         sparseFallback: marketDataEval.sparseFallbackState,
         sparseRetry: sparseRetryDetails,
         dataQualityReason: dataQualityReason || marketDataEval.reason,
@@ -3030,9 +3399,9 @@ async function computeEntrySignal(symbol, opts = {}) {
       probability: predictorTp?.probability ?? null,
       netEdgeBps: edge.netEdgeBps,
       quoteAgeMs,
-      requiredDepthUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
       availableDepthUsd: availableDepthUsdForEval,
-      cappedOrderNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
+      cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd,
       confidenceCap: marketDataEval.confidenceMultiplierCap,
       sparseFallback: marketDataEval.sparseFallbackState,
     });
@@ -3278,8 +3647,8 @@ async function computeEntrySignal(symbol, opts = {}) {
 
 
 
-function safeIso(ts) {
-  if (!ts) return null;
+function safeIso(ts = Date.now()) {
+  if (ts === null || ts === undefined || ts === '') return null;
   if (typeof ts === 'string') {
     const ms = Date.parse(ts);
     return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
@@ -3471,6 +3840,8 @@ const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
 const lockedTpLossExitBlockedLogBySymbol = new Map();
+const lockedTpThesisBreakCancelAtBySymbol = new Map(); // symbol -> ms timestamp of last thesis_break cancel
+const LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS = 30_000; // don't reattach TP for 30s after thesis_break cancel
 const positionMissingCountBySymbol = new Map();
 const lastConfirmedPositionSeenAtBySymbol = new Map(); // symbol -> ms
 const exitStateFirstSeenAtBySymbol = new Map(); // symbol -> ms (bookkeeping fallback, not broker confirmation)
@@ -3727,6 +4098,17 @@ function updateTrackedSellIdentity(state, {
   state.sellClientOrderId = resolvedClientOrderId;
   state.sellOrderSubmittedAt = resolvedSubmittedAt;
   state.sellOrderLimit = resolvedLimitPrice;
+  state.expectedOpenSell = !shouldClearIdentity;
+
+  if (shouldClearIdentity) {
+    state.reconciliationState = state.reconciliationState || 'open_sell_identity_cleared';
+    state.reconciliationReason = state.reconciliationReason || 'tracked_sell_identity_cleared';
+    state.lastReconciliationAction = 'clear_tracked_sell_identity';
+  } else if (!state.brokerOpenSellFound) {
+    state.reconciliationState = 'open_sell_pending_visibility';
+    state.reconciliationReason = 'awaiting_open_orders_confirmation';
+    state.lastReconciliationAction = 'track_sell_identity_update';
+  }
 
   const sellQty = resolveOrderQty(order);
   if (Number.isFinite(sellQty) && sellQty > 0) {
@@ -3987,11 +4369,19 @@ const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let entryStaleQuoteSkipCount = 0;
-const staleQuoteSkipStateBySymbol = new Map();
 const STALE_QUOTE_SCAN_COOLDOWN_MAX_MS = 20 * 60 * 1000;
 const STALE_QUOTE_SCAN_COOLDOWN_STEP_MS = Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 30000);
 const STALE_QUOTE_HOPELESS_COOLDOWN_MS = Math.max(STALE_QUOTE_SCAN_COOLDOWN_STEP_MS * 4, 600000);
 const STALE_QUOTE_HOPELESS_MULTIPLIER = 10;
+const symbolHealthTracker = createSymbolHealthTracker({
+  reasonPolicies: {
+    stale_quote_primary: { threshold: 3, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS },
+    marketdata_unavailable: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS, 30000) },
+    ob_depth_insufficient: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 45000) },
+    predictor_warmup: { threshold: 3, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 60000) },
+    sparse_fallback_rejected: { threshold: 2, cooldownMs: Math.max(ENTRY_SCAN_INTERVAL_MS * 2, 60000) },
+  },
+});
 const ENTRY_SCAN_PROGRESS_HEARTBEAT_MS = Math.max(2000, Math.min(ENTRY_SCAN_INTERVAL_MS, 5000));
 const ENTRY_SKIP_REASON_TOTALS_MAX_KEYS = 50;
 const entrySkipReasonTotals = new Map();
@@ -4146,6 +4536,7 @@ const positionsListCache = {
 };
 let entryManagerRunning = false;
 let entryScanRunning = false;
+let entryScanRerunRequested = false;
 let entryManagerIntervalId = null;
 let entryWatchdogIntervalId = null;
 const openPositionsCache = {
@@ -4165,6 +4556,8 @@ const marketDataState = {
   cooldownLoggedAt: 0,
 };
 let lastBarsPrefetchMs = 0;
+let lastQuotesPrefetchMs = 0;
+let lastOrderbooksPrefetchMs = 0;
 let lastPrefetchedBars = {
   bars1mBySymbol: new Map(),
   bars5mBySymbol: new Map(),
@@ -4172,6 +4565,7 @@ let lastPrefetchedBars = {
 };
 let lastPrefetchedBarsUpdatedAtMs = 0;
 let lastPrefetchedBarsSymbols = new Set();
+let entryScanPrefetchInFlightPromise = null;
 let predictorWarmupCompletedLogged = false;
 let engineState = 'booting';
 let engineStateUpdatedAt = null;
@@ -4190,28 +4584,7 @@ const ENGINE_STATE_ALLOWED = new Set([
   'rate_limited',
   'degraded',
 ]);
-const entryManagerHeartbeat = {
-  started: false,
-  startedAt: null,
-  running: false,
-  lastHeartbeatAt: null,
-  lastScanAt: null,
-  lastScanDurationMs: null,
-  lastScanResult: null,
-  currentScanStartedAt: null,
-  currentScanLastProgressAt: null,
-  currentScanSymbolsProcessed: 0,
-  currentScanUniverseSize: 0,
-  currentScanState: 'idle',
-  currentScanStaleQuoteCooldownCount: 0,
-  currentScanStalePrimaryQuoteCount: 0,
-  currentScanDataUnavailableCount: 0,
-  currentScanMarketRejectionCount: 0,
-  currentScanTopSkipReasons: {},
-  totalScans: 0,
-  lastWatchdogWarningAt: null,
-  lastWatchdogReason: null,
-};
+const entryManagerHeartbeat = createEntryManagerHeartbeat();
 const lastActionTrace = {
   lastWarmupBatch: null,
   lastEntryScan: null,
@@ -4223,6 +4596,7 @@ const lastActionTrace = {
 };
 let dataDegradedUntil = 0;
 const insufficientBalanceExitCooldowns = new Map();
+const forbiddenExitCooldowns = new Map();
 let equityPeak = null;
 let equityTodayOpen = null;
 let equityTodayKey = null;
@@ -4230,10 +4604,7 @@ let lastRiskMetricsLogAt = 0;
 let tradingHaltedByGuard = false;
 let lastRiskSnapshot = null;
 const INSUFFICIENT_BALANCE_EXIT_COOLDOWN_MS = 60000;
-
-function safeIso(tsMs = Date.now()) {
-  return new Date(tsMs).toISOString();
-}
+const FORBIDDEN_EXIT_COOLDOWN_MS = 15 * 60 * 1000;
 
 function setEngineState(nextState, { reason = null, context = null } = {}) {
   const normalized = String(nextState || '').trim().toLowerCase();
@@ -4262,42 +4633,12 @@ function setLastActionTrace(field, payload) {
   };
 }
 
-function updateEntryScanProgress({
-  startMs = null,
-  symbolsProcessed = null,
-  universeSize = null,
-  state = null,
-  staleQuoteCooldownCount = null,
-  stalePrimaryQuoteCount = null,
-  dataUnavailableCount = null,
-  marketRejectionCount = null,
-  topSkipReasons = null,
-} = {}) {
-  const nowIso = safeIso();
-  if (Number.isFinite(startMs)) entryManagerHeartbeat.currentScanStartedAt = safeIso(startMs);
-  if (Number.isFinite(symbolsProcessed)) entryManagerHeartbeat.currentScanSymbolsProcessed = Math.max(0, Math.floor(symbolsProcessed));
-  if (Number.isFinite(universeSize)) entryManagerHeartbeat.currentScanUniverseSize = Math.max(0, Math.floor(universeSize));
-  if (typeof state === 'string' && state.trim()) entryManagerHeartbeat.currentScanState = state.trim();
-  if (Number.isFinite(staleQuoteCooldownCount)) entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = Math.max(0, Math.floor(staleQuoteCooldownCount));
-  if (Number.isFinite(stalePrimaryQuoteCount)) entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = Math.max(0, Math.floor(stalePrimaryQuoteCount));
-  if (Number.isFinite(dataUnavailableCount)) entryManagerHeartbeat.currentScanDataUnavailableCount = Math.max(0, Math.floor(dataUnavailableCount));
-  if (Number.isFinite(marketRejectionCount)) entryManagerHeartbeat.currentScanMarketRejectionCount = Math.max(0, Math.floor(marketRejectionCount));
-  if (topSkipReasons && typeof topSkipReasons === 'object') entryManagerHeartbeat.currentScanTopSkipReasons = { ...topSkipReasons };
-  entryManagerHeartbeat.currentScanLastProgressAt = nowIso;
-  entryManagerHeartbeat.lastHeartbeatAt = nowIso;
+function updateEntryScanProgress(options = {}) {
+  applyEntryScanProgressUpdate(entryManagerHeartbeat, safeIso, options);
 }
 
-function clearEntryScanProgress({ state = 'idle' } = {}) {
-  entryManagerHeartbeat.currentScanStartedAt = null;
-  entryManagerHeartbeat.currentScanLastProgressAt = null;
-  entryManagerHeartbeat.currentScanSymbolsProcessed = 0;
-  entryManagerHeartbeat.currentScanUniverseSize = 0;
-  entryManagerHeartbeat.currentScanState = state;
-  entryManagerHeartbeat.currentScanStaleQuoteCooldownCount = 0;
-  entryManagerHeartbeat.currentScanStalePrimaryQuoteCount = 0;
-  entryManagerHeartbeat.currentScanDataUnavailableCount = 0;
-  entryManagerHeartbeat.currentScanMarketRejectionCount = 0;
-  entryManagerHeartbeat.currentScanTopSkipReasons = {};
+function clearEntryScanProgress(options = {}) {
+  applyEntryScanProgressClear(entryManagerHeartbeat, options);
 }
 
  
@@ -4671,6 +5012,8 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
     supportedCryptoPairsState.stats = dynamicUniverse.stats;
     lastUniverseDiagnostics = {
       ...lastUniverseDiagnostics,
+      effectiveUniverseMode: lastUniverseDiagnostics.effectiveUniverseMode || 'dynamic_full_universe',
+      dynamicUniverseActive: true,
       dynamicUniverseInitInProgress: false,
       dynamicUniverseInitCompletedAt: supportedCryptoPairsState.lastUpdated,
       dynamicUniverseInitFailedAt: null,
@@ -4680,6 +5023,10 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       dynamicRejectedMalformedCount: dynamicUniverse.stats.malformedCount,
       dynamicRejectedUnsupportedCount: dynamicUniverse.stats.unsupportedCount,
       dynamicRejectedDuplicateCount: dynamicUniverse.stats.duplicateCount,
+      acceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
+      dynamicAcceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
+      acceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
+      dynamicAcceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
       lastUniverseRefreshAt: supportedCryptoPairsState.lastUpdated,
     };
     console.log('entry_universe_dynamic_sync', {
@@ -5050,6 +5397,30 @@ function buildStaleQuoteLogMeta({
     ageSeconds: formatLoggedAgeSeconds(ageMs),
     lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAgeMs),
   };
+}
+
+function createStaleQuoteError(message, {
+  staleReasonCode = 'stale_quote_primary',
+  symbol = null,
+  source = null,
+  quoteTsMs = null,
+  quoteReceivedAtMs = null,
+  quoteAgeMs = null,
+  effectiveMaxAgeMs = null,
+  quoteTimestampSource = null,
+  quoteDataSource = null,
+} = {}) {
+  const err = new Error(message);
+  err.staleReasonCode = staleReasonCode;
+  err.symbol = symbol;
+  err.quoteSource = source || null;
+  err.quoteTsMs = Number.isFinite(Number(quoteTsMs)) ? Number(quoteTsMs) : null;
+  err.quoteReceivedAtMs = Number.isFinite(Number(quoteReceivedAtMs)) ? Number(quoteReceivedAtMs) : null;
+  err.quoteAgeMs = Number.isFinite(Number(quoteAgeMs)) ? Number(quoteAgeMs) : null;
+  err.effectiveMaxAgeMs = Number.isFinite(Number(effectiveMaxAgeMs)) ? Number(effectiveMaxAgeMs) : null;
+  err.quoteTimestampSource = quoteTimestampSource || source || null;
+  err.quoteDataSource = quoteDataSource || null;
+  return err;
 }
 
 async function withExpensiveMarketDataLimit(fn, dedupeKey = null) {
@@ -5585,27 +5956,60 @@ function computeNotionalForEntry({
 }
 
 async function getQuoteForTrading(symbol, opts = {}) {
-  if (!SECONDARY_QUOTE_ENABLED) {
-    return getLatestQuote(symbol, opts);
+  return getLatestQuote(symbol, opts);
+}
+
+async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
+  const symbol = normalizeSymbol(rawSymbol);
+  try {
+    return await getLatestQuote(symbol, opts);
+  } catch (primaryError) {
+    const primaryFailureReason = classifyQuoteFetchFailureReason(primaryError, 'marketdata_unavailable');
+    if (primaryFailureReason !== 'stale_quote_primary') {
+      throw primaryError;
+    }
+
+    const effectiveMaxAgeMs = Number.isFinite(Number(opts?.maxAgeMs)) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS;
+    const nowMs = Date.now();
+    const cachedQuote = scanMarketDataCache.getQuoteUsable(symbol, {
+      nowMs,
+      maxAgeMs: effectiveMaxAgeMs,
+    });
+    if (cachedQuote?.ok && cachedQuote?.usable && cachedQuote?.value) {
+      console.log('entry_scan_stale_quote_recovered', {
+        symbol,
+        recoveryPath: 'scan_marketdata_cache',
+        quoteAgeMs: cachedQuote.ageMs,
+      });
+      return cachedQuote.value;
+    }
+
+    const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });
+    if (tradeFallback) {
+      quoteCache.set(symbol, tradeFallback);
+      scanMarketDataCache.upsertQuote(symbol, tradeFallback, tradeFallback?.tsMs || Date.now());
+      recordLastQuoteAt(symbol, { tsMs: tradeFallback.tsMs, source: tradeFallback.source || 'trade_fallback' });
+      recordQuoteSuccess(symbol);
+      console.log('entry_scan_stale_quote_recovered', {
+        symbol,
+        recoveryPath: 'trade_fallback',
+        quoteAgeMs: Number.isFinite(Number(tradeFallback?.tsMs)) ? Math.max(0, Date.now() - Number(tradeFallback.tsMs)) : null,
+      });
+      return tradeFallback;
+    }
+
+    const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
+      ...opts,
+      forceRefresh: true,
+      bypassCache: true,
+    });
+    console.log('entry_scan_primary_quote_retried', {
+      symbol,
+      source: directQuote?.source || 'alpaca_direct',
+      quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
+    });
+    return directQuote;
   }
-  const best = await quoteRouter.getBestQuote(symbol, opts);
-  if (!best || !Number.isFinite(best.bid) || !Number.isFinite(best.ask)) {
-    throw new Error(`Quote unavailable for ${symbol}`);
-  }
-  const quoteAgeMs = Number.isFinite(best.ts) ? Math.max(0, Date.now() - best.ts) : null;
-  console.log('quote_source', {
-    symbol: normalizeSymbol(symbol),
-    source: best.source || 'unknown',
-    quoteAgeMs,
-    maxAgeMs: Number.isFinite(opts.maxAgeMs) ? Number(opts.maxAgeMs) : ENTRY_QUOTE_MAX_AGE_MS,
-  });
-  return {
-    bid: best.bid,
-    ask: best.ask,
-    tsMs: Number.isFinite(best.ts) ? best.ts : Date.now(),
-    receivedAtMs: Number.isFinite(Number(best.receivedAtMs)) ? Number(best.receivedAtMs) : null,
-    source: best.source || 'best_quote',
-  };
 }
 
 function computeStopDistanceBps({ atr, price }) {
@@ -6212,20 +6616,11 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     path: 'orders',
     label: 'orders_limit_buy',
   });
-  if (TWAP_ENABLED && amountToSpend >= TWAP_MIN_NOTIONAL_USD) {
-    const plannedSlices = planTwap({ totalQty: finalQty, slices: TWAP_SLICES });
-    tradeForensics.update(tradeId, {
-      twap: {
-        enabled: true,
-        totalQty: finalQty,
-        filledQty: null,
-        slices: plannedSlices.length,
-        sliceFills: [],
-        durationMs: 0,
-      },
-    });
-    console.log('twap_plan', { symbol: normalizedSymbol, slices: plannedSlices.length, mode: TWAP_PRICE_MODE, maxChaseBps: TWAP_MAX_CHASE_BPS });
-  }
+  // NOTE: A TWAP planning/telemetry stub used to live here, but it referenced
+  // `amountToSpend` and `tradeId` — neither of which exist in this function's
+  // scope — so it would have thrown at runtime whenever TWAP_ENABLED=true.
+  // The block was also a stub (logging only, no actual slicing). Removed to
+  // unblock lint; the real TWAP path lives in placeMarketBuyThenSell.
   const buyPayload = {
     symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
@@ -6527,13 +6922,33 @@ async function fetchPositions() {
   if (positionsListCache.pending) {
     return positionsListCache.pending;
   }
+  // If rate limited, return stale cache if available
+  if (isTradingRateLimited() && positionsListCache.data) {
+    console.log('fetchPositions_rate_limited_using_cache', { cooldownMs: tradingCooldownRemainingMs() });
+    return positionsListCache.data;
+  }
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions' });
   positionsListCache.pending = (async () => {
-    const res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
+    let res;
+    try {
+      res = await requestJson({
+        method: 'GET',
+        url,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      if (err?.responseHeaders) {
+        updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'positions' });
+      }
+      if (err?.statusCode === 429) {
+        markTradingThrottled({ endpoint: 'positions' });
+        if (positionsListCache.data) {
+          console.warn('fetchPositions_429_returning_stale_cache');
+          return positionsListCache.data;
+        }
+      }
+      throw err;
+    }
     const positions = Array.isArray(res) ? res : [];
     const normalized = positions.map((pos) => ({
       ...pos,
@@ -6554,6 +6969,11 @@ async function fetchPositions() {
 }
 
 async function fetchPosition(symbol) {
+  // Skip API call entirely if rate limited — callers handle null gracefully
+  if (isTradingRateLimited()) {
+    console.log('fetchPosition_rate_limited_skip', { symbol, cooldownMs: tradingCooldownRemainingMs() });
+    return null;
+  }
   const normalized = normalizeSymbolForAlpaca(symbol);
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
@@ -6568,6 +6988,9 @@ async function fetchPosition(symbol) {
     });
   } catch (err) {
     const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode, endpoint: 'positions_single' });
+    }
     const axiosData = err?.response?.data;
     const axiosSnippet =
       typeof axiosData === 'string'
@@ -6581,6 +7004,7 @@ async function fetchPosition(symbol) {
       return null;
     }
     if (statusCode === 429) {
+      markTradingThrottled({ endpoint: 'positions_single' });
       logPositionError({
         symbol,
         statusCode,
@@ -7204,18 +7628,25 @@ function shouldClearStaleTrackedSellIdentity({
   visibilityDeadlineAt = null,
   nowMs = Date.now(),
 } = {}) {
+  if (directLookupFoundOpenSell) return false;
+  if (Number(openSellCount) !== 0) return false;
+  if (Number(brokerAvailableQty) <= 0) return false;
+  if (Number(missCount) < Number(missThreshold)) return false;
+
+  // Hard cap: if missCount reaches 10x the threshold (default 20), the order
+  // is unambiguously gone — override the recency/visibility guards that were
+  // only meant to tolerate transient Alpaca propagation delays, not permanent
+  // disappearance.  Without this, stale orders poll indefinitely.
+  const MISS_HARD_CAP = Math.max(Number(missThreshold) * 10, 20);
+  if (Number(missCount) >= MISS_HARD_CAP) {
+    return true;
+  }
+
   const submittedRecently = Number.isFinite(Number(sellOrderSubmittedAt))
     ? (nowMs - Number(sellOrderSubmittedAt)) < Math.max(EXIT_REPLACE_VISIBILITY_GRACE_MS, 5000)
     : false;
   const visibilityGraceActive = Number.isFinite(Number(visibilityDeadlineAt)) && Number(visibilityDeadlineAt) > nowMs;
-  return (
-    !directLookupFoundOpenSell &&
-    !submittedRecently &&
-    !visibilityGraceActive &&
-    Number(openSellCount) === 0 &&
-    Number(brokerAvailableQty) > 0 &&
-    Number(missCount) >= Number(missThreshold)
-  );
+  return !submittedRecently && !visibilityGraceActive;
 }
 
 function shouldSkipTrackedAndHasOpenSellInRepair({
@@ -7359,6 +7790,16 @@ async function resolveExitSellabilityFromBrokerTruth({
   let currentOpenOrders = Array.isArray(openOrders) ? openOrders : null;
   let finalSellability = computeExitSellability({ symbol: canonicalSymbol, position: null, openOrders: [] });
 
+  // When under trading rate pressure, reduce attempts to 1 to avoid
+  // burning remaining API budget on redundant broker truth retries.
+  if (isTradingRateLimited() || isTradingRatePressured()) {
+    maxAttempts = 1;
+    console.log('broker_truth_rate_limited_single_attempt', {
+      symbol: canonicalSymbol,
+      cooldownMs: tradingCooldownRemainingMs(),
+    });
+  }
+
   for (let attempt = 1; attempt <= Math.max(1, maxAttempts); attempt += 1) {
     if (!currentOpenOrders) {
       currentOpenOrders = await fetchLiveOrders({ force: true });
@@ -7390,6 +7831,13 @@ async function resolveExitSellabilityFromBrokerTruth({
     trackedState.brokerOpenSellQty = finalSellability.openSellQty;
     trackedState.lastSeenOpenSellAt = finalSellability.openSellCount > 0 ? Date.now() : (trackedState.lastSeenOpenSellAt || null);
     trackedState.reconciliationState = finalSellability.openSellCount > 0 ? 'open_sell_found' : 'pending_lookup';
+    trackedState.reconciliationReason = finalSellability.openSellCount > 0 ? null : 'open_sell_lookup_in_progress';
+    trackedState.lastReconciliationAction = finalSellability.openSellCount > 0
+      ? 'refresh_tracked_open_sell'
+      : 'check_open_orders_for_tracked_sell';
+    if (!trackedState.targetPriceSource && Number.isFinite(Number(trackedState.targetPrice))) {
+      trackedState.targetPriceSource = 'reconciled_exit_math';
+    }
     trackedState.reconciliationConfidence = reconciliationConfidence;
     trackedState.orderListOnlyConsecutiveCount = reconciliationConfidence === 'order_list_only'
       ? Number(trackedState.orderListOnlyConsecutiveCount || 0) + 1
@@ -7556,6 +8004,8 @@ async function resolveExitSellabilityFromBrokerTruth({
         trackedState.brokerOpenSellQty = 0;
         trackedState.lastSeenOpenSellAt = null;
         trackedState.reconciliationState = 'open_sell_missing_cleared';
+        trackedState.reconciliationReason = 'tracked_sell_identity_cleared_after_miss_threshold';
+        trackedState.lastReconciliationAction = 'clear_stale_tracked_sell_identity';
         trackedState.reconciliationConfidence = null;
         trackedState.orderListOnlyConsecutiveCount = 0;
         trackedState.lastConfidenceWarningAtCount = 0;
@@ -8166,7 +8616,16 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     }));
     recordLastQuoteAt(symbol, { tsMs: null, source: 'stale', reason: 'absurd_age' });
     recordQuoteFailure(symbol, 'stale_quote');
-    throw new Error(`Quote age absurd for ${symbol}`);
+    throw createStaleQuoteError(`Quote age absurd for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: rawAgeMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote',
+    });
   }
 
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
@@ -8180,7 +8639,16 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     }));
     recordLastQuoteAt(symbol, { tsMs, source: 'stale', reason: 'stale_quote' });
     recordQuoteFailure(symbol, 'stale_quote');
-    throw new Error(`Quote stale for ${symbol}`);
+    throw createStaleQuoteError(`Quote stale for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: ageMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote',
+    });
   }
 
   const normalizedQuote = {
@@ -8199,8 +8667,6 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   return normalizedQuote;
 
 }
-
-quoteRouter.setPrimaryQuoteFetcher(async (symbol, opts = {}) => getLatestQuote(symbol, opts));
 
 async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   const symbol = normalizeSymbol(rawSymbol);
@@ -8257,11 +8723,29 @@ async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   }
 
   if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
-    throw new Error(`Quote age absurd for ${symbol}`);
+    throw createStaleQuoteError(`Quote age absurd for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca_direct',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: rawAgeMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote_direct',
+    });
   }
 
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
-    throw new Error(`Quote stale for ${symbol}`);
+    throw createStaleQuoteError(`Quote stale for ${symbol}`, {
+      staleReasonCode: 'stale_quote_primary',
+      symbol,
+      source: 'alpaca_direct',
+      quoteTsMs: tsMs,
+      quoteReceivedAtMs: nowMs,
+      quoteAgeMs: ageMs,
+      effectiveMaxAgeMs: effectiveMaxAgeMsFinal,
+      quoteDataSource: 'primary_quote_direct',
+    });
   }
 
   const normalizedQuote = {
@@ -8357,7 +8841,7 @@ async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   return withExpensiveMarketDataLimit(() => requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') }), `ORDERBOOK:${location}:${dataSymbols.join(',')}`);
 }
 
-async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}) {
+async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false, sameScanQuote = null } = {}) {
   const now = Date.now();
   const passCached = orderbookPassCache.get(symbol);
   if (!bypassCache && passCached?.passId === marketDataPassId && passCached?.orderbook) {
@@ -8523,14 +9007,30 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
   }
 
   let quoteFallback = null;
+  const quoteFallbackMaxAgeMs = Number.isFinite(Number(maxAgeMs))
+    ? Math.max(Number(maxAgeMs), ENTRY_QUOTE_MAX_AGE_MS)
+    : ENTRY_QUOTE_MAX_AGE_MS;
+  const sameScanQuoteViability = evaluatePrimaryQuoteViability({
+    quote: sameScanQuote,
+    nowMs: Date.now(),
+    maxAgeMs: quoteFallbackMaxAgeMs,
+  });
+  if (sameScanQuoteViability.ok) {
+    quoteFallback = sameScanQuote;
+  }
   try {
-    quoteFallback = await getLatestQuote(symbol, { maxAgeMs });
+    if (!quoteFallback) {
+      quoteFallback = await getLatestQuote(symbol, { maxAgeMs: quoteFallbackMaxAgeMs });
+    }
   } catch (err) {
     lastFailure = {
       reason: 'ob_fallback_quotes_missing',
       details: {
         ...(lastFailure?.details || {}),
         symbol,
+        quoteFallbackMaxAgeMs,
+        sameScanQuoteAvailable: Boolean(sameScanQuote),
+        sameScanQuoteUsable: Boolean(sameScanQuoteViability.ok),
         fallbackError: err?.message || String(err),
       },
     };
@@ -8545,7 +9045,7 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
       tsFallbackUsed: true,
       receivedAtMs: Date.now(),
       synthetic: true,
-      source: 'quote_fallback',
+      source: sameScanQuoteViability.ok ? 'same_scan_quote_fallback' : 'quote_fallback',
     };
     orderbookCache.set(symbol, syntheticOrderbook);
     scanMarketDataCache.upsertOrderbook(symbol, { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' }, syntheticOrderbook?.tsMs || Date.now());
@@ -8562,6 +9062,8 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false } = {}
       symbol,
       fallback: 'quotes',
       fallbackStatus: 'missing',
+      sameScanQuoteAvailable: Boolean(sameScanQuote),
+      sameScanQuoteUsable: Boolean(sameScanQuoteViability.ok),
     },
   };
 }
@@ -8794,6 +9296,9 @@ async function fetchStockBars({ symbols, limit = 6, timeframe = '1Min' }) {
 }
 
 async function fetchOrderById(orderId) {
+  if (isTradingRateLimited()) {
+    await waitForTradingCooldown();
+  }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `orders/${orderId}`,
@@ -8807,6 +9312,12 @@ async function fetchOrderById(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_get' });
+    }
+    if (err?.statusCode === 429) {
+      markTradingThrottled({ endpoint: 'orders_get' });
+    }
     logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
@@ -9309,6 +9820,26 @@ async function submitLimitSell({
         cooldownUntilMs: retryAt,
       };
     }
+    if (status === 403) {
+      const now = Date.now();
+      const retryAt = now + FORBIDDEN_EXIT_COOLDOWN_MS;
+      forbiddenExitCooldowns.set(normalizedSymbol, retryAt);
+      console.error('tp_attach_deferred_forbidden', {
+        symbol,
+        canonicalSymbol: normalizedSymbol,
+        reason: 'broker_forbidden',
+        brokerStatus: status,
+        brokerMessage: bodyText,
+        cooldownMs: FORBIDDEN_EXIT_COOLDOWN_MS,
+        retryAtMs: retryAt,
+        retryAtIso: new Date(retryAt).toISOString(),
+      });
+      return {
+        skipped: true,
+        reason: 'exit_forbidden_cooldown',
+        cooldownUntilMs: retryAt,
+      };
+    }
     console.error('tp_sell_error', { symbol, status, body: bodyText });
     throw err;
   }
@@ -9513,8 +10044,43 @@ async function submitStopTriggeredExit({
     allowSellBelowMin: false,
     bypassDisable: true,
   });
+  let finalIocResult = iocResult;
+  if (iocResult?.skipped && iocResult?.reason === 'no_position_qty') {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const brokerTruth = await resolveExitSellabilityFromBrokerTruth({
+        symbol,
+        maxAttempts: 2,
+        retryMs: 300,
+      });
+      if (brokerTruth?.openSellCount > 0) break;
+      if (!(brokerTruth?.availableQty > 0)) {
+        await sleep(200);
+        continue;
+      }
+      const retryQty = Number.isFinite(Number(qty)) && Number(qty) > 0
+        ? Math.min(Number(qty), Number(brokerTruth.availableQty))
+        : Number(brokerTruth.availableQty);
+      console.log('stop_trigger_recheck_retry', {
+        symbol,
+        attempt,
+        availableQty: Number(brokerTruth.availableQty) || 0,
+        retryQty,
+      });
+      finalIocResult = await submitIocLimitSell({
+        symbol,
+        qty: retryQty,
+        limitPrice: iocLimit,
+        reason,
+        allowSellBelowMin: false,
+        bypassDisable: true,
+      });
+      if (finalIocResult?.order?.id || finalIocResult?.order?.order_id) break;
+      if (finalIocResult?.reason !== 'no_position_qty') break;
+      await sleep(200);
+    }
+  }
 
-  const hasOrder = Boolean(iocResult?.order?.id || iocResult?.order?.order_id);
+  const hasOrder = Boolean(finalIocResult?.order?.id || finalIocResult?.order?.order_id);
   if (hasOrder) {
     stateRef.exitExecutionState = 'exit_submitted';
     stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
@@ -9523,30 +10089,30 @@ async function submitStopTriggeredExit({
     stateRef.reconciliationReason = 'stop_trigger_exit_submitted';
     stateRef.lastReconciliationAction = 'submit_stop_trigger_exit';
     updateIntentState(symbol, { state: 'stop_triggered_exit_pending', stopTriggeredAt: stateRef.stopTriggeredAt });
-    console.log('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, orderId: iocResult?.order?.id || iocResult?.order?.order_id || null });
-    return { ok: true, state: stateRef.exitExecutionState, submitted: true, result: iocResult };
+    console.log('stop_trigger_submit_result', { symbol, reason, state: stateRef.exitExecutionState, orderId: finalIocResult?.order?.id || finalIocResult?.order?.order_id || null });
+    return { ok: true, state: stateRef.exitExecutionState, submitted: true, result: finalIocResult };
   }
 
-  stateRef.exitExecutionState = iocResult?.reason === 'ioc_disabled' ? 'exit_retry_pending' : 'exit_failed_needs_repair';
+  stateRef.exitExecutionState = finalIocResult?.reason === 'ioc_disabled' ? 'exit_retry_pending' : 'exit_failed_needs_repair';
   stateRef.stopTriggeredAt = new Date(nowMs).toISOString();
   stateRef.stopTriggerReason = reason;
   stateRef.reconciliationState = stateRef.exitExecutionState;
-  stateRef.reconciliationReason = iocResult?.reason || 'stop_trigger_submit_failed';
+  stateRef.reconciliationReason = finalIocResult?.reason || 'stop_trigger_submit_failed';
   stateRef.lastReconciliationAction = 'schedule_stop_trigger_retry';
   updateIntentState(symbol, { state: stateRef.exitExecutionState });
   console.warn('exit_retry_scheduled', {
     symbol,
     reason,
     exitState: stateRef.exitExecutionState,
-    submitReason: iocResult?.reason || null,
+    submitReason: finalIocResult?.reason || null,
   });
   console.warn('stop_trigger_submit_result', {
     symbol,
     reason,
     state: stateRef.exitExecutionState,
-    submitReason: iocResult?.reason || null,
+    submitReason: finalIocResult?.reason || null,
   });
-  return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: iocResult };
+  return { ok: false, state: stateRef.exitExecutionState, submitted: false, result: finalIocResult };
 }
 
 async function attachInitialExitLimit({
@@ -9794,7 +10360,6 @@ async function attachInitialExitLimit({
     profitabilityFloorPrice: profitabilityFloorEffective,
     feeBpsRoundTrip,
     profitBufferBps,
-    desiredNetExitBps: desiredNetExitBpsValue,
     entrySpreadBpsUsed,
     slippageBpsUsed,
     spreadBufferBps,
@@ -10485,15 +11050,7 @@ async function repairOrphanExits() {
           const orderQty = resolveOrderQty(order);
           return Number.isFinite(orderQty) && orderQty > 0 && orderHasValidLimit(order);
         });
-        const bestOrder = openSellCandidates.reduce((best, candidate) => {
-          const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
-          const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
-          const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
-          const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
-          const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
-          const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
-          return safeCandidateTs > safeBestTs ? candidate : best;
-        }, openSellCandidates[0] || null);
+        const bestOrder = selectMostRecentSellOrder(openSellCandidates);
         const refreshedSellOrderId = bestOrder?.id || bestOrder?.order_id || null;
         const refreshedSellOrderLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
         const refreshedSellOrderQty = resolveOrderQty(bestOrder);
@@ -10621,15 +11178,7 @@ async function repairOrphanExits() {
         continue;
       }
 
-      const bestOrder = openSellCandidates.reduce((best, candidate) => {
-        const bestRawTs = best?.created_at || best?.createdAt || best?.submitted_at || best?.submittedAt || null;
-        const candidateRawTs = candidate?.created_at || candidate?.createdAt || candidate?.submitted_at || candidate?.submittedAt || null;
-        const bestTs = bestRawTs ? Date.parse(bestRawTs) : null;
-        const candidateTs = candidateRawTs ? Date.parse(candidateRawTs) : null;
-        const safeBestTs = Number.isFinite(bestTs) ? bestTs : 0;
-        const safeCandidateTs = Number.isFinite(candidateTs) ? candidateTs : 0;
-        return safeCandidateTs > safeBestTs ? candidate : best;
-      }, openSellCandidates[0]);
+      const bestOrder = selectMostRecentSellOrder(openSellCandidates);
 
       const adoptedOrderId = bestOrder?.id || bestOrder?.order_id || null;
       const adoptedLimit = normalizeOrderLimitPrice(bestOrder) ?? Number(bestOrder?.limit_price);
@@ -10703,6 +11252,11 @@ async function repairOrphanExits() {
         adoptedLimit,
         positionQty: qty,
         orderQty: adoptedQty,
+      });
+      updateIntentState(symbol, {
+        state: 'managing',
+        exitOrderId: adoptedOrderId || null,
+        reservedQty: Number.isFinite(adoptedQty) ? adoptedQty : qty,
       });
 
       if (STOPS_ENABLED && STOPLOSS_ENABLED) {
@@ -11214,8 +11768,12 @@ async function manageExitStates() {
       }
       symbolLocks.set(symbol, true);
       try {
-        const heldMs = Math.max(0, now - state.entryTime);
-        const heldSeconds = heldMs / 1000;
+        const entryTimeRef = Number.isFinite(state.entryTime)
+          ? state.entryTime
+          : (Number.isFinite(state.sellOrderSubmittedAt) ? state.sellOrderSubmittedAt : null);
+        const rawHeldMs = Number.isFinite(entryTimeRef) ? now - entryTimeRef : NaN;
+        const heldMs = Number.isFinite(rawHeldMs) ? Math.max(0, rawHeldMs) : NaN;
+        const heldSeconds = Number.isFinite(heldMs) ? heldMs / 1000 : NaN;
         const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
         const openBuyCount = symbolOrders.filter((order) => {
           const side = String(order.side || '').toLowerCase();
@@ -11234,6 +11792,18 @@ async function manageExitStates() {
         }
         if (Number.isFinite(cooldownUntil) && cooldownUntil <= now) {
           insufficientBalanceExitCooldowns.delete(normalizePair(symbol));
+        }
+        const forbiddenUntil = forbiddenExitCooldowns.get(normalizePair(symbol));
+        if (Number.isFinite(forbiddenUntil) && forbiddenUntil > now) {
+          console.log('exit_manager_skip_orders', {
+            symbol,
+            reason: 'forbidden_exit_cooldown',
+            remainingMs: Math.max(0, forbiddenUntil - now),
+          });
+          continue;
+        }
+        if (Number.isFinite(forbiddenUntil) && forbiddenUntil <= now) {
+          forbiddenExitCooldowns.delete(normalizePair(symbol));
         }
 
         let bid = null;
@@ -11403,7 +11973,7 @@ async function manageExitStates() {
         const refreshCooldownActive =
           Number.isFinite(lastRefreshAtMs) && now - lastRefreshAtMs < EXIT_REFRESH_COOLDOWN_MS;
         const quoteAgeMs = Number.isFinite(state.lastQuoteTsMs) ? Math.max(0, now - state.lastQuoteTsMs) : null;
-        const failedTradeStale = Number.isFinite(heldSeconds) && heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
+        const failedTradeStale = !Number.isFinite(heldSeconds) || heldSeconds >= FAILED_TRADE_MAX_AGE_SEC;
         const timeStopTriggered = Number.isFinite(EXIT_MAX_HOLD_SECONDS) && EXIT_MAX_HOLD_SECONDS > 0 && heldSeconds >= EXIT_MAX_HOLD_SECONDS;
         const thesisBrokenForRefresh =
           failedTradeStale &&
@@ -11741,6 +12311,34 @@ async function manageExitStates() {
               orderLimit: Number.isFinite(liveLimit) ? liveLimit : null,
             });
           } else {
+            // Check thesis_break cooldown: if we recently cancelled the TP due
+            // to a protective exit (thesis_break, stale_trade, time_stop),
+            // don't reattach — let the defensive exit path handle it instead
+            // of burning API budget in a cancel→reattach→cancel loop.
+            const thesisBreakCancelAt = lockedTpThesisBreakCancelAtBySymbol.get(normalizePair(symbol));
+            const thesisBreakCooldownActive = Number.isFinite(thesisBreakCancelAt) &&
+              (Date.now() - thesisBreakCancelAt) < LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS;
+            if (thesisBreakCooldownActive && protectiveExitTriggerActive) {
+              const cooldownRemainingMs = LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS - (Date.now() - thesisBreakCancelAt);
+              console.log('locked_tp_reattach_blocked_thesis_break_cooldown', {
+                symbol,
+                tacticDecision,
+                cooldownRemainingMs,
+                thesisBreakCancelAt,
+              });
+              // Disable locked_tp so the code falls through to the
+              // defensive exit branches (stoploss, hard_stop, force_exit,
+              // ioc/market) which can actually close the position.
+              state.lockedTpEnabled = false;
+              state.exitMode = 'defensive';
+              actionTaken = 'thesis_break_cooldown_skip';
+              reasonCode = 'locked_tp_thesis_break_cooldown';
+              continue;
+            }
+            // Clear expired cooldown
+            if (Number.isFinite(thesisBreakCancelAt) && !thesisBreakCooldownActive) {
+              lockedTpThesisBreakCancelAtBySymbol.delete(normalizePair(symbol));
+            }
             console.log('locked_tp_missing_reattach', { symbol, intendedLockedTpLimit, lockedTpFloor: lockedTpFloor ?? null });
             const plannedQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0 ? availableQtyOverride : state.qty;
             const replacement = await submitLimitSell({
@@ -11828,6 +12426,40 @@ async function manageExitStates() {
               orderId: state.sellOrderId,
               reason: 'locked_tp_override_release',
             });
+            // After cancelling the locked TP, clear tracked identity so the
+            // next exit-scan iteration can place a fresh order without hitting
+            // the reattach_pending_visibility grace gate.  Without this
+            // continue, the loop falls through to openSellCount===0 in the
+            // same tick and either (a) places another order immediately then
+            // gets stuck in visibility grace, or (b) wastes an API round-trip
+            // on a replacement that a concurrent thesis-break will cancel.
+            updateTrackedSellIdentity(state, {
+              symbol,
+              orderId: null,
+              clientOrderId: null,
+              submittedAtMs: null,
+              limitPrice: null,
+              source: 'locked_tp_override_release_clear',
+            });
+            state.lockedTpOrderId = null;
+            state.lockedTpClientOrderId = null;
+            state.exitVisibilityState = null;
+            state.exitVisibilityStartedAt = null;
+            state.exitVisibilityDeadlineAt = null;
+            // Record thesis_break cancel timestamp to prevent reattach thrashing.
+            // Without this, the next scan immediately reattaches a TP that will
+            // be cancelled again on the following scan — burning API budget.
+            if (tacticalProtectiveExit) {
+              lockedTpThesisBreakCancelAtBySymbol.set(normalizePair(symbol), Date.now());
+              console.log('locked_tp_thesis_break_cooldown_set', {
+                symbol,
+                tacticDecision,
+                cooldownMs: LOCKED_TP_THESIS_BREAK_REATTACH_COOLDOWN_MS,
+              });
+            }
+            actionTaken = 'cancel_replace_pending';
+            reasonCode = 'locked_tp_override_release';
+            continue;
           }
         }
 
@@ -11872,6 +12504,7 @@ async function manageExitStates() {
               limitPrice: forcedLimit,
               reason: 'max_hold_forced_exit',
               allowSellBelowMin: false,
+              bypassDisable: true,
             });
             if (!iocResult?.skipped) {
               requestedQty = iocResult.requestedQty;
@@ -12291,6 +12924,18 @@ async function manageExitStates() {
               allowSellBelowMin: false,
             });
             replacement = replacement?.order || replacement;
+            if (replacement?.skipped && replacement?.reason === 'ioc_disabled') {
+              replacement = await submitLimitSell({
+                symbol,
+                qty: plannedQty,
+                limitPrice: targetPrice,
+                reason: tacticDecision,
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                openOrders: symbolOrders,
+                availableQtyOverride,
+                allowSellBelowMin: false,
+              });
+            }
           } else {
             replacement = await submitLimitSell({
               symbol,
@@ -12342,6 +12987,16 @@ async function manageExitStates() {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement.reason;
               updateSellabilityBlockCause(state, symbol, replacement.reason, { source: 'submit_limit_sell' });
+              // If the replacement was skipped because we're still inside a
+              // visibility grace that has already expired, resolve it so the
+              // next iteration can try fresh instead of looping forever.
+              if (
+                state.exitVisibilityState &&
+                Number.isFinite(state.exitVisibilityDeadlineAt) &&
+                state.exitVisibilityDeadlineAt <= now
+              ) {
+                resolveReplaceVisibilityGrace(state, { symbol, reason: 'grace_expired_replacement_skipped' });
+              }
             } else {
               actionTaken = 'hold_existing_order';
               reasonCode = replacement?.reason || 'place_gtc_tp_skipped';
@@ -12821,6 +13476,7 @@ async function manageExitStates() {
             limitPrice: roundDownToTick(bid, symbol),
             reason: 'failed_trade',
             allowSellBelowMin: false,
+            bypassDisable: true,
           });
           const requestedQty = ioc?.requestedQty;
           const filledQty = normalizeFilledQty(ioc?.order);
@@ -12837,6 +13493,7 @@ async function manageExitStates() {
             });
             realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
           }
+          const exitSubmitted = Boolean(realizedOrderId);
           console.log('exit_failed_trade', {
             symbol,
             ageSec: heldSeconds,
@@ -12845,20 +13502,31 @@ async function manageExitStates() {
             entryMomentumState: failedTradeDecision.entryMomentumState,
             currentMomentumState: failedTradeDecision.currentMomentumState,
             reason: failedTradeDecision.reason,
+            exitSubmitted,
+            submitReason: ioc?.reason || null,
+            orderId: realizedOrderId || null,
           });
-          exitState.delete(symbol);
-          actionTaken = 'failed_trade_exit';
-          reasonCode = 'failed_trade';
-          lastActionAt.set(symbol, now);
-          await logExitRealized({
-            symbol,
-            entryPrice: state.entryPrice,
-            feeBpsRoundTrip,
-            entrySpreadBpsUsed: state.entrySpreadBpsUsed,
-            heldSeconds,
-            reasonCode,
-            orderId: realizedOrderId,
-          });
+          if (exitSubmitted) {
+            exitState.delete(symbol);
+            actionTaken = 'failed_trade_exit';
+            reasonCode = 'failed_trade';
+            lastActionAt.set(symbol, now);
+            await logExitRealized({
+              symbol,
+              entryPrice: state.entryPrice,
+              feeBpsRoundTrip,
+              entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+              heldSeconds,
+              reasonCode,
+              orderId: realizedOrderId,
+            });
+          } else {
+            state.exitExecutionState = 'exit_retry_pending';
+            state.reconciliationState = 'exit_retry_pending';
+            state.reconciliationReason = ioc?.reason || 'failed_trade_exit_not_submitted';
+            state.lastReconciliationAction = 'failed_trade_exit_not_submitted';
+            updateIntentState(symbol, { state: 'exit_retry_pending' });
+          }
           continue;
         }
 
@@ -13808,54 +14476,164 @@ function buildBarsMapFromBatch(symbols, barsResp) {
   return barsBySymbol;
 }
 
+async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
+  const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  if (symbols.length === 0) {
+    return {
+      ok: true,
+      prefetchedQuotes: 0,
+      prefetchedOrderbooks: 0,
+      quoteHydrationState: ENTRY_PREFETCH_QUOTES ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      orderbookHydrationState: ENTRY_PREFETCH_ORDERBOOKS ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      skippedEndpoints: [],
+      seededSymbols: 0,
+      totalSymbolsObserved: 0,
+    };
+  }
+
+  const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
+  const ratePressureActive = isUnderRatePressure();
+  const effectiveSeedCap = ratePressureActive ? Math.max(4, Math.floor(maxSeedSymbolsPerPass * 0.5)) : maxSeedSymbolsPerPass;
+  const seedSymbols = symbols.slice(0, Math.max(1, effectiveSeedCap));
+  const nowMs = Date.now();
+  const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
+  const quoteCooldownActive = !opts.force && ENTRY_PREFETCH_QUOTES && Boolean(cooldownSnapshot.quote);
+  const orderbookCooldownActive = !opts.force && ENTRY_PREFETCH_ORDERBOOKS && Boolean(cooldownSnapshot.orderbook);
+  const shouldPrefetchQuotes = ENTRY_PREFETCH_QUOTES && !quoteCooldownActive;
+  const shouldPrefetchOrderbooks = ENTRY_PREFETCH_ORDERBOOKS && !orderbookCooldownActive;
+  const cooldownBlockedEndpoints = [];
+  if (quoteCooldownActive) cooldownBlockedEndpoints.push('quote');
+  if (orderbookCooldownActive) cooldownBlockedEndpoints.push('orderbook');
+  if (cooldownBlockedEndpoints.length > 0) {
+    console.warn('entry_eligibility_hydration_partial_cooldown', {
+      reason: 'endpoint_cooldown',
+      blockedEndpoints: cooldownBlockedEndpoints,
+      cooldownSnapshot,
+      seedSymbols: seedSymbols.length,
+      totalSymbolsObserved: symbols.length,
+      ratePressureState: getRatePressureState(),
+    });
+  }
+
+  const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
+  const chunks = chunkArray(seedSymbols, chunkSize);
+  let prefetchedQuotes = 0;
+  let prefetchedOrderbooks = 0;
+  try {
+    for (const chunkSymbols of chunks) {
+      if (shouldPrefetchQuotes) {
+        const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
+        warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+        const quoteSymbols = quotesResp?.quotes && typeof quotesResp.quotes === 'object'
+          ? Object.keys(quotesResp.quotes)
+          : [];
+        prefetchedQuotes += quoteSymbols.length;
+      }
+      if (shouldPrefetchOrderbooks) {
+        const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
+        warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
+        const orderbookSymbols = orderbooksResp?.orderbooks && typeof orderbooksResp.orderbooks === 'object'
+          ? Object.keys(orderbooksResp.orderbooks)
+          : [];
+        prefetchedOrderbooks += orderbookSymbols.length;
+      }
+    }
+  } catch (err) {
+    console.warn('entry_eligibility_hydration_failed', {
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      ratePressureState: getRatePressureState(),
+    });
+    return { ok: false, error: err?.message || String(err) };
+  }
+
+  const completedAtMs = Date.now();
+  if (shouldPrefetchQuotes) {
+    lastQuotesPrefetchMs = completedAtMs;
+  }
+  if (shouldPrefetchOrderbooks) {
+    lastOrderbooksPrefetchMs = completedAtMs;
+  }
+
+  return {
+    ok: true,
+    prefetchedQuotes,
+    prefetchedOrderbooks,
+    quoteHydrationState: ENTRY_PREFETCH_QUOTES
+      ? (shouldPrefetchQuotes ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    orderbookHydrationState: ENTRY_PREFETCH_ORDERBOOKS
+      ? (shouldPrefetchOrderbooks ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    skippedEndpoints: cooldownBlockedEndpoints,
+    seededSymbols: seedSymbols.length,
+    totalSymbolsObserved: symbols.length,
+    ratePressureState: getRatePressureState(),
+  };
+}
+
 async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
+  if (entryScanPrefetchInFlightPromise) {
+    if (opts.nonBlockingIfInFlight) {
+      return {
+        ok: true,
+        skipped: 'prefetch_inflight',
+        inFlight: true,
+        prefetchedBars: lastPrefetchedBars,
+        prefetchAgeMs: lastPrefetchedBarsUpdatedAtMs ? Date.now() - lastPrefetchedBarsUpdatedAtMs : null,
+      };
+    }
+    return entryScanPrefetchInFlightPromise;
+  }
+
+  entryScanPrefetchInFlightPromise = (async () => {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
   const seedSymbols = symbols.slice(0, maxSeedSymbolsPerPass);
   const nowMs = Date.now();
-  if (!opts.force && nowMs - lastBarsPrefetchMs < BARS_PREFETCH_INTERVAL_MS) {
-    return {
-      ok: true,
-      skipped: 'interval_gate',
-      prefetchedBars: lastPrefetchedBars,
-      reusedPrefetch: true,
-      prefetchAgeMs: lastPrefetchedBarsUpdatedAtMs ? Date.now() - lastPrefetchedBarsUpdatedAtMs : null,
-    };
-  }
+  const barsIntervalActive = !opts.force && (nowMs - lastBarsPrefetchMs < BARS_PREFETCH_INTERVAL_MS);
+  const reusableBars = getPrefetchedBarsIfReusable({
+    symbols: seedSymbols,
+    maxAgeMs: BARS_PREFETCH_INTERVAL_MS,
+  });
+  const canReuseBars = Boolean(reusableBars?.bars);
+  const shouldPrefetchBars = !barsIntervalActive || !canReuseBars;
   if (symbols.length === 0) {
     return {
       ok: true,
       prefetchedBars: lastPrefetchedBars,
+      barsReused: canReuseBars,
+      barsPrefetchState: 'skipped_no_symbols',
+      quotePrefetchState: ENTRY_PREFETCH_QUOTES ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      prefetchedQuotes: 0,
+      prefetchedOrderbooks: 0,
     };
   }
 
   const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
-  if (!opts.force) {
-    const cooldownBlockedEndpoints = [];
-    if (ENTRY_PREFETCH_QUOTES && cooldownSnapshot.quote) cooldownBlockedEndpoints.push('quote');
-    if (cooldownSnapshot.bars) cooldownBlockedEndpoints.push('bars');
-    if (ENTRY_PREFETCH_ORDERBOOKS && cooldownSnapshot.orderbook) cooldownBlockedEndpoints.push('orderbook');
-    if (cooldownBlockedEndpoints.length > 0) {
-      console.warn('entry_scan_prefetch_skipped', {
-        reason: 'endpoint_cooldown',
-        blockedEndpoints: cooldownBlockedEndpoints,
-        cooldownSnapshot,
-        prefetchQuotes: ENTRY_PREFETCH_QUOTES,
-        prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
-      });
-      return {
-        ok: true,
-        skipped: 'endpoint_cooldown',
-        skippedEndpoints: cooldownBlockedEndpoints,
-        cooldownSnapshot,
-        prefetchedBars: lastPrefetchedBars,
-        prefetchQuotes: ENTRY_PREFETCH_QUOTES,
-        prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
-      };
-    }
+  const quoteCooldownActive = !opts.force && ENTRY_PREFETCH_QUOTES && Boolean(cooldownSnapshot.quote);
+  const orderbookCooldownActive = !opts.force && ENTRY_PREFETCH_ORDERBOOKS && Boolean(cooldownSnapshot.orderbook);
+  const barsCooldownActive = !opts.force && Boolean(cooldownSnapshot.bars);
+  const shouldPrefetchQuotes = ENTRY_PREFETCH_QUOTES && !quoteCooldownActive;
+  const shouldPrefetchOrderbooks = ENTRY_PREFETCH_ORDERBOOKS && !orderbookCooldownActive;
+  const shouldPrefetchBarsWithCooldown = shouldPrefetchBars && !barsCooldownActive;
+  const cooldownBlockedEndpoints = [];
+  if (quoteCooldownActive) cooldownBlockedEndpoints.push('quote');
+  if (orderbookCooldownActive) cooldownBlockedEndpoints.push('orderbook');
+  if (barsCooldownActive) cooldownBlockedEndpoints.push('bars');
+  if (cooldownBlockedEndpoints.length > 0) {
+    console.warn('entry_scan_prefetch_partial_cooldown', {
+      reason: 'endpoint_cooldown',
+      blockedEndpoints: cooldownBlockedEndpoints,
+      cooldownSnapshot,
+      prefetchQuotes: ENTRY_PREFETCH_QUOTES,
+      prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
+      barsIntervalActive,
+      barsReused: canReuseBars,
+    });
   }
 
-  lastBarsPrefetchMs = nowMs;
   const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
   const chunks = chunkArray(seedSymbols, chunkSize);
   const bars1mBySymbol = new Map();
@@ -13863,6 +14641,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   const bars15mBySymbol = new Map();
   let prefetchedQuotes = 0;
   let prefetchedOrderbooks = 0;
+  const prefetchedBars = shouldPrefetchBarsWithCooldown ? {
+    bars1mBySymbol,
+    bars5mBySymbol,
+    bars15mBySymbol,
+  } : (canReuseBars ? reusableBars.bars : lastPrefetchedBars);
   const warmupLimits = getWarmupBarLimits();
   const ranges = {
     '1m': getBarsFetchRange({ timeframe: '1Min', limit: warmupLimits['1m'] }),
@@ -13886,7 +14669,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     '15Min': 0,
   };
   const processChunk = async (chunkSymbols) => {
-    if (ENTRY_PREFETCH_QUOTES) {
+    if (shouldPrefetchQuotes) {
       const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
       warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
       const quoteSymbols = quotesResp?.quotes && typeof quotesResp.quotes === 'object'
@@ -13894,13 +14677,20 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         : [];
       prefetchedQuotes += quoteSymbols.length;
     }
-    if (ENTRY_PREFETCH_ORDERBOOKS) {
+    if (shouldPrefetchOrderbooks) {
       const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
       warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
       const orderbookSymbols = orderbooksResp?.orderbooks && typeof orderbooksResp.orderbooks === 'object'
         ? Object.keys(orderbooksResp.orderbooks)
         : [];
       prefetchedOrderbooks += orderbookSymbols.length;
+    }
+    if (!shouldPrefetchBarsWithCooldown) {
+      return {
+        bars1m: new Map(),
+        bars5m: new Map(),
+        bars15m: new Map(),
+      };
     }
     const bars1mResp = await fetchCryptoBarsWarmupPaged({
       symbols: chunkSymbols,
@@ -13935,6 +14725,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     for (let i = 0; i < chunks.length; i += warmupPrefetchConcurrency) {
       const batch = chunks.slice(i, i + warmupPrefetchConcurrency);
       const batchResults = await Promise.all(batch.map((chunkSymbols) => processChunk(chunkSymbols)));
+      if (!shouldPrefetchBarsWithCooldown) continue;
       for (const result of batchResults) {
         updatePredictorWarmupProgress({
           currentTimeframe: '1Min',
@@ -13993,17 +14784,23 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     return { ok: false, error: err?.message || String(err) };
   }
 
-  lastPrefetchedBars = {
-    bars1mBySymbol,
-    bars5mBySymbol,
-    bars15mBySymbol,
-  };
-  lastPrefetchedBarsUpdatedAtMs = Date.now();
-  lastPrefetchedBarsSymbols = new Set(seedSymbols);
+  const completedAtMs = Date.now();
+  if (shouldPrefetchBarsWithCooldown) {
+    lastBarsPrefetchMs = nowMs;
+    lastPrefetchedBars = prefetchedBars;
+    lastPrefetchedBarsUpdatedAtMs = completedAtMs;
+    lastPrefetchedBarsSymbols = new Set(seedSymbols);
+  }
+  if (shouldPrefetchQuotes) {
+    lastQuotesPrefetchMs = completedAtMs;
+  }
+  if (shouldPrefetchOrderbooks) {
+    lastOrderbooksPrefetchMs = completedAtMs;
+  }
 
   return {
     ok: true,
-    prefetchedBars: lastPrefetchedBars,
+    prefetchedBars,
     prefetchOrderbooks: ENTRY_PREFETCH_ORDERBOOKS,
     prefetchQuotes: ENTRY_PREFETCH_QUOTES,
     warmupPrefetchConcurrency,
@@ -14013,9 +14810,26 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     totalSymbolsObserved: symbols.length,
     prefetchedQuotes,
     prefetchedOrderbooks,
-    quotePrefetchState: ENTRY_PREFETCH_QUOTES ? 'enabled' : 'skipped_env_disabled',
-    orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'enabled' : 'skipped_env_disabled',
+    barsReused: canReuseBars && !shouldPrefetchBarsWithCooldown,
+    barsPrefetchState: shouldPrefetchBarsWithCooldown
+      ? 'enabled'
+      : (canReuseBars ? 'reused' : (barsCooldownActive ? 'skipped_endpoint_cooldown' : 'skipped')),
+    quotePrefetchState: ENTRY_PREFETCH_QUOTES
+      ? (shouldPrefetchQuotes ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS
+      ? (shouldPrefetchOrderbooks ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    skippedEndpoints: cooldownBlockedEndpoints,
+    lastBarsPrefetchMs,
+    lastQuotesPrefetchMs,
+    lastOrderbooksPrefetchMs,
   };
+  })().finally(() => {
+    entryScanPrefetchInFlightPromise = null;
+  });
+
+  return entryScanPrefetchInFlightPromise;
 }
 
 function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
@@ -14061,7 +14875,19 @@ function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
 
 async function runEntryScanOnce() {
   beginMarketDataPass();
-  if (entryScanRunning) return;
+  if (entryScanRunning) {
+    entryScanRerunRequested = true;
+    const deferred = recordDeferredScanTick(entryManagerHeartbeat, safeIso, {
+      reason: 'previous_scan_still_running',
+      currentScanStartedAt: entryManagerHeartbeat.currentScanStartedAt,
+      currentScanState: entryManagerHeartbeat.currentScanState,
+      lastScanDurationMs: entryManagerHeartbeat.lastScanDurationMs,
+      rerunQueued: true,
+    });
+    console.log('entry_scan_tick_skipped', deferred);
+    return;
+  }
+  entryScanRerunRequested = false;
   entryScanRunning = true;
   entryManagerHeartbeat.running = true;
   entryManagerHeartbeat.lastHeartbeatAt = safeIso();
@@ -14077,11 +14903,25 @@ async function runEntryScanOnce() {
     return;
   }
   if (PREDICTOR_WARMUP_BLOCK_TRADES && warmupSnapshot?.inProgress === true) {
+    const supportedSnapshot = getSupportedCryptoPairsSnapshot();
+    const supportedStats = supportedSnapshot?.stats || null;
     emitEntryScanNoopSummary({ startMs, reason: 'warmup_in_progress' });
     clearEntryScanProgress({ state: 'idle' });
     setEngineState('warming_up', { reason: 'warmup_in_progress' });
     lastUniverseDiagnostics = {
       ...lastUniverseDiagnostics,
+      dynamicUniverseActive: supportedCryptoPairsState.loaded || lastUniverseDiagnostics.dynamicUniverseActive,
+      effectiveUniverseMode: lastUniverseDiagnostics.effectiveUniverseMode || 'dynamic_full_universe',
+      dynamicTradableSymbolsFound: supportedStats?.tradableCryptoCount ?? lastUniverseDiagnostics.dynamicTradableSymbolsFound,
+      acceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.acceptedSymbolsCount,
+      dynamicAcceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.dynamicAcceptedSymbolsCount,
+      acceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : lastUniverseDiagnostics.acceptedSymbolsSample,
+      dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : lastUniverseDiagnostics.dynamicAcceptedSymbolsSample,
+      lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || lastUniverseDiagnostics.lastUniverseRefreshAt,
       entryScanBlockedBy: 'warmup_in_progress',
     };
     entryScanRunning = false;
@@ -14245,51 +15085,154 @@ async function runEntryScanOnce() {
     const normalizedUniverse = universe
       .map((sym) => normalizeSymbol(sym))
       .filter(Boolean);
+    let accountInfoForUniverse = { portfolioValue: 0, buyingPower: 0 };
+    try {
+      accountInfoForUniverse = await getAccountInfo();
+    } catch (accountErr) {
+      console.warn('entry_universe_account_info_unavailable', { error: accountErr?.message || String(accountErr) });
+    }
+    const tier3Allowed = shouldAllowDynamicTier3({
+      portfolioValue: accountInfoForUniverse.portfolioValue,
+    });
+    const tier3SuppressedByPortfolio = EXECUTION_TIER3_DEFAULT && !tier3Allowed;
     let tierFilteredUniverse = normalizedUniverse;
-    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && !EXECUTION_TIER3_DEFAULT) {
-      const allowedExecutionSymbols = new Set([...EXECUTION_TIER1_SYMBOLS, ...EXECUTION_TIER2_SYMBOLS]);
-      tierFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
+    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic')) {
+      const executionFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
         executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
         executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-        executionTier3Default: EXECUTION_TIER3_DEFAULT,
+        executionTier3Default: tier3Allowed,
       });
-      const filteredOut = normalizedUniverse.filter((symbol) => !allowedExecutionSymbols.has(symbol));
+      tierFilteredUniverse = executionFilteredUniverse;
       console.log('entry_universe_tier_filter', {
         rawDynamicCount: normalizedUniverse.length,
         filteredCount: tierFilteredUniverse.length,
-        filteredOutCount: filteredOut.length,
+        filteredOutCount: Math.max(0, normalizedUniverse.length - tierFilteredUniverse.length),
         tier1Count: EXECUTION_TIER1_SYMBOLS.size,
         tier2Count: EXECUTION_TIER2_SYMBOLS.size,
         tier3Default: EXECUTION_TIER3_DEFAULT,
-        filteredOutSample: filteredOut.slice(0, 10),
+        tier3SuppressedByPortfolio,
+        tier3MinPortfolioUsd: ENTRY_TIER3_MIN_PORTFOLIO_USD,
+        portfolioValueUsd: Number(accountInfoForUniverse.portfolioValue || 0),
+        entryDynamicAllowTier3Override: ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
       });
     }
     const filteredSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
-    const prioritizedSymbols = filteredSymbols.sort((a, b) => {
-      const aTier = EXECUTION_TIER1_SYMBOLS.has(a) ? 1 : EXECUTION_TIER2_SYMBOLS.has(a) ? 2 : 3;
-      const bTier = EXECUTION_TIER1_SYMBOLS.has(b) ? 1 : EXECUTION_TIER2_SYMBOLS.has(b) ? 2 : 3;
-      if (aTier !== bTier) return aTier - bTier;
-      return String(a).localeCompare(String(b));
+    let eligibilityHydration = null;
+    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && filteredSymbols.length > 0) {
+      eligibilityHydration = await hydrateEntryEligibilityMarketData(filteredSymbols);
+    }
+    const buildRankingMapsFromScanCache = () => {
+      const nowMs = Date.now();
+      return {
+        nowMs,
+        quoteBySymbol: Object.fromEntries(
+          filteredSymbols.map((symbol) => {
+            const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
+              nowMs,
+              maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+            });
+            return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
+          }),
+        ),
+        orderbookBySymbol: Object.fromEntries(
+          filteredSymbols.map((symbol) => {
+            const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
+              nowMs,
+              maxAgeMs: ORDERBOOK_MAX_AGE_MS,
+            });
+            return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
+          }),
+        ),
+      };
+    };
+    const dynamicRankingResolution = await resolveDynamicUniverseRankingWithHydration(filteredSymbols, {
+      rankOptions: {
+        executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+        executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+        maxSymbols: filteredSymbols.length,
+        requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+        requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+        quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      },
+      getMarketDataMaps: buildRankingMapsFromScanCache,
+      hydrate: async () => hydrateEntryEligibilityMarketData(filteredSymbols, { force: true }),
     });
+    const rankedDynamicUniverse = dynamicRankingResolution.finalRank;
+    if (dynamicRankingResolution?.hydrationRetry?.attempted) {
+      console.log('entry_universe_hydration_retry', {
+        triggeredBy: dynamicRankingResolution.hydrationRetry.triggeredBy,
+        recovered: Boolean(dynamicRankingResolution.hydrationRetry.recovered),
+        initialEligibleCount: Number(dynamicRankingResolution?.initialRank?.eligibilityCounts?.eligibleCount || 0),
+        finalEligibleCount: Number(dynamicRankingResolution?.finalRank?.eligibilityCounts?.eligibleCount || 0),
+        hydrationResult: dynamicRankingResolution.hydrationRetry.result || null,
+      });
+    }
+    const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
+      ? rankedDynamicUniverse.symbols
+      : filteredSymbols.sort((a, b) => {
+        const aTier = EXECUTION_TIER1_SYMBOLS.has(a) ? 1 : EXECUTION_TIER2_SYMBOLS.has(a) ? 2 : 3;
+        const bTier = EXECUTION_TIER1_SYMBOLS.has(b) ? 1 : EXECUTION_TIER2_SYMBOLS.has(b) ? 2 : 3;
+        if (aTier !== bTier) return aTier - bTier;
+        return String(a).localeCompare(String(b));
+      });
     const ratePressureActive = isUnderRatePressure();
+    const configuredUniverseCap = Number.isFinite(ENTRY_UNIVERSE_MAX_SYMBOLS) ? ENTRY_UNIVERSE_MAX_SYMBOLS : null;
     const effectiveUniverseCap = ratePressureActive
-      ? Math.max(4, Math.floor(ENTRY_UNIVERSE_MAX_SYMBOLS * 0.5))
-      : ENTRY_UNIVERSE_MAX_SYMBOLS;
+      ? Math.max(
+        4,
+        configuredUniverseCap != null
+          ? Math.floor(configuredUniverseCap * 0.5)
+          : Math.floor(prioritizedSymbols.length * 0.5),
+      )
+      : configuredUniverseCap;
+    const universeCapDiagnostics = {
+      configuredCap: configuredUniverseCap,
+      configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      effectiveCap: effectiveUniverseCap,
+      effectiveCapSource: ratePressureActive ? 'rate_pressure_backoff' : ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      ratePressureActive,
+      rankedEligibleCountBeforeCap: prioritizedSymbols.length,
+      configuredPrimaryCount: configuredUniverse.primaryCount,
+      acceptedSymbolsCountBeforeCap: prioritizedSymbols.length,
+    };
     if (ratePressureActive) {
       console.warn('universe_rate_pressure_backoff', {
-        configuredCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+        configuredCap: configuredUniverseCap,
         effectiveCap: effectiveUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
         ratePressureState: getRatePressureState(),
       });
     }
-    const scanSymbols = prioritizedSymbols.slice(0, effectiveUniverseCap);
-    if (prioritizedSymbols.length > effectiveUniverseCap) {
+    const scanSymbols = Number.isFinite(effectiveUniverseCap)
+      ? prioritizedSymbols.slice(0, effectiveUniverseCap)
+      : prioritizedSymbols.slice();
+    if (Number.isFinite(effectiveUniverseCap) && prioritizedSymbols.length > effectiveUniverseCap) {
       console.warn('dynamic_universe_capped', {
         acceptedBeforeCap: prioritizedSymbols.length,
         effectiveCap: effectiveUniverseCap,
+        configuredCap: configuredUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
         droppedCount: prioritizedSymbols.length - effectiveUniverseCap,
+      });
+    }
+    const capSmallerThanPrimary = Number.isFinite(effectiveUniverseCap) && effectiveUniverseCap < configuredUniverse.primaryCount;
+    const capSmallerThanRankedEligible = Number.isFinite(effectiveUniverseCap) && effectiveUniverseCap < prioritizedSymbols.length;
+    if (capSmallerThanPrimary || capSmallerThanRankedEligible) {
+      console.error('entry_universe_cap_warning', {
+        warning: 'effective_universe_cap_lower_than_expected_universe',
+        effectiveCap: effectiveUniverseCap,
+        configuredCap: configuredUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        rankedEligibleCountBeforeCap: prioritizedSymbols.length,
+        scanSymbolsCountAfterCap: scanSymbols.length,
+        capSmallerThanPrimary,
+        capSmallerThanRankedEligible,
+        envEntryUniverseMaxSymbols: String(process.env.ENTRY_UNIVERSE_MAX_SYMBOLS ?? ''),
       });
     }
     updateEntryScanProgress({
@@ -14314,31 +15257,111 @@ async function runEntryScanOnce() {
       dynamicRejectedMalformedCount: dynamicUniverseStats?.malformedCount ?? 0,
       dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
       dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
-      acceptedSymbolsCount: scanSymbols.length,
+      acceptedSymbolsCount: prioritizedSymbols.length,
+      scanSymbolsCount: scanSymbols.length,
+      dynamicAcceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? 0,
       universeSymbolCap: effectiveUniverseCap,
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      configuredUniverseCap: configuredUniverseCap,
+      configuredUniverseCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      universeCapDiagnostics: {
+        ...universeCapDiagnostics,
+        capSmallerThanPrimary,
+        capSmallerThanRankedEligible,
+        droppedByCapCount: Math.max(0, prioritizedSymbols.length - scanSymbols.length),
+      },
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
+      dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs)
+        ? supportedSnapshot.pairs.slice(0, 10)
+        : [],
       fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       stableExclusionEnabled: ENTRY_UNIVERSE_EXCLUDE_STABLES,
-      stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - scanSymbols.length),
+      stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - filteredSymbols.length),
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
       alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
       lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
       entryScanBlockedBy: null,
+      entryScanBlockedStage: null,
       universeZeroReason: null,
       fallbackReason,
+      rankingHydration: eligibilityHydration ? {
+        ok: Boolean(eligibilityHydration.ok),
+        prefetchedQuotes: Number(eligibilityHydration.prefetchedQuotes || 0),
+        prefetchedOrderbooks: Number(eligibilityHydration.prefetchedOrderbooks || 0),
+        quoteHydrationState: eligibilityHydration.quoteHydrationState || null,
+        orderbookHydrationState: eligibilityHydration.orderbookHydrationState || null,
+        skippedEndpoints: Array.isArray(eligibilityHydration.skippedEndpoints) ? eligibilityHydration.skippedEndpoints : [],
+        seededSymbols: Number(eligibilityHydration.seededSymbols || 0),
+        totalSymbolsObserved: Number(eligibilityHydration.totalSymbolsObserved || 0),
+      } : null,
+      rankingHydrationRetry: dynamicRankingResolution?.hydrationRetry?.attempted ? {
+        attempted: true,
+        triggeredBy: dynamicRankingResolution.hydrationRetry.triggeredBy,
+        recovered: Boolean(dynamicRankingResolution.hydrationRetry.recovered),
+        result: dynamicRankingResolution.hydrationRetry.result || null,
+      } : {
+        attempted: false,
+        triggeredBy: null,
+        recovered: false,
+        result: null,
+      },
+      rankingEligibilityCounts: rankedDynamicUniverse?.eligibilityCounts || null,
+      rankingFailureCounts: rankedDynamicUniverse?.failureCounts || null,
+      rankingFreshnessWindowsMs: {
+        quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+        orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
+        quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      },
+      entryFreshnessWindowsMs: {
+        entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        orderbookMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      },
     };
     if (!scanSymbols.length) {
-      const universeZeroReason = lastUniverseDiagnostics.dynamicUniverseInitError
-        ? 'dynamic_universe_init_failed'
-        : fallbackReason || 'no_accepted_symbols_after_filters';
+      const rankingEligibleCounts = rankedDynamicUniverse?.eligibilityCounts || {};
+      const rankingFailureCounts = rankedDynamicUniverse?.failureCounts || {};
+      const rankingDroppedSample = Array.isArray(rankedDynamicUniverse?.droppedDiagnostics)
+        ? rankedDynamicUniverse.droppedDiagnostics.slice(0, 5)
+        : [];
+      const rankingFilteredOut = filteredSymbols.length > 0
+        && rankedDynamicUniverse?.symbols?.length === 0
+        && ENTRY_UNIVERSE_MODE === 'dynamic'
+        && universeMode.startsWith('dynamic');
+      const hydrationRetryAttempted = Boolean(dynamicRankingResolution?.hydrationRetry?.attempted);
+      const universeZeroReason = deriveDynamicUniverseEmptyReason({
+        dynamicUniverseInitError: lastUniverseDiagnostics.dynamicUniverseInitError,
+        filteredSymbolCount: filteredSymbols.length,
+        rankingFilteredOut,
+        requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+        hydrationRetryAttempted,
+        eligibilityCounts: rankingEligibleCounts,
+        fallbackReason,
+      });
       lastUniverseDiagnostics = {
         ...lastUniverseDiagnostics,
         entryScanBlockedBy: 'universe_empty',
+        entryScanBlockedStage: 'ranking_after_hydration',
         universeZeroReason,
+        rankingEligibilityCounts: {
+          normalizedUniverseCount: normalizedUniverse.length,
+          tierFilteredUniverseCount: tierFilteredUniverse.length,
+          stableFilteredUniverseCount: filteredSymbols.length,
+          freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
+          healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
+          recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
+          eligibleCount: Number(rankingEligibleCounts.eligibleCount || 0),
+        },
+        rankingFailureCounts: {
+          freshness: Number(rankingFailureCounts.freshness || 0),
+          spread: Number(rankingFailureCounts.spread || 0),
+          orderbookRecency: Number(rankingFailureCounts.orderbookRecency || 0),
+        },
+        rankingDroppedSample,
       };
       console.error('entry_universe_empty', {
         envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
@@ -14348,7 +15371,34 @@ async function runEntryScanOnce() {
         lastUniverseRefreshAt: lastUniverseDiagnostics.lastUniverseRefreshAt,
         fallbackReason,
         universeZeroReason,
+        normalizedUniverseCount: normalizedUniverse.length,
+        tierFilteredUniverseCount: tierFilteredUniverse.length,
+        stableFilteredUniverseCount: filteredSymbols.length,
+        freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
+        healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
+        recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
+        eligibleCount: Number(rankingEligibleCounts.eligibleCount || 0),
+        rankingFailureCounts: lastUniverseDiagnostics.rankingFailureCounts,
+        rankingFreshnessWindowsMs: lastUniverseDiagnostics.rankingFreshnessWindowsMs,
+        entryFreshnessWindowsMs: lastUniverseDiagnostics.entryFreshnessWindowsMs,
+        rankingHydrationRetry: lastUniverseDiagnostics.rankingHydrationRetry,
+        rankingDroppedSample,
       });
+      emitEntryScanNoopSummary({
+        startMs,
+        reason: 'universe_empty',
+        extra: {
+          universeSize: 0,
+          universeIsOverride,
+          universeMode,
+          dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+          stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
+          rankingEligibilityCounts: lastUniverseDiagnostics.rankingEligibilityCounts,
+        },
+      });
+      clearEntryScanProgress({ state: 'idle' });
+      setEngineState('ready', { reason: 'universe_empty' });
+      return;
     }
     console.log('entry_universe_selection', {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
@@ -14357,23 +15407,36 @@ async function runEntryScanOnce() {
       overrideActive: universeIsOverride,
       configuredOverrideActive: ENTRY_UNIVERSE_MODE === 'configured',
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
-      acceptedSymbols: scanSymbols.length,
+      acceptedSymbols: prioritizedSymbols.length,
+      scanSymbols: scanSymbols.length,
       entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
       stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       configuredPrimarySample: configuredUniverse.primary.slice(0, 6),
       configuredSecondarySample: configuredUniverse.secondary.slice(0, 6),
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
+      dynamicRankingSample: rankedDynamicUniverse.diagnostics.slice(0, 5),
+      dynamicRankingDroppedSample: rankedDynamicUniverse.droppedDiagnostics.slice(0, 5),
+      rankingFreshnessWindowsMs: lastUniverseDiagnostics.rankingFreshnessWindowsMs,
+      entryFreshnessWindowsMs: lastUniverseDiagnostics.entryFreshnessWindowsMs,
+      dynamicRequireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+      dynamicRequireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+      tier3SuppressedByPortfolio,
+      tier3MinPortfolioUsd: ENTRY_TIER3_MIN_PORTFOLIO_USD,
+      portfolioValueUsd: Number(accountInfoForUniverse.portfolioValue || 0),
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
       nodeEnv: NODE_ENV,
     });
     console.log('entry_universe_startup_summary', {
       requestedMode: ENTRY_UNIVERSE_MODE,
       effectiveMode: universeMode,
-      acceptedSymbolsCount: scanSymbols.length,
+      acceptedSymbolsCount: prioritizedSymbols.length,
+      scanSymbolsCount: scanSymbols.length,
       dynamicUniverseActive: universeMode.startsWith('dynamic'),
-      acceptedSymbolsSample: scanSymbols.slice(0, 10),
+      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
@@ -14383,6 +15446,9 @@ async function runEntryScanOnce() {
       warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       fallbackOccurred: Boolean(fallbackReason),
       fallbackReason,
+      secondaryQuoteEnabled: false,
+      secondaryQuoteRouterEnabled: false,
+      secondaryQuoteRouterProvider: null,
     });
     if (fallbackReason) {
       console.warn('entry_universe_fallback_active', {
@@ -14535,37 +15601,40 @@ async function runEntryScanOnce() {
 
     let prefetchedBars = null;
     let prefetchResult = null;
-    const reusablePrefetch = getPrefetchedBarsIfReusable({ symbols: scanSymbols });
-    if (reusablePrefetch?.bars) {
-      prefetchedBars = reusablePrefetch.bars;
-      console.log('entry_scan_prefetch_reused', {
-        reused: true,
-        ageMs: reusablePrefetch.ageMs,
-        cachedSymbols: reusablePrefetch.symbolCount,
-      });
-    } else {
+    updateEntryScanProgress({
+      startMs,
+      symbolsProcessed: 0,
+      universeSize: scanSymbols.length,
+      state: 'prefetching_market_data',
+    });
+    const prefetchHeartbeat = setInterval(() => {
       updateEntryScanProgress({
         startMs,
         symbolsProcessed: 0,
         universeSize: scanSymbols.length,
         state: 'prefetching_market_data',
       });
-      const prefetchHeartbeat = setInterval(() => {
-        updateEntryScanProgress({
-          startMs,
-          symbolsProcessed: 0,
-          universeSize: scanSymbols.length,
-          state: 'prefetching_market_data',
-        });
-      }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
-      try {
-        prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
-        if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
-          prefetchedBars = prefetchResult.prefetchedBars;
-        }
-      } finally {
-        clearInterval(prefetchHeartbeat);
+    }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
+    try {
+      prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
+      if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
+        prefetchedBars = prefetchResult.prefetchedBars;
       }
+      if (prefetchResult?.barsReused) {
+        console.log('entry_scan_bars_prefetch_reused', {
+          barsReused: true,
+          barsPrefetchState: prefetchResult?.barsPrefetchState || null,
+          quotePrefetchState: prefetchResult?.quotePrefetchState || null,
+          orderbookPrefetchState: prefetchResult?.orderbookPrefetchState || null,
+          prefetchedQuotes: Number(prefetchResult?.prefetchedQuotes || 0),
+          prefetchedOrderbooks: Number(prefetchResult?.prefetchedOrderbooks || 0),
+          lastBarsPrefetchMs: prefetchResult?.lastBarsPrefetchMs || null,
+          lastQuotesPrefetchMs: prefetchResult?.lastQuotesPrefetchMs || null,
+          lastOrderbooksPrefetchMs: prefetchResult?.lastOrderbooksPrefetchMs || null,
+        });
+      }
+    } finally {
+      clearInterval(prefetchHeartbeat);
     }
     const entryMarketDataContext = buildEntryMarketDataContext({
       scanId: `${startMs}`,
@@ -14590,7 +15659,8 @@ async function runEntryScanOnce() {
     }, {});
     const computeProgressCounters = () => {
       const skipCountsSoFar = buildSkipCountsSoFar();
-      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0);
+      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0) + Number(skipCountsSoFar.symbol_health_cooldown || 0);
+      const symbolHealthCooldownCount = staleQuoteCooldownCount;
       const stalePrimaryQuoteCount = Number(skipCountsSoFar.stale_quote_primary || 0);
       const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
       const marketRejectionCount = Object.entries(skipCountsSoFar)
@@ -14606,6 +15676,7 @@ async function runEntryScanOnce() {
       return {
         skipCountsSoFar,
         staleQuoteCooldownCount,
+        symbolHealthCooldownCount,
         stalePrimaryQuoteCount,
         dataUnavailableCount,
         marketRejectionCount,
@@ -14624,6 +15695,7 @@ async function runEntryScanOnce() {
         universeSize: scanSymbols.length,
         state: 'scanning_symbols',
         staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+        symbolHealthCooldownCount: progressCounters.symbolHealthCooldownCount,
         stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
         dataUnavailableCount: progressCounters.dataUnavailableCount,
         marketRejectionCount: progressCounters.marketRejectionCount,
@@ -14638,6 +15710,7 @@ async function runEntryScanOnce() {
           signalReadyCountSoFar: signalReadyCount,
           skipCountsSoFar: progressCounters.skipCountsSoFar,
           staleQuoteCooldownCount: progressCounters.staleQuoteCooldownCount,
+          symbolHealthCooldownCount: progressCounters.symbolHealthCooldownCount,
           stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
           dataUnavailableCount: progressCounters.dataUnavailableCount,
           marketRejectionCount: progressCounters.marketRejectionCount,
@@ -14696,16 +15769,17 @@ async function runEntryScanOnce() {
           continue;
         }
       }
-      const staleCooldown = getStaleQuoteCooldownState(symbol);
-      if (staleCooldown.active) {
+      const symbolEligibility = symbolHealthTracker.evaluateEligibility(symbol);
+      if (!symbolEligibility.eligible) {
+        const cooldown = symbolEligibility.cooldown || {};
         skipped += 1;
-        recordSkip('stale_quote_cooldown', symbol, {
-          untilMs: staleCooldown.untilMs,
-          remainingMs: staleCooldown.remainingMs,
-          attempts: staleCooldown.attempts,
+        recordSkip('symbol_health_cooldown', symbol, {
+          untilMs: cooldown.untilMs || 0,
+          remainingMs: cooldown.remainingMs || 0,
+          attempts: cooldown.failures || 0,
           suppressed: true,
-          reason: staleCooldown.reason || null,
-          quoteAgeMs: staleCooldown.quoteAgeMs,
+          reason: cooldown.reason || null,
+          quoteAgeMs: Number.isFinite(Number(cooldown.quoteAgeMs)) ? Number(cooldown.quoteAgeMs) : null,
         });
         continue;
       }
@@ -14715,6 +15789,7 @@ async function runEntryScanOnce() {
         fallbackBudgetState,
         entryMarketDataContext,
         sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
+        accountInfo: accountInfoForUniverse,
       });
       const recordBase = signal?.record ? { ...signal.record } : null;
       const candidateMeta = signal?.meta || {};
@@ -14741,11 +15816,16 @@ async function runEntryScanOnce() {
         if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) {
           entryStaleQuoteSkipCount += 1;
           noteStaleQuoteSkip(symbol);
-        } else {
-          clearStaleQuoteSkipState(symbol);
         }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
+        if (['marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(skipReason)) {
+          symbolHealthTracker.recordFailure(symbol, skipReason, signal.meta || {});
+        } else if (shouldCountSparseFallbackReject({ marketDataEval: signal.meta }) || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signal?.meta?.sparseRetry })) {
+          symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signal.meta || {});
+        } else {
+          symbolHealthTracker.noteHealthy(symbol);
+        }
         recordSkip(skipReason, symbol, signal.meta || null);
         if (recordBase) {
           recordBase.decision = 'skipped';
@@ -14759,7 +15839,7 @@ async function runEntryScanOnce() {
       }
 
       signalReadyCount += 1;
-      clearStaleQuoteSkipState(symbol);
+      symbolHealthTracker.noteHealthy(symbol);
       const riskGuard = await maybeUpdateRiskGuards();
       if (!riskGuard.ok || tradingHaltedReason || tradingHaltedByGuard) {
         skipped += 1;
@@ -14968,7 +16048,8 @@ async function runEntryScanOnce() {
       acc[reason] = count;
       return acc;
     }, {});
-    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0);
+    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0) + Number(skipDetailCountsObj.symbol_health_cooldown || 0);
+    const symbolHealthCooldownCount = staleQuoteCooldownCount;
     const stalePrimaryQuoteCount = Number(skipDetailCountsObj.stale_quote_primary || 0);
     const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
     const marketRejectionCount = Object.entries(skipDetailCountsObj)
@@ -15042,18 +16123,14 @@ async function runEntryScanOnce() {
         });
         return acc;
       }, {});
-    const staleQuoteCooldownSample = Array.from(staleQuoteSkipStateBySymbol.entries())
-      .filter(([, state]) => Number(state?.untilMs) > endMs)
-      .sort((a, b) => Number(b?.[1]?.untilMs || 0) - Number(a?.[1]?.untilMs || 0))
-      .slice(0, 8)
-      .map(([symbol, state]) => ({
-        symbol,
-        untilMs: Number(state?.untilMs) || 0,
-        remainingMs: Math.max(0, Number(state?.untilMs || 0) - endMs),
-        attempts: Number(state?.attempts) || 0,
-        reason: state?.reason || null,
-        quoteAgeMs: Number.isFinite(Number(state?.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
-      }));
+    const staleQuoteCooldownSample = symbolHealthTracker.listActiveCooldowns({ limit: 8 }).map((state) => ({
+      symbol: state.symbol,
+      untilMs: Number(state.untilMs) || 0,
+      remainingMs: Number(state.remainingMs) || 0,
+      attempts: Number(state.failures) || 0,
+      reason: state.reason || null,
+      quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
+    }));
     const completedSummary = {
       startMs,
       endMs,
@@ -15084,16 +16161,21 @@ async function runEntryScanOnce() {
       sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
       warmupFallbackBudgetConfigured: PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN,
       warmupFallbackBudgetEffective: effectiveWarmupFallbackBudget,
-      secondaryQuoteEnabled: SECONDARY_QUOTE_ENABLED,
+      secondaryQuoteEnabled: false,
+      secondaryQuoteRouterEnabled: false,
+      secondaryQuoteRouterProvider: null,
       entryQuoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       entryQuoteFreshness: getQuoteFreshnessPolicy(),
       staleEntryQuoteSkips: entryStaleQuoteSkipCount,
       staleQuoteCooldownCount,
+      symbolHealthCooldownCount,
       stalePrimaryQuoteCount,
       dataUnavailableCount,
       marketRejectionCount,
       staleQuoteCooldownActive: staleQuoteCooldownSample.length,
       staleQuoteCooldownSample,
+      symbolHealthCooldownActive: staleQuoteCooldownSample.length,
+      symbolHealthCooldownSample: staleQuoteCooldownSample,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
@@ -15172,6 +16254,18 @@ async function runEntryScanOnce() {
     entryManagerHeartbeat.lastHeartbeatAt = safeIso();
     if (!entryScanRunning && !entryManagerHeartbeat.currentScanStartedAt && entryManagerHeartbeat.currentScanState !== 'aborted') {
       clearEntryScanProgress({ state: 'idle' });
+    }
+    if (entryScanRerunRequested) {
+      entryScanRerunRequested = false;
+      console.log('entry_scan_rerun_execute', {
+        reason: 'deferred_scan_tick',
+        queuedAt: safeIso(),
+      });
+      setTimeout(() => {
+        runEntryScanOnce().catch((err) => {
+          console.error('entry_scan_rerun_failed', err?.message || err);
+        });
+      }, 0);
     }
   }
 }
@@ -16905,6 +17999,14 @@ async function fetchOrders(params = {}) {
     label: 'orders_list',
   });
   const fetcher = async () => {
+    if (isTradingRateLimited()) {
+      // If rate limited and we have cached data, return stale cache rather than wait
+      if (isOpenStatus && openOrdersCache.data) {
+        console.log('fetchOrders_rate_limited_using_cache', { cooldownMs: tradingCooldownRemainingMs() });
+        return openOrdersCache.data;
+      }
+      await waitForTradingCooldown();
+    }
     let response;
     try {
       response = await requestJson({
@@ -16913,6 +18015,17 @@ async function fetchOrders(params = {}) {
         headers: alpacaHeaders(),
       });
     } catch (err) {
+      if (err?.responseHeaders) {
+        updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_list' });
+      }
+      if (err?.statusCode === 429) {
+        markTradingThrottled({ endpoint: 'orders_list' });
+        // Return stale cache on 429 instead of crashing
+        if (isOpenStatus && openOrdersCache.data) {
+          console.warn('fetchOrders_429_returning_stale_cache');
+          return openOrdersCache.data;
+        }
+      }
       logHttpError({ label: 'orders', url, error: err });
       throw err;
     }
@@ -17158,74 +18271,12 @@ function getAlpacaBaseStatus() {
 
 
 function getLifecycleSnapshot() {
-  const bySymbol = {};
-  for (const [symbol, state] of entryIntentState.entries()) {
-    bySymbol[symbol] = { ...state };
-  }
-  const diagnostics = {
-    exitMissingCount: 0,
-    repairingExitCount: 0,
-    orphanPositionCount: 0,
-    stopTriggeredExitPendingCount: 0,
-    managingWithoutExitCount: 0,
-  };
-  for (const [symbol, state] of exitState.entries()) {
-    const existing = bySymbol[symbol] || {};
-    const lifecycleState = String(existing.state || '').toLowerCase();
-    const hasTrackedExitPlan = Boolean(state && (state.sellOrderId || state.targetPrice || state.requiredExitBps || state.exitExecutionState));
-    if (lifecycleState === 'managing' && !hasTrackedExitPlan) {
-      diagnostics.managingWithoutExitCount += 1;
-      diagnostics.exitMissingCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'exit_missing',
-        diagnosticsState: 'exit_missing',
-        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
-      };
-      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
-      continue;
-    }
-    if (state?.exitExecutionState === 'exit_retry_pending' || state?.exitExecutionState === 'exit_failed_needs_repair') {
-      diagnostics.repairingExitCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'repairing_exit',
-        diagnosticsState: state?.exitExecutionState,
-      };
-    } else if (state?.exitExecutionState === 'exit_submitted') {
-      diagnostics.stopTriggeredExitPendingCount += 1;
-      bySymbol[symbol] = {
-        ...existing,
-        state: 'stop_triggered_exit_pending',
-        diagnosticsState: 'stop_triggered_exit_pending',
-      };
-    } else if (!bySymbol[symbol]) {
-      diagnostics.orphanPositionCount += 1;
-      bySymbol[symbol] = {
-        symbol,
-        state: 'orphan_position',
-        diagnosticsState: 'orphan_position',
-      };
-    }
-  }
-  for (const [symbol, state] of Object.entries(bySymbol)) {
-    if (String(state?.state || '').toLowerCase() === 'managing' && !exitState.has(symbol)) {
-      diagnostics.managingWithoutExitCount += 1;
-      diagnostics.exitMissingCount += 1;
-      bySymbol[symbol] = {
-        ...state,
-        state: 'exit_missing',
-        diagnosticsState: 'exit_missing',
-        lifecycleInvariantViolation: 'lifecycle_managing_without_exit_state',
-      };
-      console.warn('lifecycle_invariant_violation', { symbol, violation: 'lifecycle_managing_without_exit_state' });
-    }
-  }
-  return {
-    bySymbol,
+  return buildLifecycleSnapshot({
+    entryIntentState,
+    exitState,
     authoritativeCount: authoritativeTradeState.size,
-    diagnostics,
-  };
+    hasPendingExitAttach,
+  });
 }
 
 function getSessionGovernorSummary() {
@@ -17308,6 +18359,8 @@ function __resetManagerIntervalsForTests() {
   exitRepairIntervalId = null;
   exitRepairBootstrapTimeoutId = null;
   entryManagerRunning = false;
+  entryScanRunning = false;
+  entryScanRerunRequested = false;
   exitManagerRunning = false;
   entryManagerHeartbeat.running = false;
   clearEntryScanProgress({ state: 'idle' });
@@ -17318,6 +18371,9 @@ function getLastHttpError() {
 }
 
 async function cancelOrder(orderId) {
+  if (isTradingRateLimited()) {
+    await waitForTradingCooldown();
+  }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `orders/${orderId}`,
@@ -17331,6 +18387,12 @@ async function cancelOrder(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
+    if (err?.responseHeaders) {
+      updateTradingRateHeaders(err.responseHeaders, { statusCode: err?.statusCode, endpoint: 'orders_cancel' });
+    }
+    if (err?.statusCode === 429) {
+      markTradingThrottled({ endpoint: 'orders_cancel' });
+    }
     logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
@@ -17527,8 +18589,11 @@ module.exports = {
   computeProviderQuoteAgeMs,
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeEffectivePerScanBudget,
+  computeAdaptiveOrderbookThresholds,
+  shouldAllowDynamicTier3,
   evaluatePrimaryQuoteViability,
   classifyQuoteFetchFailureReason,
+  extractStaleQuoteMeta,
   resolveEntryExecutionContext,
 
   __setQuoteCacheEntryForTests: (symbol, quote) => {
@@ -17544,8 +18609,40 @@ module.exports = {
   __testNoteStaleQuoteSkip: noteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState: getStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState: clearStaleQuoteSkipState,
+  __testSetEntryScanRunningForTests: (value) => {
+    entryScanRunning = Boolean(value);
+  },
+  __testSetEntryScanRerunRequestedForTests: (value) => {
+    entryScanRerunRequested = Boolean(value);
+  },
+  __testGetEntryScanRerunRequestedForTests: () => entryScanRerunRequested,
+  __testExtractStaleQuoteMeta: extractStaleQuoteMeta,
   __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
   __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
   __getScanMarketDataCacheForTests: () => scanMarketDataCache,
+  __setLifecycleStateForTests: ({ symbol, intentState = null, trackedExitState = null, pendingExitAttach = null }) => {
+    const normalized = normalizeSymbol(symbol);
+    if (!normalized) return;
+    if (intentState && typeof intentState === 'object') {
+      entryIntentState.set(normalized, { ...intentState, symbol: normalized });
+    } else {
+      entryIntentState.delete(normalized);
+    }
+    if (trackedExitState && typeof trackedExitState === 'object') {
+      exitState.set(normalized, { ...trackedExitState, symbol: normalized });
+    } else {
+      exitState.delete(normalized);
+    }
+    if (pendingExitAttach && typeof pendingExitAttach === 'object') {
+      pendingExitAttachBySymbol.set(normalized, { ...pendingExitAttach });
+    } else {
+      pendingExitAttachBySymbol.delete(normalized);
+    }
+  },
+  __clearLifecycleStateForTests: () => {
+    entryIntentState.clear();
+    exitState.clear();
+    pendingExitAttachBySymbol.clear();
+  },
 
 };

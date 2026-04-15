@@ -4,6 +4,10 @@
     "slug": "backend-diagnostic",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "dark"
+    "userInterfaceStyle": "dark",
+    "extra": {
+      "backendUrl": "",
+      "apiToken": ""
+    }
   }
 }

@@ -2,6 +2,41 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 
+// Process-level safety nets. Without these, an unhandled async error in a
+// route or background job silently kills the server mid-trade. We log and,
+// for uncaught exceptions, exit so the platform restarts us in a clean state.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error('unhandled_rejection', {
+    message: err.message,
+    stack: err.stack,
+  });
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaught_exception', {
+    message: err?.message || String(err),
+    stack: err?.stack || null,
+  });
+  // Give logs a tick to flush, then exit so the supervisor restarts us.
+  setTimeout(() => process.exit(1), 100).unref();
+});
+
+// In-memory ring buffer that captures structured console output so the
+// frontend can display recent backend logs without needing Render access.
+const LOG_RING_MAX = Number(process.env.LOG_RING_MAX) || 500;
+const logRing = [];
+function pushLogEntry(level, args) {
+  const parts = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a)));
+  logRing.push({ ts: Date.now(), level, msg: parts.join(' ') });
+  if (logRing.length > LOG_RING_MAX) logRing.shift();
+}
+const origLog = console.log;
+const origWarn = console.warn;
+const origError = console.error;
+console.log = (...args) => { pushLogEntry('info', args); origLog.apply(console, args); };
+console.warn = (...args) => { pushLogEntry('warn', args); origWarn.apply(console, args); };
+console.error = (...args) => { pushLogEntry('error', args); origError.apply(console, args); };
+
 const nodeEnv = String(process.env.NODE_ENV || '').trim().toLowerCase();
 const explicitDotenvPath = process.env.DOTENV_CONFIG_PATH ? path.resolve(process.env.DOTENV_CONFIG_PATH) : null;
 const localDevDotenvPath = path.resolve(__dirname, '.env');
@@ -47,6 +82,8 @@ const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeC
 const { LIVE_CRITICAL_DEFAULTS } = require('./config/liveDefaults');
 const { preflightStoragePaths, resolveStoragePaths, logOnce } = require('./modules/storagePaths');
 const { corsOptionsDelegate } = require('./middleware/corsPolicy');
+const { emitStartupTruthSummary } = require('./modules/startupTruthSummary');
+const { shapeEntryManagerTelemetry } = require('./modules/entryTelemetryShape');
 
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -198,7 +235,6 @@ console.log('runtime_entry_engine_flags', {
   ENTRY_QUOTE_MAX_AGE_MS: runtimeStrategyConfig.entryQuoteMaxAgeMs,
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS_env: runtimeStrategyConfig.regimeStaleThresholdMs,
   regimeStaleThresholdUsedMs: getEntryRegimeStaleThresholdMs(),
-  SECONDARY_QUOTE_ENABLED: readLiveBoolean('SECONDARY_QUOTE_ENABLED'),
   QUOTE_RETRY: readLiveNumber('QUOTE_RETRY'),
   ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS: runtimeStrategyConfig.sparseRequireStrongerEdgeBps,
   ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS: runtimeStrategyConfig.sparseStaleQuoteToleranceMs,
@@ -237,6 +273,12 @@ function maskConfigValue(key, value) {
 function resolveGitCommit() {
   if (process.env.RENDER_GIT_COMMIT) return process.env.RENDER_GIT_COMMIT;
   if (process.env.GIT_COMMIT) return process.env.GIT_COMMIT;
+  // In production, rely on the platform to inject GIT_COMMIT at build time.
+  // Shelling out on every boot forks a child process and fails in containers
+  // that don't ship git. Dev-only fallback follows.
+  if (String(process.env.NODE_ENV || '').toLowerCase() === 'production') {
+    return null;
+  }
   try {
     return String(execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
   } catch (_) {
@@ -248,7 +290,7 @@ function writeRunSnapshot() {
   const tracked = [
     'TRADING_ENABLED', 'STOPS_ENABLED', 'STOPLOSS_ENABLED', 'POSITION_SIZING_MODE', 'TWAP_ENABLED',
     'CORRELATION_GUARD_ENABLED', 'VOLATILITY_FILTER_ENABLED', 'LIQUIDITY_WINDOW_ENABLED',
-    'DRAWDOWN_GUARD_ENABLED', 'RISK_KILL_SWITCH_ENABLED', 'SECONDARY_QUOTE_ENABLED',
+    'DRAWDOWN_GUARD_ENABLED', 'RISK_KILL_SWITCH_ENABLED',
     'PREDICTOR_CALIBRATION_ENABLED',
   ];
   const config = {};
@@ -409,7 +451,7 @@ async function getRecentBuyFillLookup() {
     const result = await fetchActivities({
       activity_types: 'FILL',
       direction: 'desc',
-      page_size: '200',
+      page_size: '100',
     });
     const bySymbol = buildLatestBuyFillLookup(result?.items || []);
     activityFillsCache.bySymbol = bySymbol;
@@ -534,12 +576,27 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/debug/auth', (req, res) => {
+  const authStatus = getAlpacaAuthStatus();
+  const baseStatus = getAlpacaBaseStatus();
   res.json({
     ok: true,
     apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
     version: VERSION,
     serverTime: new Date().toISOString(),
+    alpacaAuthOk: Boolean(authStatus?.alpacaAuthOk),
+    effectiveTradeBase: baseStatus?.tradeBase || null,
+    effectiveDataBase: baseStatus?.dataBase || null,
   });
+});
+
+app.get('/debug/logs', (req, res) => {
+  const sinceMs = Number(req.query.since) || 0;
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), LOG_RING_MAX);
+  const level = req.query.level || null; // 'info', 'warn', 'error', or null for all
+  let entries = sinceMs ? logRing.filter((e) => e.ts > sinceMs) : logRing.slice();
+  if (level) entries = entries.filter((e) => e.level === level);
+  entries = entries.slice(-limit);
+  res.json({ ok: true, count: entries.length, entries });
 });
 
 app.get('/debug/runtime-config', (req, res) => {
@@ -697,6 +754,7 @@ app.get('/dashboard', async (req, res) => {
     const concurrencyRiskGuardCount = Number(entryDiagnostics?.gating?.concurrencyRiskGuardCount || 0);
     const lastEntryScanSummary = entryDiagnostics?.entryScan || null;
     const entryManagerState = entryDiagnostics?.entryManager || managerStatus?.entryManagerHeartbeat || {};
+    const entryManagerTelemetry = shapeEntryManagerTelemetry(entryManagerState);
     const lastSuccessfulAction = entryDiagnostics?.lastSuccessfulAction || null;
     const lastExecutionFailure = entryDiagnostics?.lastExecutionFailure || null;
 
@@ -735,6 +793,20 @@ app.get('/dashboard', async (req, res) => {
         : Number.isFinite(sellOrderLimitFromState)
           ? 'exit_state'
           : null;
+      const visibleOpenSell = Number.isFinite(activeSellLimitFromOrders);
+      const managingWithVisibleSell = lifecycleState === 'managing' && visibleOpenSell;
+      const inferredExpectedOpenSell = managingWithVisibleSell
+        ? true
+        : Boolean(botState?.expectedOpenSell);
+      const inferredBrokerOpenSellFound = managingWithVisibleSell
+        ? true
+        : Boolean(botState?.brokerOpenSellFound);
+      const inferredReconciliationState = botState?.reconciliationState
+        || (managingWithVisibleSell ? 'open_sell_found' : null);
+      const inferredLastReconciliationAction = botState?.lastReconciliationAction
+        || (managingWithVisibleSell ? 'dashboard_open_orders_visible' : null);
+      const inferredTargetPriceSource = botState?.targetPriceSource
+        || (Number.isFinite(activeSellLimit) ? 'open_orders' : null);
       if (!botState && lifecycleState === 'managing') {
         console.warn('ambiguous_exit_state_detected', {
           symbol,
@@ -778,14 +850,14 @@ app.get('/dashboard', async (req, res) => {
           entryPriceUsed: toFiniteNumberOrNull(botState?.entryPriceUsed),
           sellOrderId: botState?.sellOrderId || null,
           sellOrderSubmittedAt: botState?.sellOrderSubmittedAt || null,
-          expectedOpenSell: Boolean(botState?.expectedOpenSell),
-          brokerOpenSellFound: Boolean(botState?.brokerOpenSellFound),
+          expectedOpenSell: inferredExpectedOpenSell,
+          brokerOpenSellFound: inferredBrokerOpenSellFound,
           brokerOpenSellQty: toFiniteNumberOrNull(botState?.brokerOpenSellQty),
           lastSeenOpenSellAt: botState?.lastSeenOpenSellAt || null,
-          reconciliationState: botState?.reconciliationState || null,
+          reconciliationState: inferredReconciliationState,
           reconciliationReason: botState?.reconciliationReason || null,
-          lastReconciliationAction: botState?.lastReconciliationAction || null,
-          targetPriceSource: botState?.targetPriceSource || null,
+          lastReconciliationAction: inferredLastReconciliationAction,
+          targetPriceSource: inferredTargetPriceSource,
           unresolvedManagedState: Boolean(!botState && lifecycleState === 'managing'),
           unresolvedManagedReason: !botState && lifecycleState === 'managing'
             ? 'lifecycle_managing_without_exit_state'
@@ -813,10 +885,17 @@ app.get('/dashboard', async (req, res) => {
         effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
         dynamicUniverseActive,
         dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-        acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+        acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+        scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
         universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
+        configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
+        configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
+        universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+          : [],
+        scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+          ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
           : [],
         fallbackOccurred,
         fallbackReason: universeDiagnostics?.fallbackReason || null,
@@ -866,9 +945,13 @@ app.get('/dashboard', async (req, res) => {
           backendReachable: true,
           authConfigured: Boolean(process.env.API_TOKEN),
           dynamicUniverseActive,
-          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
+          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
             : [],
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
@@ -884,6 +967,11 @@ app.get('/dashboard', async (req, res) => {
           dataRejectionCount: staleDataRejectionCount,
           staleDataRejectionCount,
           staleCooldownSuppressionCount,
+          symbolHealthCooldownCount: Number(lastEntryScanSummary?.symbolHealthCooldownCount || 0),
+          symbolHealthCooldownActive: Number(lastEntryScanSummary?.symbolHealthCooldownActive || 0),
+          symbolHealthCooldownSample: Array.isArray(lastEntryScanSummary?.symbolHealthCooldownSample)
+            ? lastEntryScanSummary.symbolHealthCooldownSample
+            : [],
           staleQuoteRejectionCount,
           insufficientBarsCount,
           warmupBlockedCount,
@@ -904,6 +992,7 @@ app.get('/dashboard', async (req, res) => {
             universeSize: Number(entryManagerState?.currentScanUniverseSize || 0),
             state: entryManagerState?.currentScanState || 'idle',
             staleQuoteCooldownCount: Number(entryManagerState?.currentScanStaleQuoteCooldownCount || 0),
+            currentScanSymbolHealthCooldownCount: Number(entryManagerState?.currentScanSymbolHealthCooldownCount || 0),
             stalePrimaryQuoteCount: Number(entryManagerState?.currentScanStalePrimaryQuoteCount || 0),
             dataUnavailableCount: Number(entryManagerState?.currentScanDataUnavailableCount || 0),
             marketRejectionCount: Number(entryManagerState?.currentScanMarketRejectionCount || 0),
@@ -923,9 +1012,17 @@ app.get('/dashboard', async (req, res) => {
           effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
           dynamicUniverseActive,
           dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
+          universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
+          configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
+          configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
+          universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+            : [],
+          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
+            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
             : [],
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
@@ -939,7 +1036,7 @@ app.get('/dashboard', async (req, res) => {
             currentTimeframe: predictorWarmup?.currentTimeframe ?? null,
           },
           ratePressureState,
-          entryManager: entryManagerState,
+          entryManager: { ...entryManagerState, telemetry: entryManagerTelemetry },
           lastSuccessfulAction,
           lastExecutionFailure,
         },
@@ -949,6 +1046,7 @@ app.get('/dashboard', async (req, res) => {
         entryScan: entryDiagnostics?.entryScan || null,
         predictorCandidates: entryDiagnostics?.predictorCandidates || null,
         skipReasonsBySymbol: entryDiagnostics?.skipReasonsBySymbol || {},
+        entryTelemetry: entryManagerTelemetry,
       },
       events: Object.values(lifecycleSnapshot?.bySymbol || {}).slice(-25).map((item) => ({
         ts: item.updatedAt || item.createdAt || null,
@@ -1312,6 +1410,7 @@ app.get('/debug/status', async (req, res) => {
         capEnabled: guardStatus.capEnabled,
         lastScanAt: guardStatus.lastScanAt,
         lastQuoteAt,
+        entryTelemetry: shapeEntryManagerTelemetry(tradingStatus?.entryManagerHeartbeat || {}),
       },
     });
   } catch (error) {
@@ -1492,7 +1591,24 @@ app.get('/market/stocks/bars', async (req, res) => {
   }
 });
 
- 
+// 404 handler for unmatched routes. Must come after all route definitions.
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'not_found', path: req.path });
+});
+
+// Global error handler. Catches anything thrown (sync or async) from a route
+// that wasn't caught locally, so we never leak raw stack traces and every
+// failure flows through serializeError.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, _next) => {
+  console.error('unhandled_route_error', {
+    method: req.method,
+    path: req.path,
+    message: err?.message || String(err),
+    stack: err?.stack || null,
+  });
+  return sendError(res, err, 'Internal server error');
+});
 
 const port = process.env.PORT || 3000;
 let bootstrapTradingStarted = false;
@@ -1519,23 +1635,14 @@ async function bootstrapTrading() {
     const baseStatus = getAlpacaBaseStatus();
     const universeDiagnostics = getUniverseDiagnosticsSnapshot();
     const warmup = getPredictorWarmupSnapshot();
-    console.log('startup_truth_summary', {
-      alpacaCredentialsPresent: Boolean(authStatus?.alpacaAuthOk),
-      effectiveTradeBase: baseStatus?.tradeBase || null,
-      effectiveDataBase: baseStatus?.dataBase || null,
-      dynamicUniverseActive: Boolean(universeDiagnostics?.dynamicUniverseActive),
-      requestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeConfig.entryUniverseModeRaw || null,
-      effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
-      acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
-      warmupSettings: {
-        enabled: Boolean(process.env.PREDICTOR_WARMUP_ENABLED ? String(process.env.PREDICTOR_WARMUP_ENABLED) !== 'false' : true),
-        inProgress: Boolean(warmup?.inProgress),
-        chunkSize: runtimeConfig.entryPrefetchChunkSize,
-        prefetchConcurrency: runtimeConfig.predictorWarmupPrefetchConcurrency,
-      },
-      apiTokenEnabled: Boolean(String(process.env.API_TOKEN || '').trim()),
-      fallbackOccurred: Boolean(universeDiagnostics?.fallbackOccurred),
-      fallbackReason: universeDiagnostics?.fallbackReason || null,
+    emitStartupTruthSummary(console.log, {
+      authStatus,
+      baseStatus,
+      universeDiagnostics,
+      warmup,
+      runtimeConfig,
+      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
+      env: process.env,
     });
     startupTruthLogged = true;
   }

@@ -7,16 +7,33 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node startup.test.js && node auth.test.js && node quoteUtils.test.js && node symbolUtils.test.js && node trade.test.js && node predictorWarmup.test.js && node modules/orderExecution.test.js && node modules/orderbookMetrics.test.js && node modules/entryMarketDataEval.test.js && node modules/entryMarketDataContext.test.js && node modules/marketDataCache.test.js && node modules/entryUniversePolicy.test.js && node modules/tradeGuards.test.js && node modules/quotes.test.js && node config/runtimeConfig.test.js && node config/validateEnv.test.js && node config/liveDefaults.test.js && node modules/storagePaths.test.js && node trade.telemetryExit.test.js",
+    "test": "npm run test:core && npm run test:modules && npm run test:config && npm run test:telemetry",
     "smoke": "node smoke.test.js",
     "check:runtime-env": "node scripts/check_runtime_env.js",
     "preflight": "node scripts/check_runtime_env.js && node smoke.test.js",
-    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js"
+    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "postinstall": "node ../scripts/install-git-hooks.js",
+    "test:setup": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js -e \"process.exit(0)\"",
+    "test:core": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js startup.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js auth.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js quoteUtils.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js symbolUtils.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js trade.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js predictorWarmup.test.js",
+    "test:modules": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/orderExecution.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/orderbookMetrics.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/entryMarketDataEval.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/entryMarketDataContext.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/marketDataCache.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/entryUniversePolicy.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/tradeGuards.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/quotes.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/storagePaths.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/entryScanHeartbeat.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/startupTruthSummary.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js modules/entryTelemetryShape.test.js",
+    "test:config": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js config/runtimeConfig.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js config/validateEnv.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js config/liveDefaults.test.js",
+    "test:telemetry": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js trade.telemetryExit.test.js",
+    "check:complexity": "node scripts/check_complexity_budget.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
     "cors": "^2.8.5",
     "dotenv": "^16.0.3",
     "express": "^4.22.1"
+  },
+  "devDependencies": {
+    "eslint": "^9.14.0",
+    "@eslint/js": "^9.14.0",
+    "globals": "^15.12.0",
+    "prettier": "^3.3.3"
   }
 }

@@ -1,6 +1,7 @@
 const path = require('path');
 const recorder = require('../modules/recorder');
 const { normalizePair } = require('../symbolUtils');
+const { resolveDefaultTradeBase, normalizeDataBase } = require('../modules/orderExecution');
 const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 
@@ -89,54 +90,20 @@ const isRenderEnvironment = () =>
       process.env.RENDER_GIT_COMMIT
   );
 
-const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
-const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
-
-function normalizeTradeBase(baseUrl) {
-  if (!baseUrl) return 'https://api.alpaca.markets';
-  const trimmed = baseUrl.replace(/\/+$/, '');
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.hostname.includes('data.alpaca.markets')) {
-      console.warn('trade_base_invalid_host', { host: parsed.hostname });
-      return 'https://api.alpaca.markets';
-    }
-  } catch (err) {
-    console.warn('trade_base_parse_failed', { baseUrl: trimmed });
-  }
-  return trimmed.replace(/\/v2$/, '');
-}
-
-function normalizeDataBase(baseUrl) {
-  if (!baseUrl) return 'https://data.alpaca.markets';
-  let trimmed = baseUrl.replace(/\/+$/, '');
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.hostname.includes('api.alpaca.markets') || parsed.hostname.includes('paper-api.alpaca.markets')) {
-      console.warn('data_base_invalid_host', { host: parsed.hostname });
-      return 'https://data.alpaca.markets';
-    }
-  } catch (err) {
-    console.warn('data_base_parse_failed', { baseUrl: trimmed });
-  }
-  trimmed = trimmed.replace(/\/v1beta2$/, '');
-  trimmed = trimmed.replace(/\/v1beta3$/, '');
-  trimmed = trimmed.replace(/\/v2\/stocks$/, '');
-  trimmed = trimmed.replace(/\/v2$/, '');
-  return trimmed;
-}
-
 const validateEnv = () => {
-  const tradeBase = RAW_TRADE_BASE;
-  const dataBase = RAW_DATA_BASE;
+  const rawTradeBase = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || '';
+  const rawDataBase = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
+  const tradeBaseResolution = resolveDefaultTradeBase({ env: process.env, rawTradeBase });
+  const tradeBase = tradeBaseResolution.tradeBase;
+  const dataBase = rawDataBase;
   const rawTradeBaseSource = process.env.TRADE_BASE
     ? 'TRADE_BASE'
     : process.env.ALPACA_API_BASE
       ? 'ALPACA_API_BASE'
       : 'missing';
   const rawDataBaseSource = process.env.DATA_BASE ? 'DATA_BASE' : 'default';
-  const effectiveTradeBase = normalizeTradeBase(RAW_TRADE_BASE);
-  const effectiveDataBase = normalizeDataBase(RAW_DATA_BASE);
+  const effectiveTradeBase = tradeBase;
+  const effectiveDataBase = normalizeDataBase(rawDataBase);
   const apiToken = String(process.env.API_TOKEN || '').trim();
   const alpacaKeyRaw =
     process.env.APCA_API_KEY_ID ||
@@ -189,6 +156,9 @@ const validateEnv = () => {
     console.warn('config_warning', {
       field: 'TRADE_BASE',
       message: 'TRADE_BASE not set; falling back to ALPACA_API_BASE or default.',
+      resolvedTradeBase: tradeBase,
+      resolutionSource: tradeBaseResolution.source,
+      credentialTier: tradeBaseResolution.credentialTier,
     });
   }
 

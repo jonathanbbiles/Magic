@@ -1,9 +1,6 @@
 const assert = require('assert/strict');
 
 const quotesModulePath = require.resolve('./quotes');
-const httpClient = require('../httpClient');
-
-const originalHttpJson = httpClient.httpJson;
 
 async function withEnv(overrides, fn) {
   const previous = { ...process.env };
@@ -25,96 +22,40 @@ async function run() {
     tsMs: Date.now(),
     receivedAtMs: Date.now() - 25,
   }));
-  const primary = await withEnv({ SECONDARY_QUOTE_ENABLED: 'false' }, () => quotes.getBestQuote('BTC/USD'));
-  assert.equal(primary.source, 'primary');
-  assert.equal(Number.isFinite(primary.receivedAtMs), true);
 
-  delete require.cache[quotesModulePath];
-  httpClient.httpJson = async () => ({
-    data: {
-      RAW: {
-        BTC: {
-          USD: {
-            BID: 90,
-            ASK: 91,
-            LASTUPDATE: Math.floor((Date.now() - 1000) / 1000),
-          },
-        },
-      },
-    },
-  });
-  const quotesPrimaryPreferred = require('./quotes');
-  quotesPrimaryPreferred.setPrimaryQuoteFetcher(async () => ({
-    bid: 10,
-    ask: 11,
-    tsMs: Date.now() - 900,
-    receivedAtMs: Date.now() - 50,
-  }));
-  const preferPrimary = await withEnv({
-    SECONDARY_QUOTE_ENABLED: 'true',
-    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
-    QUOTE_RETRY: '0',
-  }, () => quotesPrimaryPreferred.getBestQuote('BTC/USD', { maxAgeMs: 30000 }));
-  assert.equal(preferPrimary.source, 'primary');
+  const best = await quotes.getBestQuote('BTC/USD', { maxAgeMs: 30000 });
+  assert.equal(best.source, 'primary');
+  assert.equal(Number.isFinite(best.receivedAtMs), true);
 
-  delete require.cache[quotesModulePath];
-  httpClient.httpJson = async () => ({
-    data: {
-      RAW: {
-        ETH: {
-          USD: {
-            BID: 100,
-            ASK: 101,
-            LASTUPDATE: Math.floor(Date.now() / 1000),
-          },
-        },
-      },
-    },
-  });
-  const quotesWithSecondary = require('./quotes');
-  quotesWithSecondary.setPrimaryQuoteFetcher(async () => null);
-  const secondary = await withEnv({
-    SECONDARY_QUOTE_ENABLED: 'true',
-    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
-    QUOTE_RETRY: '0',
-  }, () => quotesWithSecondary.getBestQuote('ETH/USD'));
-  assert.equal(secondary.source, 'cryptocompare');
-  assert.equal(Number.isFinite(secondary.receivedAtMs), true);
-
-  delete require.cache[quotesModulePath];
-  httpClient.httpJson = async () => ({
-    data: {
-      RAW: {
-        ETH: {
-          USD: {
-            BID: 100,
-            ASK: 101,
-            LASTUPDATE: Math.floor(Date.now() / 1000),
-          },
-        },
-      },
-    },
-  });
-  const quotesSecondaryPreferred = require('./quotes');
-  quotesSecondaryPreferred.setPrimaryQuoteFetcher(async () => ({
+  quotes.setPrimaryQuoteFetcher(async () => ({
     bid: 10,
     ask: 11,
     tsMs: Date.now() - 45000,
     receivedAtMs: Date.now() - 50,
   }));
-  const preferSecondary = await withEnv({
-    SECONDARY_QUOTE_ENABLED: 'true',
-    SECONDARY_QUOTE_PROVIDER: 'cryptocompare',
-    QUOTE_RETRY: '0',
-  }, () => quotesSecondaryPreferred.getBestQuote('ETH/USD', { maxAgeMs: 30000 }));
-  assert.equal(preferSecondary.source, 'cryptocompare');
+  const stale = await withEnv({ MAX_QUOTE_AGE_MS: '30000' }, () => quotes.getBestQuote('ETH/USD'));
+  assert.equal(stale.source, 'primary_stale');
+
+  quotes.setPrimaryQuoteFetcher(async () => null);
+  const unavailable = await quotes.getBestQuote('SOL/USD');
+  assert.equal(unavailable, null);
+
+  const secondaryConfig = quotes.getSecondaryQuoteConfig();
+  assert.equal(secondaryConfig.enabled, false);
+  assert.equal(secondaryConfig.provider, null);
+
+  const secondaryDetailed = await quotes.getSecondaryQuoteDetailed('ETH/USD');
+  assert.equal(secondaryDetailed.ok, false);
+  assert.equal(secondaryDetailed.category, 'disabled');
+
+  const secondaryQuote = await quotes.getSecondaryQuote('ETH/USD');
+  assert.equal(secondaryQuote, null);
 
   console.log('quotes module tests passed');
 }
 
 run()
   .finally(() => {
-    httpClient.httpJson = originalHttpJson;
     delete require.cache[quotesModulePath];
   })
   .catch((err) => {

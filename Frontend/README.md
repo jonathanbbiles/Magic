@@ -6,19 +6,19 @@ This frontend is a minimal Expo diagnostic app used to verify backend reachabili
 
 The app polls `GET /dashboard` and renders account + position diagnostics.
 
-## Environment variables
+## Environment/config
 
-Set these Expo public env vars before running:
+This app supports backend config from either Expo public env vars or Expo app config extras:
 
-- `EXPO_PUBLIC_BACKEND_URL` (optional override; default is `https://magic-lw8t.onrender.com`)
-- `EXPO_PUBLIC_API_TOKEN` (optional, but needed when backend secret `API_TOKEN` is set)
+- Env vars: `EXPO_PUBLIC_BACKEND_URL`, `EXPO_PUBLIC_API_TOKEN`
+- App config (`app.json`): `expo.extra.backendUrl`, `expo.extra.apiToken`
 
-Examples:
+Resolution order is explicit and consistent:
 
-```bash
-export EXPO_PUBLIC_BACKEND_URL="https://magic-lw8t.onrender.com"
-export EXPO_PUBLIC_API_TOKEN="your_api_token"
-```
+1. Env var first (`EXPO_PUBLIC_BACKEND_URL` / `EXPO_PUBLIC_API_TOKEN`)
+2. `app.json` extra second (`expo.extra.backendUrl` / `expo.extra.apiToken`)
+
+`EXPO_PUBLIC_BACKEND_URL` is still required logically: the app shows the existing blocker and does not poll until a backend URL is found from either source.
 
 ## Run the frontend
 
@@ -47,7 +47,7 @@ Backend/Frontend auth key mapping:
 
 ## Networking notes
 
-The app defaults to the deployed backend URL (`https://magic-lw8t.onrender.com`) and only uses an Expo override when explicitly provided.
+The app does not hardcode the backend URL in source. Provide it via env vars or `expo.extra` in `app.json`.
 
 ## Scope clarification
 

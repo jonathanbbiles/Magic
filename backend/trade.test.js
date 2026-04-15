@@ -128,6 +128,48 @@ assert.equal(typeof tradeLifecycle.getPredictorWarmupSnapshot, 'function');
 const lifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
 assert.equal(typeof lifecycleSnapshot, 'object');
 assert.equal(typeof lifecycleSnapshot.authoritativeCount, 'number');
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+  trackedExitState: {
+    qty: 10,
+    entryPrice: 1.25,
+    desiredNetExitBps: 45,
+    sellOrderId: 'sell-123',
+    reconciliationState: 'open_sell_found',
+  },
+});
+const adoptableLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(adoptableLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'managing');
+assert.equal(adoptableLifecycleSnapshot.bySymbol['SKY/USD']?.diagnosticsState, undefined);
+
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+  trackedExitState: {
+    qty: 10,
+    entryPrice: 1.25,
+    requiredExitBps: 55,
+  },
+});
+const reconstructibleLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(reconstructibleLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'managing');
+assert.equal(reconstructibleLifecycleSnapshot.bySymbol['SKY/USD']?.diagnosticsState, undefined);
+
+tradeLifecycle.__clearLifecycleStateForTests();
+tradeLifecycle.__setLifecycleStateForTests({
+  symbol: 'SKY/USD',
+  intentState: { state: 'managing' },
+});
+const missingLifecycleSnapshot = tradeLifecycle.getLifecycleSnapshot();
+assert.equal(missingLifecycleSnapshot.bySymbol['SKY/USD']?.state, 'exit_missing');
+assert.equal(
+  missingLifecycleSnapshot.bySymbol['SKY/USD']?.lifecycleInvariantViolation,
+  'lifecycle_managing_without_exit_state',
+);
+tradeLifecycle.__clearLifecycleStateForTests();
 const governorSnapshot = tradeLifecycle.getSessionGovernorSummary();
 assert.equal(typeof governorSnapshot.coolDownActive, 'boolean');
 const universeSnapshot = tradeLifecycle.getUniverseDiagnosticsSnapshot();
@@ -244,11 +286,17 @@ const {
   shouldMarkProviderQuoteStaleAfterRefresh,
   computeProviderQuoteAgeMs,
   computeEffectivePerScanBudget,
+  computeAdaptiveOrderbookThresholds,
+  shouldAllowDynamicTier3,
   evaluatePrimaryQuoteViability,
   classifyQuoteFetchFailureReason,
   __testNoteStaleQuoteSkip,
   __testGetStaleQuoteCooldownState,
   __testClearStaleQuoteSkipState,
+  __testSetEntryScanRunningForTests,
+  __testSetEntryScanRerunRequestedForTests,
+  __testGetEntryScanRerunRequestedForTests,
+  __testExtractStaleQuoteMeta,
 } = tradeEntryBasis;
 
 assert.equal(
@@ -275,6 +323,46 @@ const stalePrimaryViability = evaluatePrimaryQuoteViability({
 });
 assert.equal(stalePrimaryViability.ok, false);
 assert.equal(stalePrimaryViability.reason, 'stale_quote_primary');
+const adaptiveThresholdsSmall = computeAdaptiveOrderbookThresholds({
+  symbol: 'UNI/USD',
+  portfolioValue: 107.51,
+  buyingPower: 50,
+  quoteMid: 10,
+});
+assert.ok(Math.abs(adaptiveThresholdsSmall.minDepthUsd - 64.506) < 1e-9);
+assert.ok(Math.abs(adaptiveThresholdsSmall.impactNotionalUsd - 10.751) < 1e-9);
+
+const adaptiveThresholdsFloor = computeAdaptiveOrderbookThresholds({
+  symbol: 'UNI/USD',
+  portfolioValue: 20,
+  buyingPower: 20,
+  quoteMid: 10,
+});
+assert.equal(adaptiveThresholdsFloor.minDepthUsd, 25);
+assert.equal(adaptiveThresholdsFloor.impactNotionalUsd, 10);
+
+const adaptiveThresholdsCeil = computeAdaptiveOrderbookThresholds({
+  symbol: 'BTC/USD',
+  portfolioValue: 4000,
+  buyingPower: 5000,
+  quoteMid: 50000,
+});
+assert.equal(adaptiveThresholdsCeil.minDepthUsd, 175);
+assert.equal(adaptiveThresholdsCeil.impactNotionalUsd, 400);
+
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, executionTier3Default: true }), false);
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 600, minPortfolioUsd: 500, executionTier3Default: true }), true);
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, allowOverride: true, executionTier3Default: true }), true);
+
+__testSetEntryScanRunningForTests(false);
+__testSetEntryScanRerunRequestedForTests(false);
+assert.equal(__testGetEntryScanRerunRequestedForTests(), false);
+__testSetEntryScanRunningForTests(true);
+tradeEntryBasis.runEntryScanOnce();
+tradeEntryBasis.runEntryScanOnce();
+assert.equal(__testGetEntryScanRerunRequestedForTests(), true);
+__testSetEntryScanRunningForTests(false);
+__testSetEntryScanRerunRequestedForTests(false);
 
 const freshPrimaryViability = evaluatePrimaryQuoteViability({
   quote: { tsMs: Date.now() - 5000 },
@@ -285,16 +373,56 @@ assert.equal(freshPrimaryViability.ok, true);
 assert.equal(classifyQuoteFetchFailureReason(new Error('Quote stale for BTC/USD')), 'stale_quote_primary');
 assert.equal(classifyQuoteFetchFailureReason(new Error('Quote not available for BTC/USD')), 'marketdata_unavailable');
 assert.equal(classifyQuoteFetchFailureReason(new Error('socket timeout')), 'marketdata_unavailable');
+assert.equal(
+  classifyQuoteFetchFailureReason({ message: 'quote not available', staleReasonCode: 'stale_quote_primary' }),
+  'stale_quote_primary',
+);
 
 __testClearStaleQuoteSkipState('XRP/USD');
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
 const cooldown1 = __testGetStaleQuoteCooldownState('XRP/USD');
-assert.equal(cooldown1.active, true);
+assert.equal(cooldown1.active, false);
 const remaining1 = cooldown1.remainingMs;
 __testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
 const cooldown2 = __testGetStaleQuoteCooldownState('XRP/USD');
-assert.equal(cooldown2.active, true);
-assert.ok(cooldown2.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
+assert.equal(cooldown2.active, false);
+assert.equal(cooldown2.remainingMs, remaining1);
+__testNoteStaleQuoteSkip('XRP/USD', { reason: 'stale_quote_primary', quoteAgeMs: 90000 });
+const cooldown3 = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(cooldown3.active, true);
+assert.ok(cooldown3.remainingMs >= remaining1, 'stale cooldown should scale up on repeat failures');
+assert.equal(cooldown3.quoteAgeMs, 90000);
+
+__testClearStaleQuoteSkipState('XRP/USD');
+const recoveredCooldown = __testGetStaleQuoteCooldownState('XRP/USD');
+assert.equal(recoveredCooldown.active, false);
+assert.equal(recoveredCooldown.attempts, 0);
+
+const recoveredStaleMeta = __testExtractStaleQuoteMeta({
+  error: {
+    staleReasonCode: 'stale_quote_primary',
+    quoteAgeMs: 123456,
+    quoteSource: 'alpaca',
+    quoteTsMs: 1700000000000,
+    quoteReceivedAtMs: 1700000123456,
+  },
+  maxAgeMs: 1000,
+});
+assert.equal(recoveredStaleMeta.quoteAgeMs, 123456);
+assert.equal(recoveredStaleMeta.quoteSource, 'alpaca');
+assert.equal(recoveredStaleMeta.staleReasonCode, 'stale_quote_primary');
+assert.equal(typeof recoveredStaleMeta.hopelesslyStale, 'boolean');
+
+__testClearStaleQuoteSkipState('ADA/USD');
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+let hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
+assert.equal(hopelessCooldown.active, false);
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+__testNoteStaleQuoteSkip('ADA/USD', { reason: 'stale_quote_hopeless', quoteAgeMs: 160000 });
+hopelessCooldown = __testGetStaleQuoteCooldownState('ADA/USD');
+assert.equal(hopelessCooldown.active, true);
+assert.equal(hopelessCooldown.reason, 'stale_quote_primary');
+assert.equal(hopelessCooldown.quoteAgeMs, 160000);
 
 const resolvedEntry = resolveEntryBasis({ avgEntryPrice: '100', fallbackEntryPrice: 95 });
 assert.equal(resolvedEntry.entryBasisType, 'alpaca_avg_entry');
@@ -308,6 +436,8 @@ assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetConfigured: ORDERBOOK_
 assert.ok(tradeSourceEarly.includes('confirmAttemptsBudgetEffective: sparseConfirmBudgetEffective'));
 assert.ok(tradeSourceEarly.includes('providerAgeMs: sparseRetryDetails.providerAgeMs'));
 assert.ok(tradeSourceEarly.includes('entryQuoteFreshness: getQuoteFreshnessPolicy()'));
+assert.ok(tradeSourceEarly.includes("stale_quote_primary: { threshold: 3, cooldownMs: STALE_QUOTE_SCAN_COOLDOWN_STEP_MS }"));
+assert.ok(tradeSourceEarly.includes('clearStaleQuoteSkipState(asset.symbol);'));
 assert.ok(!tradeSourceEarly.includes("const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000);"));
 assert.ok(!tradeSourceEarly.includes("const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = readNumber('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);"));
 assert.ok(tradeSourceEarly.includes("console.log('engine_transition'"));
@@ -316,25 +446,67 @@ assert.ok(tradeSourceEarly.includes('if (activeScanProgress || activeScanWithout
 assert.ok(tradeSourceEarly.includes("console.log('entry_scan_progress'"));
 assert.ok(tradeSourceEarly.includes('currentScanLastProgressAt'));
 assert.ok(tradeSourceEarly.includes("state: 'prefetching_market_data'"));
+assert.ok(tradeSourceEarly.includes('hydrateEntryEligibilityMarketData(filteredSymbols)'));
+assert.ok(tradeSourceEarly.includes("reason: 'universe_empty'"));
+assert.ok(tradeSourceEarly.includes("setEngineState('ready', { reason: 'universe_empty' })"));
+assert.ok(tradeSourceEarly.includes('stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - filteredSymbols.length)'));
+assert.ok(!tradeSourceEarly.includes('stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - scanSymbols.length)'));
 assert.ok(tradeSourceEarly.includes('includeOrderbook: false'));
 assert.ok(tradeSourceEarly.includes("fetchQuote: getLatestQuoteFromQuotesOnly"));
 assert.ok(tradeSourceEarly.includes("console.log('exit_order_confidence_low'"));
 assert.ok(tradeSourceEarly.includes("reconciliationConfidence: 'snapshot_confirmed'"));
+assert.ok(tradeSourceEarly.includes("state.reconciliationState = 'open_sell_pending_visibility'"));
+assert.ok(tradeSourceEarly.includes("trackedState.lastReconciliationAction = finalSellability.openSellCount > 0"));
 assert.ok(tradeSourceEarly.includes('orderListOnlyConsecutiveCount'));
 assert.ok(tradeSourceEarly.includes("console.log('position_outside_scan_universe'"));
 assert.ok(tradeSourceEarly.includes('POSITION_UNIVERSE_MISMATCH_CHECK_INTERVAL_MS'));
 assert.ok(tradeSourceEarly.includes("why: 'marketdata_unavailable'"));
 assert.ok(tradeSourceEarly.includes("reason: 'stale_quote_primary'"));
+assert.ok(!tradeSourceEarly.includes('secondaryFailureCategory'));
+assert.ok(!tradeSourceEarly.includes('getSecondaryQuoteDetailed(symbol, { maxAgeMs: effectiveMaxAgeMs })'));
+assert.ok(tradeSourceEarly.includes('getLatestQuoteFromQuotesOnly(symbol, {'));
+assert.ok(tradeSourceEarly.includes('async function getEntryScanQuoteWithPrimaryRetry'));
+assert.ok(tradeSourceEarly.includes("console.log('entry_scan_primary_quote_retried'"));
+assert.ok(tradeSourceEarly.includes("console.log('entry_scan_stale_quote_recovered'"));
+assert.ok(tradeSourceEarly.includes("recoveryPath: 'scan_marketdata_cache'"));
+assert.ok(tradeSourceEarly.includes("recoveryPath: 'trade_fallback'"));
+assert.ok(tradeSourceEarly.includes('const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });'));
+assert.ok(tradeSourceEarly.includes('if (!staleMeta.hopelesslyStale) {'));
+assert.ok(tradeSourceEarly.includes('staleRefreshAttempted: !staleMeta.hopelesslyStale'));
+assert.ok(tradeSourceEarly.includes('skippedSparseRetry: staleMeta.hopelesslyStale'));
 assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_trade_and_sparse'"));
 assert.ok(tradeSourceEarly.includes('skippedOrderbookFetch: true'));
-assert.ok(tradeSourceEarly.includes('skippedTradeFetch: true'));
+assert.ok(tradeSourceEarly.includes('skippedTradeFetch: false'));
 assert.ok(tradeSourceEarly.includes('skippedSparseRetry: true'));
+assert.ok(tradeSourceEarly.includes('const configuredUniverseCap = Number.isFinite(ENTRY_UNIVERSE_MAX_SYMBOLS) ? ENTRY_UNIVERSE_MAX_SYMBOLS : null;'));
+assert.ok(tradeSourceEarly.includes('const scanSymbols = Number.isFinite(effectiveUniverseCap)'));
+assert.ok(tradeSourceEarly.includes('scanSymbolsSample: scanSymbols.slice(0, 10),'));
+assert.ok(tradeSourceEarly.includes("skipped: 'prefetch_inflight'"));
+assert.ok(!tradeSourceEarly.includes('nonBlockingIfInFlight: true'));
+assert.ok(tradeSourceEarly.includes("console.log('entry_scan_bars_prefetch_reused'"));
+assert.ok(tradeSourceEarly.includes('barsPrefetchState'));
+assert.ok(tradeSourceEarly.includes('quotePrefetchState'));
+assert.ok(tradeSourceEarly.includes('orderbookPrefetchState'));
+assert.ok(tradeSourceEarly.includes('barsReused: canReuseBars && !shouldPrefetchBarsWithCooldown'));
+assert.ok(tradeSourceEarly.includes('const shouldPrefetchQuotes = ENTRY_PREFETCH_QUOTES && !quoteCooldownActive;'));
+assert.ok(tradeSourceEarly.includes('const shouldPrefetchOrderbooks = ENTRY_PREFETCH_ORDERBOOKS && !orderbookCooldownActive;'));
+assert.ok(!tradeSourceEarly.includes("console.log('entry_scan_prefetch_reused'"));
+assert.ok(tradeSourceEarly.includes('quoteSnapshot?.ok && quoteSnapshot?.usable'));
+assert.ok(tradeSourceEarly.includes('orderbookSnapshot?.ok && orderbookSnapshot?.usable'));
 assert.ok(tradeSourceEarly.includes("'predictor_gate'"));
 assert.ok(tradeSourceEarly.includes("'entry_regime_gate'"));
 assert.ok(tradeSourceEarly.includes("'net_edge_gate'"));
+assert.ok(tradeSourceEarly.includes('cappedOrderNotionalUsd: adaptiveLiquidityThresholds.impactNotionalUsd'));
+assert.ok(tradeSourceEarly.includes('requiredDepthUsd: adaptiveLiquidityThresholds.minDepthUsd'));
+assert.ok(tradeSourceEarly.includes('evaluateEconomicEntryPrefilter'));
 assert.ok(tradeSourceEarly.includes('staleQuoteCooldownCount'));
+assert.ok(tradeSourceEarly.includes('symbolHealthCooldownCount'));
+assert.ok(tradeSourceEarly.includes('symbolHealthCooldownSample'));
 assert.ok(tradeSourceEarly.includes('stalePrimaryQuoteCount'));
 assert.ok(tradeSourceEarly.includes('dataUnavailableCount'));
+assert.ok(tradeSourceEarly.includes('secondaryQuoteEnabled: false'));
+assert.ok(tradeSourceEarly.includes('secondaryQuoteRouterEnabled: false'));
+assert.ok(tradeSourceEarly.includes('secondaryQuoteRouterProvider: null'));
 assert.ok(tradeSourceEarly.includes('marketRejectionCount'));
 assert.ok(tradeSourceEarly.includes('lastSuccessfulAction'));
 assert.ok(tradeSourceEarly.includes('lastExecutionFailure'));
@@ -1012,9 +1184,9 @@ assert.match(
   /const sellClientOrderId = sellOrder\?\.client_order_id \|\| sellOrder\?\.clientOrderId \|\| null;[\s\S]*sellClientOrderId,/,
 );
 assert.match(tradeSource, /const clamp01 = \(x\) => clamp\(Number\(x\), 0, 1\);/);
-assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 15\);/);
+assert.match(tradeSource, /const REGIME_MIN_VOL_BPS = readNumber\('REGIME_MIN_VOL_BPS', 10\);/);
 assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER1 = readNumber\('REGIME_MIN_VOL_BPS_TIER1', 4\);/);
-assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 8\);/);
+assert.match(tradeSource, /const REGIME_MIN_VOL_BPS_TIER2 = readNumber\('REGIME_MIN_VOL_BPS_TIER2', 6\);/);
 assert.match(tradeSource, /const PREDICTOR_WARMUP_BLOCK_TRADES = readEnvFlag\('PREDICTOR_WARMUP_BLOCK_TRADES', true\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_1M = readNumber\('PREDICTOR_MIN_BARS_1M', 30\);/);
 assert.match(tradeSource, /const PREDICTOR_MIN_BARS_5M = readNumber\('PREDICTOR_MIN_BARS_5M', 30\);/);
@@ -1031,6 +1203,10 @@ assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER1 = readNu
 assert.match(tradeSource, /const VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2 = readNumber\('VOL_COMPRESSION_MIN_LONG_VOL_BPS_TIER2', 4\);/);
 assert.match(tradeSource, /const MIN_NET_EDGE_BPS = readNumber\('MIN_NET_EDGE_BPS', 5\);/);
 assert.match(tradeSource, /const ENTRY_PROFIT_BUFFER_BPS = readNumber\('ENTRY_PROFIT_BUFFER_BPS', 5\);/);
+assert.match(tradeSource, /const FEE_BPS_ROUND_TRIP = readNumber\('FEE_BPS_ROUND_TRIP', 20\);/);
+assert.match(tradeSource, /const ENTRY_SLIPPAGE_BUFFER_BPS = readNumber\('ENTRY_SLIPPAGE_BUFFER_BPS', 10\);/);
+assert.match(tradeSource, /const TARGET_PROFIT_BPS = readNumber\('TARGET_PROFIT_BPS', 140\);/);
+assert.match(tradeSource, /const MAX_SPREAD_BPS_TO_TRADE = readNumber\('MAX_SPREAD_BPS_TO_TRADE', 25\);/);
 assert.match(tradeSource, /const MAX_CONCURRENT_POSITIONS = readNumber\('MAX_CONCURRENT_POSITIONS', 68\);/);
 assert.match(tradeSource, /const MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT = 0\.10;/);
 assert.match(tradeSource, /const TRADE_PORTFOLIO_PCT = Math\.max\(0, Math\.min\(MAX_PORTFOLIO_ALLOCATION_PER_TRADE_PCT, TRADE_PORTFOLIO_PCT_RAW\)\);/);
@@ -1092,8 +1268,8 @@ withEnv({
 }, () => {
   delete require.cache[marketDataConfigPath];
   const cfg = require('./config/marketData');
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.35);
-  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.40);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER1, 0.50);
+  assert.equal(cfg.MIN_PROB_TO_ENTER_TIER2, 0.52);
 });
 
 withEnv({
