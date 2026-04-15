@@ -548,6 +548,7 @@ function AppInner() {
     ?? runtime?.dynamicTradableSymbolsFound
     ?? truth?.dynamicTradableSymbolsFound,
   );
+  const entryScanBlockedBy = String(meta?.universe?.entryScanBlockedBy || '').toLowerCase();
   const isWarmingUp = String(engineState || '').toLowerCase() === 'warming_up';
   const hasRealUniverseCount = Number.isFinite(acceptedSymbolsCount) && acceptedSymbolsCount > 0;
   const hasScanCount = Number.isFinite(scanSymbolsCount) && scanSymbolsCount >= 0;
@@ -555,6 +556,8 @@ function AppInner() {
     && (acceptedSymbolsCount == null || acceptedSymbolsCount === 0);
   const universeSummary = hasRealUniverseCount && hasScanCount
     ? `Scanning ${scanSymbolsCount} of ${acceptedSymbolsCount}`
+    : entryScanBlockedBy === 'universe_empty'
+      ? 'Universe empty after backend filters'
     : isWarmingUp && hasPlaceholderUniverseCounts
       ? (Number.isFinite(dynamicTradableSymbolsFound) && dynamicTradableSymbolsFound > 0
         ? `Initializing… ${dynamicTradableSymbolsFound} tradable found`

@@ -184,11 +184,21 @@ function rankDynamicUniverseByExecutionQuality(
   const capped = Number.isFinite(maxSymbols)
     ? eligibilityFiltered.slice(0, Math.max(0, Math.floor(maxSymbols)))
     : eligibilityFiltered;
+  const droppedDiagnostics = scored.filter((row) => !eligibilityFiltered.some((kept) => kept.symbol === row.symbol));
+  const eligibilityCounts = {
+    totalCount: normalizedSymbols.length,
+    freshQuoteCount: scored.filter((row) => row.hasFreshQuote).length,
+    healthySpreadCount: scored.filter((row) => Number.isFinite(row.spreadBps) && row.spreadBps > 0 && row.spreadBps <= 40).length,
+    recentOrderbookCount: scored.filter((row) => row.hasRecentOrderbook).length,
+    eligibleCount: eligibilityFiltered.length,
+  };
 
   return {
     symbols: capped.map((row) => row.symbol),
     diagnostics: capped,
     droppedCount: Math.max(0, normalizedSymbols.length - capped.length),
+    droppedDiagnostics,
+    eligibilityCounts,
   };
 }
 

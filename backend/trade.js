@@ -14462,6 +14462,102 @@ function buildBarsMapFromBatch(symbols, barsResp) {
   return barsBySymbol;
 }
 
+async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
+  const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  if (symbols.length === 0) {
+    return {
+      ok: true,
+      prefetchedQuotes: 0,
+      prefetchedOrderbooks: 0,
+      quoteHydrationState: ENTRY_PREFETCH_QUOTES ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      orderbookHydrationState: ENTRY_PREFETCH_ORDERBOOKS ? 'skipped_no_symbols' : 'skipped_env_disabled',
+      skippedEndpoints: [],
+      seededSymbols: 0,
+      totalSymbolsObserved: 0,
+    };
+  }
+
+  const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
+  const ratePressureActive = isUnderRatePressure();
+  const effectiveSeedCap = ratePressureActive ? Math.max(4, Math.floor(maxSeedSymbolsPerPass * 0.5)) : maxSeedSymbolsPerPass;
+  const seedSymbols = symbols.slice(0, Math.max(1, effectiveSeedCap));
+  const nowMs = Date.now();
+  const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
+  const quoteCooldownActive = !opts.force && ENTRY_PREFETCH_QUOTES && Boolean(cooldownSnapshot.quote);
+  const orderbookCooldownActive = !opts.force && ENTRY_PREFETCH_ORDERBOOKS && Boolean(cooldownSnapshot.orderbook);
+  const shouldPrefetchQuotes = ENTRY_PREFETCH_QUOTES && !quoteCooldownActive;
+  const shouldPrefetchOrderbooks = ENTRY_PREFETCH_ORDERBOOKS && !orderbookCooldownActive;
+  const cooldownBlockedEndpoints = [];
+  if (quoteCooldownActive) cooldownBlockedEndpoints.push('quote');
+  if (orderbookCooldownActive) cooldownBlockedEndpoints.push('orderbook');
+  if (cooldownBlockedEndpoints.length > 0) {
+    console.warn('entry_eligibility_hydration_partial_cooldown', {
+      reason: 'endpoint_cooldown',
+      blockedEndpoints: cooldownBlockedEndpoints,
+      cooldownSnapshot,
+      seedSymbols: seedSymbols.length,
+      totalSymbolsObserved: symbols.length,
+      ratePressureState: getRatePressureState(),
+    });
+  }
+
+  const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
+  const chunks = chunkArray(seedSymbols, chunkSize);
+  let prefetchedQuotes = 0;
+  let prefetchedOrderbooks = 0;
+  try {
+    for (const chunkSymbols of chunks) {
+      if (shouldPrefetchQuotes) {
+        const quotesResp = await fetchCryptoQuotes({ symbols: chunkSymbols });
+        warmQuoteCacheFromBatch(chunkSymbols, quotesResp);
+        const quoteSymbols = quotesResp?.quotes && typeof quotesResp.quotes === 'object'
+          ? Object.keys(quotesResp.quotes)
+          : [];
+        prefetchedQuotes += quoteSymbols.length;
+      }
+      if (shouldPrefetchOrderbooks) {
+        const orderbooksResp = await fetchCryptoOrderbooks({ symbols: chunkSymbols });
+        warmOrderbookCacheFromBatch(chunkSymbols, orderbooksResp);
+        const orderbookSymbols = orderbooksResp?.orderbooks && typeof orderbooksResp.orderbooks === 'object'
+          ? Object.keys(orderbooksResp.orderbooks)
+          : [];
+        prefetchedOrderbooks += orderbookSymbols.length;
+      }
+    }
+  } catch (err) {
+    console.warn('entry_eligibility_hydration_failed', {
+      errorName: err?.name || null,
+      errorMessage: err?.message || String(err),
+      ratePressureState: getRatePressureState(),
+    });
+    return { ok: false, error: err?.message || String(err) };
+  }
+
+  const completedAtMs = Date.now();
+  if (shouldPrefetchQuotes) {
+    lastQuotesPrefetchMs = completedAtMs;
+  }
+  if (shouldPrefetchOrderbooks) {
+    lastOrderbooksPrefetchMs = completedAtMs;
+  }
+
+  return {
+    ok: true,
+    prefetchedQuotes,
+    prefetchedOrderbooks,
+    quoteHydrationState: ENTRY_PREFETCH_QUOTES
+      ? (shouldPrefetchQuotes ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    orderbookHydrationState: ENTRY_PREFETCH_ORDERBOOKS
+      ? (shouldPrefetchOrderbooks ? 'enabled' : 'skipped_endpoint_cooldown')
+      : 'skipped_env_disabled',
+    skippedEndpoints: cooldownBlockedEndpoints,
+    seededSymbols: seedSymbols.length,
+    totalSymbolsObserved: symbols.length,
+    ratePressureState: getRatePressureState(),
+  };
+}
+
 async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   if (entryScanPrefetchInFlightPromise) {
     if (opts.nonBlockingIfInFlight) {
@@ -15009,6 +15105,11 @@ async function runEntryScanOnce() {
     const filteredSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
       excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
     });
+    let eligibilityHydration = null;
+    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && filteredSymbols.length > 0) {
+      eligibilityHydration = await hydrateEntryEligibilityMarketData(filteredSymbols);
+    }
+    const rankingNowMs = Date.now();
     const rankedDynamicUniverse = rankDynamicUniverseByExecutionQuality(filteredSymbols, {
       executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
       executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
@@ -15018,7 +15119,7 @@ async function runEntryScanOnce() {
       quoteBySymbol: Object.fromEntries(
         filteredSymbols.map((symbol) => {
           const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
-            nowMs: Date.now(),
+            nowMs: rankingNowMs,
             maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
           });
           return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
@@ -15027,14 +15128,14 @@ async function runEntryScanOnce() {
       orderbookBySymbol: Object.fromEntries(
         filteredSymbols.map((symbol) => {
           const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
-            nowMs: Date.now(),
+            nowMs: rankingNowMs,
             maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
           });
           return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
         }),
       ),
       quoteMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
-      nowMs: Date.now(),
+      nowMs: rankingNowMs,
     });
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
       ? rankedDynamicUniverse.symbols
@@ -15106,7 +15207,7 @@ async function runEntryScanOnce() {
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
       stableExclusionEnabled: ENTRY_UNIVERSE_EXCLUDE_STABLES,
-      stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - scanSymbols.length),
+      stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - filteredSymbols.length),
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
       barsMaxConcurrent: runtimeLiveConfig.barsMaxConcurrent,
@@ -15115,15 +15216,47 @@ async function runEntryScanOnce() {
       entryScanBlockedBy: null,
       universeZeroReason: null,
       fallbackReason,
+      rankingHydration: eligibilityHydration ? {
+        ok: Boolean(eligibilityHydration.ok),
+        prefetchedQuotes: Number(eligibilityHydration.prefetchedQuotes || 0),
+        prefetchedOrderbooks: Number(eligibilityHydration.prefetchedOrderbooks || 0),
+        quoteHydrationState: eligibilityHydration.quoteHydrationState || null,
+        orderbookHydrationState: eligibilityHydration.orderbookHydrationState || null,
+        skippedEndpoints: Array.isArray(eligibilityHydration.skippedEndpoints) ? eligibilityHydration.skippedEndpoints : [],
+        seededSymbols: Number(eligibilityHydration.seededSymbols || 0),
+        totalSymbolsObserved: Number(eligibilityHydration.totalSymbolsObserved || 0),
+      } : null,
+      rankingEligibilityCounts: rankedDynamicUniverse?.eligibilityCounts || null,
     };
     if (!scanSymbols.length) {
-      const universeZeroReason = lastUniverseDiagnostics.dynamicUniverseInitError
-        ? 'dynamic_universe_init_failed'
-        : fallbackReason || 'no_accepted_symbols_after_filters';
+      const rankingEligibleCounts = rankedDynamicUniverse?.eligibilityCounts || {};
+      const rankingDroppedSample = Array.isArray(rankedDynamicUniverse?.droppedDiagnostics)
+        ? rankedDynamicUniverse.droppedDiagnostics.slice(0, 5)
+        : [];
+      const rankingFilteredOut = filteredSymbols.length > 0
+        && rankedDynamicUniverse?.symbols?.length === 0
+        && ENTRY_UNIVERSE_MODE === 'dynamic'
+        && universeMode.startsWith('dynamic');
+      const universeZeroReason = rankingFilteredOut
+        ? (ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE ? 'no_symbols_with_fresh_marketdata' : 'dynamic_ranking_empty')
+        : (
+          lastUniverseDiagnostics.dynamicUniverseInitError
+            ? 'dynamic_universe_init_failed'
+            : fallbackReason || 'no_accepted_symbols_after_filters'
+        );
       lastUniverseDiagnostics = {
         ...lastUniverseDiagnostics,
         entryScanBlockedBy: 'universe_empty',
         universeZeroReason,
+        rankingEligibilityCounts: {
+          normalizedUniverseCount: normalizedUniverse.length,
+          tierFilteredUniverseCount: tierFilteredUniverse.length,
+          stableFilteredUniverseCount: filteredSymbols.length,
+          freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
+          healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
+          recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
+        },
+        rankingDroppedSample,
       };
       console.error('entry_universe_empty', {
         envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
@@ -15133,7 +15266,29 @@ async function runEntryScanOnce() {
         lastUniverseRefreshAt: lastUniverseDiagnostics.lastUniverseRefreshAt,
         fallbackReason,
         universeZeroReason,
+        normalizedUniverseCount: normalizedUniverse.length,
+        tierFilteredUniverseCount: tierFilteredUniverse.length,
+        stableFilteredUniverseCount: filteredSymbols.length,
+        freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
+        healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
+        recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
+        rankingDroppedSample,
       });
+      emitEntryScanNoopSummary({
+        startMs,
+        reason: 'universe_empty',
+        extra: {
+          universeSize: 0,
+          universeIsOverride,
+          universeMode,
+          dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+          stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
+          rankingEligibilityCounts: lastUniverseDiagnostics.rankingEligibilityCounts,
+        },
+      });
+      clearEntryScanProgress({ state: 'idle' });
+      setEngineState('ready', { reason: 'universe_empty' });
+      return;
     }
     console.log('entry_universe_selection', {
       envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
