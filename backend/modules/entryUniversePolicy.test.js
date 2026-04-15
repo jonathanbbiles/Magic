@@ -4,6 +4,7 @@ const {
   buildDynamicCryptoUniverseFromAssets,
   filterDynamicUniverseByExecutionPolicy,
   rankDynamicUniverseByExecutionQuality,
+  resolveDynamicUniverseRankingWithHydration,
 } = require('./entryUniversePolicy');
 
 const uniPrimaryOnly = buildEntryUniverse({
@@ -162,5 +163,72 @@ const hydratedRank = rankDynamicUniverseByExecutionQuality(
 );
 assert.equal(hydratedRank.symbols.length, 6);
 assert.equal(hydratedRank.eligibilityCounts.eligibleCount, 6);
+
+async function runHydrationRetryRegressionTests() {
+  const symbols = ['BTC/USD', 'ETH/USD'];
+  let pass = 0;
+  const quoteStore = {};
+  const orderbookStore = {};
+  const baseRankOptions = {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: true,
+    quoteMaxAgeMs: 15000,
+  };
+
+  const hydratedResolution = await resolveDynamicUniverseRankingWithHydration(symbols, {
+    rankOptions: baseRankOptions,
+    getMarketDataMaps: () => ({
+      nowMs: 1700000015000,
+      quoteBySymbol: quoteStore,
+      orderbookBySymbol: orderbookStore,
+    }),
+    hydrate: async () => {
+      pass += 1;
+      quoteStore['BTC/USD'] = { bid: 100, ask: 100.02, tsMs: 1700000014000 };
+      orderbookStore['BTC/USD'] = { ok: true, orderbook: { tsMs: 1700000014100 } };
+      return { ok: true, prefetchedQuotes: 1, prefetchedOrderbooks: 1 };
+    },
+  });
+  assert.equal(pass, 1);
+  assert.equal(hydratedResolution.initialRank.symbols.length, 0);
+  assert.deepEqual(hydratedResolution.finalRank.symbols, ['BTC/USD']);
+  assert.equal(hydratedResolution.hydrationRetry.attempted, true);
+  assert.equal(hydratedResolution.hydrationRetry.recovered, true);
+
+  const partialResolution = await resolveDynamicUniverseRankingWithHydration(symbols, {
+    rankOptions: baseRankOptions,
+    getMarketDataMaps: () => ({
+      nowMs: 1700000015000,
+      quoteBySymbol: {
+        'BTC/USD': { bid: 100, ask: 100.02, tsMs: 1700000014000 },
+      },
+      orderbookBySymbol: {
+        'BTC/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      },
+    }),
+    hydrate: async () => ({ ok: true, prefetchedQuotes: 0, prefetchedOrderbooks: 0 }),
+  });
+  assert.deepEqual(partialResolution.finalRank.symbols, ['BTC/USD']);
+  assert.equal(partialResolution.hydrationRetry.attempted, false);
+
+  const noDataResolution = await resolveDynamicUniverseRankingWithHydration(symbols, {
+    rankOptions: baseRankOptions,
+    getMarketDataMaps: () => ({
+      nowMs: 1700000015000,
+      quoteBySymbol: {},
+      orderbookBySymbol: {},
+    }),
+    hydrate: async () => ({ ok: true, prefetchedQuotes: 0, prefetchedOrderbooks: 0 }),
+  });
+  assert.equal(noDataResolution.hydrationRetry.attempted, true);
+  assert.equal(noDataResolution.hydrationRetry.recovered, false);
+  assert.deepEqual(noDataResolution.finalRank.symbols, []);
+}
+
+runHydrationRetryRegressionTests().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
 
 console.log('entry universe policy tests passed');

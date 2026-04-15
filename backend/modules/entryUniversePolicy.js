@@ -202,10 +202,64 @@ function rankDynamicUniverseByExecutionQuality(
   };
 }
 
+async function resolveDynamicUniverseRankingWithHydration(
+  symbols = [],
+  {
+    rankOptions = {},
+    getMarketDataMaps,
+    hydrate,
+  } = {},
+) {
+  const normalizedSymbols = uniqSymbols((Array.isArray(symbols) ? symbols : [])
+    .map((symbol) => normalizePair(symbol))
+    .filter(Boolean));
+  const readMaps = typeof getMarketDataMaps === 'function'
+    ? getMarketDataMaps
+    : (() => ({ quoteBySymbol: {}, orderbookBySymbol: {}, nowMs: Date.now() }));
+
+  const firstMaps = readMaps() || {};
+  const initialRank = rankDynamicUniverseByExecutionQuality(normalizedSymbols, {
+    ...rankOptions,
+    quoteBySymbol: firstMaps.quoteBySymbol || {},
+    orderbookBySymbol: firstMaps.orderbookBySymbol || {},
+    nowMs: Number.isFinite(firstMaps.nowMs) ? firstMaps.nowMs : Date.now(),
+  });
+  if (normalizedSymbols.length === 0 || initialRank.symbols.length > 0) {
+    return {
+      initialRank,
+      finalRank: initialRank,
+      hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
+    };
+  }
+
+  const retryResult = typeof hydrate === 'function'
+    ? await hydrate({ symbols: normalizedSymbols, reason: 'initial_rank_empty' })
+    : { ok: false, skipped: 'hydrate_not_available' };
+  const secondMaps = readMaps() || {};
+  const retryRank = rankDynamicUniverseByExecutionQuality(normalizedSymbols, {
+    ...rankOptions,
+    quoteBySymbol: secondMaps.quoteBySymbol || {},
+    orderbookBySymbol: secondMaps.orderbookBySymbol || {},
+    nowMs: Number.isFinite(secondMaps.nowMs) ? secondMaps.nowMs : Date.now(),
+  });
+
+  return {
+    initialRank,
+    finalRank: retryRank,
+    hydrationRetry: {
+      attempted: true,
+      triggeredBy: 'initial_rank_empty',
+      recovered: retryRank.symbols.length > 0,
+      result: retryResult || null,
+    },
+  };
+}
+
 module.exports = {
   parseSymbolList,
   buildEntryUniverse,
   buildDynamicCryptoUniverseFromAssets,
   filterDynamicUniverseByExecutionPolicy,
   rankDynamicUniverseByExecutionQuality,
+  resolveDynamicUniverseRankingWithHydration,
 };

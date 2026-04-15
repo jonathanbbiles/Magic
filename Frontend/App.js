@@ -549,7 +549,11 @@ function AppInner() {
     ?? truth?.dynamicTradableSymbolsFound,
   );
   const entryScanBlockedBy = String(meta?.universe?.entryScanBlockedBy || '').toLowerCase();
+  const universeZeroReason = String(meta?.universe?.universeZeroReason || '').toLowerCase();
   const isWarmingUp = String(engineState || '').toLowerCase() === 'warming_up';
+  const topSkipReasons = entryScan?.topSkipReasons || meta?.topSkipReasons || {};
+  const netEdgeGateSkips = toNum(topSkipReasons?.net_edge_gate) ?? 0;
+  const backendAuthIssue = typeof error === 'string' && /http\s+(401|403)/i.test(error);
   const hasRealUniverseCount = Number.isFinite(acceptedSymbolsCount) && acceptedSymbolsCount > 0;
   const hasScanCount = Number.isFinite(scanSymbolsCount) && scanSymbolsCount >= 0;
   const hasPlaceholderUniverseCounts = (scanSymbolsCount == null || scanSymbolsCount === 0)
@@ -563,6 +567,19 @@ function AppInner() {
         ? `Initializing… ${dynamicTradableSymbolsFound} tradable found`
         : 'Initializing…')
       : '—';
+  const entryStatusSummary = !backendOk
+    ? (backendAuthIssue ? 'Backend auth required (API token)' : 'Backend unreachable')
+    : isWarmingUp || warmupInProgress
+      ? 'Warming up models'
+      : entryScanBlockedBy === 'universe_empty'
+        ? (
+          universeZeroReason.includes('fresh_marketdata')
+            ? 'Waiting for fresh market data'
+            : 'Universe empty after hydration'
+        )
+      : netEdgeGateSkips > 0
+        ? 'Strategy skipped entry (net edge gate)'
+        : 'Scanning normally';
 
   // Full diagnostics + logs bundle for copy
   const copyFullBundle = useCallback(async () => {
@@ -664,6 +681,9 @@ function AppInner() {
             </View>
             <View style={s.statRow}>
               <Stat label="Universe" value={universeSummary} />
+            </View>
+            <View style={s.statRow}>
+              <Stat label="Entry status" value={entryStatusSummary} />
             </View>
           </View>
 
