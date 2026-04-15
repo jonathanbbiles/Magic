@@ -5,6 +5,7 @@ const {
   filterDynamicUniverseByExecutionPolicy,
   rankDynamicUniverseByExecutionQuality,
   resolveDynamicUniverseRankingWithHydration,
+  deriveDynamicUniverseEmptyReason,
 } = require('./entryUniversePolicy');
 
 const uniPrimaryOnly = buildEntryUniverse({
@@ -115,6 +116,27 @@ assert.equal(reuseHeadroomRank.diagnostics[0].quoteAgeMs <= 5000, true);
 assert.equal(reuseHeadroomRank.eligibilityCounts.totalCount, 2);
 assert.equal(reuseHeadroomRank.eligibilityCounts.freshQuoteCount, 1);
 assert.equal(reuseHeadroomRank.droppedDiagnostics.length, 1);
+
+const alignedFreshnessRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    requireFreshQuote: true,
+    quoteMaxAgeMs: 5000,
+    quoteEligibilityMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.05, tsMs: 1700000004000 }, // 11s old
+      'ETH/USD': { bid: 50, ask: 50.02, tsMs: 1700000013000 }, // 2s old
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000011000 } },
+    },
+  },
+);
+assert.deepEqual(alignedFreshnessRank.symbols, ['ETH/USD', 'BTC/USD']);
+assert.equal(alignedFreshnessRank.eligibilityCounts.freshQuoteCount, 2);
 
 const coldCacheRank = rankDynamicUniverseByExecutionQuality(
   ['BTC/USD', 'ETH/USD', 'LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
@@ -230,5 +252,29 @@ runHydrationRetryRegressionTests().catch((err) => {
   console.error(err);
   process.exitCode = 1;
 });
+
+assert.equal(deriveDynamicUniverseEmptyReason({
+  filteredSymbolCount: 2,
+  rankingFilteredOut: true,
+  requireFreshQuote: true,
+  hydrationRetryAttempted: true,
+  eligibilityCounts: {
+    freshQuoteCount: 2,
+    healthySpreadCount: 0,
+    eligibleCount: 0,
+  },
+}), 'fresh_quotes_but_no_healthy_spread');
+
+assert.equal(deriveDynamicUniverseEmptyReason({
+  filteredSymbolCount: 2,
+  rankingFilteredOut: true,
+  requireFreshQuote: true,
+  hydrationRetryAttempted: true,
+  eligibilityCounts: {
+    freshQuoteCount: 0,
+    healthySpreadCount: 0,
+    eligibleCount: 0,
+  },
+}), 'no_symbols_with_fresh_marketdata_after_hydration');
 
 console.log('entry universe policy tests passed');
