@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Constants from 'expo-constants';
 import {
   ActivityIndicator,
   FlatList,
@@ -56,21 +57,38 @@ const theme = {
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
 
-const RAW_BACKEND_URL =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
-const API_TOKEN =
-  (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
+function readExpoExtraConfig() {
+  const expoConfigExtra = Constants.expoConfig?.extra;
+  const manifest2Extra = Constants.manifest2?.extra?.expoClient?.extra;
+  const extra = expoConfigExtra ?? manifest2Extra;
+  return extra && typeof extra === 'object' ? extra : {};
+}
+
+function readStringConfig(value) {
+  return String(value || '').trim();
+}
+
 function resolveBackendConfig() {
-  const trimmed = String(RAW_BACKEND_URL || '').trim();
-  if (trimmed) {
+  const extra = readExpoExtraConfig();
+  const envBackendUrl = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
+  const extraBackendUrl = readStringConfig(extra?.backendUrl);
+  const envApiToken = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
+  const extraApiToken = readStringConfig(extra?.apiToken);
+
+  const baseUrl = envBackendUrl || extraBackendUrl || null;
+  const apiToken = envApiToken || extraApiToken || '';
+
+  if (baseUrl) {
     return {
-      baseUrl: trimmed,
+      baseUrl,
+      apiToken,
       warning: null,
       missing: false,
     };
   }
   return {
     baseUrl: null,
+    apiToken,
     warning: 'Missing required EXPO_PUBLIC_BACKEND_URL. Set this variable before launching the app.',
     missing: true,
   };
@@ -78,6 +96,7 @@ function resolveBackendConfig() {
 
 const BACKEND_CONFIG = resolveBackendConfig();
 const BASE_URL = BACKEND_CONFIG.baseUrl;
+const API_TOKEN = BACKEND_CONFIG.apiToken;
 const FETCH_TIMEOUT_MS = 20000;
 
 // ---------------------------------------------------------------------------
