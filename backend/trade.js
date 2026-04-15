@@ -3964,7 +3964,7 @@ async function confirmEntryIntent(intent, options = {}) {
     const orderbookMeta = orderbook?.ok
       ? computeOrderbookMetrics(orderbook.orderbook, { bid, ask }, {
         bandBps: ORDERBOOK_BAND_BPS,
-        minDepthUsd: adaptiveLiquidityThresholds.minDepthUsd,
+        minDepthUsd: ORDERBOOK_MIN_DEPTH_USD,
         maxImpactBps: ORDERBOOK_MAX_IMPACT_BPS,
         impactNotionalUsd: ORDERBOOK_IMPACT_NOTIONAL_USD,
         minLevelsPerSide: ORDERBOOK_MIN_LEVELS_PER_SIDE,
@@ -5998,21 +5998,17 @@ async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
       return tradeFallback;
     }
 
-    try {
-      const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
-        ...opts,
-        forceRefresh: true,
-        bypassCache: true,
-      });
-      console.log('entry_scan_primary_quote_retried', {
-        symbol,
-        source: directQuote?.source || 'alpaca_direct',
-        quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
-      });
-      return directQuote;
-    } catch (retryError) {
-      throw retryError;
-    }
+    const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
+      ...opts,
+      forceRefresh: true,
+      bypassCache: true,
+    });
+    console.log('entry_scan_primary_quote_retried', {
+      symbol,
+      source: directQuote?.source || 'alpaca_direct',
+      quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
+    });
+    return directQuote;
   }
 }
 
