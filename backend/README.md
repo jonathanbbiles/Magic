@@ -8,6 +8,12 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 2. Create a `.env` file with your Alpaca API credentials (required for trading). `API_TOKEN` is optional route protection.
 3. `npm start`
 
+## Test ergonomics and quality gates
+
+- `npm test` now runs grouped suites (`test:core`, `test:modules`, `test:config`, `test:telemetry`) with concise logging enabled by default (`TEST_LOG_LEVEL=quiet`).
+- For full debug output during investigation, run any test command with `TEST_LOG_LEVEL=normal`.
+- `npm run check:complexity` enforces a line-count budget on `backend/trade.js` (default max: `19000`, override with `TRADE_JS_MAX_LINES`).
+
 ## Production environment source of truth
 
 - Managed-host production (Render/Fly/etc.) must use real platform environment variables as source of truth.
