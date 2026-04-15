@@ -60,7 +60,7 @@ const RAW_BACKEND_URL =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
-const DEFAULT_DEV_BACKEND_URL = 'http://127.0.0.1:3000';
+const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
 
 function resolveBackendConfig() {
   const trimmed = String(RAW_BACKEND_URL || '').trim();
@@ -73,8 +73,8 @@ function resolveBackendConfig() {
     };
   }
   return {
-    baseUrl: DEFAULT_DEV_BACKEND_URL,
-    warning: `EXPO_PUBLIC_BACKEND_URL is not set. Using dev fallback ${DEFAULT_DEV_BACKEND_URL}.`,
+    baseUrl: DEFAULT_BACKEND_URL,
+    warning: `EXPO_PUBLIC_BACKEND_URL is not set. Using deployed fallback ${DEFAULT_BACKEND_URL}.`,
     usingFallback: true,
     missing: true,
   };
@@ -512,9 +512,20 @@ function AppInner() {
   const meta = dashboard?.meta || {};
   const truth = meta?.truth || {};
   const runtime = meta?.runtime || {};
+  const hasDashboardPayload = Boolean(dashboard && typeof dashboard === 'object' && !Array.isArray(dashboard));
   const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? '—';
-  const alpacaOk = runtime?.alpacaCredentialsPresent ?? truth?.alpacaConnected ?? false;
-  const backendOk = truth?.backendReachable !== false;
+  const alpacaConnected = runtime?.alpacaCredentialsPresent ?? truth?.alpacaConnected;
+  const backendReachable = truth?.backendReachable;
+  const alpacaStatus = !hasDashboardPayload ? 'unknown' : alpacaConnected === true ? 'OK' : alpacaConnected === false ? 'off' : 'unknown';
+  const backendStatus = !hasDashboardPayload
+    ? (error ? 'down' : 'unknown')
+    : backendReachable === true
+      ? 'up'
+      : backendReachable === false
+        ? 'down'
+        : 'unknown';
+  const alpacaOk = alpacaStatus === 'OK';
+  const backendOk = backendStatus === 'up';
   const entryScan = dashboard?.diagnostics?.entryScan || {};
   const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
   const warmup = meta?.predictorWarmup || {};
@@ -600,8 +611,8 @@ function AppInner() {
           {/* Status chips */}
           <View style={s.chipRow}>
             <Chip label={`Engine: ${engineState}`} ok={String(engineState).toLowerCase() !== 'degraded'} />
-            <Chip label={`Alpaca: ${alpacaOk ? 'OK' : 'off'}`} ok={alpacaOk} />
-            <Chip label={`Backend: ${backendOk ? 'up' : 'down'}`} ok={backendOk} />
+            <Chip label={`Alpaca: ${alpacaStatus}`} ok={alpacaOk} />
+            <Chip label={`Backend: ${backendStatus}`} ok={backendOk} />
             {BACKEND_CONFIG.usingFallback ? <Chip label="Config: fallback" ok={false} /> : null}
           </View>
 
