@@ -530,11 +530,36 @@ function AppInner() {
   const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
   const warmup = meta?.predictorWarmup || {};
   const warmupInProgress = Boolean(warmup?.inProgress);
-  const scanSymbolsCount = toNum(meta?.scanSymbolsCount ?? runtime?.scanSymbolsCount ?? truth?.scanSymbolsCount);
-  const acceptedSymbolsCount = toNum(meta?.acceptedSymbolsCount ?? runtime?.acceptedSymbolsCount ?? truth?.acceptedSymbolsCount);
-  const universeSummary = Number.isFinite(scanSymbolsCount) && Number.isFinite(acceptedSymbolsCount)
+  const scanSymbolsCount = toNum(
+    meta?.scanSymbolsCount
+    ?? meta?.universe?.scanSymbolsCount
+    ?? runtime?.scanSymbolsCount
+    ?? truth?.scanSymbolsCount,
+  );
+  const acceptedSymbolsCount = toNum(
+    meta?.acceptedSymbolsCount
+    ?? meta?.universe?.acceptedSymbolsCount
+    ?? runtime?.acceptedSymbolsCount
+    ?? truth?.acceptedSymbolsCount,
+  );
+  const dynamicTradableSymbolsFound = toNum(
+    meta?.dynamicTradableSymbolsFound
+    ?? meta?.universe?.dynamicTradableSymbolsFound
+    ?? runtime?.dynamicTradableSymbolsFound
+    ?? truth?.dynamicTradableSymbolsFound,
+  );
+  const isWarmingUp = String(engineState || '').toLowerCase() === 'warming_up';
+  const hasRealUniverseCount = Number.isFinite(acceptedSymbolsCount) && acceptedSymbolsCount > 0;
+  const hasScanCount = Number.isFinite(scanSymbolsCount) && scanSymbolsCount >= 0;
+  const hasPlaceholderUniverseCounts = (scanSymbolsCount == null || scanSymbolsCount === 0)
+    && (acceptedSymbolsCount == null || acceptedSymbolsCount === 0);
+  const universeSummary = hasRealUniverseCount && hasScanCount
     ? `Scanning ${scanSymbolsCount} of ${acceptedSymbolsCount}`
-    : '—';
+    : isWarmingUp && hasPlaceholderUniverseCounts
+      ? (Number.isFinite(dynamicTradableSymbolsFound) && dynamicTradableSymbolsFound > 0
+        ? `Initializing… ${dynamicTradableSymbolsFound} tradable found`
+        : 'Initializing…')
+      : '—';
 
   // Full diagnostics + logs bundle for copy
   const copyFullBundle = useCallback(async () => {
@@ -589,7 +614,7 @@ function AppInner() {
 
       <TabBar tabs={TABS} active={tab} onChange={setTab} />
 
-      {BACKEND_CONFIG.warning ? (
+      {BACKEND_CONFIG.warning && backendStatus !== 'up' ? (
         <View style={s.configBanner}>
           <Text style={s.configBannerText}>{BACKEND_CONFIG.warning}</Text>
         </View>
@@ -613,7 +638,7 @@ function AppInner() {
             <Chip label={`Engine: ${engineState}`} ok={String(engineState).toLowerCase() !== 'degraded'} />
             <Chip label={`Alpaca: ${alpacaStatus}`} ok={alpacaOk} />
             <Chip label={`Backend: ${backendStatus}`} ok={backendOk} />
-            {BACKEND_CONFIG.usingFallback ? <Chip label="Config: fallback" ok={false} /> : null}
+            {BACKEND_CONFIG.usingFallback ? <Chip label="Config: fallback" ok={backendOk} /> : null}
           </View>
 
           {/* Portfolio card */}

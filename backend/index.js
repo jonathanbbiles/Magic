@@ -885,8 +885,8 @@ app.get('/dashboard', async (req, res) => {
         effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
         dynamicUniverseActive,
         dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-        acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
-        scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
+        acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+        scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
         universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
@@ -942,8 +942,8 @@ app.get('/dashboard', async (req, res) => {
           backendReachable: true,
           authConfigured: Boolean(process.env.API_TOKEN),
           dynamicUniverseActive,
-          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
-          scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
+          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
             : [],
@@ -1009,8 +1009,8 @@ app.get('/dashboard', async (req, res) => {
           effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
           dynamicUniverseActive,
           dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-          acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
-          scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
+          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
+          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
             : [],
