@@ -32,6 +32,14 @@ const parseOptionalPositiveInt = (value, fallback = null) => {
   return Math.floor(parsed);
 };
 
+const resolveEntryUniverseMaxSymbolsSource = (env = process.env) => {
+  const envRaw = String(env.ENTRY_UNIVERSE_MAX_SYMBOLS ?? '').trim();
+  if (envRaw) return 'env';
+  const defaultRaw = String(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS ?? '').trim();
+  if (defaultRaw) return 'live_default';
+  return 'uncapped';
+};
+
 const parseSymbols = (raw) =>
   String(raw ?? '')
     .split(',')
@@ -94,6 +102,7 @@ function getRuntimeConfig(env = process.env) {
       env.ENTRY_UNIVERSE_MAX_SYMBOLS,
       parseOptionalPositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MAX_SYMBOLS, null),
     ),
+    entryUniverseMaxSymbolsSource: resolveEntryUniverseMaxSymbolsSource(env),
     executionTier1Symbols,
     executionTier2Symbols,
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
@@ -163,6 +172,7 @@ function getRuntimeConfigSummary(env = process.env) {
     entryDynamicRequireOrderbookForTier3: config.entryDynamicRequireOrderbookForTier3,
     entryUniverseExcludeStables: config.entryUniverseExcludeStables,
     entryUniverseMaxSymbols: config.entryUniverseMaxSymbols,
+    entryUniverseMaxSymbolsSource: config.entryUniverseMaxSymbolsSource,
     entryScanIntervalMs: config.entryScanIntervalMs,
     entryPrefetchChunkSize: config.entryPrefetchChunkSize,
     entryPrefetchQuotes: config.entryPrefetchQuotes,

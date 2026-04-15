@@ -107,6 +107,7 @@ withEnv({}, () => {
   assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
   assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
+  assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
   assert.equal(cfg.entryTier3MinPortfolioUsd, 500);
   assert.equal(cfg.entryDynamicRequireFreshQuote, true);
   assert.equal(cfg.entryDynamicRequireOrderbookForTier3, true);
@@ -115,6 +116,7 @@ withEnv({}, () => {
 withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: '24' }, () => {
   const cfg = getRuntimeConfig();
   assert.equal(cfg.entryUniverseMaxSymbols, 24);
+  assert.equal(cfg.entryUniverseMaxSymbolsSource, 'env');
 });
 
 withEnv({
