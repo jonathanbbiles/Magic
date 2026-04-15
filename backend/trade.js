@@ -10,6 +10,7 @@ const {
   requireAlpacaAuth,
   normalizeTradeBase,
   normalizeDataBase,
+  resolveDefaultTradeBase,
   configureOrderExecutionRuntime,
 } = require('./modules/orderExecution');
 const { withAlpacaMdLimit, getRatePressureState, isUnderRatePressure } = require('./modules/alpacaRateLimiter');
@@ -102,17 +103,26 @@ const {
   recordDeferredScanTick,
 } = require('./modules/entryScanHeartbeat');
 
-const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || LIVE_CRITICAL_DEFAULTS.TRADE_BASE;
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || '';
 const RAW_DATA_BASE = process.env.DATA_BASE || LIVE_CRITICAL_DEFAULTS.DATA_BASE;
 const DEBUG_ALPACA_HTTP = String(process.env.DEBUG_ALPACA_HTTP || '').trim() === '1';
 const DEBUG_ALPACA_HTTP_OK = String(process.env.DEBUG_ALPACA_HTTP_OK || '').trim() === '1';
 
-const TRADE_BASE = normalizeTradeBase(RAW_TRADE_BASE);
+const tradeBaseResolution = resolveDefaultTradeBase({ rawTradeBase: RAW_TRADE_BASE });
+const TRADE_BASE = normalizeTradeBase(tradeBaseResolution.tradeBase);
 const DATA_BASE = normalizeDataBase(RAW_DATA_BASE);
 const ALPACA_BASE_URL = `${TRADE_BASE}/v2`;
 const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
+
+if (!RAW_TRADE_BASE) {
+  console.warn('trade_base_autoselected', {
+    source: tradeBaseResolution.source,
+    credentialTier: tradeBaseResolution.credentialTier,
+    tradeBase: TRADE_BASE,
+  });
+}
 
 configureOrderExecutionRuntime({
   setEngineState,
