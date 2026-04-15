@@ -83,7 +83,7 @@ const {
   buildEntryUniverse,
   buildDynamicCryptoUniverseFromAssets,
   filterDynamicUniverseByExecutionPolicy,
-  rankDynamicUniverseByExecutionQuality,
+  resolveDynamicUniverseRankingWithHydration,
 } = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
 const { evaluateEconomicEntryPrefilter } = require('./modules/economicEntryPrefilter');
@@ -15109,34 +15109,52 @@ async function runEntryScanOnce() {
     if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && filteredSymbols.length > 0) {
       eligibilityHydration = await hydrateEntryEligibilityMarketData(filteredSymbols);
     }
-    const rankingNowMs = Date.now();
-    const rankedDynamicUniverse = rankDynamicUniverseByExecutionQuality(filteredSymbols, {
-      executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
-      executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-      maxSymbols: filteredSymbols.length,
-      requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
-      requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
-      quoteBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => {
-          const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
-            nowMs: rankingNowMs,
-            maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
-          });
-          return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
-        }),
-      ),
-      orderbookBySymbol: Object.fromEntries(
-        filteredSymbols.map((symbol) => {
-          const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
-            nowMs: rankingNowMs,
-            maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
-          });
-          return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
-        }),
-      ),
-      quoteMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
-      nowMs: rankingNowMs,
+    const buildRankingMapsFromScanCache = () => {
+      const nowMs = Date.now();
+      return {
+        nowMs,
+        quoteBySymbol: Object.fromEntries(
+          filteredSymbols.map((symbol) => {
+            const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
+              nowMs,
+              maxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+            });
+            return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
+          }),
+        ),
+        orderbookBySymbol: Object.fromEntries(
+          filteredSymbols.map((symbol) => {
+            const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
+              nowMs,
+              maxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
+            });
+            return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
+          }),
+        ),
+      };
+    };
+    const dynamicRankingResolution = await resolveDynamicUniverseRankingWithHydration(filteredSymbols, {
+      rankOptions: {
+        executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+        executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+        maxSymbols: filteredSymbols.length,
+        requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+        requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+        quoteMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
+      },
+      getMarketDataMaps: buildRankingMapsFromScanCache,
+      hydrate: async () => hydrateEntryEligibilityMarketData(filteredSymbols, { force: true }),
     });
+    const rankedDynamicUniverse = dynamicRankingResolution.finalRank;
+    if (dynamicRankingResolution?.hydrationRetry?.attempted) {
+      console.log('entry_universe_hydration_retry', {
+        triggeredBy: dynamicRankingResolution.hydrationRetry.triggeredBy,
+        recovered: Boolean(dynamicRankingResolution.hydrationRetry.recovered),
+        initialEligibleCount: Number(dynamicRankingResolution?.initialRank?.eligibilityCounts?.eligibleCount || 0),
+        finalEligibleCount: Number(dynamicRankingResolution?.finalRank?.eligibilityCounts?.eligibleCount || 0),
+        hydrationResult: dynamicRankingResolution.hydrationRetry.result || null,
+      });
+    }
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
       ? rankedDynamicUniverse.symbols
       : filteredSymbols.sort((a, b) => {
@@ -15214,6 +15232,7 @@ async function runEntryScanOnce() {
       alpacaMdMaxConcurrency: runtimeLiveConfig.alpacaMdMaxConcurrency,
       lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
       entryScanBlockedBy: null,
+      entryScanBlockedStage: null,
       universeZeroReason: null,
       fallbackReason,
       rankingHydration: eligibilityHydration ? {
@@ -15226,6 +15245,17 @@ async function runEntryScanOnce() {
         seededSymbols: Number(eligibilityHydration.seededSymbols || 0),
         totalSymbolsObserved: Number(eligibilityHydration.totalSymbolsObserved || 0),
       } : null,
+      rankingHydrationRetry: dynamicRankingResolution?.hydrationRetry?.attempted ? {
+        attempted: true,
+        triggeredBy: dynamicRankingResolution.hydrationRetry.triggeredBy,
+        recovered: Boolean(dynamicRankingResolution.hydrationRetry.recovered),
+        result: dynamicRankingResolution.hydrationRetry.result || null,
+      } : {
+        attempted: false,
+        triggeredBy: null,
+        recovered: false,
+        result: null,
+      },
       rankingEligibilityCounts: rankedDynamicUniverse?.eligibilityCounts || null,
     };
     if (!scanSymbols.length) {
@@ -15237,8 +15267,13 @@ async function runEntryScanOnce() {
         && rankedDynamicUniverse?.symbols?.length === 0
         && ENTRY_UNIVERSE_MODE === 'dynamic'
         && universeMode.startsWith('dynamic');
+      const hydrationRetryAttempted = Boolean(dynamicRankingResolution?.hydrationRetry?.attempted);
       const universeZeroReason = rankingFilteredOut
-        ? (ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE ? 'no_symbols_with_fresh_marketdata' : 'dynamic_ranking_empty')
+        ? (ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE
+          ? (hydrationRetryAttempted
+            ? 'no_symbols_with_fresh_marketdata_after_hydration'
+            : 'no_symbols_with_fresh_marketdata')
+          : 'dynamic_ranking_empty')
         : (
           lastUniverseDiagnostics.dynamicUniverseInitError
             ? 'dynamic_universe_init_failed'
@@ -15247,6 +15282,7 @@ async function runEntryScanOnce() {
       lastUniverseDiagnostics = {
         ...lastUniverseDiagnostics,
         entryScanBlockedBy: 'universe_empty',
+        entryScanBlockedStage: 'ranking_after_hydration',
         universeZeroReason,
         rankingEligibilityCounts: {
           normalizedUniverseCount: normalizedUniverse.length,
@@ -15272,6 +15308,7 @@ async function runEntryScanOnce() {
         freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
         healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
         recentOrderbookCount: Number(rankingEligibleCounts.recentOrderbookCount || 0),
+        rankingHydrationRetry: lastUniverseDiagnostics.rankingHydrationRetry,
         rankingDroppedSample,
       });
       emitEntryScanNoopSummary({
