@@ -10,7 +10,7 @@ The app polls `GET /dashboard` and renders account + position diagnostics.
 
 Set these Expo public env vars before running:
 
-- `EXPO_PUBLIC_BACKEND_URL` (optional override; when not provided, the app falls back to `https://magic-lw8t.onrender.com`)
+- `EXPO_PUBLIC_BACKEND_URL` (**required**; app blocks and does not poll until this is set)
 - `EXPO_PUBLIC_API_TOKEN` (optional, but needed when backend secret `API_TOKEN` is set)
 
 Examples:
@@ -47,7 +47,7 @@ Backend/Frontend auth key mapping:
 
 ## Networking notes
 
-The app defaults to the deployed backend URL (`https://magic-lw8t.onrender.com`) and only uses an Expo override when explicitly provided.
+The app never uses a hardcoded backend fallback URL. You must provide `EXPO_PUBLIC_BACKEND_URL` explicitly.
 
 ## Scope clarification
 

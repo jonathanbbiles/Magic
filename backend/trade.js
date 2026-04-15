@@ -847,6 +847,7 @@ const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeSta
 const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
   ? Math.max(2, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
   : null;
+const ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE = String(runtimeLiveConfig.entryUniverseMaxSymbolsSource || 'uncapped');
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
 const EXECUTION_TIER2_SYMBOLS = new Set(runtimeLiveConfig.executionTier2Symbols);
@@ -898,6 +899,8 @@ function logRuntimeConfigEffective() {
     entrySymbolsPrimary: ENTRY_SYMBOLS_PRIMARY,
     entrySymbolsSecondary: ENTRY_SYMBOLS_SECONDARY,
     entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+    entryUniverseMaxSymbolsConfigured: ENTRY_UNIVERSE_MAX_SYMBOLS,
+    entryUniverseMaxSymbolsSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
     supportedCryptoPairsRefreshMs: SUPPORTED_CRYPTO_PAIRS_REFRESH_MS,
     quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
   });
@@ -1136,6 +1139,10 @@ let lastUniverseDiagnostics = {
   dynamicAcceptedSymbolsCount: 0,
   dynamicAcceptedSymbolsSample: [],
   fallbackOccurred: false,
+  universeSymbolCap: null,
+  configuredUniverseCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+  configuredUniverseCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+  universeCapDiagnostics: null,
   configuredPrimaryCount: 0,
   configuredSecondaryCount: 0,
   warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
@@ -15176,10 +15183,21 @@ async function runEntryScanOnce() {
           : Math.floor(prioritizedSymbols.length * 0.5),
       )
       : configuredUniverseCap;
+    const universeCapDiagnostics = {
+      configuredCap: configuredUniverseCap,
+      configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      effectiveCap: effectiveUniverseCap,
+      effectiveCapSource: ratePressureActive ? 'rate_pressure_backoff' : ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      ratePressureActive,
+      rankedEligibleCountBeforeCap: prioritizedSymbols.length,
+      configuredPrimaryCount: configuredUniverse.primaryCount,
+      acceptedSymbolsCountBeforeCap: prioritizedSymbols.length,
+    };
     if (ratePressureActive) {
       console.warn('universe_rate_pressure_backoff', {
         configuredCap: configuredUniverseCap,
         effectiveCap: effectiveUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
         ratePressureState: getRatePressureState(),
       });
     }
@@ -15190,7 +15208,25 @@ async function runEntryScanOnce() {
       console.warn('dynamic_universe_capped', {
         acceptedBeforeCap: prioritizedSymbols.length,
         effectiveCap: effectiveUniverseCap,
+        configuredCap: configuredUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
         droppedCount: prioritizedSymbols.length - effectiveUniverseCap,
+      });
+    }
+    const capSmallerThanPrimary = Number.isFinite(effectiveUniverseCap) && effectiveUniverseCap < configuredUniverse.primaryCount;
+    const capSmallerThanRankedEligible = Number.isFinite(effectiveUniverseCap) && effectiveUniverseCap < prioritizedSymbols.length;
+    if (capSmallerThanPrimary || capSmallerThanRankedEligible) {
+      console.error('entry_universe_cap_warning', {
+        warning: 'effective_universe_cap_lower_than_expected_universe',
+        effectiveCap: effectiveUniverseCap,
+        configuredCap: configuredUniverseCap,
+        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        rankedEligibleCountBeforeCap: prioritizedSymbols.length,
+        scanSymbolsCountAfterCap: scanSymbols.length,
+        capSmallerThanPrimary,
+        capSmallerThanRankedEligible,
+        envEntryUniverseMaxSymbols: String(process.env.ENTRY_UNIVERSE_MAX_SYMBOLS ?? ''),
       });
     }
     updateEntryScanProgress({
@@ -15219,6 +15255,14 @@ async function runEntryScanOnce() {
       scanSymbolsCount: scanSymbols.length,
       dynamicAcceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? 0,
       universeSymbolCap: effectiveUniverseCap,
+      configuredUniverseCap: configuredUniverseCap,
+      configuredUniverseCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      universeCapDiagnostics: {
+        ...universeCapDiagnostics,
+        capSmallerThanPrimary,
+        capSmallerThanRankedEligible,
+        droppedByCapCount: Math.max(0, prioritizedSymbols.length - scanSymbols.length),
+      },
       acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
       scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs)

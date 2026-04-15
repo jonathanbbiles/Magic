@@ -4,7 +4,15 @@ const { buildStartupTruthSummary } = require('./startupTruthSummary');
 const payload = buildStartupTruthSummary({
   authStatus: { alpacaAuthOk: true },
   baseStatus: { tradeBase: 'https://api.alpaca.markets', dataBase: 'https://data.alpaca.markets' },
-  universeDiagnostics: { acceptedSymbolsCount: 12, scanSymbolsCount: 6, fallbackOccurred: false },
+  universeDiagnostics: {
+    acceptedSymbolsCount: 12,
+    scanSymbolsCount: 6,
+    fallbackOccurred: false,
+    universeSymbolCap: 6,
+    configuredUniverseCap: 6,
+    configuredUniverseCapSource: 'env',
+    universeCapDiagnostics: { ratePressureActive: false },
+  },
   warmup: { inProgress: true },
   runtimeConfig: { entryPrefetchChunkSize: 8, predictorWarmupPrefetchConcurrency: 3 },
   runtimeEntryUniverseModeRaw: 'dynamic',
@@ -14,6 +22,8 @@ const payload = buildStartupTruthSummary({
 assert.equal(payload.alpacaCredentialsPresent, true);
 assert.equal(payload.acceptedSymbolsCount, 12);
 assert.equal(payload.scanSymbolsCount, 6);
+assert.equal(payload.universeSymbolCap, 6);
+assert.equal(payload.configuredUniverseCapSource, 'env');
 assert.equal(payload.warmupSettings.prefetchConcurrency, 3);
 assert.equal(payload.apiTokenEnabled, false);
 

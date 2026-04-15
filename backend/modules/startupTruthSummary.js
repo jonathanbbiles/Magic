@@ -16,6 +16,14 @@ function buildStartupTruthSummary({
     effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
     acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
     scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
+    universeSymbolCap: Number.isFinite(Number(universeDiagnostics?.universeSymbolCap))
+      ? Number(universeDiagnostics.universeSymbolCap)
+      : null,
+    configuredUniverseCap: Number.isFinite(Number(universeDiagnostics?.configuredUniverseCap))
+      ? Number(universeDiagnostics.configuredUniverseCap)
+      : null,
+    configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
+    universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
     warmupSettings: {
       enabled: Boolean(env?.PREDICTOR_WARMUP_ENABLED ? String(env.PREDICTOR_WARMUP_ENABLED) !== 'false' : true),
       inProgress: Boolean(warmup?.inProgress),

@@ -242,7 +242,20 @@ async function resolveDynamicUniverseRankingWithHydration(
     orderbookBySymbol: firstMaps.orderbookBySymbol || {},
     nowMs: Number.isFinite(firstMaps.nowMs) ? firstMaps.nowMs : Date.now(),
   });
-  if (normalizedSymbols.length === 0 || initialRank.symbols.length > 0) {
+  if (normalizedSymbols.length === 0) {
+    return {
+      initialRank,
+      finalRank: initialRank,
+      hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
+    };
+  }
+
+  const missingAfterInitial = Math.max(0, normalizedSymbols.length - initialRank.symbols.length);
+  const staleFreshnessCount = Array.isArray(initialRank.droppedDiagnostics)
+    ? initialRank.droppedDiagnostics.filter((row) => row.failedFreshness || row.failedOrderbookRecency).length
+    : 0;
+  const shouldRetryHydration = missingAfterInitial > 0 && staleFreshnessCount > 0;
+  if (!shouldRetryHydration) {
     return {
       initialRank,
       finalRank: initialRank,
@@ -251,7 +264,7 @@ async function resolveDynamicUniverseRankingWithHydration(
   }
 
   const retryResult = typeof hydrate === 'function'
-    ? await hydrate({ symbols: normalizedSymbols, reason: 'initial_rank_empty' })
+    ? await hydrate({ symbols: normalizedSymbols, reason: initialRank.symbols.length > 0 ? 'partial_rank_missing_symbols' : 'initial_rank_empty' })
     : { ok: false, skipped: 'hydrate_not_available' };
   const secondMaps = readMaps() || {};
   const retryRank = rankDynamicUniverseByExecutionQuality(normalizedSymbols, {
@@ -266,8 +279,8 @@ async function resolveDynamicUniverseRankingWithHydration(
     finalRank: retryRank,
     hydrationRetry: {
       attempted: true,
-      triggeredBy: 'initial_rank_empty',
-      recovered: retryRank.symbols.length > 0,
+      triggeredBy: initialRank.symbols.length > 0 ? 'partial_rank_missing_symbols' : 'initial_rank_empty',
+      recovered: retryRank.symbols.length > initialRank.symbols.length,
       result: retryResult || null,
     },
   };

@@ -888,6 +888,9 @@ app.get('/dashboard', async (req, res) => {
         acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
         scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
         universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
+        configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
+        configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
+        universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
         acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
           ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
           : [],
@@ -1011,6 +1014,10 @@ app.get('/dashboard', async (req, res) => {
           dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
           acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
           scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
+          universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
+          configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
+          configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
+          universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
           acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
             ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
             : [],

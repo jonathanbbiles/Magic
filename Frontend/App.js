@@ -60,22 +60,18 @@ const RAW_BACKEND_URL =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_BACKEND_URL) || '';
 const API_TOKEN =
   (typeof process !== 'undefined' && process?.env?.EXPO_PUBLIC_API_TOKEN) || '';
-const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
-
 function resolveBackendConfig() {
   const trimmed = String(RAW_BACKEND_URL || '').trim();
   if (trimmed) {
     return {
       baseUrl: trimmed,
       warning: null,
-      usingFallback: false,
       missing: false,
     };
   }
   return {
-    baseUrl: DEFAULT_BACKEND_URL,
-    warning: `EXPO_PUBLIC_BACKEND_URL is not set. Using deployed fallback ${DEFAULT_BACKEND_URL}.`,
-    usingFallback: true,
+    baseUrl: null,
+    warning: 'Missing required EXPO_PUBLIC_BACKEND_URL. Set this variable before launching the app.',
     missing: true,
   };
 }
@@ -99,6 +95,11 @@ function makeHeaders() {
 }
 
 async function apiFetch(path) {
+  if (!BASE_URL) {
+    const e = new Error('Missing EXPO_PUBLIC_BACKEND_URL');
+    e.status = 503;
+    throw e;
+  }
   const url = `${String(BASE_URL).replace(/\/$/, '')}${path}`;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -444,6 +445,7 @@ const TABS = [
 ];
 
 function AppInner() {
+  const backendConfigured = Boolean(BASE_URL);
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -454,6 +456,12 @@ function AppInner() {
   const logsDataRef = useRef([]);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
+    if (!backendConfigured) {
+      setLoading(false);
+      setRefreshing(false);
+      setError('Missing EXPO_PUBLIC_BACKEND_URL. Configure the backend URL to enable dashboard polling.');
+      return;
+    }
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
@@ -468,13 +476,16 @@ function AppInner() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [backendConfigured]);
 
   useEffect(() => {
+    if (!backendConfigured) {
+      return undefined;
+    }
     load();
     const id = setInterval(() => load(), POLL_MS);
     return () => clearInterval(id);
-  }, [load]);
+  }, [backendConfigured, load]);
 
   // Derived state
   const positions = useMemo(() => {
@@ -658,7 +669,16 @@ function AppInner() {
         </View>
       ) : null}
 
-      {tab === 'overview' ? (
+      {!backendConfigured ? (
+        <View style={s.configBlocker}>
+          <Text style={s.configBlockerTitle}>Backend URL required</Text>
+          <Text style={s.configBlockerText}>
+            Set EXPO_PUBLIC_BACKEND_URL (for example in your shell env) and reload Expo.
+          </Text>
+        </View>
+      ) : null}
+
+      {backendConfigured && tab === 'overview' ? (
         <ScrollView
           style={s.scrollBody}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} />}
@@ -676,7 +696,6 @@ function AppInner() {
             <Chip label={`Engine: ${engineState}`} ok={String(engineState).toLowerCase() !== 'degraded'} />
             <Chip label={`Alpaca: ${alpacaStatus}`} ok={alpacaOk} />
             <Chip label={`Backend: ${backendStatus}`} ok={backendOk} />
-            {BACKEND_CONFIG.usingFallback ? <Chip label="Config: fallback" ok={backendOk} /> : null}
           </View>
 
           {/* Portfolio card */}
@@ -739,7 +758,7 @@ function AppInner() {
         </ScrollView>
       ) : null}
 
-      {tab === 'positions' ? (
+      {backendConfigured && tab === 'positions' ? (
         <ScrollView
           style={s.scrollBody}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} />}
@@ -753,7 +772,7 @@ function AppInner() {
         </ScrollView>
       ) : null}
 
-      {tab === 'diagnostics' ? (
+      {backendConfigured && tab === 'diagnostics' ? (
         <ScrollView
           style={s.scrollBody}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} />}
@@ -968,6 +987,17 @@ const s = StyleSheet.create({
     paddingHorizontal: theme.spacing.md,
   },
   configBannerText: { color: theme.colors.chipWarnText, fontWeight: '700', fontSize: 12 },
+  configBlocker: {
+    marginHorizontal: theme.spacing.lg,
+    marginTop: theme.spacing.md,
+    borderWidth: 1,
+    borderColor: theme.colors.errorBorder,
+    backgroundColor: theme.colors.errorBg,
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.lg,
+  },
+  configBlockerTitle: { color: theme.colors.errorText, fontWeight: '800', fontSize: 16, marginBottom: 6 },
+  configBlockerText: { color: theme.colors.errorText, fontWeight: '600', fontSize: 13 },
 
   // Error states
   errorBanner: {
