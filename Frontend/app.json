@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "extra": {
-      "backendUrl": "https://magic-lw8t.onrender.com",
+      "backendUrl": "",
       "apiToken": ""
     }
   }
