@@ -12,10 +12,11 @@ This app resolves backend URL in this order:
 
 - Preferred env var: `EXPO_PUBLIC_BACKEND_URL`
 - Optional app config fallback: `expo.extra.backendUrl` in `app.json` / app config
+- Built-in default fallback: `https://magic-lw8t.onrender.com`
 - Web-only fallback: browser `window.location.origin`
 - Optional env var: `EXPO_PUBLIC_API_TOKEN`
 
-If no backend URL can be resolved from any source above, the app shows a blocker UI and does not poll.
+Only the backend base URL is built in. No backend secret or API key is hardcoded in frontend source.
 
 ## Run the frontend
 
@@ -44,7 +45,7 @@ Backend/Frontend auth key mapping:
 
 ## Networking notes
 
-The app does not hardcode any production backend URL in source.
+The app includes a built-in default backend base URL fallback (`https://magic-lw8t.onrender.com`) for diagnostics.
 
 ## Scope clarification
 

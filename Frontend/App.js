@@ -56,6 +56,7 @@ const theme = {
 // ---------------------------------------------------------------------------
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
+const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
 
 function readExpoExtraConfig() {
   const expoConfigExtra = Constants.expoConfig?.extra;
@@ -80,17 +81,25 @@ function resolveBackendConfig() {
   const extra = readExpoExtraConfig();
   const envBackendUrl = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
   const extraBackendUrl = readStringConfig(extra?.backendUrl);
+  const defaultBackendUrl = readStringConfig(DEFAULT_BACKEND_URL);
   const webOriginFallback = readWebOriginFallback();
   const envApiToken = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
   const extraApiToken = readStringConfig(extra?.apiToken);
 
-  const baseUrl = envBackendUrl || extraBackendUrl || webOriginFallback;
+  const baseUrl = envBackendUrl || extraBackendUrl || defaultBackendUrl || webOriginFallback;
   const apiToken = envApiToken || extraApiToken || '';
 
   if (baseUrl) {
-    const warning = !envBackendUrl && (extraBackendUrl || webOriginFallback)
-      ? `EXPO_PUBLIC_BACKEND_URL not set; using ${extraBackendUrl ? 'expo extra.backendUrl' : 'web origin fallback'}.`
-      : null;
+    let warning = null;
+    if (!envBackendUrl) {
+      if (extraBackendUrl) {
+        warning = 'EXPO_PUBLIC_BACKEND_URL not set; using expo extra.backendUrl.';
+      } else if (defaultBackendUrl) {
+        warning = 'EXPO_PUBLIC_BACKEND_URL not set; using built-in backend URL.';
+      } else if (webOriginFallback) {
+        warning = 'EXPO_PUBLIC_BACKEND_URL not set; using web origin fallback.';
+      }
+    }
     return {
       baseUrl,
       apiToken,
