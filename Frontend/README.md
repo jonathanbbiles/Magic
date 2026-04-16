@@ -8,12 +8,14 @@ The app polls `GET /dashboard` and renders account + position diagnostics.
 
 ## Environment/config
 
-This app requires backend URL from Expo public env vars:
+This app resolves backend URL in this order:
 
-- Required env var: `EXPO_PUBLIC_BACKEND_URL`
+- Preferred env var: `EXPO_PUBLIC_BACKEND_URL`
+- Optional app config fallback: `expo.extra.backendUrl` in `app.json` / app config
+- Web-only fallback: browser `window.location.origin`
 - Optional env var: `EXPO_PUBLIC_API_TOKEN`
 
-`EXPO_PUBLIC_BACKEND_URL` is mandatory at runtime. If missing, the app shows a blocker UI and does not poll.
+If no backend URL can be resolved from any source above, the app shows a blocker UI and does not poll.
 
 ## Run the frontend
 
@@ -42,7 +44,7 @@ Backend/Frontend auth key mapping:
 
 ## Networking notes
 
-The app does not hardcode the backend URL in source and does not fall back to `app.json` extras.
+The app does not hardcode any production backend URL in source.
 
 ## Scope clarification
 

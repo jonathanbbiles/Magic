@@ -68,20 +68,33 @@ function readStringConfig(value) {
   return String(value || '').trim();
 }
 
+function readWebOriginFallback() {
+  if (Platform.OS !== 'web') return '';
+  if (typeof window === 'undefined' || !window?.location?.origin) return '';
+  const origin = readStringConfig(window.location.origin);
+  if (!/^https?:\/\//i.test(origin)) return '';
+  return origin;
+}
+
 function resolveBackendConfig() {
   const extra = readExpoExtraConfig();
   const envBackendUrl = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
+  const extraBackendUrl = readStringConfig(extra?.backendUrl);
+  const webOriginFallback = readWebOriginFallback();
   const envApiToken = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
   const extraApiToken = readStringConfig(extra?.apiToken);
 
-  const baseUrl = envBackendUrl;
+  const baseUrl = envBackendUrl || extraBackendUrl || webOriginFallback;
   const apiToken = envApiToken || extraApiToken || '';
 
   if (baseUrl) {
+    const warning = !envBackendUrl && (extraBackendUrl || webOriginFallback)
+      ? `EXPO_PUBLIC_BACKEND_URL not set; using ${extraBackendUrl ? 'expo extra.backendUrl' : 'web origin fallback'}.`
+      : null;
     return {
       baseUrl,
       apiToken,
-      warning: null,
+      warning,
       missing: false,
     };
   }
@@ -477,7 +490,7 @@ function AppInner() {
     if (!backendConfigured) {
       setLoading(false);
       setRefreshing(false);
-      setError('Missing EXPO_PUBLIC_BACKEND_URL. Configure the backend URL to enable dashboard polling.');
+      setError('Missing backend URL. Configure EXPO_PUBLIC_BACKEND_URL (or expo extra.backendUrl) to enable dashboard polling.');
       return;
     }
     if (isRefresh) setRefreshing(true);
@@ -691,7 +704,7 @@ function AppInner() {
         <View style={s.configBlocker}>
           <Text style={s.configBlockerTitle}>Backend URL required</Text>
           <Text style={s.configBlockerText}>
-            Set EXPO_PUBLIC_BACKEND_URL (for example in your shell env) and reload Expo.
+            Set EXPO_PUBLIC_BACKEND_URL (or expo extra.backendUrl) and reload Expo.
           </Text>
         </View>
       ) : null}
