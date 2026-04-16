@@ -13176,7 +13176,9 @@ async function manageExitStates() {
               if (Number.isFinite(bid)) state.lastBid = bid;
               if (Number.isFinite(ask)) state.lastAsk = ask;
               if (Number.isFinite(bid) && Number.isFinite(ask)) state.lastMid = (bid + ask) / 2;
-            } catch (_) {}
+            } catch (quoteRetryErr) {
+              console.warn('exit_quote_retry_failed', { symbol, error: quoteRetryErr?.message || String(quoteRetryErr) });
+            }
           }
 
           // Recompute spreadBps if bid/ask are now available
