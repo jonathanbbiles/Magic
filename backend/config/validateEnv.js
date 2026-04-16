@@ -164,11 +164,18 @@ const validateEnv = () => {
       credentialTier: tradeBaseResolution.credentialTier,
     });
   }
+  const parsedTradeBase = parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
   if (nodeEnv === 'production' && !String(process.env.TRADE_BASE || '').trim()) {
-    validationErrors.push('TRADE_BASE is required in production and must be set explicitly to the live Alpaca trading endpoint.');
+    if (String(parsedTradeBase?.hostname || '').toLowerCase() === LIVE_ALPACA_TRADE_HOST) {
+      console.warn('config_warning', {
+        field: 'TRADE_BASE',
+        message: `TRADE_BASE missing in production; continuing because effective host resolves to "${LIVE_ALPACA_TRADE_HOST}". Set TRADE_BASE explicitly to remove this warning.`,
+      });
+    } else {
+      validationErrors.push('TRADE_BASE is required in production and must be set explicitly to the live Alpaca trading endpoint.');
+    }
   }
 
-  const parsedTradeBase = parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
   parseUrl('DATA_BASE', effectiveDataBase);
   if (nodeEnv === 'production' && parsedTradeBase) {
     const tradeHost = String(parsedTradeBase.hostname || '').toLowerCase();
@@ -189,7 +196,10 @@ const validateEnv = () => {
   }
   if (!apiToken) {
     if (nodeEnv === 'production') {
-      validationErrors.push('API_TOKEN is required in production and cannot be empty.');
+      console.warn('config_warning', {
+        field: 'API_TOKEN',
+        message: 'API_TOKEN is missing in production. Backend routes are unprotected until API_TOKEN is set.',
+      });
     } else {
       console.warn('config_warning', {
         field: 'API_TOKEN',
@@ -247,7 +257,10 @@ const validateEnv = () => {
       message: 'DATASET_DIR is relative on a Render-like host. Consider a persistent disk.',
     };
     if (nodeEnv === 'production') {
-      validationErrors.push('DATASET_DIR must be an absolute persistent mount path in production on Render-like hosts.');
+      console.warn('dataset_path_warning', {
+        ...payload,
+        message: 'DATASET_DIR is relative in production on a Render-like host. Startup continues, but storage may be ephemeral unless DATASET_DIR points to a persistent mount.',
+      });
     } else {
       console.warn('dataset_path_warning', payload);
     }

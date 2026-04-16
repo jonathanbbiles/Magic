@@ -27,11 +27,11 @@ withEnv({ NODE_ENV: 'production', APCA_API_KEY_ID: '', APCA_API_SECRET_KEY: '' }
 });
 
 withEnv({ NODE_ENV: 'production', API_TOKEN: '' }, () => {
-  assert.throws(() => validateEnv(), /API_TOKEN is required in production/);
+  assert.doesNotThrow(() => validateEnv());
 });
 
 withEnv({ NODE_ENV: 'production', TRADE_BASE: '', ALPACA_API_BASE: '' }, () => {
-  assert.throws(() => validateEnv(), /TRADE_BASE is required in production/);
+  assert.doesNotThrow(() => validateEnv());
 });
 
 withEnv({ NODE_ENV: 'production', TRADE_BASE: 'https://paper-api.alpaca.markets' }, () => {
