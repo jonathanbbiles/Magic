@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { resolveUniverseCap } = require('./universeCap');
+const { resolveUniverseCap, normalizeConfiguredCap } = require('./universeCap');
 
 {
   const cap = resolveUniverseCap({ configuredCap: null, configuredCapSource: 'uncapped', ratePressureActive: false, prioritizedCount: 10 });
@@ -15,5 +15,12 @@ const { resolveUniverseCap } = require('./universeCap');
   assert.equal(cap.effectiveCap, 12);
   assert.equal(cap.effectiveCapSource, 'env');
 }
+
+assert.equal(normalizeConfiguredCap(null), null);
+assert.equal(normalizeConfiguredCap(undefined), null);
+assert.equal(normalizeConfiguredCap(''), null);
+assert.equal(normalizeConfiguredCap('   '), null);
+assert.equal(normalizeConfiguredCap('not_a_number'), null);
+assert.equal(normalizeConfiguredCap(7.8), 7);
 
 console.log('universe cap tests passed');

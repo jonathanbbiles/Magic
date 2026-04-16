@@ -21,7 +21,7 @@ function resolveSymbolTier(symbol, policy) {
 }
 
 function isSparseDepthState(depthState) {
-  return depthState === 'orderbook_sparse' || depthState === 'depth_calc_unreliable';
+  return depthState === 'orderbook_sparse' || depthState === 'depth_calc_unreliable' || depthState === 'quote_fallback';
 }
 
 function evaluateEntryMarketData({
@@ -68,9 +68,11 @@ function evaluateEntryMarketData({
     reasons.push('quote_stale');
   } else if (isSparseDepthState(depthState)) {
     dataQualityState = 'orderbook_sparse';
+    const quoteFallbackMode = depthState === 'quote_fallback';
     sparseFallbackState = {
       evaluated: true,
-      path: 'sparse_depth',
+      path: quoteFallbackMode ? 'quote_fallback' : 'sparse_depth',
+      quoteFallbackMode,
       enabled: Boolean(policy?.sparseFallback?.enabled),
       symbolAllowed: false,
       quoteFresh: false,
@@ -101,7 +103,12 @@ function evaluateEntryMarketData({
     sparseFallbackState.quoteFresh = Number.isFinite(quoteAgeMs) && quoteAgeMs <= sparseFallback.requireQuoteFreshMs;
     sparseFallbackState.quoteWithinFallbackTolerance = Number.isFinite(quoteAgeMs) && quoteAgeMs <= staleQuoteToleranceMs;
     sparseFallbackState.spreadOk = Number.isFinite(spreadBps) && spreadBps <= sparseFallback.maxSpreadBps;
-    sparseFallbackState.edgeOk = Number.isFinite(netEdgeBps) && netEdgeBps >= (edgeFloorBps + sparseFallback.requireStrongerEdgeBps);
+    const strongerEdgeBps = quoteFallbackMode
+      ? Number(sparseFallback.quoteFallbackRequireStrongerEdgeBps ?? sparseFallback.requireStrongerEdgeBps)
+      : Number(sparseFallback.requireStrongerEdgeBps);
+    const strongerEdgeBpsApplied = Number.isFinite(strongerEdgeBps) ? Math.max(0, strongerEdgeBps) : 0;
+    sparseFallbackState.strongerEdgeBpsApplied = strongerEdgeBpsApplied;
+    sparseFallbackState.edgeOk = Number.isFinite(netEdgeBps) && netEdgeBps >= (edgeFloorBps + strongerEdgeBpsApplied);
     sparseFallbackState.probabilityOk = Number.isFinite(predictorProbability) && predictorProbability >= sparseFallback.minProbability;
     sparseFallbackState.depthOk = Number.isFinite(requiredDepthUsdUsed) &&
       Number.isFinite(availableDepthUsdUsed) &&
@@ -140,7 +147,7 @@ function evaluateEntryMarketData({
             : !sparseFallbackState.spreadOk
                 ? 'sparse_fallback_spread_wide'
                 : !sparseFallbackState.edgeOk
-                  ? 'sparse_fallback_edge_weak'
+                  ? (quoteFallbackMode ? 'quote_fallback_edge_weak' : 'sparse_fallback_edge_weak')
                   : !sparseFallbackState.probabilityOk
                     ? 'sparse_fallback_probability_weak'
                     : !sparseFallbackState.depthOk

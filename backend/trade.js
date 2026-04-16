@@ -73,6 +73,7 @@ const {
   classifyRegimeScorecard,
   computeExpectedNetEdgeBps,
   computeNetEdgeBps,
+  resolveEntryFillProbability,
   computeConfidenceScore,
   shouldExitFailedTrade,
 } = require('./modules/tradeGuards');
@@ -308,6 +309,8 @@ const CONFIDENCE_SPREAD_WEIGHT = readNumber('CONFIDENCE_SPREAD_WEIGHT', 0.20);
 const CONFIDENCE_LIQUIDITY_WEIGHT = readNumber('CONFIDENCE_LIQUIDITY_WEIGHT', 0.20);
 const CONFIDENCE_MOMENTUM_WEIGHT = readNumber('CONFIDENCE_MOMENTUM_WEIGHT', 0.15);
 const CONFIDENCE_REGIME_WEIGHT = readNumber('CONFIDENCE_REGIME_WEIGHT', 0.10);
+const ENTRY_FILL_PROBABILITY_LIQUIDITY_WEIGHT = readNumber('ENTRY_FILL_PROBABILITY_LIQUIDITY_WEIGHT', 0.35);
+const ENTRY_FILL_PROBABILITY_MIN = readNumber('ENTRY_FILL_PROBABILITY_MIN', 0.25);
 
 const ENGINE_V2_ENABLED = readEnvFlag('ENGINE_V2_ENABLED', false);
 const ENTRY_INTENTS_ENABLED = readEnvFlag('ENTRY_INTENTS_ENABLED', false);
@@ -860,6 +863,7 @@ const ORDERBOOK_SPARSE_FALLBACK_ENABLED = readEnvFlag('ORDERBOOK_SPARSE_FALLBACK
 const ORDERBOOK_SPARSE_FALLBACK_SYMBOLS = parseSymbolSet(process.env.ORDERBOOK_SPARSE_FALLBACK_SYMBOLS || 'BTC/USD,ETH/USD,AVAX/USD,LINK/USD');
 const ORDERBOOK_SPARSE_MAX_SPREAD_BPS = readNumber('ORDERBOOK_SPARSE_MAX_SPREAD_BPS', 12);
 const ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS = readNumber('ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS', 240);
+const ORDERBOOK_QUOTE_FALLBACK_REQUIRE_STRONGER_EDGE_BPS = readNumber('ORDERBOOK_QUOTE_FALLBACK_REQUIRE_STRONGER_EDGE_BPS', 0);
 const ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS = Math.max(1000, runtimeLiveConfig.sparseQuoteFreshMs);
 const ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS = Math.max(
   ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
@@ -885,9 +889,7 @@ const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
-const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
-  ? Math.max(1, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
-  : null;
+const ENTRY_UNIVERSE_MAX_SYMBOLS = runtimeLiveConfig.entryUniverseMaxSymbols;
 const ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE = String(runtimeLiveConfig.entryUniverseMaxSymbolsSource || 'uncapped');
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
 const EXECUTION_TIER1_SYMBOLS = new Set(runtimeLiveConfig.executionTier1Symbols);
@@ -1599,6 +1601,7 @@ function getEntryMarketDataPolicy() {
       symbols: ORDERBOOK_SPARSE_FALLBACK_SYMBOLS,
       maxSpreadBps: ORDERBOOK_SPARSE_MAX_SPREAD_BPS,
       requireStrongerEdgeBps: ORDERBOOK_SPARSE_REQUIRE_STRONGER_EDGE_BPS,
+      quoteFallbackRequireStrongerEdgeBps: ORDERBOOK_QUOTE_FALLBACK_REQUIRE_STRONGER_EDGE_BPS,
       requireQuoteFreshMs: ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS,
       staleQuoteToleranceMs: ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS,
       minProbability: ORDERBOOK_SPARSE_MIN_PROBABILITY,
@@ -3290,7 +3293,13 @@ async function computeEntrySignal(symbol, opts = {}) {
     };
   }
 
-  const fillProbability = clamp01((Number(predictorTp?.probability) || 0.5) * clamp01(orderbookMeta?.liquidityScore || 0.5));
+  const fillProbabilityMeta = resolveEntryFillProbability({
+    predictorProbability: predictorTp?.probability ?? 0.5,
+    liquidityScore: orderbookMeta?.liquidityScore ?? 0.5,
+    liquidityWeight: ENTRY_FILL_PROBABILITY_LIQUIDITY_WEIGHT,
+    minFillProbability: ENTRY_FILL_PROBABILITY_MIN,
+  });
+  const fillProbability = fillProbabilityMeta.fillProbability;
   const regimePenaltyBps = resolveRegimePenaltyBps({
     regimeEngineEnabled: REGIME_ENGINE_V2_ENABLED,
     regimeLabel: regimeScorecard?.label,
@@ -3319,9 +3328,19 @@ async function computeEntrySignal(symbol, opts = {}) {
     netEdgeBps: edge.netEdgeBps,
     predictorProbability: predictorTp?.probability ?? null,
     fillProbability,
+    fillProbabilityModel: fillProbabilityMeta,
     regimeLabel: regimeScorecard?.label || null,
     regimePenaltyBps,
     liquidityScore: Number.isFinite(orderbookMeta?.liquidityScore) ? orderbookMeta.liquidityScore : null,
+    edgeComponents: {
+      expectedMoveBps: edge.expectedMoveBps,
+      expectedMoveAfterFillBps: edge.expectedMoveBps * fillProbability,
+      feeBpsRoundTrip: edge.feeBpsRoundTrip,
+      expectedSlippageBps: edge.expectedSlippageBps,
+      spreadPenaltyBps: edge.spreadPenaltyBps,
+      regimePenaltyBps: edge.regimePenaltyBps,
+      minNetEdgeBps: edgeRequirements.minNetEdgeBps,
+    },
   });
 
   if (ENGINE_V2_ENABLED && edge.netEdgeBps < ENTRY_EXPECTED_NET_EDGE_FLOOR_BPS) {
@@ -3519,6 +3538,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         marketDataEval,
         edge,
         fillProbability,
+        fillProbabilityModel: fillProbabilityMeta,
         targetMoveBps: edgeRequirements.targetMoveBps,
         feeBpsRoundTrip: edgeRequirements.feeBpsRoundTrip,
         slippageBps: edgeRequirements.slippageBps,
@@ -9135,9 +9155,27 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false, sameS
     };
   }
   if (quoteFallback && Number.isFinite(quoteFallback.bid) && Number.isFinite(quoteFallback.ask) && quoteFallback.bid > 0 && quoteFallback.ask > 0) {
+    const levelCount = Math.max(2, Math.floor(readNumber('ORDERBOOK_QUOTE_FALLBACK_LEVELS', 3)));
+    const stepBps = Math.max(0.5, readNumber('ORDERBOOK_QUOTE_FALLBACK_STEP_BPS', 2));
+    const perLevelNotionalUsd = Math.max(
+      1,
+      readNumber(
+        'ORDERBOOK_QUOTE_FALLBACK_LEVEL_NOTIONAL_USD',
+        Math.max(ORDERBOOK_MIN_DEPTH_USD, ORDERBOOK_IMPACT_NOTIONAL_USD) / levelCount,
+      ),
+    );
+    const syntheticAsks = [];
+    const syntheticBids = [];
+    for (let i = 0; i < levelCount; i += 1) {
+      const offsetBps = i * stepBps;
+      const askPx = quoteFallback.ask * (1 + (offsetBps / BPS));
+      const bidPx = quoteFallback.bid * (1 - (offsetBps / BPS));
+      syntheticAsks.push({ p: askPx, s: perLevelNotionalUsd / Math.max(askPx, 1e-6) });
+      syntheticBids.push({ p: bidPx, s: perLevelNotionalUsd / Math.max(bidPx, 1e-6) });
+    }
     const syntheticOrderbook = {
-      asks: [{ p: quoteFallback.ask, s: 1 }],
-      bids: [{ p: quoteFallback.bid, s: 1 }],
+      asks: syntheticAsks,
+      bids: syntheticBids,
       bestAsk: quoteFallback.ask,
       bestBid: quoteFallback.bid,
       tsMs: quoteFallback.tsMs || Date.now(),
@@ -9145,6 +9183,9 @@ async function getLatestOrderbook(symbol, { maxAgeMs, bypassCache = false, sameS
       receivedAtMs: Date.now(),
       synthetic: true,
       source: sameScanQuoteViability.ok ? 'same_scan_quote_fallback' : 'quote_fallback',
+      syntheticLevelCount: levelCount,
+      syntheticStepBps: stepBps,
+      syntheticPerLevelNotionalUsd: perLevelNotionalUsd,
     };
     orderbookCache.set(symbol, syntheticOrderbook);
     scanMarketDataCache.upsertOrderbook(symbol, { ok: true, orderbook: syntheticOrderbook, source: 'quote_fallback' }, syntheticOrderbook?.tsMs || Date.now());

@@ -82,10 +82,12 @@ function estimateBuyImpactBps(asks, bestAsk, notionalUsd) {
 
 function resolveDepthState({ asks, bids, askSide, bidSide }) {
   const minLevelsPerSide = Math.max(1, Math.floor(Number(askSide?.minLevelsPerSide ?? bidSide?.minLevelsPerSide ?? 2) || 2));
+  const quoteFallbackMode = Boolean(askSide?.quoteFallbackMode || bidSide?.quoteFallbackMode);
   if (!Array.isArray(asks) || !Array.isArray(bids)) return 'orderbook_malformed';
   if (!asks.length || !bids.length) return 'orderbook_sparse';
   if (askSide.levelCounts.valid === 0 || bidSide.levelCounts.valid === 0) return 'orderbook_malformed';
   if (askSide.levelCounts.inBand === 0 || bidSide.levelCounts.inBand === 0) return 'depth_calc_unreliable';
+  if (quoteFallbackMode) return 'quote_fallback';
   if (askSide.levelCounts.valid < minLevelsPerSide || bidSide.levelCounts.valid < minLevelsPerSide) return 'orderbook_sparse';
   return 'ok';
 }
@@ -123,9 +125,19 @@ function computeOrderbookMetrics(orderbook, quote, config) {
     };
   }
 
-  const minLevelsPerSide = Math.max(1, Math.floor(Number(config.minLevelsPerSide) || 2));
-  const askSide = { ...computeDepthForSide({ levels: asks, bestPrice: ask, bandBps: config.bandBps, side: 'ask' }), minLevelsPerSide };
-  const bidSide = { ...computeDepthForSide({ levels: bids, bestPrice: bid, bandBps: config.bandBps, side: 'bid' }), minLevelsPerSide };
+  const quoteFallbackMode = Boolean(orderbook?.synthetic) && String(orderbook?.source || '').includes('quote_fallback');
+  const minLevelsPerSideConfig = Math.max(1, Math.floor(Number(config.minLevelsPerSide) || 2));
+  const minLevelsPerSide = quoteFallbackMode ? 1 : minLevelsPerSideConfig;
+  const askSide = {
+    ...computeDepthForSide({ levels: asks, bestPrice: ask, bandBps: config.bandBps, side: 'ask' }),
+    minLevelsPerSide,
+    quoteFallbackMode,
+  };
+  const bidSide = {
+    ...computeDepthForSide({ levels: bids, bestPrice: bid, bandBps: config.bandBps, side: 'bid' }),
+    minLevelsPerSide,
+    quoteFallbackMode,
+  };
   const askDepthUsd = askSide.depthUsd;
   const bidDepthUsd = bidSide.depthUsd;
   const totalDepthUsd = askDepthUsd + bidDepthUsd;
@@ -149,7 +161,7 @@ function computeOrderbookMetrics(orderbook, quote, config) {
   const hardFailImpact = !Number.isFinite(impactBpsBuy) || impactBpsBuy > (config.maxImpactBps * 3);
 
   let reason = null;
-  if (hardFailDepth || depthState !== 'ok') {
+  if (hardFailDepth || (depthState !== 'ok' && depthState !== 'quote_fallback')) {
     reason = 'ob_depth_insufficient';
   } else if (hardFailImpact) {
     reason = 'ob_impact_too_high';
@@ -178,7 +190,7 @@ function computeOrderbookMetrics(orderbook, quote, config) {
       asks: askSide.levelCounts,
       bids: bidSide.levelCounts,
     },
-    ok: !(hardFailDepth || hardFailImpact || depthState !== 'ok'),
+    ok: !(hardFailDepth || hardFailImpact || (depthState !== 'ok' && depthState !== 'quote_fallback')),
     reason,
   };
 }

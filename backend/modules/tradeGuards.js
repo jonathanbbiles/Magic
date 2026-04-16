@@ -329,6 +329,32 @@ function computeNetEdgeBps({ expectedMoveBps, feeBpsRoundTrip, entrySlippageBuff
   };
 }
 
+function resolveEntryFillProbability({
+  predictorProbability,
+  liquidityScore = 1,
+  liquidityWeight = 0.35,
+  minFillProbability = 0.25,
+} = {}) {
+  const baseProbability = clamp01(Number(predictorProbability));
+  const liquidity = clamp01(Number(liquidityScore));
+  const normalizedLiquidityWeight = clamp01(Number(liquidityWeight));
+  const effectiveMinFillProbability = clamp01(Number(minFillProbability));
+  const liquidityMultiplier = (1 - normalizedLiquidityWeight) + (normalizedLiquidityWeight * liquidity);
+  const fillProbability = clamp(
+    baseProbability * liquidityMultiplier,
+    effectiveMinFillProbability,
+    1,
+  );
+  return {
+    baseProbability,
+    liquidityScore: liquidity,
+    liquidityWeight: normalizedLiquidityWeight,
+    liquidityMultiplier,
+    minFillProbability: effectiveMinFillProbability,
+    fillProbability,
+  };
+}
+
 function computeConfidenceScore({
   predictorProbability,
   spreadBps,
@@ -433,6 +459,7 @@ module.exports = {
   classifyRegimeScorecard,
   computeExpectedNetEdgeBps,
   computeNetEdgeBps,
+  resolveEntryFillProbability,
   computeConfidenceScore,
   shouldExitFailedTrade,
 };

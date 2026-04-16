@@ -16,6 +16,7 @@ const policy = {
     staleQuoteToleranceMs: 30000,
     minProbability: 0.6,
     confidenceCapMultiplier: 0.5,
+    quoteFallbackRequireStrongerEdgeBps: 0,
   },
 };
 
@@ -123,6 +124,46 @@ const sparseRejectedDepth = evaluateEntryMarketData({
 });
 assert.equal(sparseRejectedDepth.executionMode, 'reject');
 assert.equal(sparseRejectedDepth.reason, 'ob_depth_insufficient');
+
+const quoteFallbackAllowed = evaluateEntryMarketData({
+  symbol: 'BTC/USD',
+  symbolTier: 'tier1',
+  spreadBps: 8,
+  quoteAgeMs: 2000,
+  requiredEdgeBps: 50,
+  minNetEdgeBps: 5,
+  netEdgeBps: 8.3,
+  predictorProbability: 0.7,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 120,
+  orderbookMeta: { ok: true, depthState: 'quote_fallback', impactBpsBuy: 2.0 },
+  policy,
+});
+assert.equal(quoteFallbackAllowed.executionMode, 'sparse_fallback');
+assert.equal(quoteFallbackAllowed.reason, null);
+assert.equal(quoteFallbackAllowed.sparseFallbackState.quoteFallbackMode, true);
+assert.equal(quoteFallbackAllowed.sparseFallbackState.path, 'quote_fallback');
+
+const quoteFallbackStaleRejected = evaluateEntryMarketData({
+  symbol: 'BTC/USD',
+  symbolTier: 'tier1',
+  spreadBps: 8,
+  quoteAgeMs: 45000,
+  requiredEdgeBps: 50,
+  minNetEdgeBps: 5,
+  netEdgeBps: 9.1,
+  predictorProbability: 0.7,
+  weakLiquidity: false,
+  cappedOrderNotionalUsd: 100,
+  requiredDepthUsd: 100,
+  availableDepthUsd: 120,
+  orderbookMeta: { ok: true, depthState: 'quote_fallback', impactBpsBuy: 2.0 },
+  policy,
+});
+assert.equal(quoteFallbackStaleRejected.executionMode, 'reject');
+assert.equal(quoteFallbackStaleRejected.reason, 'quote_stale');
 
 const liquidityRejected = evaluateEntryMarketData({
   symbol: 'SOL/USD',

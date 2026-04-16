@@ -125,6 +125,16 @@ withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: '24' }, () => {
   assert.equal(summary.entryUniverseMaxSymbolsSource, 'env');
 });
 
+withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: '' }, () => {
+  const cfg = getRuntimeConfig();
+  assert.equal(cfg.entryUniverseMaxSymbols, null);
+  assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
+});
+
+withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: 'nope' }, () => {
+  assert.throws(() => getRuntimeConfig(), /Expected positive integer/);
+});
+
 withEnv({
   ENTRY_QUOTE_MAX_AGE_MS: '45000',
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS: '70000',

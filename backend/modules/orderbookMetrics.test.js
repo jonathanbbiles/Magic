@@ -59,6 +59,19 @@ assert.equal(relaxedLevelsMetrics.depthState, 'ok');
 assert.ok(relaxedLevelsMetrics.askDepthUsd > 0);
 assert.ok(relaxedLevelsMetrics.bidDepthUsd > 0);
 
+const quoteFallbackMetrics = computeOrderbookMetrics(
+  {
+    asks: [{ p: '10', s: '30' }],
+    bids: [{ p: '9.99', s: '30' }],
+    synthetic: true,
+    source: 'quote_fallback',
+  },
+  { ask: 10, bid: 9.99 },
+  baseConfig,
+);
+assert.equal(quoteFallbackMetrics.depthState, 'quote_fallback');
+assert.equal(quoteFallbackMetrics.ok, true);
+
 const malformedBook = {
   asks: [{ p: 'bad', s: 'oops' }],
   bids: [{ price: null, qty: undefined }],
