@@ -56,7 +56,6 @@ const theme = {
 // ---------------------------------------------------------------------------
 const POLL_MS = 20000;
 const LOG_POLL_MS = 5000;
-const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
 
 function readExpoExtraConfig() {
   const expoConfigExtra = Constants.expoConfig?.extra;
@@ -72,11 +71,10 @@ function readStringConfig(value) {
 function resolveBackendConfig() {
   const extra = readExpoExtraConfig();
   const envBackendUrl = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
-  const extraBackendUrl = readStringConfig(extra?.backendUrl);
   const envApiToken = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
   const extraApiToken = readStringConfig(extra?.apiToken);
 
-  const baseUrl = envBackendUrl || extraBackendUrl || DEFAULT_BACKEND_URL;
+  const baseUrl = envBackendUrl;
   const apiToken = envApiToken || extraApiToken || '';
 
   if (baseUrl) {

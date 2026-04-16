@@ -2,6 +2,7 @@ const path = require('path');
 const recorder = require('../modules/recorder');
 const { normalizePair } = require('../symbolUtils');
 const { resolveDefaultTradeBase, normalizeDataBase } = require('../modules/orderExecution');
+const { preflightStoragePaths } = require('../modules/storagePaths');
 const { getRuntimeConfig, getRuntimeConfigSummary, validateRuntimeConfig } = require('./runtimeConfig');
 const { LIVE_CRITICAL_DEFAULTS } = require('./liveDefaults');
 
@@ -89,6 +90,8 @@ const isRenderEnvironment = () =>
       process.env.RENDER_EXTERNAL_URL ||
       process.env.RENDER_GIT_COMMIT
   );
+const LIVE_ALPACA_TRADE_HOST = 'api.alpaca.markets';
+const PAPER_ALPACA_TRADE_HOST = 'paper-api.alpaca.markets';
 
 const validateEnv = () => {
   const rawTradeBase = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || '';
@@ -161,9 +164,22 @@ const validateEnv = () => {
       credentialTier: tradeBaseResolution.credentialTier,
     });
   }
+  if (nodeEnv === 'production' && !String(process.env.TRADE_BASE || '').trim()) {
+    validationErrors.push('TRADE_BASE is required in production and must be set explicitly to the live Alpaca trading endpoint.');
+  }
 
-  parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
+  const parsedTradeBase = parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
   parseUrl('DATA_BASE', effectiveDataBase);
+  if (nodeEnv === 'production' && parsedTradeBase) {
+    const tradeHost = String(parsedTradeBase.hostname || '').toLowerCase();
+    if (tradeHost !== LIVE_ALPACA_TRADE_HOST) {
+      if (tradeHost === PAPER_ALPACA_TRADE_HOST) {
+        validationErrors.push(`TRADE_BASE cannot point to paper in production. Received host "${tradeHost}". Expected "${LIVE_ALPACA_TRADE_HOST}".`);
+      } else {
+        validationErrors.push(`TRADE_BASE must resolve to "${LIVE_ALPACA_TRADE_HOST}" in production. Received host "${tradeHost}".`);
+      }
+    }
+  }
 
   if (apiToken && apiToken.length < 12) {
     console.warn('config_warning', {
@@ -172,10 +188,14 @@ const validateEnv = () => {
     });
   }
   if (!apiToken) {
-    console.warn('config_warning', {
-      field: 'API_TOKEN',
-      message: 'API_TOKEN not set. Backend endpoints are unprotected.',
-    });
+    if (nodeEnv === 'production') {
+      validationErrors.push('API_TOKEN is required in production and cannot be empty.');
+    } else {
+      console.warn('config_warning', {
+        field: 'API_TOKEN',
+        message: 'API_TOKEN not set. Backend endpoints are unprotected.',
+      });
+    }
   }
   if (apiToken) {
     assertNonPlaceholderSecret('API_TOKEN', apiToken, { required: false, provided: true });
@@ -199,6 +219,15 @@ const validateEnv = () => {
   }
   assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: strictSecretsMode, provided: alpacaKeyProvided });
   assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: strictSecretsMode, provided: alpacaSecretProvided });
+  const alpacaTier = String(tradeBaseResolution.credentialTier || 'unknown');
+  if (nodeEnv === 'production') {
+    if (alpacaTier === 'paper') {
+      validationErrors.push('Live trading in production cannot use paper-tier Alpaca credentials (PK* key detected).');
+    }
+    if (alpacaTier === 'unknown') {
+      validationErrors.push('Unable to verify Alpaca credential tier from key format. Expected a live AK* key in production.');
+    }
+  }
 
   corsAllowedOrigins.forEach((origin) => {
     parseUrl('CORS_ALLOWED_ORIGINS', origin);
@@ -213,10 +242,24 @@ const validateEnv = () => {
   }
 
   if (!datasetDirAbsolute && isRenderEnvironment()) {
-    console.warn('dataset_path_warning', {
+    const payload = {
       datasetDir,
       message: 'DATASET_DIR is relative on a Render-like host. Consider a persistent disk.',
-    });
+    };
+    if (nodeEnv === 'production') {
+      validationErrors.push('DATASET_DIR must be an absolute persistent mount path in production on Render-like hosts.');
+    } else {
+      console.warn('dataset_path_warning', payload);
+    }
+  }
+
+  const storagePreflight = preflightStoragePaths();
+  if (nodeEnv === 'production' && isRenderEnvironment()) {
+    if (!storagePreflight?.writableRoot) {
+      validationErrors.push(`DATASET_DIR is not writable in production. Preferred root: "${storagePreflight?.root || datasetDir}".`);
+    } else if (storagePreflight.writableRoot !== storagePreflight.root) {
+      validationErrors.push(`DATASET_DIR must be writable without fallback in production. Preferred root "${storagePreflight.root}" is not writable.`);
+    }
   }
 
   try {
@@ -379,6 +422,18 @@ const validateEnv = () => {
     if (!sparseFallbackSymbols.length) {
       throw new Error('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS must include at least one symbol when set.');
     }
+    if (!orderbookSparseFallbackEnabled && sparseFallbackSymbols.length > 0) {
+      console.warn('config_warning', {
+        field: 'ORDERBOOK_SPARSE_FALLBACK_SYMBOLS',
+        message: 'Sparse fallback symbols are configured while sparse fallback is disabled.',
+      });
+    }
+    if (!parseBooleanEnv('ORDERBOOK_SPARSE_ALLOW_TIER2', true)) {
+      const tier2Conflicts = sparseFallbackSymbols.filter((symbol) => executionTier2Symbols.includes(symbol));
+      if (tier2Conflicts.length > 0) {
+        throw new Error(`ORDERBOOK_SPARSE_ALLOW_TIER2=false conflicts with sparse fallback symbols in tier2: ${tier2Conflicts.join(', ')}`);
+      }
+    }
     validateRuntimeConfig(process.env);
     if (
       runtimeSummary.entryUniverseModeEffective === 'dynamic' &&
@@ -532,6 +587,7 @@ const validateEnv = () => {
     datasetDir,
     datasetPath,
     datasetDirAbsolute,
+    storageWritableRoot: storagePreflight?.writableRoot || null,
     recorderEnabled,
     httpTimeoutMs: Number(process.env.HTTP_TIMEOUT_MS) || null,
   });

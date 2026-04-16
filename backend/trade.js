@@ -89,6 +89,9 @@ const {
 } = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
 const { evaluateEconomicEntryPrefilter } = require('./modules/economicEntryPrefilter');
+const { resolveUniverseCap } = require('./modules/universeCap');
+const { resolvePostScanEngineState } = require('./modules/warmupReadiness');
+const { deriveEquityBoundConcurrency } = require('./modules/concurrencyGuard');
 const {
   selectMostRecentSellOrder,
   buildLifecycleSnapshot,
@@ -883,7 +886,7 @@ const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCas
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
 const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
-  ? Math.max(2, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
+  ? Math.max(1, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
   : null;
 const ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE = String(runtimeLiveConfig.entryUniverseMaxSymbolsSource || 'uncapped');
 const SUPPORTED_CRYPTO_PAIRS_REFRESH_MS = Math.max(60000, readNumber('SUPPORTED_CRYPTO_PAIRS_REFRESH_MS', 3600000));
@@ -15098,10 +15101,10 @@ async function runEntryScanOnce() {
       consecutiveLosses = 0;
     }
     const maxConcurrentPositionsEffective = getEffectiveMaxConcurrentPositions();
-    const capEnabled =
+    let capEnabled =
       Number.isFinite(maxConcurrentPositionsEffective) &&
       maxConcurrentPositionsEffective !== Number.POSITIVE_INFINITY;
-    const maxConcurrentPositionsLog = capEnabled ? maxConcurrentPositionsEffective : null;
+    let maxConcurrentPositionsLog = capEnabled ? maxConcurrentPositionsEffective : null;
     const autoScanSymbols = AUTO_SCAN_SYMBOLS_OVERRIDE;
     const universeIsOverride = autoScanSymbols.length > 0;
     if (HALT_ON_ORPHANS) {
@@ -15294,20 +15297,19 @@ async function runEntryScanOnce() {
         return String(a).localeCompare(String(b));
       });
     const ratePressureActive = isUnderRatePressure();
-    const configuredUniverseCap = Number.isFinite(ENTRY_UNIVERSE_MAX_SYMBOLS) ? ENTRY_UNIVERSE_MAX_SYMBOLS : null;
-    const effectiveUniverseCap = ratePressureActive
-      ? Math.max(
-        4,
-        configuredUniverseCap != null
-          ? Math.floor(configuredUniverseCap * 0.5)
-          : Math.floor(prioritizedSymbols.length * 0.5),
-      )
-      : configuredUniverseCap;
+    const universeCapResolution = resolveUniverseCap({
+      configuredCap: ENTRY_UNIVERSE_MAX_SYMBOLS,
+      configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      ratePressureActive,
+      prioritizedCount: prioritizedSymbols.length,
+    });
+    const configuredUniverseCap = universeCapResolution.configuredCap;
+    const effectiveUniverseCap = universeCapResolution.effectiveCap;
     const universeCapDiagnostics = {
       configuredCap: configuredUniverseCap,
-      configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      configuredCapSource: universeCapResolution.configuredCapSource,
       effectiveCap: effectiveUniverseCap,
-      effectiveCapSource: ratePressureActive ? 'rate_pressure_backoff' : ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+      effectiveCapSource: universeCapResolution.effectiveCapSource,
       ratePressureActive,
       rankedEligibleCountBeforeCap: prioritizedSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
@@ -15317,7 +15319,7 @@ async function runEntryScanOnce() {
       console.warn('universe_rate_pressure_backoff', {
         configuredCap: configuredUniverseCap,
         effectiveCap: effectiveUniverseCap,
-        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+        configuredCapSource: universeCapResolution.configuredCapSource,
         ratePressureState: getRatePressureState(),
       });
     }
@@ -15329,7 +15331,7 @@ async function runEntryScanOnce() {
         acceptedBeforeCap: prioritizedSymbols.length,
         effectiveCap: effectiveUniverseCap,
         configuredCap: configuredUniverseCap,
-        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+        configuredCapSource: universeCapResolution.configuredCapSource,
         droppedCount: prioritizedSymbols.length - effectiveUniverseCap,
       });
     }
@@ -15340,7 +15342,7 @@ async function runEntryScanOnce() {
         warning: 'effective_universe_cap_lower_than_expected_universe',
         effectiveCap: effectiveUniverseCap,
         configuredCap: configuredUniverseCap,
-        configuredCapSource: ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE,
+        configuredCapSource: universeCapResolution.configuredCapSource,
         configuredPrimaryCount: configuredUniverse.primaryCount,
         rankedEligibleCountBeforeCap: prioritizedSymbols.length,
         scanSymbolsCountAfterCap: scanSymbols.length,
@@ -15677,6 +15679,36 @@ async function runEntryScanOnce() {
       }
     }
     const heldPositionsCount = heldSymbols.size;
+    const equityConcurrencyGuard = deriveEquityBoundConcurrency({
+      configuredCap: maxConcurrentPositionsEffective,
+      portfolioValue: accountInfoForUniverse?.portfolioValue,
+      tradePortfolioPct: TRADE_PORTFOLIO_PCT,
+      minViableTradeNotionalUsd: Number(process.env.MIN_VIABLE_TRADE_NOTIONAL_USD || 25),
+    });
+    if (Number.isFinite(equityConcurrencyGuard?.effectiveCap)) {
+      maxConcurrentPositionsLog = equityConcurrencyGuard.effectiveCap;
+      capEnabled = true;
+    }
+    if (equityConcurrencyGuard?.reducedByEquity) {
+      console.warn('concurrency_cap_reduced_by_equity', {
+        configuredCap: maxConcurrentPositionsEffective,
+        effectiveCap: equityConcurrencyGuard.effectiveCap,
+        equityBoundCap: equityConcurrencyGuard.equityBoundCap,
+        portfolioValueUsd: Number(accountInfoForUniverse?.portfolioValue || 0),
+      });
+    }
+    if (equityConcurrencyGuard?.reason === 'min_viable_trade_notional_unmet') {
+      console.warn('min_viable_trade_notional_unmet', {
+        perTradeNotionalUsd: equityConcurrencyGuard.perTradeNotionalUsd,
+        minViableTradeNotionalUsd: equityConcurrencyGuard.minViableTradeNotionalUsd,
+      });
+    }
+    if (equityConcurrencyGuard?.reason === 'account_economics_invalid') {
+      console.warn('account_economics_invalid', {
+        portfolioValueUsd: Number(accountInfoForUniverse?.portfolioValue || 0),
+        tradePortfolioPct: TRADE_PORTFOLIO_PCT,
+      });
+    }
     let signalReadyCount = 0;
     let signalBlockedByWarmupCount = 0;
 
@@ -15694,7 +15726,7 @@ async function runEntryScanOnce() {
     if (!capEnabled) {
       console.log('max_concurrent_positions_config', { env: MAX_CONCURRENT_POSITIONS, effective: getEffectiveMaxConcurrentPositions() });
     }
-    if (capEnabled && heldPositionsCount >= maxConcurrentPositionsEffective) {
+    if (capEnabled && heldPositionsCount >= maxConcurrentPositionsLog) {
       const endMs = Date.now();
       console.log('entry_scan', {
         startMs,
@@ -15714,6 +15746,7 @@ async function runEntryScanOnce() {
         maxConcurrentPositionsEffective: maxConcurrentPositionsLog,
         capEnabled,
         heldPositionsCount,
+        economicsGuardReason: equityConcurrencyGuard?.reason || null,
       });
       return;
     }
@@ -16357,13 +16390,13 @@ async function runEntryScanOnce() {
       predictorWarmupCompletedLogged = true;
       console.log('predictor_warmup_complete', { readySignals: signalReadyCount, universeSize });
     }
-    if (placed > 0) {
-      setEngineState('placing_buy', { reason: 'entry_submitted' });
-    } else if (signalReadyCount > 0) {
-      setEngineState('ready', { reason: 'scan_complete_no_entry' });
-    } else {
-      setEngineState('warming_up', { reason: 'signals_not_ready' });
-    }
+    const postScanState = resolvePostScanEngineState({
+      placed,
+      signalReadyCount,
+      warmupBlocking: PREDICTOR_WARMUP_BLOCK_TRADES,
+      warmupInProgress: Boolean(getPredictorWarmupStatus()?.inProgress),
+    });
+    setEngineState(postScanState.state, { reason: postScanState.reason });
   } catch (err) {
     const endMs = Date.now();
     console.warn('entry_scan_aborted', { error: err?.message || String(err) });

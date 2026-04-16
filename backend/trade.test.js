@@ -478,7 +478,7 @@ assert.ok(tradeSourceEarly.includes("action: 'skip_orderbook_trade_and_sparse'")
 assert.ok(tradeSourceEarly.includes('skippedOrderbookFetch: true'));
 assert.ok(tradeSourceEarly.includes('skippedTradeFetch: false'));
 assert.ok(tradeSourceEarly.includes('skippedSparseRetry: true'));
-assert.ok(tradeSourceEarly.includes('const configuredUniverseCap = Number.isFinite(ENTRY_UNIVERSE_MAX_SYMBOLS) ? ENTRY_UNIVERSE_MAX_SYMBOLS : null;'));
+assert.ok(tradeSourceEarly.includes('const universeCapResolution = resolveUniverseCap({'));
 assert.ok(tradeSourceEarly.includes('const scanSymbols = Number.isFinite(effectiveUniverseCap)'));
 assert.ok(tradeSourceEarly.includes('scanSymbolsSample: scanSymbols.slice(0, 10),'));
 assert.ok(tradeSourceEarly.includes("skipped: 'prefetch_inflight'"));

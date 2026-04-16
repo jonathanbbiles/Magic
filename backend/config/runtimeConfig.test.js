@@ -90,6 +90,7 @@ withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true' }, () => {
 
 withEnv({}, () => {
   const cfg = getRuntimeConfig();
+  const summary = getRuntimeConfigSummary();
   assert.deepEqual(cfg.executionTier1Symbols, ['BTC/USD', 'ETH/USD']);
   assert.deepEqual(cfg.executionTier2Symbols, ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD']);
   assert.equal(cfg.predictorWarmupMinBars1m, 35);
@@ -108,6 +109,8 @@ withEnv({}, () => {
   assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
+  assert.equal(summary.entryUniverseMaxSymbols, null);
+  assert.equal(summary.entryUniverseMaxSymbolsSource, 'uncapped');
   assert.equal(cfg.entryTier3MinPortfolioUsd, 500);
   assert.equal(cfg.entryDynamicRequireFreshQuote, true);
   assert.equal(cfg.entryDynamicRequireOrderbookForTier3, true);
@@ -115,8 +118,11 @@ withEnv({}, () => {
 
 withEnv({ ENTRY_UNIVERSE_MAX_SYMBOLS: '24' }, () => {
   const cfg = getRuntimeConfig();
+  const summary = getRuntimeConfigSummary();
   assert.equal(cfg.entryUniverseMaxSymbols, 24);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'env');
+  assert.equal(summary.entryUniverseMaxSymbols, 24);
+  assert.equal(summary.entryUniverseMaxSymbolsSource, 'env');
 });
 
 withEnv({

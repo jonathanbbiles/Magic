@@ -25,7 +25,7 @@ read-only diagnostic dashboard.
 ```sh
 cd backend
 npm install        # also wires up .git-hooks via postinstall
-cp .env.example .env   # fill in Alpaca paper keys first
+cp .env.example .env   # fill in live Alpaca keys (never commit secrets)
 npm test
 npm run smoke
 npm start
@@ -39,8 +39,7 @@ npm install
 EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ```
 
-Frontend backend config is read from `EXPO_PUBLIC_BACKEND_URL` first, then
-`Frontend/app.json` at `expo.extra.backendUrl`.
+Frontend requires `EXPO_PUBLIC_BACKEND_URL` at runtime (no hardcoded or app.json fallback URL).
 
 ## CI
 
