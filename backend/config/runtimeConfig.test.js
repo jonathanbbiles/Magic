@@ -88,6 +88,10 @@ withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'true' }, () => {
   assert.equal(getRuntimeConfig().entryUniverseExcludeStables, true);
 });
 
+withEnv({ ENTRY_TIER3_MIN_PORTFOLIO_USD: '0' }, () => {
+  assert.equal(getRuntimeConfig().entryTier3MinPortfolioUsd, 0);
+});
+
 withEnv({}, () => {
   const cfg = getRuntimeConfig();
   const summary = getRuntimeConfigSummary();
@@ -111,7 +115,7 @@ withEnv({}, () => {
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
   assert.equal(summary.entryUniverseMaxSymbols, null);
   assert.equal(summary.entryUniverseMaxSymbolsSource, 'uncapped');
-  assert.equal(cfg.entryTier3MinPortfolioUsd, 500);
+  assert.equal(cfg.entryTier3MinPortfolioUsd, 0);
   assert.equal(cfg.entryDynamicRequireFreshQuote, true);
   assert.equal(cfg.entryDynamicRequireOrderbookForTier3, true);
 });

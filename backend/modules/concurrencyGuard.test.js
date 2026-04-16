@@ -14,4 +14,12 @@ const { deriveEquityBoundConcurrency } = require('./concurrencyGuard');
   assert.equal(result.reason, null);
 }
 
+{
+  const result = deriveEquityBoundConcurrency({ configuredCap: 6, portfolioValue: 107, tradePortfolioPct: 0.1, minViableTradeNotionalUsd: 0 });
+  assert.equal(result.effectiveCap, 6);
+  assert.equal(result.reason, null);
+  assert.equal(result.economicsValid, true);
+  assert.equal(result.reducedByEquity, false);
+}
+
 console.log('concurrency guard tests passed');

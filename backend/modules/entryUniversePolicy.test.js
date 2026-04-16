@@ -49,6 +49,18 @@ assert.equal(dynamicUniverse.stats.unsupportedCount, 0);
 assert.equal(dynamicUniverse.stats.duplicateCount, 1);
 assert.deepEqual(dynamicUniverse.stats.quoteCounts, { USD: 2, USDT: 2, USDC: 1 });
 
+const dynamicAllTradableUniverse = buildDynamicCryptoUniverseFromAssets([
+  { symbol: 'BTC/USD', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'ETH/USD', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'XRP/USDT', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'USDC/USD', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'AAVE/USD', class: 'crypto', tradable: true, status: 'active' },
+  { symbol: 'DOGE/USD', class: 'crypto', tradable: false, status: 'active' },
+]);
+assert.deepEqual(dynamicAllTradableUniverse.symbols, ['BTC/USD', 'ETH/USD', 'XRP/USDT', 'USDC/USD', 'AAVE/USD']);
+assert.equal(dynamicAllTradableUniverse.stats.tradableCryptoCount, 5);
+assert.equal(dynamicAllTradableUniverse.stats.acceptedCount, 5);
+
 const rawDynamicSymbols = ['BTC/USD', 'PEPE/USD', 'ETH/USD', 'PAXG/USD', 'UNI/USD'];
 assert.deepEqual(
   filterDynamicUniverseByExecutionPolicy(rawDynamicSymbols, {

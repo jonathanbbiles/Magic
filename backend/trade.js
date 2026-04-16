@@ -84,8 +84,7 @@ const { createMarketDataCache } = require('./modules/marketDataCache');
 const {
   buildEntryUniverse,
   buildDynamicCryptoUniverseFromAssets,
-  filterDynamicUniverseByExecutionPolicy,
-  resolveDynamicUniverseRankingWithHydration,
+  rankDynamicUniverseByExecutionQuality,
   deriveDynamicUniverseEmptyReason,
 } = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
@@ -1060,7 +1059,9 @@ function shouldAllowDynamicTier3({
 } = {}) {
   if (!executionTier3Default) return false;
   if (allowOverride) return true;
-  return Number(portfolioValue || 0) >= Number(minPortfolioUsd || 0);
+  const minPortfolio = Number(minPortfolioUsd);
+  if (!Number.isFinite(minPortfolio) || minPortfolio <= 0) return true;
+  return Number(portfolioValue || 0) >= minPortfolio;
 }
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
@@ -15255,29 +15256,12 @@ async function runEntryScanOnce() {
       portfolioValue: accountInfoForUniverse.portfolioValue,
     });
     const tier3SuppressedByPortfolio = EXECUTION_TIER3_DEFAULT && !tier3Allowed;
-    let tierFilteredUniverse = normalizedUniverse;
-    if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic')) {
-      const executionFilteredUniverse = filterDynamicUniverseByExecutionPolicy(normalizedUniverse, {
-        executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
-        executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-        executionTier3Default: tier3Allowed,
-      });
-      tierFilteredUniverse = executionFilteredUniverse;
-      console.log('entry_universe_tier_filter', {
-        rawDynamicCount: normalizedUniverse.length,
-        filteredCount: tierFilteredUniverse.length,
-        filteredOutCount: Math.max(0, normalizedUniverse.length - tierFilteredUniverse.length),
-        tier1Count: EXECUTION_TIER1_SYMBOLS.size,
-        tier2Count: EXECUTION_TIER2_SYMBOLS.size,
-        tier3Default: EXECUTION_TIER3_DEFAULT,
-        tier3SuppressedByPortfolio,
-        tier3MinPortfolioUsd: ENTRY_TIER3_MIN_PORTFOLIO_USD,
-        portfolioValueUsd: Number(accountInfoForUniverse.portfolioValue || 0),
-        entryDynamicAllowTier3Override: ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
-      });
-    }
-    const filteredSymbols = applyEntryUniverseStableFilter(tierFilteredUniverse, {
-      excludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+    const dynamicStableExclusionExplicit = String(process.env.ENTRY_UNIVERSE_EXCLUDE_STABLES ?? '').trim() !== '';
+    const stableExclusionActive = ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic')
+      ? ENTRY_UNIVERSE_EXCLUDE_STABLES && dynamicStableExclusionExplicit
+      : ENTRY_UNIVERSE_EXCLUDE_STABLES;
+    const filteredSymbols = applyEntryUniverseStableFilter(normalizedUniverse, {
+      excludeStables: stableExclusionActive,
     });
     let eligibilityHydration = null;
     if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && filteredSymbols.length > 0) {
@@ -15307,30 +15291,25 @@ async function runEntryScanOnce() {
         ),
       };
     };
-    const dynamicRankingResolution = await resolveDynamicUniverseRankingWithHydration(filteredSymbols, {
-      rankOptions: {
-        executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
-        executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-        maxSymbols: filteredSymbols.length,
-        requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
-        requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
-        quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
-        quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
-        orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
-      },
-      getMarketDataMaps: buildRankingMapsFromScanCache,
-      hydrate: async () => hydrateEntryEligibilityMarketData(filteredSymbols, { force: true }),
+    const rankingMaps = buildRankingMapsFromScanCache();
+    const rankedDynamicUniverse = rankDynamicUniverseByExecutionQuality(filteredSymbols, {
+      executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+      executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+      maxSymbols: filteredSymbols.length,
+      requireFreshQuote: false,
+      requireOrderbookForTier3: false,
+      quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+      orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+      quoteBySymbol: rankingMaps.quoteBySymbol || {},
+      orderbookBySymbol: rankingMaps.orderbookBySymbol || {},
+      nowMs: Number.isFinite(rankingMaps.nowMs) ? rankingMaps.nowMs : Date.now(),
     });
-    const rankedDynamicUniverse = dynamicRankingResolution.finalRank;
-    if (dynamicRankingResolution?.hydrationRetry?.attempted) {
-      console.log('entry_universe_hydration_retry', {
-        triggeredBy: dynamicRankingResolution.hydrationRetry.triggeredBy,
-        recovered: Boolean(dynamicRankingResolution.hydrationRetry.recovered),
-        initialEligibleCount: Number(dynamicRankingResolution?.initialRank?.eligibilityCounts?.eligibleCount || 0),
-        finalEligibleCount: Number(dynamicRankingResolution?.finalRank?.eligibilityCounts?.eligibleCount || 0),
-        hydrationResult: dynamicRankingResolution.hydrationRetry.result || null,
-      });
-    }
+    const dynamicRankingResolution = {
+      initialRank: rankedDynamicUniverse,
+      finalRank: rankedDynamicUniverse,
+      hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
+    };
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
       ? rankedDynamicUniverse.symbols
       : filteredSymbols.sort((a, b) => {
@@ -15436,7 +15415,8 @@ async function runEntryScanOnce() {
       fallbackOccurred: Boolean(fallbackReason),
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
-      stableExclusionEnabled: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+      stableExclusionEnabled: stableExclusionActive,
+      dynamicStableExclusionExplicit,
       stableSymbolsExcludedCount: Math.max(0, normalizedUniverse.length - filteredSymbols.length),
       warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
       warmupPrefetchConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
@@ -15523,7 +15503,7 @@ async function runEntryScanOnce() {
         universeZeroReason,
         rankingEligibilityCounts: {
           normalizedUniverseCount: normalizedUniverse.length,
-          tierFilteredUniverseCount: tierFilteredUniverse.length,
+          tierFilteredUniverseCount: filteredSymbols.length,
           stableFilteredUniverseCount: filteredSymbols.length,
           freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
           healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
@@ -15546,7 +15526,7 @@ async function runEntryScanOnce() {
         fallbackReason,
         universeZeroReason,
         normalizedUniverseCount: normalizedUniverse.length,
-        tierFilteredUniverseCount: tierFilteredUniverse.length,
+        tierFilteredUniverseCount: filteredSymbols.length,
         stableFilteredUniverseCount: filteredSymbols.length,
         freshQuoteCount: Number(rankingEligibleCounts.freshQuoteCount || 0),
         healthySpreadCount: Number(rankingEligibleCounts.healthySpreadCount || 0),
@@ -15593,7 +15573,8 @@ async function runEntryScanOnce() {
       dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
       acceptedSymbols: prioritizedSymbols.length,
       scanSymbols: scanSymbols.length,
-      entryUniverseExcludeStables: ENTRY_UNIVERSE_EXCLUDE_STABLES,
+      entryUniverseExcludeStables: stableExclusionActive,
+      dynamicStableExclusionExplicit,
       stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
       configuredPrimaryCount: configuredUniverse.primaryCount,
       configuredSecondaryCount: configuredUniverse.secondaryCount,
@@ -15726,7 +15707,7 @@ async function runEntryScanOnce() {
       configuredCap: maxConcurrentPositionsEffective,
       portfolioValue: accountInfoForUniverse?.portfolioValue,
       tradePortfolioPct: TRADE_PORTFOLIO_PCT,
-      minViableTradeNotionalUsd: Number(process.env.MIN_VIABLE_TRADE_NOTIONAL_USD || 25),
+      minViableTradeNotionalUsd: Number(process.env.MIN_VIABLE_TRADE_NOTIONAL_USD ?? 0),
     });
     if (Number.isFinite(equityConcurrencyGuard?.effectiveCap)) {
       maxConcurrentPositionsLog = equityConcurrencyGuard.effectiveCap;

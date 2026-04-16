@@ -353,6 +353,7 @@ assert.equal(adaptiveThresholdsCeil.impactNotionalUsd, 400);
 assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, executionTier3Default: true }), false);
 assert.equal(shouldAllowDynamicTier3({ portfolioValue: 600, minPortfolioUsd: 500, executionTier3Default: true }), true);
 assert.equal(shouldAllowDynamicTier3({ portfolioValue: 100, minPortfolioUsd: 500, allowOverride: true, executionTier3Default: true }), true);
+assert.equal(shouldAllowDynamicTier3({ portfolioValue: 10, minPortfolioUsd: 0, executionTier3Default: true }), true);
 
 __testSetEntryScanRunningForTests(false);
 __testSetEntryScanRerunRequestedForTests(false);

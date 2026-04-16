@@ -65,8 +65,10 @@ Optional:
 - `ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS` (runtime-configured sparse stale tolerance cap; default `30000`)
 - `ENTRY_SYMBOLS_PRIMARY` (required when `ENTRY_UNIVERSE_MODE=configured`; provide at least one symbol such as `BTC/USD`)
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY` (default `false`)
-- `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `true`; excludes `USDC/USD`, `USDT/USD`, `BUSD/USD`, `DAI/USD` from scan symbols)
-- `ENTRY_UNIVERSE_MAX_SYMBOLS` (default `12`; hard cap for accepted scan symbols, with additional backoff under rate pressure)
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `false`; opt-in stable exclusion for dynamic scans, excludes `USDC/USD`, `USDT/USD`, `BUSD/USD`, `DAI/USD` when explicitly enabled)
+- `ENTRY_UNIVERSE_MAX_SYMBOLS` (default uncapped; hard cap for accepted scan symbols only when explicitly set to a positive value)
+- `ENTRY_TIER3_MIN_PORTFOLIO_USD` (default `0`; set to `0` to disable dynamic tier3 portfolio minimum suppression)
+- `MIN_VIABLE_TRADE_NOTIONAL_USD` (default `0`; set to `0` to disable minimum viable trade notional concurrency guard)
 - `ENTRY_PREFETCH_CHUNK_SIZE` (batch chunk for scan prefetch; code caps effective value at `20`)
 - `ENTRY_PREFETCH_QUOTES` (default `true`; when `true`, prefetch batches latest quotes before symbol evaluation)
 - `ENTRY_PREFETCH_ORDERBOOKS` (default `true`; when `true`, prefetch also batches orderbooks instead of bars-only prefetch)
@@ -237,8 +239,9 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 
 - **dynamic**: backend discovers tradable symbols from Alpaca assets at runtime (`dynamic_full_universe`). This is optional and requires explicit production opt-in.
 - **configured**: backend uses explicit allowlists from `ENTRY_SYMBOLS_PRIMARY`.
-- With dynamic full-universe scanning, symbols not explicitly listed in `EXECUTION_TIER1_SYMBOLS` or `EXECUTION_TIER2_SYMBOLS` are treated as tier3 when `EXECUTION_TIER3_DEFAULT=true`.
-- When `EXECUTION_TIER3_DEFAULT=false`, dynamic scanning is filtered to `EXECUTION_TIER1_SYMBOLS + EXECUTION_TIER2_SYMBOLS` only.
+- Dynamic universe mode scans all active tradable Alpaca crypto assets returned by `/v2/assets?asset_class=crypto` by default.
+- `EXECUTION_TIER1_SYMBOLS` / `EXECUTION_TIER2_SYMBOLS` are execution metadata for tiering/ordering, not a dynamic-universe allowlist.
+- Symbols not listed in `EXECUTION_TIER1_SYMBOLS` or `EXECUTION_TIER2_SYMBOLS` are treated as tier3 metadata in dynamic mode when `EXECUTION_TIER3_DEFAULT=true`.
 
 Production safety rule:
 - Keep `ENTRY_UNIVERSE_MODE=configured` with at least one `ENTRY_SYMBOLS_PRIMARY` symbol for normal live operation, or
@@ -253,13 +256,11 @@ For stable live deployments, also set:
 ## Live example profile
 
 `backend/.env.live.example` now reflects production intent:
-- configured universe scanning (`ENTRY_UNIVERSE_MODE=configured`)
-- dynamic universe blocked in production by default (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
-- stablecoin exclusion enabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=true`)
-- if enabled (`ENTRY_UNIVERSE_EXCLUDE_STABLES=true`), exclusions are surfaced in runtime diagnostics (`stableExclusionEnabled`, `stableSymbolsExcludedCount`) and universe-selection logs
-- `EXECUTION_TIER3_DEFAULT=false` to keep configured mode behavior deterministic
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=12` aligns with the configured production profile
-- `ENTRY_SYMBOLS_PRIMARY` is the active production universe list
+- dynamic universe scanning (`ENTRY_UNIVERSE_MODE=dynamic`)
+- dynamic universe enabled in production with explicit opt-in (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`)
+- stablecoin exclusion disabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=false`)
+- `EXECUTION_TIER3_DEFAULT=true` and `ENTRY_TIER3_MIN_PORTFOLIO_USD=0` so dynamic tier3 is not suppressed by portfolio minimum
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=` leaves dynamic scanning uncapped unless explicitly configured
 - conservative scan cadence/prefetch/rate-limit settings remain unchanged
 
 ## Render deployment sync
@@ -267,15 +268,16 @@ For stable live deployments, also set:
 Changing `backend/.env.live.example` in git **does not** update deployed Render environment variables automatically.
 After merging, manually copy these values into Render:
 
-- `ENTRY_UNIVERSE_MODE=configured`
+- `ENTRY_UNIVERSE_MODE=dynamic`
 - `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
-- `ENTRY_UNIVERSE_EXCLUDE_STABLES=true`
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=12`
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
 - `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
-- `EXECUTION_TIER3_DEFAULT=false`
+- `EXECUTION_TIER3_DEFAULT=true`
+- `ENTRY_TIER3_MIN_PORTFOLIO_USD=0`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=8`
 - `ENTRY_PREFETCH_QUOTES=true`
@@ -288,7 +290,7 @@ After merging, manually copy these values into Render:
 - `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
 - `SECONDARY_QUOTE_ENABLED=false` (deprecated; secondary quote providers are disabled in the live entry path)
 - `QUOTE_RETRY=2`
 
@@ -300,15 +302,16 @@ Do not store real secrets in git-tracked files. Keep `API_TOKEN`, `APCA_API_KEY_
 
 Intended live non-secret env values:
 
-- `ENTRY_UNIVERSE_MODE=configured`
+- `ENTRY_UNIVERSE_MODE=dynamic`
 - `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
-- `ENTRY_UNIVERSE_EXCLUDE_STABLES=true`
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=12`
+- `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
 - `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
-- `EXECUTION_TIER3_DEFAULT=false`
+- `EXECUTION_TIER3_DEFAULT=true`
+- `ENTRY_TIER3_MIN_PORTFOLIO_USD=0`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
 - `ENTRY_PREFETCH_CHUNK_SIZE=8`
 - `ENTRY_PREFETCH_QUOTES=true`
