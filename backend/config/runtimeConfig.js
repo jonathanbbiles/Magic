@@ -22,6 +22,16 @@ const parsePositiveInt = (value, fallback) => {
   return Math.floor(parsed);
 };
 
+const parseNonNegativeInt = (value, fallback) => {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Expected non-negative integer but received "${value}"`);
+  }
+  return Math.floor(parsed);
+};
+
 const parseOptionalPositiveInt = (value, fallback = null) => {
   const raw = String(value ?? '').trim();
   if (!raw) return fallback;
@@ -106,9 +116,9 @@ function getRuntimeConfig(env = process.env) {
     executionTier1Symbols,
     executionTier2Symbols,
     executionTier3Default: parseBoolean(env.EXECUTION_TIER3_DEFAULT, parseBoolean(LIVE_CRITICAL_DEFAULTS.EXECUTION_TIER3_DEFAULT, true)),
-    entryTier3MinPortfolioUsd: parsePositiveInt(
+    entryTier3MinPortfolioUsd: parseNonNegativeInt(
       env.ENTRY_TIER3_MIN_PORTFOLIO_USD,
-      parsePositiveInt(LIVE_CRITICAL_DEFAULTS.ENTRY_TIER3_MIN_PORTFOLIO_USD, 500),
+      parseNonNegativeInt(LIVE_CRITICAL_DEFAULTS.ENTRY_TIER3_MIN_PORTFOLIO_USD, 500),
     ),
     entryDynamicAllowTier3Override: parseBoolean(
       env.ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE,
