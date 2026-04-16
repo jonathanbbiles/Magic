@@ -6,6 +6,7 @@ const {
   classifyRegimeScorecard,
   computeExpectedNetEdgeBps,
   computeNetEdgeBps,
+  resolveEntryFillProbability,
   computeConfidenceScore,
   shouldExitFailedTrade,
 } = require('./tradeGuards');
@@ -245,6 +246,24 @@ const edge = computeNetEdgeBps({
 assert.equal(edge.grossEdgeBps, 260);
 assert.equal(edge.netEdgeBps, 205);
 assert.equal(edge.netEdgeBps > 5, true);
+
+const healthyFill = resolveEntryFillProbability({
+  predictorProbability: 0.66,
+  liquidityScore: 0.82,
+  liquidityWeight: 0.35,
+  minFillProbability: 0.25,
+});
+assert.ok(healthyFill.fillProbability > 0.55);
+
+const healthyTier1Edge = computeNetEdgeBps({
+  expectedMoveBps: 90,
+  feeBpsRoundTrip: 20,
+  entrySlippageBufferBps: 6,
+  exitSlippageBufferBps: 6,
+  adverseSpreadCostBps: 7,
+  fillProbability: healthyFill.fillProbability,
+});
+assert.equal(healthyTier1Edge.netEdgeBps > 5, true);
 
 const negativeEdge = computeNetEdgeBps({
   expectedMoveBps: 24.31,
