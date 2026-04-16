@@ -2249,20 +2249,50 @@ async function computeEntrySignal(symbol, opts = {}) {
   if (primaryQuoteViabilityFinal.ok) {
     clearStaleQuoteSkipState(asset.symbol);
   }
-  const quoteHopelesslyStale = Number.isFinite(primaryQuoteViabilityFinal.quoteAgeMs)
-    && primaryQuoteViabilityFinal.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
   if (!primaryQuoteViabilityFinal.ok) {
-    const cooldownMs = quoteHopelesslyStale ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null;
+    if (lateScanEvaluation) {
+      const recoveredAfterFinalRefresh = await forceRefreshStaleQuoteOnce();
+      if (recoveredAfterFinalRefresh) {
+        const viabilityAfterFinalRefresh = evaluatePrimaryQuoteViability({
+          quote,
+          nowMs: Date.now(),
+          maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+        });
+        if (viabilityAfterFinalRefresh.ok) {
+          staleQuoteRecoveredByForcedRefresh = true;
+          clearStaleQuoteSkipState(asset.symbol);
+          console.log('entry_quote_scan_latency_recovered', {
+            symbol: asset.symbol,
+            symbolTier,
+            scanElapsedMsAtSymbol,
+            symbolIndex: Number.isFinite(symbolIndex) ? symbolIndex : null,
+            quoteAgeMs: viabilityAfterFinalRefresh.quoteAgeMs,
+            source: quoteSource,
+            thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+          });
+        }
+      }
+    }
+  }
+  const primaryQuoteViabilityAfterFinalRefresh = evaluatePrimaryQuoteViability({
+    quote,
+    nowMs: Date.now(),
+    maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+  });
+  const quoteHopelesslyStaleAfterFinalRefresh = Number.isFinite(primaryQuoteViabilityAfterFinalRefresh.quoteAgeMs)
+    && primaryQuoteViabilityAfterFinalRefresh.quoteAgeMs > (ENTRY_QUOTE_MAX_AGE_MS * STALE_QUOTE_HOPELESS_MULTIPLIER);
+  if (!primaryQuoteViabilityAfterFinalRefresh.ok) {
+    const cooldownMs = quoteHopelesslyStaleAfterFinalRefresh ? STALE_QUOTE_HOPELESS_COOLDOWN_MS : null;
     noteStaleQuoteSkip(asset.symbol, {
       cooldownMs,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.reason,
-      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
+      reason: quoteHopelesslyStaleAfterFinalRefresh ? 'stale_quote_hopeless' : primaryQuoteViabilityAfterFinalRefresh.reason,
+      quoteAgeMs: primaryQuoteViabilityAfterFinalRefresh.quoteAgeMs,
     });
     console.log('entry_quote_viability_skip', {
       symbol: asset.symbol,
       symbolTier,
-      reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.staleReasonCode,
-      quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
+      reason: quoteHopelesslyStaleAfterFinalRefresh ? 'stale_quote_hopeless' : primaryQuoteViabilityAfterFinalRefresh.staleReasonCode,
+      quoteAgeMs: primaryQuoteViabilityAfterFinalRefresh.quoteAgeMs,
       quoteSource,
       scanElapsedMsAtSymbol,
       staleCause: Number.isFinite(scanElapsedMsAtSymbol) && scanElapsedMsAtSymbol > ENTRY_QUOTE_MAX_AGE_MS
@@ -2281,10 +2311,10 @@ async function computeEntrySignal(symbol, opts = {}) {
       meta: {
         symbol: asset.symbol,
         symbolTier,
-        reason: primaryQuoteViabilityFinal.staleReasonCode,
-        quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
+        reason: primaryQuoteViabilityAfterFinalRefresh.staleReasonCode,
+        quoteAgeMs: primaryQuoteViabilityAfterFinalRefresh.quoteAgeMs,
         thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
-        staleQuoteHopeless: quoteHopelesslyStale,
+        staleQuoteHopeless: quoteHopelesslyStaleAfterFinalRefresh,
         staleRefreshAttempted: true,
         staleRefreshRecovered: false,
         skippedOrderbookFetch: true,
@@ -4696,6 +4726,7 @@ let entryScanRunning = false;
 let entryScanRerunRequested = false;
 let entryScanDeferredSinceMs = null;
 let entryManagerIntervalId = null;
+let entryManagerImmediateScanRequested = false;
 let entryWatchdogIntervalId = null;
 const openPositionsCache = {
   tsMs: 0,
@@ -5862,15 +5893,35 @@ function getPrefetchedBarsIfReusable({ symbols = [], maxAgeMs = BARS_PREFETCH_IN
   if (!lastPrefetchedBars || !lastPrefetchedBarsUpdatedAtMs) return null;
   const ageMs = Date.now() - lastPrefetchedBarsUpdatedAtMs;
   if (Number.isFinite(maxAgeMs) && ageMs > maxAgeMs) return null;
-  const requested = new Set((Array.isArray(symbols) ? symbols : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean));
-  if (requested.size === 0) return null;
+  const requested = Array.from(
+    new Set((Array.isArray(symbols) ? symbols : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean)),
+  );
+  if (requested.length === 0) return null;
+  const reusableSymbols = [];
+  const missingSymbols = [];
   for (const symbol of requested) {
-    if (!lastPrefetchedBarsSymbols.has(symbol)) return null;
+    if (lastPrefetchedBarsSymbols.has(symbol)) {
+      reusableSymbols.push(symbol);
+    } else {
+      missingSymbols.push(symbol);
+    }
   }
+  if (reusableSymbols.length === 0) return null;
   return {
     bars: lastPrefetchedBars,
     ageMs,
     symbolCount: lastPrefetchedBarsSymbols.size,
+    reusableSymbols,
+    missingSymbols,
+  };
+}
+
+function clonePrefetchedBarsSnapshot(barsSnapshot) {
+  const base = barsSnapshot && typeof barsSnapshot === 'object' ? barsSnapshot : {};
+  return {
+    bars1mBySymbol: base.bars1mBySymbol instanceof Map ? new Map(base.bars1mBySymbol) : new Map(),
+    bars5mBySymbol: base.bars5mBySymbol instanceof Map ? new Map(base.bars5mBySymbol) : new Map(),
+    bars15mBySymbol: base.bars15mBySymbol instanceof Map ? new Map(base.bars15mBySymbol) : new Map(),
   };
 }
 
@@ -14789,8 +14840,13 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     symbols: seedSymbols,
     maxAgeMs: BARS_PREFETCH_INTERVAL_MS,
   });
-  const canReuseBars = Boolean(reusableBars?.bars);
-  const shouldPrefetchBars = !barsIntervalActive || !canReuseBars;
+  const reusableCoverageSymbols = Array.isArray(reusableBars?.reusableSymbols) ? reusableBars.reusableSymbols : [];
+  const missingBarSymbols = Array.isArray(reusableBars?.missingSymbols)
+    ? reusableBars.missingSymbols
+    : seedSymbols.slice();
+  const canReuseBars = Boolean(reusableBars?.bars) && reusableCoverageSymbols.length > 0;
+  const hasAllSeedBarsCovered = canReuseBars && missingBarSymbols.length === 0;
+  const shouldPrefetchBars = !hasAllSeedBarsCovered;
   if (symbols.length === 0) {
     return {
       ok: true,
@@ -14829,16 +14885,16 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
   const chunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
   const chunks = chunkArray(seedSymbols, chunkSize);
-  const bars1mBySymbol = new Map();
-  const bars5mBySymbol = new Map();
-  const bars15mBySymbol = new Map();
+  const barsFetchChunks = chunkArray(missingBarSymbols, chunkSize);
+  const missingBarsSymbolSet = new Set(missingBarSymbols);
   let prefetchedQuotes = 0;
   let prefetchedOrderbooks = 0;
-  const prefetchedBars = shouldPrefetchBarsWithCooldown ? {
-    bars1mBySymbol,
-    bars5mBySymbol,
-    bars15mBySymbol,
-  } : (canReuseBars ? reusableBars.bars : lastPrefetchedBars);
+  const prefetchedBars = shouldPrefetchBarsWithCooldown
+    ? clonePrefetchedBarsSnapshot(canReuseBars ? reusableBars.bars : null)
+    : (canReuseBars ? reusableBars.bars : lastPrefetchedBars);
+  const bars1mBySymbol = prefetchedBars?.bars1mBySymbol instanceof Map ? prefetchedBars.bars1mBySymbol : new Map();
+  const bars5mBySymbol = prefetchedBars?.bars5mBySymbol instanceof Map ? prefetchedBars.bars5mBySymbol : new Map();
+  const bars15mBySymbol = prefetchedBars?.bars15mBySymbol instanceof Map ? prefetchedBars.bars15mBySymbol : new Map();
   const warmupLimits = getWarmupBarLimits();
   const ranges = {
     '1m': getBarsFetchRange({ timeframe: '1Min', limit: warmupLimits['1m'] }),
@@ -14848,11 +14904,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
 
   const warmupPrefetchConcurrency = Math.max(
     1,
-    Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, chunks.length || 1),
+    Math.min(PREDICTOR_WARMUP_PREFETCH_CONCURRENCY, barsFetchChunks.length || 1),
   );
   startPredictorWarmup({
     totalSymbolsPlanned: seedSymbols.length,
-    totalChunks: chunks.length,
+    totalChunks: barsFetchChunks.length || chunks.length,
   });
   let symbolsCompleted = 0;
   let chunksCompleted = 0;
@@ -14878,7 +14934,15 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         : [];
       prefetchedOrderbooks += orderbookSymbols.length;
     }
-    if (!shouldPrefetchBarsWithCooldown) {
+    if (!shouldPrefetchBarsWithCooldown || missingBarSymbols.length === 0) {
+      return {
+        bars1m: new Map(),
+        bars5m: new Map(),
+        bars15m: new Map(),
+      };
+    }
+    const barsChunkSymbols = chunkSymbols.filter((symbol) => missingBarsSymbolSet.has(symbol));
+    if (barsChunkSymbols.length === 0) {
       return {
         bars1m: new Map(),
         bars5m: new Map(),
@@ -14886,21 +14950,21 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       };
     }
     const bars1mResp = await fetchCryptoBarsWarmupPaged({
-      symbols: chunkSymbols,
+      symbols: barsChunkSymbols,
       perSymbolLimit: warmupLimits['1m'],
       timeframe: '1Min',
       start: ranges['1m'].start,
       end: ranges['1m'].end,
     });
     const bars5mResp = await fetchCryptoBarsWarmupPaged({
-      symbols: chunkSymbols,
+      symbols: barsChunkSymbols,
       perSymbolLimit: warmupLimits['5m'],
       timeframe: '5Min',
       start: ranges['5m'].start,
       end: ranges['5m'].end,
     });
     const bars15mResp = await fetchCryptoBarsWarmupPaged({
-      symbols: chunkSymbols,
+      symbols: barsChunkSymbols,
       perSymbolLimit: warmupLimits['15m'],
       timeframe: '15Min',
       start: ranges['15m'].start,
@@ -14908,9 +14972,9 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     });
 
     return {
-      bars1m: buildBarsMapFromBatch(chunkSymbols, bars1mResp),
-      bars5m: buildBarsMapFromBatch(chunkSymbols, bars5mResp),
-      bars15m: buildBarsMapFromBatch(chunkSymbols, bars15mResp),
+      bars1m: buildBarsMapFromBatch(barsChunkSymbols, bars1mResp),
+      bars5m: buildBarsMapFromBatch(barsChunkSymbols, bars5mResp),
+      bars15m: buildBarsMapFromBatch(barsChunkSymbols, bars15mResp),
     };
   };
 
@@ -14918,7 +14982,7 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     for (let i = 0; i < chunks.length; i += warmupPrefetchConcurrency) {
       const batch = chunks.slice(i, i + warmupPrefetchConcurrency);
       const batchResults = await Promise.all(batch.map((chunkSymbols) => processChunk(chunkSymbols)));
-      if (!shouldPrefetchBarsWithCooldown) continue;
+      if (!shouldPrefetchBarsWithCooldown || missingBarSymbols.length === 0) continue;
       for (const result of batchResults) {
         updatePredictorWarmupProgress({
           currentTimeframe: '1Min',
@@ -14966,6 +15030,26 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
         });
       }
     }
+    if (!shouldPrefetchBarsWithCooldown && canReuseBars) {
+      updatePredictorWarmupProgress({
+        symbolsCompleted: reusableCoverageSymbols.length,
+        chunksCompleted: chunks.length,
+        timeframesCompleted: {
+          '1Min': chunks.length,
+          '5Min': chunks.length,
+          '15Min': chunks.length,
+        },
+        currentTimeframe: null,
+        lastCompletedTimeframe: 'reused',
+        lastBatchSummary: {
+          reuseOnly: true,
+          reusedSymbols: reusableCoverageSymbols.length,
+          missingSymbols: missingBarSymbols.length,
+          barsAgeMs: Number.isFinite(reusableBars?.ageMs) ? Math.max(0, Math.floor(reusableBars.ageMs)) : null,
+          chunkSize,
+        },
+      });
+    }
     finishPredictorWarmup();
   } catch (err) {
     setPredictorWarmupError(err);
@@ -15003,9 +15087,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     totalSymbolsObserved: symbols.length,
     prefetchedQuotes,
     prefetchedOrderbooks,
-    barsReused: canReuseBars && !shouldPrefetchBarsWithCooldown,
+    barsReused: canReuseBars && (!shouldPrefetchBarsWithCooldown || reusableCoverageSymbols.length > 0),
+    barsReusedSymbolCount: reusableCoverageSymbols.length,
+    barsMissingSymbolCount: missingBarSymbols.length,
     barsPrefetchState: shouldPrefetchBarsWithCooldown
-      ? 'enabled'
+      ? (canReuseBars ? 'partial_reused_plus_fetch' : 'enabled')
       : (canReuseBars ? 'reused' : (barsCooldownActive ? 'skipped_endpoint_cooldown' : 'skipped')),
     quotePrefetchState: ENTRY_PREFETCH_QUOTES
       ? (shouldPrefetchQuotes ? 'enabled' : 'skipped_endpoint_cooldown')
@@ -16537,21 +16623,36 @@ async function runEntryScanOnce() {
       entryScanRerunRequested = false;
       const scanDurationMs = Math.max(0, Date.now() - startMs);
       const deferredForMs = Math.max(0, Date.now() - Number(entryScanDeferredSinceMs || Date.now()));
-      const rerunDelayMs = Math.max(0, ENTRY_SCAN_INTERVAL_MS - scanDurationMs);
       console.log('entry_scan_rerun_execute', {
         reason: 'deferred_scan_tick',
         queuedAt: safeIso(),
         deferredForMs,
-        rerunDelayMs,
+        rerunDelayMs: 0,
+        schedulerMode: 'completion_driven',
+        scanDurationMs,
       });
       entryScanDeferredSinceMs = null;
-      setTimeout(() => {
-        runEntryScanOnce().catch((err) => {
-          console.error('entry_scan_rerun_failed', err?.message || err);
-        });
-      }, rerunDelayMs);
+      entryManagerImmediateScanRequested = true;
     }
   }
+}
+
+function scheduleNextEntryScan(delayMs = ENTRY_SCAN_INTERVAL_MS) {
+  if (!entryManagerRunning) return;
+  if (entryManagerIntervalId) clearTimeout(entryManagerIntervalId);
+  const safeDelayMs = Math.max(0, Math.floor(Number(delayMs) || 0));
+  entryManagerIntervalId = setTimeout(async () => {
+    try {
+      await runEntryScanOnce();
+    } catch (err) {
+      console.error('entry_manager_failed', err?.message || err);
+    } finally {
+      if (!entryManagerRunning) return;
+      const nextDelayMs = entryManagerImmediateScanRequested ? 0 : ENTRY_SCAN_INTERVAL_MS;
+      entryManagerImmediateScanRequested = false;
+      scheduleNextEntryScan(nextDelayMs);
+    }
+  }, safeDelayMs);
 }
 
 function startExitManager() {
@@ -16628,11 +16729,8 @@ function startEntryManager() {
       }
     }, 0);
   }
-  entryManagerIntervalId = setInterval(() => {
-    runEntryScanOnce().catch((err) => {
-      console.error('entry_manager_failed', err?.message || err);
-    });
-  }, ENTRY_SCAN_INTERVAL_MS);
+  entryManagerImmediateScanRequested = false;
+  scheduleNextEntryScan(0);
   logRuntimeConfigEffective();
   console.log('entry_manager_runtime_config', {
     stage: 'entry_manager_start',
@@ -18639,7 +18737,7 @@ function getTradingManagerStatus() {
 }
 
 function __resetManagerIntervalsForTests() {
-  if (entryManagerIntervalId) clearInterval(entryManagerIntervalId);
+  if (entryManagerIntervalId) clearTimeout(entryManagerIntervalId);
   if (entryWatchdogIntervalId) clearInterval(entryWatchdogIntervalId);
   if (exitManagerIntervalId) clearInterval(exitManagerIntervalId);
   if (exitRepairIntervalId) clearInterval(exitRepairIntervalId);
@@ -18653,6 +18751,7 @@ function __resetManagerIntervalsForTests() {
   entryScanRunning = false;
   entryScanRerunRequested = false;
   entryScanDeferredSinceMs = null;
+  entryManagerImmediateScanRequested = false;
   exitManagerRunning = false;
   entryManagerHeartbeat.running = false;
   clearEntryScanProgress({ state: 'idle' });
@@ -18909,6 +19008,17 @@ module.exports = {
   },
   __testGetEntryScanRerunRequestedForTests: () => entryScanRerunRequested,
   __testExtractStaleQuoteMeta: extractStaleQuoteMeta,
+  __testGetPrefetchedBarsIfReusableForTests: getPrefetchedBarsIfReusable,
+  __testSetLastPrefetchedBarsForTests: ({ bars = null, updatedAtMs = null, symbols = [] } = {}) => {
+    lastPrefetchedBars = bars || {
+      bars1mBySymbol: new Map(),
+      bars5mBySymbol: new Map(),
+      bars15mBySymbol: new Map(),
+    };
+    lastPrefetchedBarsUpdatedAtMs = Number.isFinite(Number(updatedAtMs)) ? Number(updatedAtMs) : 0;
+    lastPrefetchedBarsSymbols = new Set((Array.isArray(symbols) ? symbols : []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean));
+  },
+  __testPrefetchEntryScanMarketDataForTests: prefetchEntryScanMarketData,
   __warmQuoteCacheFromBatchForTests: warmQuoteCacheFromBatch,
   __warmOrderbookCacheFromBatchForTests: warmOrderbookCacheFromBatch,
   __getScanMarketDataCacheForTests: () => scanMarketDataCache,
