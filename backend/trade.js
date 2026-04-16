@@ -885,7 +885,7 @@ const ENTRY_UNIVERSE_MODE = runtimeLiveConfig.entryUniverseModeEffective;
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase() || 'development';
 const ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION = runtimeLiveConfig.allowDynamicUniverseInProduction;
 const ENTRY_UNIVERSE_EXCLUDE_STABLES = runtimeLiveConfig.entryUniverseExcludeStables;
-const ENTRY_UNIVERSE_MAX_SYMBOLS = Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
+const ENTRY_UNIVERSE_MAX_SYMBOLS = runtimeLiveConfig.entryUniverseMaxSymbols != null && Number.isFinite(Number(runtimeLiveConfig.entryUniverseMaxSymbols))
   ? Math.max(1, Math.floor(Number(runtimeLiveConfig.entryUniverseMaxSymbols)))
   : null;
 const ENTRY_UNIVERSE_MAX_SYMBOLS_SOURCE = String(runtimeLiveConfig.entryUniverseMaxSymbolsSource || 'uncapped');
