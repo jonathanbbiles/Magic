@@ -692,6 +692,15 @@ assert.equal(
   }),
   'provider_quote_stale_after_refresh',
 );
+assert.equal(
+  tradeEntryBasis.shouldCountEntryStaleQuoteSkip({
+    why: 'marketdata_unavailable',
+    skipReason: tradeEntryBasis.resolveEntrySkipReason('marketdata_unavailable', { reason: 'stale_quote_primary' }),
+  }),
+  true,
+);
+assert.equal(tradeEntryBasis.shouldRecordEntryHealthFailure('stale_quote_primary'), true);
+assert.equal(tradeEntryBasis.shouldRecordEntryHealthFailure('spread_gate'), false);
 
 const predictorCandidate = tradeEntryBasis.buildPredictorCandidateSignal({
   symbol: 'BTC/USD',
@@ -718,6 +727,46 @@ const predictorCandidateRequiredEdgeFallback = tradeEntryBasis.buildPredictorCan
 assert.equal(predictorCandidateRequiredEdgeFallback.requiredEdgeBps, 27);
 assert.equal(predictorCandidateRequiredEdgeFallback.dataQualityReason, 'provider_quote_stale_after_refresh');
 assert.deepEqual(predictorCandidateRequiredEdgeFallback.sparseRetry, { providerQuoteStaleAfterRefresh: true });
+const predictorCandidateEvGate = tradeEntryBasis.buildPredictorCandidateSignal({
+  symbol: 'SOL/USD',
+  recordBase: {
+    predictorProbability: 0.55,
+    spreadBps: 5.5,
+    expectedMoveBps: 12.1,
+    requiredEdgeBps: 8.7,
+    expectedNetEdgeBps: 3.2,
+    fillProbability: 0.42,
+    quoteAgeMs: 4100,
+    quoteTsMs: 1700000000001,
+    quoteReceivedAtMs: 1700000000021,
+    regimeLabel: 'neutral',
+    regimePenaltyBps: 1.8,
+  },
+  candidateMeta: {
+    edge: { netEdgeBps: 3.2 },
+  },
+  candidateDecision: 'skipped',
+  candidateSkipReason: 'ev_gate',
+});
+assert.equal(predictorCandidateEvGate.expectedMoveBps, 12.1);
+assert.equal(predictorCandidateEvGate.requiredEdgeBps, 8.7);
+assert.equal(predictorCandidateEvGate.netEdgeBps, 3.2);
+assert.equal(predictorCandidateEvGate.fillProbability, 0.42);
+assert.equal(predictorCandidateEvGate.quoteAgeMs, 4100);
+assert.equal(predictorCandidateEvGate.quoteTsMs, 1700000000001);
+assert.equal(predictorCandidateEvGate.quoteReceivedAtMs, 1700000000021);
+assert.equal(predictorCandidateEvGate.regimeLabel, 'neutral');
+assert.equal(predictorCandidateEvGate.regimePenaltyBps, 1.8);
+const predictorCandidateNullPreserved = tradeEntryBasis.buildPredictorCandidateSignal({
+  symbol: 'ADA/USD',
+  recordBase: { predictorProbability: null, spreadBps: null },
+  candidateMeta: {},
+  candidateDecision: 'skipped',
+  candidateSkipReason: 'ev_gate',
+});
+assert.equal(predictorCandidateNullPreserved.expectedMoveBps, null);
+assert.equal(predictorCandidateNullPreserved.requiredEdgeBps, null);
+assert.equal(predictorCandidateNullPreserved.netEdgeBps, null);
 
 async function runSparseQuoteRefreshToleranceTest() {
   const calls = [];
