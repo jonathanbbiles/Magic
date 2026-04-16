@@ -2150,6 +2150,42 @@ async function computeEntrySignal(symbol, opts = {}) {
     quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
     return true;
   };
+  const scanStartedAtMs = Number(opts?.scanTiming?.scanStartedAtMs);
+  const symbolIndex = Number(opts?.scanTiming?.symbolIndex);
+  const scanElapsedMsAtSymbol = Number.isFinite(scanStartedAtMs) ? Math.max(0, Date.now() - scanStartedAtMs) : null;
+  const lateScanEvaluation = Number.isFinite(scanElapsedMsAtSymbol)
+    && scanElapsedMsAtSymbol >= Math.max(ENTRY_SCAN_INTERVAL_MS, Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.75));
+  const nearStaleQuote = Number.isFinite(quoteAgeMs) && quoteAgeMs >= Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.6);
+  const quoteSourceLower = String(quoteSource || '').toLowerCase();
+  const quoteLikelyPrefetchedOrCached = ['prefetch', 'cache', 'pass'].some((token) => quoteSourceLower.includes(token));
+  const shouldLateRefresh = quoteLikelyPrefetchedOrCached && (lateScanEvaluation || nearStaleQuote);
+  if (shouldLateRefresh) {
+    const preRefreshQuoteAgeMs = quoteAgeMs;
+    const refreshed = await forceRefreshStaleQuoteOnce();
+    if (refreshed) {
+      console.log('entry_quote_late_refresh', {
+        symbol: asset.symbol,
+        symbolTier,
+        reason: lateScanEvaluation ? 'scan_latency_revalidation' : 'age_revalidation',
+        scanElapsedMsAtSymbol,
+        symbolIndex: Number.isFinite(symbolIndex) ? symbolIndex : null,
+        preRefreshQuoteAgeMs,
+        thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        refreshedQuoteSource: quoteSource,
+        refreshedQuoteAgeMs: quoteAgeMs,
+      });
+    } else {
+      console.log('entry_quote_late_refresh_failed', {
+        symbol: asset.symbol,
+        symbolTier,
+        reason: lateScanEvaluation ? 'scan_latency_revalidation' : 'age_revalidation',
+        scanElapsedMsAtSymbol,
+        symbolIndex: Number.isFinite(symbolIndex) ? symbolIndex : null,
+        preRefreshQuoteAgeMs,
+        thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+      });
+    }
+  }
 
   const primaryQuoteViability = evaluatePrimaryQuoteViability({
     quote,
@@ -2227,6 +2263,11 @@ async function computeEntrySignal(symbol, opts = {}) {
       symbolTier,
       reason: quoteHopelesslyStale ? 'stale_quote_hopeless' : primaryQuoteViabilityFinal.staleReasonCode,
       quoteAgeMs: primaryQuoteViabilityFinal.quoteAgeMs,
+      quoteSource,
+      scanElapsedMsAtSymbol,
+      staleCause: Number.isFinite(scanElapsedMsAtSymbol) && scanElapsedMsAtSymbol > ENTRY_QUOTE_MAX_AGE_MS
+        ? 'scan_latency'
+        : 'upstream_or_cache_staleness',
       quoteFreshnessPolicy: getQuoteFreshnessPolicy(),
       thresholdName: 'normalEntryQuoteMaxAgeMs',
       thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
@@ -4653,6 +4694,7 @@ const positionsListCache = {
 let entryManagerRunning = false;
 let entryScanRunning = false;
 let entryScanRerunRequested = false;
+let entryScanDeferredSinceMs = null;
 let entryManagerIntervalId = null;
 let entryWatchdogIntervalId = null;
 const openPositionsCache = {
@@ -15027,17 +15069,28 @@ function emitEntryScanNoopSummary({ startMs, reason, extra = {} }) {
 async function runEntryScanOnce() {
   beginMarketDataPass();
   if (entryScanRunning) {
+    const wasQueued = entryScanRerunRequested;
     entryScanRerunRequested = true;
-    const deferred = recordDeferredScanTick(entryManagerHeartbeat, safeIso, {
-      reason: 'previous_scan_still_running',
-      currentScanStartedAt: entryManagerHeartbeat.currentScanStartedAt,
-      currentScanState: entryManagerHeartbeat.currentScanState,
-      lastScanDurationMs: entryManagerHeartbeat.lastScanDurationMs,
-      rerunQueued: true,
-    });
-    console.log('entry_scan_tick_skipped', deferred);
+    if (!wasQueued) {
+      entryScanDeferredSinceMs = Date.now();
+      const deferred = recordDeferredScanTick(entryManagerHeartbeat, safeIso, {
+        reason: 'previous_scan_still_running',
+        currentScanStartedAt: entryManagerHeartbeat.currentScanStartedAt,
+        currentScanState: entryManagerHeartbeat.currentScanState,
+        lastScanDurationMs: entryManagerHeartbeat.lastScanDurationMs,
+        rerunQueued: true,
+      });
+      console.log('entry_scan_tick_skipped', deferred);
+    } else {
+      console.log('entry_scan_tick_coalesced', {
+        reason: 'previous_scan_still_running',
+        rerunQueued: true,
+        deferredForMs: Math.max(0, Date.now() - Number(entryScanDeferredSinceMs || Date.now())),
+      });
+    }
     return;
   }
+  entryScanDeferredSinceMs = null;
   entryScanRerunRequested = false;
   entryScanRunning = true;
   entryManagerHeartbeat.running = true;
@@ -15086,9 +15139,26 @@ async function runEntryScanOnce() {
     setEngineState('scanning', { reason: 'entry_scan_start' });
   }
   try {
+    const stageStartedAtByName = new Map();
+    const stageDurationsMs = {};
+    const beginStage = (stage) => {
+      stageStartedAtByName.set(stage, Date.now());
+    };
+    const completeStage = (stage) => {
+      const startedAt = Number(stageStartedAtByName.get(stage));
+      if (!Number.isFinite(startedAt)) return;
+      stageDurationsMs[stage] = Math.max(0, Date.now() - startedAt);
+      stageStartedAtByName.delete(stage);
+    };
     const finalizeScan = (summary, heartbeatResult) => {
       const endMs = Number(summary?.endMs) || Date.now();
-      lastEntryScanSummary = { ...(summary || {}), endMs };
+      if (stageStartedAtByName.size > 0) {
+        for (const [stage, startedAt] of stageStartedAtByName.entries()) {
+          stageDurationsMs[stage] = Math.max(0, endMs - Number(startedAt || endMs));
+        }
+        stageStartedAtByName.clear();
+      }
+      lastEntryScanSummary = { ...(summary || {}), endMs, stageDurationsMs };
       entryManagerHeartbeat.lastScanAt = safeIso(endMs);
       entryManagerHeartbeat.lastScanDurationMs = Number(lastEntryScanSummary?.durationMs) || Math.max(0, endMs - startMs);
       entryManagerHeartbeat.lastScanResult = heartbeatResult || 'no_trade';
@@ -15184,6 +15254,7 @@ async function runEntryScanOnce() {
       tradingHaltedReason = null;
     }
 
+    beginStage('universe_selection');
     const configuredUniverse = buildEntryUniverse({
       primaryRaw: ENTRY_SYMBOLS_PRIMARY,
       secondaryRaw: ENTRY_SYMBOLS_SECONDARY,
@@ -15267,6 +15338,7 @@ async function runEntryScanOnce() {
     if (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic') && filteredSymbols.length > 0) {
       eligibilityHydration = await hydrateEntryEligibilityMarketData(filteredSymbols);
     }
+    completeStage('universe_selection');
     const buildRankingMapsFromScanCache = () => {
       const nowMs = Date.now();
       return {
@@ -15880,7 +15952,10 @@ async function runEntryScanOnce() {
         topSkipReasons,
       };
     };
+    beginStage('symbol_evaluation');
+    let symbolIndex = -1;
     for (const symbol of scanSymbols) {
+      symbolIndex += 1;
       if (attempts >= maxAttemptsPerScan) {
         break;
       }
@@ -15987,6 +16062,11 @@ async function runEntryScanOnce() {
         entryMarketDataContext,
         sparseConfirmBudgetEffective: effectiveSparseConfirmBudget,
         accountInfo: accountInfoForUniverse,
+        scanTiming: {
+          scanStartedAtMs: startMs,
+          symbolIndex,
+          universeSize: scanSymbols.length,
+        },
       });
       const recordBase = signal?.record ? { ...signal.record } : null;
       const candidateMeta = signal?.meta || {};
@@ -16232,6 +16312,7 @@ async function runEntryScanOnce() {
         recorder.appendRecord(recordBase);
       }
     }
+    completeStage('symbol_evaluation');
 
     setEngineState('evaluating', { reason: 'entry_scan_candidates_processed' });
     const topSkipReasons = Array.from(skipDetailCounts.entries())
@@ -16454,15 +16535,21 @@ async function runEntryScanOnce() {
     }
     if (entryScanRerunRequested) {
       entryScanRerunRequested = false;
+      const scanDurationMs = Math.max(0, Date.now() - startMs);
+      const deferredForMs = Math.max(0, Date.now() - Number(entryScanDeferredSinceMs || Date.now()));
+      const rerunDelayMs = Math.max(0, ENTRY_SCAN_INTERVAL_MS - scanDurationMs);
       console.log('entry_scan_rerun_execute', {
         reason: 'deferred_scan_tick',
         queuedAt: safeIso(),
+        deferredForMs,
+        rerunDelayMs,
       });
+      entryScanDeferredSinceMs = null;
       setTimeout(() => {
         runEntryScanOnce().catch((err) => {
           console.error('entry_scan_rerun_failed', err?.message || err);
         });
-      }, 0);
+      }, rerunDelayMs);
     }
   }
 }
@@ -18565,6 +18652,7 @@ function __resetManagerIntervalsForTests() {
   entryManagerRunning = false;
   entryScanRunning = false;
   entryScanRerunRequested = false;
+  entryScanDeferredSinceMs = null;
   exitManagerRunning = false;
   entryManagerHeartbeat.running = false;
   clearEntryScanProgress({ state: 'idle' });
