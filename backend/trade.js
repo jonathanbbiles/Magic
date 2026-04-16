@@ -6238,6 +6238,25 @@ async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
       return cachedQuote.value;
     }
 
+    let directQuote = null;
+    try {
+      directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
+        ...opts,
+        forceRefresh: true,
+        bypassCache: true,
+      });
+    } catch (retryError) {
+      directQuote = null;
+    }
+    if (directQuote) {
+      console.log('entry_scan_primary_quote_retried', {
+        symbol,
+        source: directQuote?.source || 'alpaca_direct',
+        quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
+      });
+      return directQuote;
+    }
+
     const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });
     if (tradeFallback) {
       quoteCache.set(symbol, tradeFallback);
@@ -6252,17 +6271,7 @@ async function getEntryScanQuoteWithPrimaryRetry(rawSymbol, opts = {}) {
       return tradeFallback;
     }
 
-    const directQuote = await getLatestQuoteFromQuotesOnly(symbol, {
-      ...opts,
-      forceRefresh: true,
-      bypassCache: true,
-    });
-    console.log('entry_scan_primary_quote_retried', {
-      symbol,
-      source: directQuote?.source || 'alpaca_direct',
-      quoteAgeMs: Number.isFinite(Number(directQuote?.tsMs)) ? Math.max(0, Date.now() - Number(directQuote.tsMs)) : null,
-    });
-    return directQuote;
+    throw primaryError;
   }
 }
 
@@ -15497,8 +15506,8 @@ async function runEntryScanOnce() {
       executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
       executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
       maxSymbols: filteredSymbols.length,
-      requireFreshQuote: false,
-      requireOrderbookForTier3: false,
+      requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+      requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
       quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
@@ -15997,43 +16006,12 @@ async function runEntryScanOnce() {
 
     const resolveSkipReason = (reason, meta) => resolveEntrySkipReason(reason, meta);
 
+    const scanChunkSize = Math.max(1, Math.min(ENTRY_PREFETCH_CHUNK_SIZE, 20));
+    const scanSymbolChunks = chunkArray(scanSymbols, scanChunkSize);
     let prefetchedBars = null;
     let prefetchResult = null;
-    updateEntryScanProgress({
-      startMs,
-      symbolsProcessed: 0,
-      universeSize: scanSymbols.length,
-      state: 'prefetching_market_data',
-    });
-    const prefetchHeartbeat = setInterval(() => {
-      updateEntryScanProgress({
-        startMs,
-        symbolsProcessed: 0,
-        universeSize: scanSymbols.length,
-        state: 'prefetching_market_data',
-      });
-    }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
-    try {
-      prefetchResult = await prefetchEntryScanMarketData(scanSymbols);
-      if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
-        prefetchedBars = prefetchResult.prefetchedBars;
-      }
-      if (prefetchResult?.barsReused) {
-        console.log('entry_scan_bars_prefetch_reused', {
-          barsReused: true,
-          barsPrefetchState: prefetchResult?.barsPrefetchState || null,
-          quotePrefetchState: prefetchResult?.quotePrefetchState || null,
-          orderbookPrefetchState: prefetchResult?.orderbookPrefetchState || null,
-          prefetchedQuotes: Number(prefetchResult?.prefetchedQuotes || 0),
-          prefetchedOrderbooks: Number(prefetchResult?.prefetchedOrderbooks || 0),
-          lastBarsPrefetchMs: prefetchResult?.lastBarsPrefetchMs || null,
-          lastQuotesPrefetchMs: prefetchResult?.lastQuotesPrefetchMs || null,
-          lastOrderbooksPrefetchMs: prefetchResult?.lastOrderbooksPrefetchMs || null,
-        });
-      }
-    } finally {
-      clearInterval(prefetchHeartbeat);
-    }
+    let prefetchedQuotesTotal = 0;
+    let prefetchedOrderbooksTotal = 0;
     const entryMarketDataContext = buildEntryMarketDataContext({
       scanId: `${startMs}`,
       prefetchedBars,
@@ -16083,8 +16061,51 @@ async function runEntryScanOnce() {
     };
     beginStage('symbol_evaluation');
     let symbolIndex = -1;
-    for (const symbol of scanSymbols) {
-      symbolIndex += 1;
+    for (let chunkIndex = 0; chunkIndex < scanSymbolChunks.length; chunkIndex += 1) {
+      const scanChunkSymbols = scanSymbolChunks[chunkIndex] || [];
+      if (scanChunkSymbols.length === 0) continue;
+      updateEntryScanProgress({
+        startMs,
+        symbolsProcessed: scanned,
+        universeSize: scanSymbols.length,
+        state: 'prefetching_market_data',
+      });
+      const prefetchHeartbeat = setInterval(() => {
+        updateEntryScanProgress({
+          startMs,
+          symbolsProcessed: scanned,
+          universeSize: scanSymbols.length,
+          state: 'prefetching_market_data',
+        });
+      }, ENTRY_SCAN_PROGRESS_HEARTBEAT_MS);
+      try {
+        prefetchResult = await prefetchEntryScanMarketData(scanChunkSymbols);
+        prefetchedQuotesTotal += Number(prefetchResult?.prefetchedQuotes || 0);
+        prefetchedOrderbooksTotal += Number(prefetchResult?.prefetchedOrderbooks || 0);
+        if (prefetchResult?.ok && prefetchResult.prefetchedBars) {
+          prefetchedBars = prefetchResult.prefetchedBars;
+          entryMarketDataContext.prefetchedBars = prefetchedBars;
+        }
+        if (prefetchResult?.barsReused) {
+          console.log('entry_scan_bars_prefetch_reused', {
+            barsReused: true,
+            chunkIndex,
+            chunkSize: scanChunkSymbols.length,
+            barsPrefetchState: prefetchResult?.barsPrefetchState || null,
+            quotePrefetchState: prefetchResult?.quotePrefetchState || null,
+            orderbookPrefetchState: prefetchResult?.orderbookPrefetchState || null,
+            prefetchedQuotes: Number(prefetchResult?.prefetchedQuotes || 0),
+            prefetchedOrderbooks: Number(prefetchResult?.prefetchedOrderbooks || 0),
+            lastBarsPrefetchMs: prefetchResult?.lastBarsPrefetchMs || null,
+            lastQuotesPrefetchMs: prefetchResult?.lastQuotesPrefetchMs || null,
+            lastOrderbooksPrefetchMs: prefetchResult?.lastOrderbooksPrefetchMs || null,
+          });
+        }
+      } finally {
+        clearInterval(prefetchHeartbeat);
+      }
+      for (const symbol of scanChunkSymbols) {
+        symbolIndex += 1;
       if (attempts >= maxAttemptsPerScan) {
         break;
       }
@@ -16440,6 +16461,10 @@ async function runEntryScanOnce() {
         recordBase.skipReason = 'entry_not_submitted';
         recorder.appendRecord(recordBase);
       }
+      if (attempts >= maxAttemptsPerScan) {
+        break;
+      }
+    }
     }
     completeStage('symbol_evaluation');
 
@@ -16588,8 +16613,8 @@ async function runEntryScanOnce() {
         freshFetches: entryMarketDataContext.stats.freshFetches,
         usableCacheReuses: entryMarketDataContext.stats.usableCacheReuses,
         cacheFallbacksAfterFailure: entryMarketDataContext.stats.cacheFallbacksAfterFailure,
-        prefetchedQuotes: Number(prefetchResult?.prefetchedQuotes || 0),
-        prefetchedOrderbooks: Number(prefetchResult?.prefetchedOrderbooks || 0),
+        prefetchedQuotes: prefetchedQuotesTotal,
+        prefetchedOrderbooks: prefetchedOrderbooksTotal,
         rateLimited: entryMarketDataContext.stats.rateLimited,
         cooldownBlocked: entryMarketDataContext.stats.cooldownBlocked,
         sparseFallbackAttempts: entryMarketDataContext.stats.sparseFallbackAttempts,
