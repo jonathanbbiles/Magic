@@ -633,6 +633,25 @@ function resolveEntrySkipReason(reason, meta) {
   return reason || 'signal_skip';
 }
 
+function shouldCountEntryStaleQuoteSkip({ skipReason, why } = {}) {
+  const normalizedSkipReason = String(skipReason || '').toLowerCase();
+  const normalizedWhy = String(why || '').toLowerCase();
+  if (normalizedSkipReason.startsWith('stale_quote')) return true;
+  if (normalizedSkipReason === 'quote_stale_regime_gate') return true;
+  if (normalizedSkipReason === 'provider_quote_stale_after_refresh') return true;
+  return ['stale_quote', 'quote_stale_regime_gate', 'provider_quote_stale_after_refresh']
+    .includes(normalizedWhy);
+}
+
+function shouldRecordEntryHealthFailure(skipReason) {
+  const normalizedSkipReason = String(skipReason || '').toLowerCase();
+  if (['marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(normalizedSkipReason)) {
+    return true;
+  }
+  if (normalizedSkipReason.startsWith('stale_quote')) return true;
+  return ['provider_quote_stale_after_refresh', 'quote_stale_regime_gate'].includes(normalizedSkipReason);
+}
+
 function evaluatePrimaryQuoteViability({ quote, nowMs = Date.now(), maxAgeMs = ENTRY_QUOTE_MAX_AGE_MS } = {}) {
   const rawQuoteTs = quote?.tsMs;
   const quoteTsMs = normalizeQuoteTsMs(rawQuoteTs);
@@ -740,35 +759,59 @@ function extractStaleQuoteMeta({
 }
 
 function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, candidateDecision, candidateSkipReason }) {
-  const requiredEdgeBps = Number(
-    candidateMeta?.requiredEdgeBps
-    ?? recordBase?.requiredEdgeBps
-  );
-  const expectedMoveBps = Number(
-    candidateMeta?.expectedMoveBps
-    ?? candidateMeta?.edge?.expectedMoveBps
-  );
-  const netEdgeBps = Number(
-    candidateMeta?.netEdgeBps
-    ?? candidateMeta?.edge?.netEdgeBps
-  );
-  const fillProbability = Number(
-    candidateMeta?.fillProbability
-    ?? candidateMeta?.edge?.fillProbability
-  );
+  const firstDefined = (...values) => values.find((value) => value !== undefined && value !== null);
+  const requiredEdgeBps = toFiniteOrNull(firstDefined(
+    candidateMeta?.requiredEdgeBps,
+    recordBase?.requiredEdgeBps,
+    candidateMeta?.edge?.requiredEdgeBps,
+    recordBase?.edge?.requiredEdgeBps,
+  ));
+  const expectedMoveBps = toFiniteOrNull(firstDefined(
+    candidateMeta?.expectedMoveBps,
+    candidateMeta?.edge?.expectedMoveBps,
+    recordBase?.expectedMoveBps,
+    recordBase?.edge?.expectedMoveBps,
+  ));
+  const netEdgeBps = toFiniteOrNull(firstDefined(
+    candidateMeta?.netEdgeBps,
+    candidateMeta?.edge?.netEdgeBps,
+    candidateMeta?.expectedNetEdgeBps,
+    recordBase?.netEdgeBps,
+    recordBase?.expectedNetEdgeBps,
+    recordBase?.edge?.netEdgeBps,
+  ));
+  const fillProbability = toFiniteOrNull(firstDefined(
+    candidateMeta?.fillProbability,
+    candidateMeta?.edge?.fillProbability,
+    recordBase?.fillProbability,
+    recordBase?.edge?.fillProbability,
+  ));
+  const quoteAgeMs = toFiniteOrNull(firstDefined(candidateMeta?.quoteAgeMs, recordBase?.quoteAgeMs));
+  const quoteTsMs = toFiniteOrNull(firstDefined(candidateMeta?.quoteTsMs, recordBase?.quoteTsMs));
+  const quoteReceivedAtMs = toFiniteOrNull(firstDefined(candidateMeta?.quoteReceivedAtMs, recordBase?.quoteReceivedAtMs));
+  const regimeLabel = candidateMeta?.regimeScorecard?.label
+    ?? recordBase?.regimeLabel
+    ?? recordBase?.regimeScorecard?.label
+    ?? null;
+  const regimePenaltyBps = toFiniteOrNull(firstDefined(
+    candidateMeta?.regimePenaltyBps,
+    candidateMeta?.regimeScorecard?.regimePenaltyBps,
+    recordBase?.regimePenaltyBps,
+    recordBase?.regimeScorecard?.regimePenaltyBps,
+  ));
   return {
     symbol,
-    probability: Number(recordBase?.predictorProbability),
+    probability: toFiniteOrNull(recordBase?.predictorProbability),
     expectedMoveBps,
-    spreadBps: Number(candidateMeta?.spreadBps ?? recordBase?.spreadBps),
+    spreadBps: toFiniteOrNull(firstDefined(candidateMeta?.spreadBps, recordBase?.spreadBps)),
     requiredEdgeBps,
     netEdgeBps,
-    quoteAgeMs: Number(candidateMeta?.quoteAgeMs),
-    regimeLabel: candidateMeta?.regimeScorecard?.label || null,
-    regimePenaltyBps: Number(candidateMeta?.regimePenaltyBps),
+    quoteAgeMs,
+    regimeLabel,
+    regimePenaltyBps,
     fillProbability,
-    quoteTsMs: Number(candidateMeta?.quoteTsMs),
-    quoteReceivedAtMs: Number(candidateMeta?.quoteReceivedAtMs),
+    quoteTsMs,
+    quoteReceivedAtMs,
     dataQualityReason: candidateMeta?.dataQualityReason || null,
     sparseRetry: candidateMeta?.sparseRetry || null,
     decision: candidateDecision,
@@ -2158,7 +2201,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   const nearStaleQuote = Number.isFinite(quoteAgeMs) && quoteAgeMs >= Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.6);
   const quoteSourceLower = String(quoteSource || '').toLowerCase();
   const quoteLikelyPrefetchedOrCached = ['prefetch', 'cache', 'pass'].some((token) => quoteSourceLower.includes(token));
-  const shouldLateRefresh = quoteLikelyPrefetchedOrCached && (lateScanEvaluation || nearStaleQuote);
+  const shouldLateRefresh = lateScanEvaluation || (quoteLikelyPrefetchedOrCached && nearStaleQuote);
   if (shouldLateRefresh) {
     const preRefreshQuoteAgeMs = quoteAgeMs;
     const refreshed = await forceRefreshStaleQuoteOnce();
@@ -16176,13 +16219,13 @@ async function runEntryScanOnce() {
       }
       if (!signal.entryReady) {
         skipped += 1;
-        if (["stale_quote", "quote_stale_regime_gate", "provider_quote_stale_after_refresh"].includes(String(signal.why || ''))) {
+        const skipReason = resolveSkipReason(signal.why, signal.meta);
+        if (shouldCountEntryStaleQuoteSkip({ skipReason, why: signal.why })) {
           entryStaleQuoteSkipCount += 1;
           noteStaleQuoteSkip(symbol);
         }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
-        const skipReason = resolveSkipReason(signal.why, signal.meta);
-        if (['marketdata_unavailable', 'ob_depth_insufficient', 'predictor_warmup'].includes(skipReason)) {
+        if (shouldRecordEntryHealthFailure(skipReason)) {
           symbolHealthTracker.recordFailure(symbol, skipReason, signal.meta || {});
         } else if (shouldCountSparseFallbackReject({ marketDataEval: signal.meta }) || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signal?.meta?.sparseRetry })) {
           symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signal.meta || {});
@@ -16647,10 +16690,11 @@ function scheduleNextEntryScan(delayMs = ENTRY_SCAN_INTERVAL_MS) {
     } catch (err) {
       console.error('entry_manager_failed', err?.message || err);
     } finally {
-      if (!entryManagerRunning) return;
-      const nextDelayMs = entryManagerImmediateScanRequested ? 0 : ENTRY_SCAN_INTERVAL_MS;
-      entryManagerImmediateScanRequested = false;
-      scheduleNextEntryScan(nextDelayMs);
+      if (entryManagerRunning) {
+        const nextDelayMs = entryManagerImmediateScanRequested ? 0 : ENTRY_SCAN_INTERVAL_MS;
+        entryManagerImmediateScanRequested = false;
+        scheduleNextEntryScan(nextDelayMs);
+      }
     }
   }, safeDelayMs);
 }
@@ -18976,6 +19020,8 @@ module.exports = {
   shouldCountSparseFallbackReject,
   shouldCountSparseRetryFailureReject,
   resolveEntrySkipReason,
+  shouldCountEntryStaleQuoteSkip,
+  shouldRecordEntryHealthFailure,
   buildPredictorCandidateSignal,
   computeProviderQuoteAgeMs,
   shouldMarkProviderQuoteStaleAfterRefresh,
