@@ -472,6 +472,15 @@ assert.ok(tradeSourceEarly.includes("console.log('entry_scan_stale_quote_recover
 assert.ok(tradeSourceEarly.includes("recoveryPath: 'scan_marketdata_cache'"));
 assert.ok(tradeSourceEarly.includes("recoveryPath: 'trade_fallback'"));
 assert.ok(tradeSourceEarly.includes('const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });'));
+assert.ok(tradeSourceEarly.indexOf('let directQuote = null;') < tradeSourceEarly.indexOf('const tradeFallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });'));
+assert.ok(tradeSourceEarly.includes('if (directQuote) {'));
+assert.ok(tradeSourceEarly.includes('throw primaryError;'));
+assert.ok(tradeSourceEarly.includes('requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE'));
+assert.ok(tradeSourceEarly.includes('requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3'));
+assert.ok(tradeSourceEarly.includes('const scanSymbolChunks = chunkArray(scanSymbols, scanChunkSize);'));
+assert.ok(tradeSourceEarly.includes('prefetchResult = await prefetchEntryScanMarketData(scanChunkSymbols);'));
+assert.ok(tradeSourceEarly.includes('prefetchedQuotes: prefetchedQuotesTotal'));
+assert.ok(tradeSourceEarly.includes('prefetchedOrderbooks: prefetchedOrderbooksTotal'));
 assert.ok(tradeSourceEarly.includes('if (!staleMeta.hopelesslyStale) {'));
 assert.ok(tradeSourceEarly.includes('staleRefreshAttempted: !staleMeta.hopelesslyStale'));
 assert.ok(tradeSourceEarly.includes('skippedSparseRetry: staleMeta.hopelesslyStale'));
