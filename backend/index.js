@@ -682,11 +682,23 @@ app.get('/positions', async (req, res) => {
 
 app.get('/dashboard', async (req, res) => {
   try {
-    const [account, positionsRaw, openOrdersRaw] = await Promise.all([
+    const [accountResult, positionsResult, ordersResult] = await Promise.allSettled([
       fetchAccount(),
       fetchPositions(),
       fetchOrders({ status: 'open', nested: true, limit: 500 }),
     ]);
+    const account = accountResult.status === 'fulfilled' ? accountResult.value : null;
+    const positionsRaw = positionsResult.status === 'fulfilled' ? positionsResult.value : [];
+    const openOrdersRaw = ordersResult.status === 'fulfilled' ? ordersResult.value : [];
+    if (accountResult.status === 'rejected') {
+      console.warn('dashboard_partial_failure', { source: 'account', error: accountResult.reason?.message });
+    }
+    if (positionsResult.status === 'rejected') {
+      console.warn('dashboard_partial_failure', { source: 'positions', error: positionsResult.reason?.message });
+    }
+    if (ordersResult.status === 'rejected') {
+      console.warn('dashboard_partial_failure', { source: 'orders', error: ordersResult.reason?.message });
+    }
 
     let recentBuyFillBySymbol = {};
     try {
@@ -712,20 +724,27 @@ app.get('/dashboard', async (req, res) => {
       openSellOrdersBySymbol.set(normalizedSymbol, list);
     });
 
-    const exitStateBySymbol = getExitStateSnapshot();
-    const lifecycleSnapshot = getLifecycleSnapshot();
-    const governorSummary = getSessionGovernorSummary();
-    const managerStatus = getTradingManagerStatus();
+    // Snapshot calls are isolated so a single failure cannot crash the dashboard.
+    function safeSnapshot(label, fn) {
+      try { return fn(); } catch (err) {
+        console.warn('dashboard_snapshot_error', { source: label, error: err?.message });
+        return null;
+      }
+    }
+    const exitStateBySymbol = safeSnapshot('exitState', getExitStateSnapshot) || {};
+    const lifecycleSnapshot = safeSnapshot('lifecycle', getLifecycleSnapshot);
+    const governorSummary = safeSnapshot('governor', getSessionGovernorSummary);
+    const managerStatus = safeSnapshot('manager', getTradingManagerStatus) || {};
     const concurrency = await getConcurrencyGuardStatus().catch(() => null);
-    const scorecard = closedTradeStats.buildScorecard();
-    const entryDiagnostics = getEntryDiagnosticsSnapshot();
-    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
-    const predictorWarmup = getPredictorWarmupSnapshot();
-    const alpacaAuthStatus = getAlpacaAuthStatus();
-    const baseStatus = getAlpacaBaseStatus();
-    const lastError = getLastHttpError();
-    const lastQuote = getLastQuoteSnapshot();
-    const latestBySymbolRaw = tradeForensics.getLatestBySymbol();
+    const scorecard = safeSnapshot('scorecard', () => closedTradeStats.buildScorecard());
+    const entryDiagnostics = safeSnapshot('entryDiagnostics', getEntryDiagnosticsSnapshot);
+    const universeDiagnostics = safeSnapshot('universeDiagnostics', getUniverseDiagnosticsSnapshot);
+    const predictorWarmup = safeSnapshot('predictorWarmup', getPredictorWarmupSnapshot);
+    const alpacaAuthStatus = safeSnapshot('alpacaAuth', getAlpacaAuthStatus) || {};
+    const baseStatus = safeSnapshot('baseStatus', getAlpacaBaseStatus) || {};
+    const lastError = safeSnapshot('lastError', getLastHttpError);
+    const lastQuote = safeSnapshot('lastQuote', getLastQuoteSnapshot);
+    const latestBySymbolRaw = safeSnapshot('forensics', () => tradeForensics.getLatestBySymbol()) || {};
     const latestForensicsBySymbol = {};
     Object.keys(latestBySymbolRaw || {}).forEach((key) => {
       const normalizedKey = normalizeForensicsSymbolKey(key);
@@ -1655,6 +1674,7 @@ async function bootstrapTrading() {
     return;
   }
 
+  let inventoryOk = false;
   try {
     const inventory = await withTimeout(
       initializeInventoryFromPositions(),
@@ -1662,10 +1682,17 @@ async function bootstrapTrading() {
       'initializeInventoryFromPositions',
     );
     console.log(`Initialized inventory for ${inventory.size} symbols.`);
+    inventoryOk = true;
   } catch (err) {
     console.error('bootstrap_step_failed', {
       step: 'initializeInventoryFromPositions',
       message: err?.responseSnippet || err?.message || String(err),
+    });
+  }
+
+  if (!inventoryOk) {
+    console.error('bootstrap_blocked_inventory_failed', {
+      reason: 'Cannot start trading managers without a valid inventory snapshot. Entry/exit managers will not start.',
     });
   }
 
@@ -1688,7 +1715,9 @@ async function bootstrapTrading() {
   }
 
   startLabeler();
-  if (getTradingManagerStatus().tradingEnabled) {
+  if (!inventoryOk) {
+    console.warn('trading_managers_skipped_inventory_failed');
+  } else if (getTradingManagerStatus().tradingEnabled) {
     startEntryManager();
     startExitManager();
     console.log('exit_manager_start_attempted');
@@ -1715,3 +1744,24 @@ bootstrapTrading().catch((err) => {
     message: err?.responseSnippet || err?.message || String(err),
   });
 });
+
+// Graceful shutdown: let in-flight requests finish and log final state before exit.
+let shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('shutdown_initiated', { signal });
+  server.close(() => {
+    console.log('server_closed', { signal });
+    recordEquitySnapshot();
+    console.log('shutdown_complete', { signal });
+    process.exit(0);
+  });
+  // Force exit after 10 seconds if server.close hangs
+  setTimeout(() => {
+    console.error('shutdown_forced', { signal, reason: 'timeout_after_10s' });
+    process.exit(1);
+  }, 10000).unref();
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Constants from 'expo-constants';
 import {
   ActivityIndicator,
+  AppState,
   FlatList,
   Platform,
   Pressable,
@@ -383,9 +384,10 @@ class ErrorBoundary extends React.Component {
 // ---------------------------------------------------------------------------
 // Logs panel
 // ---------------------------------------------------------------------------
-function LogsPanel({ logsRef }) {
+function LogsPanel({ logsRef, appActiveRef }) {
   const [logs, setLogs] = useState([]);
   const [filter, setFilter] = useState('all');
+  const [logError, setLogError] = useState(null);
   const lastTsRef = useRef(0);
   const scrollRef = useRef(null);
 
@@ -405,14 +407,19 @@ function LogsPanel({ logsRef }) {
         });
         lastTsRef.current = data.entries[data.entries.length - 1].ts;
       }
-    } catch { /* silently retry next tick */ }
+      setLogError(null);
+    } catch (err) {
+      setLogError(err?.message || 'Log fetch failed');
+    }
   }, []);
 
   useEffect(() => {
     fetchLogs();
-    const id = setInterval(fetchLogs, LOG_POLL_MS);
+    const id = setInterval(() => {
+      if (!appActiveRef || appActiveRef.current) fetchLogs();
+    }, LOG_POLL_MS);
     return () => clearInterval(id);
-  }, [fetchLogs]);
+  }, [fetchLogs, appActiveRef]);
 
   const filtered = useMemo(() => {
     if (filter === 'all') return logs;
@@ -450,6 +457,11 @@ function LogsPanel({ logsRef }) {
           <Text style={s.smallBtnText}>Refresh</Text>
         </Pressable>
       </View>
+      {logError ? (
+        <Text style={{ color: theme.colors.warning, fontSize: 11, paddingHorizontal: theme.spacing.md, paddingBottom: theme.spacing.xs }}>
+          Log fetch error: {logError}
+        </Text>
+      ) : null}
       <View style={s.logsScrollInline}>
         {filtered.length === 0 ? (
           <Text style={s.logsEmpty}>No logs yet. Waiting for backend...</Text>
@@ -494,6 +506,15 @@ function AppInner() {
   const [expandedCards, setExpandedCards] = useState({});
   const prevPortfolioRef = useRef(null);
   const logsDataRef = useRef([]);
+  const appActiveRef = useRef(true);
+
+  // Pause polling when app is backgrounded to save battery and network
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      appActiveRef.current = nextState === 'active';
+    });
+    return () => sub.remove();
+  }, []);
 
   const load = useCallback(async ({ isRefresh = false } = {}) => {
     if (!backendConfigured) {
@@ -523,7 +544,9 @@ function AppInner() {
       return undefined;
     }
     load();
-    const id = setInterval(() => load(), POLL_MS);
+    const id = setInterval(() => {
+      if (appActiveRef.current) load();
+    }, POLL_MS);
     return () => clearInterval(id);
   }, [backendConfigured, load]);
 
@@ -839,7 +862,7 @@ function AppInner() {
 
           {/* Live logs section */}
           <Text style={[s.cardTitle, { marginTop: theme.spacing.md }]}>Live Logs</Text>
-          <LogsPanel logsRef={logsDataRef} />
+          <LogsPanel logsRef={logsDataRef} appActiveRef={appActiveRef} />
 
           <View style={{ height: 32 }} />
         </ScrollView>

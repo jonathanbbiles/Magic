@@ -1,10 +1,10 @@
 {
   "expo": {
-    "name": "Backend Diagnostic",
-    "slug": "backend-diagnostic",
+    "name": "Magic Money",
+    "slug": "magic-money",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "light",
     "extra": {}
   }
 }

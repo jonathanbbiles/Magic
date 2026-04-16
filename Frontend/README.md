@@ -1,10 +1,12 @@
-# Frontend Backend Diagnostic (Expo)
+# Magic Money — Trading Dashboard (Expo)
 
-This frontend is a minimal Expo diagnostic app used to verify backend reachability and auth behavior. It does **not** modify backend logic, routes, trading logic, env validation, or auth code.
+This frontend is an Expo-based mobile dashboard for live trading observability. It polls the backend and renders portfolio value, positions, P/L, engine status, and diagnostics on iPhone/iPad via Expo Go.
+
+It does **not** modify backend logic, routes, trading logic, env validation, or auth code.
 
 ## What this app does
 
-The app polls `GET /dashboard` and renders account + position diagnostics.
+The app polls `GET /dashboard` and renders account, positions, and trading engine diagnostics.
 
 ## Environment/config
 
@@ -49,4 +51,4 @@ The app includes a built-in default backend base URL fallback (`https://magic-lw
 
 ## Scope clarification
 
-This frontend work is isolated to the `Frontend` folder and is intended only for backend diagnostics. Backend behavior is not changed by this app.
+This frontend work is isolated to the `Frontend` folder and provides read-only observability into the trading backend. Backend behavior is not changed by this app.
