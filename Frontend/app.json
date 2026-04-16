@@ -5,9 +5,6 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
-    "extra": {
-      "backendUrl": "https://magic-lw8t.onrender.com",
-      "apiToken": ""
-    }
+    "extra": {}
   }
 }

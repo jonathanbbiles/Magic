@@ -5,7 +5,7 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 ## Setup
 
 1. `npm install`
-2. Create a `.env` file with your Alpaca API credentials (required for trading). `API_TOKEN` is optional route protection.
+2. Create a `.env` file with your Alpaca API credentials (required for trading). `API_TOKEN` is mandatory route protection in production.
 3. `npm start`
 
 ## Test ergonomics and quality gates
@@ -32,12 +32,12 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 Required:
 - `APCA_API_KEY_ID` (or compatible aliases: `ALPACA_KEY_ID`, `ALPACA_API_KEY_ID`, `ALPACA_API_KEY`)
 - `APCA_API_SECRET_KEY` (or compatible aliases: `ALPACA_SECRET_KEY`, `ALPACA_API_SECRET_KEY`)
-- `TRADE_BASE=https://api.alpaca.markets` (or `ALPACA_API_BASE` for legacy configs)
+- `TRADE_BASE=https://api.alpaca.markets` (required explicitly in production; paper endpoints are rejected)
 - `DATA_BASE=https://data.alpaca.markets`
 
 Optional auth:
-- `API_TOKEN` protects backend routes when set (send as `Authorization: Bearer <token>` or `x-api-key`).
-- If `API_TOKEN` is unset, backend starts normally and route auth is disabled.
+- `API_TOKEN` protects backend routes (send as `Authorization: Bearer <token>` or `x-api-key`).
+- In production, missing or placeholder `API_TOKEN` is a startup failure.
 
 Optional:
 - `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
@@ -117,9 +117,9 @@ Optional entry refinements (all Alpaca data only, toggleable via env vars):
 ## Notes
 
 - `GET /health`, `GET /debug/auth`, and `GET /debug/status` remain public for uptime/auth/runtime diagnostics.
-- If `API_TOKEN` is set, non-public routes require a valid token.
-- If `API_TOKEN` is not set, route auth middleware is permissive.
-- Dataset recorder writes to `DATASET_DIR` (default `./data`). On ephemeral filesystems (Render), mount a disk or set `DATASET_DIR` to a persistent path.
+- Non-public routes require a valid API token.
+- In production, server startup fails if `API_TOKEN` is missing.
+- Dataset recorder writes to `DATASET_DIR`. In production on Render-like hosts, this must be an absolute writable persistent mount path.
 - `GET /dashboard` now exposes runtime-truth diagnostics in `meta.universe`, `meta.predictorWarmup`, and `meta.truth` (dynamic universe active flag, accepted symbol count/sample, fallback state/reason, warmup progress, top skip reasons, open positions, and active sell-limit count).
 - `GET /dashboard` meta now also exposes explicit engine/entry-loop proof fields: `engineState`, `entryManagerStarted`, `lastEntryScanAt`, `lastEntryScanSummary`, `lastSuccessfulAction`, `lastExecutionFailure`, and skip-category counters for stale quotes/market/data/rate-limit/concurrency-risk.
 - `GET /dashboard` truth diagnostics now include live mid-scan heartbeat (`currentEntryScanProgress`) so active scans are visible before end-of-scan summary emission.
@@ -386,10 +386,9 @@ Set `SHADOW_INTENTS_ENABLED=true` with `ENGINE_V2_ENABLED=true` to run intent/co
 - **Alpaca trading credentials are mandatory for live/production startup and trading**:
   - `APCA_API_KEY_ID` (or supported alias)
   - `APCA_API_SECRET_KEY` (or supported alias)
-- **`API_TOKEN` is optional** and only protects backend HTTP routes.
-  - If `API_TOKEN` is unset, backend startup still succeeds and routes are not auth-protected.
-  - If `API_TOKEN` is set, auth middleware enforces it.
-  - In production/live mode, placeholder `API_TOKEN` values are rejected at startup.
+- **`API_TOKEN` is required in production** for backend HTTP route protection.
+  - Missing/placeholder values fail startup in production/live mode.
+  - Auth middleware enforces the token when present in non-production too.
 - Hosted production (Render, etc.) should provide secrets via platform environment variables.
   Checked-in dotenv files are templates/local examples and are not production truth.
 
@@ -406,3 +405,8 @@ Set `SHADOW_INTENTS_ENABLED=true` with `ENGINE_V2_ENABLED=true` to run intent/co
 - buy gating summaries (`entryScan`, `topSkipReasons`, `skipReasonsBySymbol`, signal-ready vs warmup-blocked counts)
 
 Stablecoin handling remains configuration-driven with `ENTRY_UNIVERSE_EXCLUDE_STABLES` (default `false`), and diagnostics report stable filtering impact.
+
+
+## Secret hygiene
+
+If any real Alpaca/API token credential was ever committed or shared in repository artifacts, treat it as compromised and rotate it immediately in Alpaca and your hosting platform.

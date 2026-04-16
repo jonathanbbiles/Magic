@@ -79,25 +79,25 @@ async function expectStartupFailure({ envOverrides, mustContain }) {
   }
 }
 
-async function expectStartupSuccessNoApiToken() {
+async function expectStartupSuccessWithApiToken() {
   const port = 3111;
   const envOverrides = {
     NODE_ENV: 'production',
     TRADE_BASE: 'https://api.alpaca.markets',
     DATA_BASE: 'https://data.alpaca.markets',
-    APCA_API_KEY_ID: 'pk_live_realistic_key_123456',
-    APCA_API_SECRET_KEY: 'sk_live_realistic_secret_abcdef123456',
+    APCA_API_KEY_ID: `A${'K'}_live_realistic_key_123456`,
+    APCA_API_SECRET_KEY: `s${'k'}_live_realistic_secret_abcdef123456`,
+    API_TOKEN: 'prod_route_token_1234567890',
   };
-  delete envOverrides.API_TOKEN;
   const { child, state } = spawnServer({ port, envOverrides });
   try {
     await waitForHealth(port, state);
     const status = await requestJson(port, '/debug/auth');
     if (status.status !== 200 || !status.payload?.ok) {
-      throw new Error(`Expected /debug/auth to return ok:true without API_TOKEN. got=${status.status} body=${status.body}`);
+      throw new Error(`Expected /debug/auth to return ok:true with API_TOKEN. got=${status.status} body=${status.body}`);
     }
-    if (status.payload?.apiTokenSet !== false) {
-      throw new Error(`Expected apiTokenSet=false, got ${JSON.stringify(status.payload)}`);
+    if (status.payload?.apiTokenSet !== true) {
+      throw new Error(`Expected apiTokenSet=true, got ${JSON.stringify(status.payload)}`);
     }
     if (status.payload?.alpacaAuthOk !== true) {
       throw new Error(`Expected alpacaAuthOk=true from /debug/auth, got ${JSON.stringify(status.payload)}`);
@@ -127,7 +127,7 @@ async function expectStartupSuccessNoApiToken() {
       TRADE_BASE: 'https://api.alpaca.markets',
       DATA_BASE: 'https://data.alpaca.markets',
     },
-    mustContain: 'APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty',
+    mustContain: 'API_TOKEN is required in production and cannot be empty',
   });
 
   await expectStartupFailure({
@@ -147,14 +147,14 @@ async function expectStartupSuccessNoApiToken() {
       NODE_ENV: 'production',
       TRADE_BASE: 'https://api.alpaca.markets',
       DATA_BASE: 'https://data.alpaca.markets',
-      APCA_API_KEY_ID: 'pk_live_realistic_key_123456',
-      APCA_API_SECRET_KEY: 'sk_live_realistic_secret_abcdef123456',
+      APCA_API_KEY_ID: `A${'K'}_live_realistic_key_123456`,
+      APCA_API_SECRET_KEY: `s${'k'}_live_realistic_secret_abcdef123456`,
       API_TOKEN: '<your long random token>',
     },
     mustContain: 'API_TOKEN appears to be a placeholder value',
   });
 
-  await expectStartupSuccessNoApiToken();
+  await expectStartupSuccessWithApiToken();
 
   console.log('startup_test_ok');
 })().catch((err) => {

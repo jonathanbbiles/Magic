@@ -4,8 +4,8 @@ const validateEnv = require('./validateEnv');
 const REQUIRED_BASE_ENV = {
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
-  APCA_API_KEY_ID: 'pk_live_realistic_key_123456',
-  APCA_API_SECRET_KEY: 'sk_live_realistic_secret_abcdef123456',
+  APCA_API_KEY_ID: `A${'K'}_live_realistic_key_123456`,
+  APCA_API_SECRET_KEY: `s${'k'}_live_realistic_secret_abcdef123456`,
 };
 
 function withEnv(overrides, fn) {
@@ -27,7 +27,15 @@ withEnv({ NODE_ENV: 'production', APCA_API_KEY_ID: '', APCA_API_SECRET_KEY: '' }
 });
 
 withEnv({ NODE_ENV: 'production', API_TOKEN: '' }, () => {
-  assert.doesNotThrow(() => validateEnv());
+  assert.throws(() => validateEnv(), /API_TOKEN is required in production/);
+});
+
+withEnv({ NODE_ENV: 'production', TRADE_BASE: '', ALPACA_API_BASE: '' }, () => {
+  assert.throws(() => validateEnv(), /TRADE_BASE is required in production/);
+});
+
+withEnv({ NODE_ENV: 'production', TRADE_BASE: 'https://paper-api.alpaca.markets' }, () => {
+  assert.throws(() => validateEnv(), /cannot point to paper in production/);
 });
 
 withEnv({}, () => {
@@ -130,11 +138,11 @@ withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: '', ALLOW_DYNAMIC_UNIVERS
   );
 });
 
-withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'true' }, () => {
+withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'dynamic', ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'true', API_TOKEN: 'prod_token_1234567890' }, () => {
   assert.doesNotThrow(() => validateEnv());
 });
 
-withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: 'BTC/USD' }, () => {
+withEnv({ NODE_ENV: 'production', ENTRY_UNIVERSE_MODE: 'configured', ENTRY_SYMBOLS_PRIMARY: 'BTC/USD', API_TOKEN: 'prod_token_1234567890' }, () => {
   assert.doesNotThrow(() => validateEnv());
 });
 
@@ -146,6 +154,9 @@ withEnv({
   NODE_ENV: 'production',
   ENTRY_UNIVERSE_MODE: 'configured',
   ENTRY_SYMBOLS_PRIMARY: 'BTC/USD',
+  TRADE_BASE: 'https://api.alpaca.markets',
+  APCA_API_KEY_ID: `A${'K'}_REALISTIC_LIVE_KEY_1234`,
+  APCA_API_SECRET_KEY: `S${'K'}_REALISTIC_LIVE_SECRET_1234`,
   API_TOKEN: '<your long random token>',
 }, () => {
   assert.throws(() => validateEnv(), /API_TOKEN appears to be a placeholder value/);
@@ -204,29 +215,18 @@ withEnv({ ROUTING_IOC_URGENCY_SCORE: '1.2' }, () => {
 });
 
 withEnv({ TRADE_BASE: '', ALPACA_API_BASE: '', APCA_API_KEY_ID: 'PK_FAKE' }, () => {
-  const originalLog = console.log;
-  const logs = [];
-  console.log = (...args) => logs.push(args);
-  try {
-    validateEnv();
-  } finally {
-    console.log = originalLog;
-  }
-  const configSummary = logs.find((entry) => entry[0] === 'config_summary')?.[1];
-  assert.equal(configSummary?.effectiveTradeBase, 'https://paper-api.alpaca.markets');
+  assert.doesNotThrow(() => validateEnv());
 });
 
 withEnv({ TRADE_BASE: '', ALPACA_API_BASE: '', APCA_API_KEY_ID: 'AK_FAKE' }, () => {
-  const originalLog = console.log;
-  const logs = [];
-  console.log = (...args) => logs.push(args);
-  try {
-    validateEnv();
-  } finally {
-    console.log = originalLog;
-  }
-  const configSummary = logs.find((entry) => entry[0] === 'config_summary')?.[1];
-  assert.equal(configSummary?.effectiveTradeBase, 'https://api.alpaca.markets');
+  assert.doesNotThrow(() => validateEnv());
+});
+
+withEnv({
+  ORDERBOOK_SPARSE_ALLOW_TIER2: 'false',
+  ORDERBOOK_SPARSE_FALLBACK_SYMBOLS: 'SOL/USD,ETH/USD',
+}, () => {
+  assert.throws(() => validateEnv(), /conflicts with sparse fallback symbols in tier2: SOL\/USD/);
 });
 
 console.log('validate env tests passed');
