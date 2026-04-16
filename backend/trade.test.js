@@ -488,7 +488,7 @@ assert.ok(tradeSourceEarly.includes("console.log('entry_scan_bars_prefetch_reuse
 assert.ok(tradeSourceEarly.includes('barsPrefetchState'));
 assert.ok(tradeSourceEarly.includes('quotePrefetchState'));
 assert.ok(tradeSourceEarly.includes('orderbookPrefetchState'));
-assert.ok(tradeSourceEarly.includes('barsReused: canReuseBars && !shouldPrefetchBarsWithCooldown'));
+assert.ok(tradeSourceEarly.includes('barsReused: canReuseBars && (!shouldPrefetchBarsWithCooldown || reusableCoverageSymbols.length > 0)'));
 assert.ok(tradeSourceEarly.includes('const shouldPrefetchQuotes = ENTRY_PREFETCH_QUOTES && !quoteCooldownActive;'));
 assert.ok(tradeSourceEarly.includes('const shouldPrefetchOrderbooks = ENTRY_PREFETCH_ORDERBOOKS && !orderbookCooldownActive;'));
 assert.ok(!tradeSourceEarly.includes("console.log('entry_scan_prefetch_reused'"));
