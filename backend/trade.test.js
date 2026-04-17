@@ -297,6 +297,10 @@ const {
   __testSetEntryScanRerunRequestedForTests,
   __testGetEntryScanRerunRequestedForTests,
   __testExtractStaleQuoteMeta,
+  __testApplyEntrySkipHealthMutationForTests,
+  __testSelectRotatingSeedSymbolsForTests,
+  __testResolveDynamicRankingFromScanCacheForTests,
+  __testResetSeedRotationOffsetsForTests,
 } = tradeEntryBasis;
 
 assert.equal(
@@ -398,6 +402,20 @@ __testClearStaleQuoteSkipState('XRP/USD');
 const recoveredCooldown = __testGetStaleQuoteCooldownState('XRP/USD');
 assert.equal(recoveredCooldown.active, false);
 assert.equal(recoveredCooldown.attempts, 0);
+const staleMutationSingle = __testApplyEntrySkipHealthMutationForTests('XRP/USD', {
+  skipReason: 'stale_quote_primary',
+  why: 'quote_stale',
+  meta: { quoteAgeMs: 90000 },
+});
+assert.equal(staleMutationSingle.staleQuoteSkipCounted, true);
+assert.equal(staleMutationSingle.failureMutationCount, 1);
+const staleMutationDouble = __testApplyEntrySkipHealthMutationForTests('XRP/USD', {
+  skipReason: 'stale_quote_primary',
+  why: 'quote_stale',
+  meta: { quoteAgeMs: 90000 },
+});
+assert.equal(staleMutationDouble.failureMutationCount, 1);
+__testClearStaleQuoteSkipState('XRP/USD');
 
 const recoveredStaleMeta = __testExtractStaleQuoteMeta({
   error: {
@@ -1589,3 +1607,45 @@ assert.ok(marketFnBody.includes('resolveEntryExecutionContext(normalizedSymbol, 
 assert.ok(!marketFnBody.includes('resolvedEntryTakeProfitBps'));
 assert.ok(marketFnBody.includes("reason: 'stale_quote_pre_execution_skip'"));
 assert.ok(marketFnBody.includes("return { skipped: true, reason: 'stale_quote'"));
+
+async function runEntryMarketDataRegressionTests() {
+  __testResetSeedRotationOffsetsForTests();
+  const rotationSymbols = ['A/USD', 'B/USD', 'C/USD', 'D/USD', 'E/USD'];
+  const rotationFirst = __testSelectRotatingSeedSymbolsForTests(rotationSymbols, { cap: 2, stream: 'entry_scan_prefetch' });
+  const rotationSecond = __testSelectRotatingSeedSymbolsForTests(rotationSymbols, { cap: 2, stream: 'entry_scan_prefetch' });
+  const rotationThird = __testSelectRotatingSeedSymbolsForTests(rotationSymbols, { cap: 2, stream: 'entry_scan_prefetch' });
+  assert.deepEqual(rotationFirst.symbols, ['A/USD', 'B/USD']);
+  assert.deepEqual(rotationSecond.symbols, ['C/USD', 'D/USD']);
+  assert.deepEqual(rotationThird.symbols, ['E/USD', 'A/USD']);
+
+  const retrySymbol = 'RETRYTEST/USD';
+  const rankingResolution = await __testResolveDynamicRankingFromScanCacheForTests([retrySymbol], {
+    hydrateOverride: async ({ symbols }) => {
+      const nowIso = new Date().toISOString();
+      tradeEntryBasis.__warmQuoteCacheFromBatchForTests(symbols, {
+        quotes: {
+          [retrySymbol]: { bp: 10, ap: 10.01, t: nowIso },
+        },
+      });
+      tradeEntryBasis.__warmOrderbookCacheFromBatchForTests(symbols, {
+        orderbooks: {
+          [retrySymbol]: {
+            a: [{ p: 10.01, s: 1 }],
+            b: [{ p: 10, s: 1 }],
+            t: nowIso,
+          },
+        },
+      });
+      return { ok: true, prefetchedQuotes: 1, prefetchedOrderbooks: 1 };
+    },
+  });
+  assert.equal(rankingResolution.hydrationRetry.attempted, true);
+  assert.equal(rankingResolution.hydrationRetry.triggeredBy, 'initial_rank_empty');
+  assert.equal(rankingResolution.hydrationRetry.recovered, true);
+  assert.deepEqual(rankingResolution.finalRank.symbols, [retrySymbol]);
+}
+
+runEntryMarketDataRegressionTests().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
