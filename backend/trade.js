@@ -2305,6 +2305,7 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
 
   const forceRefreshStaleQuoteOnce = async () => {
+    const priorTsMs = quoteTsMs;
     const priorAgeMs = quoteAgeMs;
     const refreshed = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
       maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
@@ -2317,12 +2318,14 @@ async function computeEntrySignal(symbol, opts = {}) {
       ? Math.max(0, Date.now() - refreshedTsMs)
       : null;
     if (
-      Number.isFinite(refreshedAgeMs) &&
-      Number.isFinite(priorAgeMs) &&
-      refreshedAgeMs > priorAgeMs
+      Number.isFinite(refreshedTsMs) &&
+      Number.isFinite(priorTsMs) &&
+      refreshedTsMs <= priorTsMs
     ) {
       console.log('entry_quote_late_refresh_rejected_older', {
         symbol: asset.symbol,
+        priorQuoteTsMs: priorTsMs,
+        refreshedQuoteTsMs: refreshedTsMs,
         priorQuoteAgeMs: priorAgeMs,
         refreshedQuoteAgeMs: refreshedAgeMs,
         refreshedQuoteSource: refreshed?.source || null,
@@ -3337,13 +3340,20 @@ async function computeEntrySignal(symbol, opts = {}) {
   const earlyGateQuoteAgeMs = Number.isFinite(earlyGateQuoteTsMs) ? Math.max(0, Date.now() - earlyGateQuoteTsMs) : null;
 
   if ((predictorTp?.probability ?? -1) < effectiveMinProbToEnter) {
+    const predictorFallbackDefaults =
+      predictorTp?.signals?.predictorFallbackDefaults === true;
     const isTimeOfDayGate = timeOfDayMakesStricter && (predictorTp?.probability ?? -1) >= baseMinProbToEnter;
+    const skipReason = predictorFallbackDefaults
+      ? 'predictor_fallback_defaults'
+      : isTimeOfDayGate
+        ? 'time_of_day_gate'
+        : 'predictor_gate';
     logEntrySkip({
       symbol: asset.symbol,
       symbolTier,
       spreadBps,
       requiredEdgeBps,
-      reason: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
+      reason: skipReason,
       probability: predictorTp?.probability ?? null,
       minProbToEnter: effectiveMinProbToEnter,
       baseMinProbToEnter,
@@ -3352,11 +3362,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       stretchProbability: predictorStretch?.probability ?? null,
       stretchTargetMoveBps: resolvedEntryStretchMoveBps,
       tpTargetMoveBps: resolvedEntryTakeProfitBps,
+      predictorFallbackDefaults,
       timeOfDay: timeOfDayMeta,
     });
     return {
       entryReady: false,
-      why: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
+      why: skipReason,
       meta: {
         symbol: asset.symbol,
         symbolTier,
@@ -3371,6 +3382,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         effectiveMinProbToEnter,
         tierMinProbThresholdApplied,
         stretchProbability: predictorStretch?.probability ?? null,
+        predictorFallbackDefaults,
         timeOfDay: timeOfDayMeta,
       },
       record: baseRecord,
