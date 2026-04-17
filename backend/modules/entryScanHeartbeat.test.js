@@ -18,10 +18,12 @@ updateEntryScanProgress(heartbeat, safeIso, {
   universeSize: 40,
   state: 'scanning_symbols',
   staleQuoteCooldownCount: 2,
+  strategyRejectionCount: 3,
 });
 assert.equal(heartbeat.currentScanState, 'scanning_symbols');
 assert.equal(heartbeat.currentScanSymbolsProcessed, 7);
 assert.equal(heartbeat.currentScanStaleQuoteCooldownCount, 2);
+assert.equal(heartbeat.currentScanStrategyRejectionCount, 3);
 assert.ok(heartbeat.currentScanStartedAt);
 
 const deferred = recordDeferredScanTick(heartbeat, safeIso, {
@@ -35,6 +37,7 @@ assert.equal(deferred.currentScanState, 'scanning_symbols');
 clearEntryScanProgress(heartbeat, { state: 'idle' });
 assert.equal(heartbeat.currentScanSymbolsProcessed, 0);
 assert.equal(heartbeat.currentScanState, 'idle');
+assert.equal(heartbeat.currentScanStrategyRejectionCount, 0);
 assert.deepEqual(heartbeat.currentScanTopSkipReasons, {});
 
 console.log('entry scan heartbeat tests passed');

@@ -224,6 +224,7 @@ async function resolveDynamicUniverseRankingWithHydration(
   symbols = [],
   {
     rankOptions = {},
+    symbolsToRank = null,
     getMarketDataMaps,
     hydrate,
   } = {},
@@ -231,52 +232,73 @@ async function resolveDynamicUniverseRankingWithHydration(
   const normalizedSymbols = uniqSymbols((Array.isArray(symbols) ? symbols : [])
     .map((symbol) => normalizePair(symbol))
     .filter(Boolean));
+  const normalizedSymbolsToRank = symbolsToRank == null
+    ? normalizedSymbols
+    : uniqSymbols((Array.isArray(symbolsToRank) ? symbolsToRank : [])
+      .map((symbol) => normalizePair(symbol))
+      .filter((symbol) => normalizedSymbols.includes(symbol)));
+  const omittedSymbols = normalizedSymbols.filter((symbol) => !normalizedSymbolsToRank.includes(symbol));
   const readMaps = typeof getMarketDataMaps === 'function'
     ? getMarketDataMaps
     : (() => ({ quoteBySymbol: {}, orderbookBySymbol: {}, nowMs: Date.now() }));
 
   const firstMaps = readMaps() || {};
-  const initialRank = rankDynamicUniverseByExecutionQuality(normalizedSymbols, {
+  const initialRank = rankDynamicUniverseByExecutionQuality(normalizedSymbolsToRank, {
     ...rankOptions,
     quoteBySymbol: firstMaps.quoteBySymbol || {},
     orderbookBySymbol: firstMaps.orderbookBySymbol || {},
     nowMs: Number.isFinite(firstMaps.nowMs) ? firstMaps.nowMs : Date.now(),
   });
-  if (normalizedSymbols.length === 0) {
+  if (normalizedSymbolsToRank.length === 0) {
+    const emptyRank = {
+      ...initialRank,
+      diagnostics: [],
+      droppedDiagnostics: [],
+      omittedDiagnostics: omittedSymbols.map((symbol) => ({ symbol, reason: 'unevaluated_this_pass' })),
+      evaluatedSymbolsCount: 0,
+      unevaluatedSymbolsCount: omittedSymbols.length,
+      totalSymbolsRequested: normalizedSymbols.length,
+    };
     return {
-      initialRank,
-      finalRank: initialRank,
+      initialRank: emptyRank,
+      finalRank: emptyRank,
       hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
     };
   }
 
-  const missingAfterInitial = Math.max(0, normalizedSymbols.length - initialRank.symbols.length);
+  const missingAfterInitial = Math.max(0, normalizedSymbolsToRank.length - initialRank.symbols.length);
   const staleFreshnessCount = Array.isArray(initialRank.droppedDiagnostics)
     ? initialRank.droppedDiagnostics.filter((row) => row.failedFreshness || row.failedOrderbookRecency).length
     : 0;
   const shouldRetryHydration = missingAfterInitial > 0 && staleFreshnessCount > 0;
+  const withCoverageDiagnostics = (rank) => ({
+    ...rank,
+    omittedDiagnostics: omittedSymbols.map((symbol) => ({ symbol, reason: 'unevaluated_this_pass' })),
+    evaluatedSymbolsCount: normalizedSymbolsToRank.length,
+    unevaluatedSymbolsCount: omittedSymbols.length,
+    totalSymbolsRequested: normalizedSymbols.length,
+  });
   if (!shouldRetryHydration) {
     return {
-      initialRank,
-      finalRank: initialRank,
+      initialRank: withCoverageDiagnostics(initialRank),
+      finalRank: withCoverageDiagnostics(initialRank),
       hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
     };
   }
 
   const retryResult = typeof hydrate === 'function'
-    ? await hydrate({ symbols: normalizedSymbols, reason: initialRank.symbols.length > 0 ? 'partial_rank_missing_symbols' : 'initial_rank_empty' })
+    ? await hydrate({ symbols: normalizedSymbolsToRank, reason: initialRank.symbols.length > 0 ? 'partial_rank_missing_symbols' : 'initial_rank_empty' })
     : { ok: false, skipped: 'hydrate_not_available' };
   const secondMaps = readMaps() || {};
-  const retryRank = rankDynamicUniverseByExecutionQuality(normalizedSymbols, {
+  const retryRank = rankDynamicUniverseByExecutionQuality(normalizedSymbolsToRank, {
     ...rankOptions,
     quoteBySymbol: secondMaps.quoteBySymbol || {},
     orderbookBySymbol: secondMaps.orderbookBySymbol || {},
     nowMs: Number.isFinite(secondMaps.nowMs) ? secondMaps.nowMs : Date.now(),
   });
-
   return {
-    initialRank,
-    finalRank: retryRank,
+    initialRank: withCoverageDiagnostics(initialRank),
+    finalRank: withCoverageDiagnostics(retryRank),
     hydrationRetry: {
       attempted: true,
       triggeredBy: initialRank.symbols.length > 0 ? 'partial_rank_missing_symbols' : 'initial_rank_empty',

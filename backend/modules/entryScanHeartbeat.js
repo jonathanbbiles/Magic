@@ -17,6 +17,7 @@ function createEntryManagerHeartbeat() {
     currentScanStalePrimaryQuoteCount: 0,
     currentScanDataUnavailableCount: 0,
     currentScanMarketRejectionCount: 0,
+    currentScanStrategyRejectionCount: 0,
     currentScanTopSkipReasons: {},
     deferredScanCount: 0,
     lastDeferredReason: null,
@@ -37,6 +38,7 @@ function updateEntryScanProgress(heartbeat, safeIso, {
   stalePrimaryQuoteCount = null,
   dataUnavailableCount = null,
   marketRejectionCount = null,
+  strategyRejectionCount = null,
   topSkipReasons = null,
 } = {}) {
   const nowIso = safeIso();
@@ -49,6 +51,7 @@ function updateEntryScanProgress(heartbeat, safeIso, {
   if (Number.isFinite(stalePrimaryQuoteCount)) heartbeat.currentScanStalePrimaryQuoteCount = Math.max(0, Math.floor(stalePrimaryQuoteCount));
   if (Number.isFinite(dataUnavailableCount)) heartbeat.currentScanDataUnavailableCount = Math.max(0, Math.floor(dataUnavailableCount));
   if (Number.isFinite(marketRejectionCount)) heartbeat.currentScanMarketRejectionCount = Math.max(0, Math.floor(marketRejectionCount));
+  if (Number.isFinite(strategyRejectionCount)) heartbeat.currentScanStrategyRejectionCount = Math.max(0, Math.floor(strategyRejectionCount));
   if (topSkipReasons && typeof topSkipReasons === 'object') heartbeat.currentScanTopSkipReasons = { ...topSkipReasons };
   heartbeat.currentScanLastProgressAt = nowIso;
   heartbeat.lastHeartbeatAt = nowIso;
@@ -65,6 +68,7 @@ function clearEntryScanProgress(heartbeat, { state = 'idle' } = {}) {
   heartbeat.currentScanStalePrimaryQuoteCount = 0;
   heartbeat.currentScanDataUnavailableCount = 0;
   heartbeat.currentScanMarketRejectionCount = 0;
+  heartbeat.currentScanStrategyRejectionCount = 0;
   heartbeat.currentScanTopSkipReasons = {};
 }
 

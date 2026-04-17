@@ -1650,22 +1650,22 @@ async function bootstrapTrading() {
   console.log('bootstrap_start');
   logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
-  if (!startupTruthLogged) {
-    const baseStatus = getAlpacaBaseStatus();
-    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
-    const warmup = getPredictorWarmupSnapshot();
-    emitStartupTruthSummary(console.log, {
-      authStatus,
-      baseStatus,
-      universeDiagnostics,
-      warmup,
-      runtimeConfig,
-      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
-      env: process.env,
-    });
-    startupTruthLogged = true;
-  }
   if (!authStatus.alpacaAuthOk) {
+    if (!startupTruthLogged) {
+      const baseStatus = getAlpacaBaseStatus();
+      const universeDiagnostics = getUniverseDiagnosticsSnapshot();
+      const warmup = getPredictorWarmupSnapshot();
+      emitStartupTruthSummary(console.log, {
+        authStatus,
+        baseStatus,
+        universeDiagnostics,
+        warmup,
+        runtimeConfig,
+        runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
+        env: process.env,
+      });
+      startupTruthLogged = true;
+    }
     console.warn('startup_blocked_missing_alpaca_auth', {
       missing: authStatus.missing,
       checkedKeyVars: authStatus.checkedKeyVars,
@@ -1723,6 +1723,21 @@ async function bootstrapTrading() {
     console.log('exit_manager_start_attempted');
   } else {
     console.log('trading_disabled_skip_entry_exit');
+  }
+  if (!startupTruthLogged) {
+    const baseStatus = getAlpacaBaseStatus();
+    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
+    const warmup = getPredictorWarmupSnapshot();
+    emitStartupTruthSummary(console.log, {
+      authStatus,
+      baseStatus,
+      universeDiagnostics,
+      warmup,
+      runtimeConfig,
+      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
+      env: process.env,
+    });
+    startupTruthLogged = true;
   }
   console.log('bootstrap_done');
 }

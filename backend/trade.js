@@ -396,6 +396,25 @@ function classifyEntrySkipReason(reason) {
   if (!normalized) return 'market';
   if (normalized === 'stale_quote_cooldown' || normalized === 'symbol_health_cooldown') return 'cooldown';
   if (
+    normalized.includes('predictor_gate') ||
+    normalized.includes('predictor_stretch_gate') ||
+    normalized.includes('time_of_day_gate') ||
+    normalized.includes('ev_gate') ||
+    normalized.includes('net_edge_gate') ||
+    normalized.includes('entry_regime_gate') ||
+    normalized.includes('profit_gate') ||
+    normalized.includes('momentum_trigger_gate') ||
+    normalized.includes('expected_net_edge_floor') ||
+    normalized.includes('sparse_fallback_tier_restricted') ||
+    normalized.includes('spread_gate') ||
+    normalized.includes('liquidity_gate') ||
+    normalized.includes('volatility_filter') ||
+    normalized.includes('correlation_guard') ||
+    normalized.includes('regime_gate')
+  ) {
+    return 'strategy';
+  }
+  if (
     normalized.includes('stale') ||
     normalized.includes('quote') ||
     normalized.includes('marketdata') ||
@@ -427,6 +446,9 @@ function getEntryDiagnosticsSnapshot() {
   const marketRejectionCount = Object.entries(skipDetailCounts)
     .filter(([reason]) => classifyEntrySkipReason(reason) === 'market')
     .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const strategyRejectionCount = Object.entries(skipDetailCounts)
+    .filter(([reason]) => classifyEntrySkipReason(reason) === 'strategy')
+    .reduce((sum, [, count]) => sum + Number(count || 0), 0);
   const staleDataRejectionCount = Object.entries(skipDetailCounts)
     .filter(([reason]) => classifyEntrySkipReason(reason) === 'stale_data')
     .reduce((sum, [, count]) => sum + Number(count || 0), 0);
@@ -449,6 +471,7 @@ function getEntryDiagnosticsSnapshot() {
     },
     gating: {
       marketRejectionCount,
+      strategyRejectionCount,
       dataRejectionCount: staleDataRejectionCount,
       staleDataRejectionCount,
       staleCooldownSuppressionCount,
@@ -881,6 +904,7 @@ function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, cand
   ));
   return {
     symbol,
+    symbolTier: candidateMeta?.symbolTier || recordBase?.symbolTier || null,
     probability: toFiniteOrNull(recordBase?.predictorProbability),
     expectedMoveBps,
     spreadBps: toFiniteOrNull(firstDefined(candidateMeta?.spreadBps, recordBase?.spreadBps)),
@@ -892,6 +916,11 @@ function buildPredictorCandidateSignal({ symbol, recordBase, candidateMeta, cand
     fillProbability,
     quoteTsMs,
     quoteReceivedAtMs,
+    minProbToEnter: toFiniteOrNull(firstDefined(candidateMeta?.minProbToEnter, recordBase?.minProbToEnter)),
+    baseMinProbToEnter: toFiniteOrNull(firstDefined(candidateMeta?.baseMinProbToEnter, recordBase?.baseMinProbToEnter)),
+    effectiveMinProbToEnter: toFiniteOrNull(firstDefined(candidateMeta?.effectiveMinProbToEnter, recordBase?.effectiveMinProbToEnter)),
+    stretchProbability: toFiniteOrNull(firstDefined(candidateMeta?.stretchProbability, recordBase?.predictorProbabilityStretch)),
+    timeOfDay: candidateMeta?.timeOfDay || null,
     dataQualityReason: candidateMeta?.dataQualityReason || null,
     sparseRetry: candidateMeta?.sparseRetry || null,
     decision: candidateDecision,
@@ -2276,8 +2305,9 @@ async function computeEntrySignal(symbol, opts = {}) {
   const scanStartedAtMs = Number(opts?.scanTiming?.scanStartedAtMs);
   const symbolIndex = Number(opts?.scanTiming?.symbolIndex);
   const scanElapsedMsAtSymbol = Number.isFinite(scanStartedAtMs) ? Math.max(0, Date.now() - scanStartedAtMs) : null;
+  const lateScanRevalidationThresholdMs = Math.max(1000, Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.6));
   const lateScanEvaluation = Number.isFinite(scanElapsedMsAtSymbol)
-    && scanElapsedMsAtSymbol >= Math.max(ENTRY_SCAN_INTERVAL_MS, Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.75));
+    && scanElapsedMsAtSymbol >= lateScanRevalidationThresholdMs;
   const nearStaleQuote = Number.isFinite(quoteAgeMs) && quoteAgeMs >= Math.floor(ENTRY_QUOTE_MAX_AGE_MS * 0.6);
   const quoteSourceLower = String(quoteSource || '').toLowerCase();
   const quoteLikelyPrefetchedOrCached = ['prefetch', 'cache', 'pass'].some((token) => quoteSourceLower.includes(token));
@@ -2294,6 +2324,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbolIndex: Number.isFinite(symbolIndex) ? symbolIndex : null,
         preRefreshQuoteAgeMs,
         thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        revalidationThresholdMs: lateScanRevalidationThresholdMs,
         refreshedQuoteSource: quoteSource,
         refreshedQuoteAgeMs: quoteAgeMs,
       });
@@ -2306,6 +2337,7 @@ async function computeEntrySignal(symbol, opts = {}) {
         symbolIndex: Number.isFinite(symbolIndex) ? symbolIndex : null,
         preRefreshQuoteAgeMs,
         thresholdAppliedMs: ENTRY_QUOTE_MAX_AGE_MS,
+        revalidationThresholdMs: lateScanRevalidationThresholdMs,
       });
     }
   }
@@ -3266,6 +3298,9 @@ async function computeEntrySignal(symbol, opts = {}) {
     enabled: TIME_OF_DAY_ENABLED,
   };
   const timeOfDayMakesStricter = TIME_OF_DAY_ENABLED && timeOfDayMultiplier < 1;
+  const earlyGateQuoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
+  const earlyGateQuoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
+  const earlyGateQuoteAgeMs = Number.isFinite(earlyGateQuoteTsMs) ? Math.max(0, Date.now() - earlyGateQuoteTsMs) : null;
 
   if ((predictorTp?.probability ?? -1) < effectiveMinProbToEnter) {
     const isTimeOfDayGate = timeOfDayMakesStricter && (predictorTp?.probability ?? -1) >= baseMinProbToEnter;
@@ -3290,6 +3325,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       why: isTimeOfDayGate ? 'time_of_day_gate' : 'predictor_gate',
       meta: {
         symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        requiredEdgeBps,
+        quoteAgeMs: earlyGateQuoteAgeMs,
+        quoteTsMs: earlyGateQuoteTsMs,
+        quoteReceivedAtMs: earlyGateQuoteReceivedAtMs,
         probability: predictorTp?.probability ?? null,
         minProbToEnter: effectiveMinProbToEnter,
         baseMinProbToEnter,
@@ -3321,6 +3362,12 @@ async function computeEntrySignal(symbol, opts = {}) {
       why: 'predictor_stretch_gate',
       meta: {
         symbol: asset.symbol,
+        symbolTier,
+        spreadBps,
+        requiredEdgeBps,
+        quoteAgeMs: earlyGateQuoteAgeMs,
+        quoteTsMs: earlyGateQuoteTsMs,
+        quoteReceivedAtMs: earlyGateQuoteReceivedAtMs,
         probability: predictorTp?.probability ?? null,
         minProbToEnter: MIN_PROB_TO_ENTER_TP,
         stretchProbability: predictorStretch?.probability ?? null,
@@ -14854,7 +14901,7 @@ function buildBarsMapFromBatch(symbols, barsResp) {
   return barsBySymbol;
 }
 
-async function resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOverride } = {}) {
+async function resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOverride, symbolsToRank = null } = {}) {
   const symbols = Array.isArray(filteredSymbols) ? filteredSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   const rankOptions = {
     executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
@@ -14893,6 +14940,7 @@ async function resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOver
   const resolveOptions = {
     rankOptions,
     getMarketDataMaps,
+    symbolsToRank,
   };
   if (hydrateOverride !== null) {
     resolveOptions.hydrate = async ({ symbols: retrySymbols, reason }) => {
@@ -14916,6 +14964,7 @@ async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
       orderbookHydrationState: ENTRY_PREFETCH_ORDERBOOKS ? 'skipped_no_symbols' : 'skipped_env_disabled',
       skippedEndpoints: [],
       seededSymbols: 0,
+      seededSymbolList: [],
       totalSymbolsObserved: 0,
     };
   }
@@ -15000,6 +15049,7 @@ async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
       : 'skipped_env_disabled',
     skippedEndpoints: cooldownBlockedEndpoints,
     seededSymbols: seedSymbols.length,
+    seededSymbolList: seedSymbols.slice(),
     totalSymbolsObserved: symbols.length,
     seedRotation: {
       offsetStart: seedSelection.offsetStart,
@@ -15634,8 +15684,13 @@ async function runEntryScanOnce() {
     }
     completeStage('universe_selection');
     const dynamicRankingEnabled = ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic');
+    const evaluatedSymbolsForPass = dynamicRankingEnabled
+      ? (Array.isArray(eligibilityHydration?.seededSymbolList) && eligibilityHydration.seededSymbolList.length
+        ? eligibilityHydration.seededSymbolList
+        : filteredSymbols)
+      : null;
     const dynamicRankingResolution = dynamicRankingEnabled
-      ? await resolveDynamicRankingFromScanCache(filteredSymbols)
+      ? await resolveDynamicRankingFromScanCache(filteredSymbols, { symbolsToRank: evaluatedSymbolsForPass })
       : await resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOverride: null });
     const rankedDynamicUniverse = dynamicRankingResolution.finalRank;
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
@@ -15763,6 +15818,10 @@ async function runEntryScanOnce() {
         orderbookHydrationState: eligibilityHydration.orderbookHydrationState || null,
         skippedEndpoints: Array.isArray(eligibilityHydration.skippedEndpoints) ? eligibilityHydration.skippedEndpoints : [],
         seededSymbols: Number(eligibilityHydration.seededSymbols || 0),
+        unevaluatedSymbols: Math.max(
+          0,
+          Number(eligibilityHydration.totalSymbolsObserved || 0) - Number(eligibilityHydration.seededSymbols || 0),
+        ),
         totalSymbolsObserved: Number(eligibilityHydration.totalSymbolsObserved || 0),
       } : null,
       rankingHydrationRetry: dynamicRankingResolution?.hydrationRetry?.attempted ? {
@@ -15778,6 +15837,11 @@ async function runEntryScanOnce() {
       },
       rankingEligibilityCounts: rankedDynamicUniverse?.eligibilityCounts || null,
       rankingFailureCounts: rankedDynamicUniverse?.failureCounts || null,
+      rankingCoverage: {
+        totalSymbolsRequested: Number(rankedDynamicUniverse?.totalSymbolsRequested || filteredSymbols.length || 0),
+        evaluatedSymbolsCount: Number(rankedDynamicUniverse?.evaluatedSymbolsCount || prioritizedSymbols.length || 0),
+        unevaluatedSymbolsCount: Number(rankedDynamicUniverse?.unevaluatedSymbolsCount || 0),
+      },
       rankingFreshnessWindowsMs: {
         quoteReuseMaxAgeMs: ENTRY_SCAN_QUOTE_REUSE_MAX_AGE_MS,
         orderbookReuseMaxAgeMs: ENTRY_SCAN_ORDERBOOK_REUSE_MAX_AGE_MS,
@@ -15912,6 +15976,9 @@ async function runEntryScanOnce() {
       scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicRankingSample: rankedDynamicUniverse.diagnostics.slice(0, 5),
       dynamicRankingDroppedSample: rankedDynamicUniverse.droppedDiagnostics.slice(0, 5),
+      dynamicRankingUnevaluatedSample: Array.isArray(rankedDynamicUniverse.omittedDiagnostics)
+        ? rankedDynamicUniverse.omittedDiagnostics.slice(0, 5)
+        : [],
       rankingFreshnessWindowsMs: lastUniverseDiagnostics.rankingFreshnessWindowsMs,
       entryFreshnessWindowsMs: lastUniverseDiagnostics.entryFreshnessWindowsMs,
       dynamicRequireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
@@ -16153,12 +16220,15 @@ async function runEntryScanOnce() {
     }, {});
     const computeProgressCounters = () => {
       const skipCountsSoFar = buildSkipCountsSoFar();
-      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0) + Number(skipCountsSoFar.symbol_health_cooldown || 0);
-      const symbolHealthCooldownCount = staleQuoteCooldownCount;
+      const staleQuoteCooldownCount = Number(skipCountsSoFar.stale_quote_cooldown || 0);
+      const symbolHealthCooldownCount = Number(skipCountsSoFar.symbol_health_cooldown || 0);
       const stalePrimaryQuoteCount = Number(skipCountsSoFar.stale_quote_primary || 0);
-      const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
+      const dataUnavailableCount = Number(skipCountsSoFar.marketdata_unavailable || 0);
       const marketRejectionCount = Object.entries(skipCountsSoFar)
         .filter(([reason]) => classifyEntrySkipReason(reason) === 'market')
+        .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+      const strategyRejectionCount = Object.entries(skipCountsSoFar)
+        .filter(([reason]) => classifyEntrySkipReason(reason) === 'strategy')
         .reduce((sum, [, count]) => sum + Number(count || 0), 0);
       const topSkipReasons = Object.entries(skipCountsSoFar)
         .sort((a, b) => b[1] - a[1])
@@ -16174,6 +16244,7 @@ async function runEntryScanOnce() {
         stalePrimaryQuoteCount,
         dataUnavailableCount,
         marketRejectionCount,
+        strategyRejectionCount,
         topSkipReasons,
       };
     };
@@ -16239,6 +16310,7 @@ async function runEntryScanOnce() {
         stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
         dataUnavailableCount: progressCounters.dataUnavailableCount,
         marketRejectionCount: progressCounters.marketRejectionCount,
+        strategyRejectionCount: progressCounters.strategyRejectionCount,
         topSkipReasons: progressCounters.topSkipReasons,
       });
       if ((scanned % progressMilestoneStep === 0) || Date.now() >= nextProgressLogAtMs) {
@@ -16254,6 +16326,7 @@ async function runEntryScanOnce() {
           stalePrimaryQuoteCount: progressCounters.stalePrimaryQuoteCount,
           dataUnavailableCount: progressCounters.dataUnavailableCount,
           marketRejectionCount: progressCounters.marketRejectionCount,
+          strategyRejectionCount: progressCounters.strategyRejectionCount,
           topSkipReasons: progressCounters.topSkipReasons,
           currentEngineState: getEngineStateSnapshot(),
         });
@@ -16595,12 +16668,15 @@ async function runEntryScanOnce() {
       acc[reason] = count;
       return acc;
     }, {});
-    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0) + Number(skipDetailCountsObj.symbol_health_cooldown || 0);
-    const symbolHealthCooldownCount = staleQuoteCooldownCount;
+    const staleQuoteCooldownCount = Number(skipDetailCountsObj.stale_quote_cooldown || 0);
+    const symbolHealthCooldownCount = Number(skipDetailCountsObj.symbol_health_cooldown || 0);
     const stalePrimaryQuoteCount = Number(skipDetailCountsObj.stale_quote_primary || 0);
-    const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0) + stalePrimaryQuoteCount;
+    const dataUnavailableCount = Number(skipDetailCountsObj.marketdata_unavailable || 0);
     const marketRejectionCount = Object.entries(skipDetailCountsObj)
       .filter(([reason]) => classifyEntrySkipReason(reason) === 'market')
+      .reduce((sum, [, count]) => sum + Number(count || 0), 0);
+    const strategyRejectionCount = Object.entries(skipDetailCountsObj)
+      .filter(([reason]) => classifyEntrySkipReason(reason) === 'strategy')
       .reduce((sum, [, count]) => sum + Number(count || 0), 0);
     const skipSamplesObj = Array.from(skipSamples.entries()).reduce((acc, [reason, samples]) => {
       acc[reason] = samples;
@@ -16658,6 +16734,13 @@ async function runEntryScanOnce() {
         if (!acc[key]) acc[key] = [];
         acc[key].push({
           reason: candidate.skipReason || 'signal_skip',
+          symbolTier: candidate.symbolTier || null,
+          spreadBps: Number.isFinite(candidate.spreadBps) ? candidate.spreadBps : null,
+          probability: Number.isFinite(candidate.probability) ? candidate.probability : null,
+          minProbToEnter: Number.isFinite(candidate.minProbToEnter) ? candidate.minProbToEnter : null,
+          baseMinProbToEnter: Number.isFinite(candidate.baseMinProbToEnter) ? candidate.baseMinProbToEnter : null,
+          effectiveMinProbToEnter: Number.isFinite(candidate.effectiveMinProbToEnter) ? candidate.effectiveMinProbToEnter : null,
+          stretchProbability: Number.isFinite(candidate.stretchProbability) ? candidate.stretchProbability : null,
           quoteAgeMs: Number.isFinite(candidate.quoteAgeMs) ? candidate.quoteAgeMs : null,
           regimeLabel: candidate.regimeLabel || null,
           regimePenaltyBps: Number.isFinite(candidate.regimePenaltyBps) ? candidate.regimePenaltyBps : null,
@@ -16665,12 +16748,17 @@ async function runEntryScanOnce() {
           netEdgeBps: Number.isFinite(candidate.netEdgeBps) ? candidate.netEdgeBps : null,
           quoteTsMs: Number.isFinite(candidate.quoteTsMs) ? candidate.quoteTsMs : null,
           quoteReceivedAtMs: Number.isFinite(candidate.quoteReceivedAtMs) ? candidate.quoteReceivedAtMs : null,
+          timeOfDay: candidate.timeOfDay || null,
           dataQualityReason: candidate.dataQualityReason || null,
           sparseRetry: candidate.sparseRetry || null,
         });
         return acc;
       }, {});
-    const staleQuoteCooldownSample = symbolHealthTracker.listActiveCooldowns({ limit: 8 }).map((state) => ({
+    const activeCooldowns = symbolHealthTracker.listActiveCooldowns({ limit: 32 });
+    const staleQuoteCooldownSample = activeCooldowns
+      .filter((state) => String(state.reason || '') === 'stale_quote_primary')
+      .slice(0, 8)
+      .map((state) => ({
       symbol: state.symbol,
       untilMs: Number(state.untilMs) || 0,
       remainingMs: Number(state.remainingMs) || 0,
@@ -16678,6 +16766,17 @@ async function runEntryScanOnce() {
       reason: state.reason || null,
       quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
     }));
+    const symbolHealthCooldownSample = activeCooldowns
+      .filter((state) => String(state.reason || '') !== 'stale_quote_primary')
+      .slice(0, 8)
+      .map((state) => ({
+        symbol: state.symbol,
+        untilMs: Number(state.untilMs) || 0,
+        remainingMs: Number(state.remainingMs) || 0,
+        attempts: Number(state.failures) || 0,
+        reason: state.reason || null,
+        quoteAgeMs: Number.isFinite(Number(state.quoteAgeMs)) ? Number(state.quoteAgeMs) : null,
+      }));
     const completedSummary = {
       startMs,
       endMs,
@@ -16719,10 +16818,11 @@ async function runEntryScanOnce() {
       stalePrimaryQuoteCount,
       dataUnavailableCount,
       marketRejectionCount,
+      strategyRejectionCount,
       staleQuoteCooldownActive: staleQuoteCooldownSample.length,
       staleQuoteCooldownSample,
-      symbolHealthCooldownActive: staleQuoteCooldownSample.length,
-      symbolHealthCooldownSample: staleQuoteCooldownSample,
+      symbolHealthCooldownActive: symbolHealthCooldownSample.length,
+      symbolHealthCooldownSample,
       marketDataBudget: {
         cacheHits: entryMarketDataContext.stats.cacheHits,
         freshFetches: entryMarketDataContext.stats.freshFetches,
