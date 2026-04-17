@@ -331,6 +331,30 @@ async function runHydrationRetryRegressionTests() {
   assert.equal(noDataResolution.hydrationRetry.attempted, true);
   assert.equal(noDataResolution.hydrationRetry.recovered, false);
   assert.deepEqual(noDataResolution.finalRank.symbols, []);
+
+  const subsetResolution = await resolveDynamicUniverseRankingWithHydration(
+    ['BTC/USD', 'ETH/USD', 'SOL/USD'],
+    {
+      symbolsToRank: ['BTC/USD'],
+      rankOptions: baseRankOptions,
+      getMarketDataMaps: () => ({
+        nowMs: 1700000015000,
+        quoteBySymbol: {
+          'BTC/USD': { bid: 100, ask: 100.02, tsMs: 1700000014000 },
+          'ETH/USD': { bid: 50, ask: 50.02, tsMs: 1700000014000 },
+          'SOL/USD': { bid: 20, ask: 20.02, tsMs: 1700000014000 },
+        },
+        orderbookBySymbol: {
+          'BTC/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+        },
+      }),
+      hydrate: async () => ({ ok: true, prefetchedQuotes: 1, prefetchedOrderbooks: 1 }),
+    },
+  );
+  assert.deepEqual(subsetResolution.finalRank.symbols, ['BTC/USD']);
+  assert.equal(subsetResolution.finalRank.evaluatedSymbolsCount, 1);
+  assert.equal(subsetResolution.finalRank.unevaluatedSymbolsCount, 2);
+  assert.equal(subsetResolution.finalRank.omittedDiagnostics.length, 2);
 }
 
 runHydrationRetryRegressionTests().catch((err) => {

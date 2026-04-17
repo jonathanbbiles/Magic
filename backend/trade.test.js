@@ -774,6 +774,12 @@ const predictorCandidateEvGate = tradeEntryBasis.buildPredictorCandidateSignal({
   },
   candidateMeta: {
     edge: { netEdgeBps: 3.2 },
+    symbolTier: 'tier2',
+    minProbToEnter: 0.58,
+    baseMinProbToEnter: 0.55,
+    effectiveMinProbToEnter: 0.58,
+    stretchProbability: 0.61,
+    timeOfDay: { hourLocal: 11, multiplier: 0.9 },
   },
   candidateDecision: 'skipped',
   candidateSkipReason: 'ev_gate',
@@ -787,6 +793,12 @@ assert.equal(predictorCandidateEvGate.quoteTsMs, 1700000000001);
 assert.equal(predictorCandidateEvGate.quoteReceivedAtMs, 1700000000021);
 assert.equal(predictorCandidateEvGate.regimeLabel, 'neutral');
 assert.equal(predictorCandidateEvGate.regimePenaltyBps, 1.8);
+assert.equal(predictorCandidateEvGate.symbolTier, 'tier2');
+assert.equal(predictorCandidateEvGate.minProbToEnter, 0.58);
+assert.equal(predictorCandidateEvGate.baseMinProbToEnter, 0.55);
+assert.equal(predictorCandidateEvGate.effectiveMinProbToEnter, 0.58);
+assert.equal(predictorCandidateEvGate.stretchProbability, 0.61);
+assert.deepEqual(predictorCandidateEvGate.timeOfDay, { hourLocal: 11, multiplier: 0.9 });
 const predictorCandidateNullPreserved = tradeEntryBasis.buildPredictorCandidateSignal({
   symbol: 'ADA/USD',
   recordBase: { predictorProbability: null, spreadBps: null },
