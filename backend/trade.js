@@ -523,6 +523,15 @@ function getUniverseDiagnosticsSnapshot() {
     acceptedSymbolsSample: Array.isArray(lastUniverseDiagnostics.acceptedSymbolsSample)
       ? lastUniverseDiagnostics.acceptedSymbolsSample.slice(0, 10)
       : [],
+    rankedAcceptedSymbolsSample: Array.isArray(lastUniverseDiagnostics.rankedAcceptedSymbolsSample)
+      ? lastUniverseDiagnostics.rankedAcceptedSymbolsSample.slice(0, 10)
+      : [],
+    dynamicAcceptedSymbolsSample: Array.isArray(lastUniverseDiagnostics.dynamicAcceptedSymbolsSample)
+      ? lastUniverseDiagnostics.dynamicAcceptedSymbolsSample.slice(0, 10)
+      : [],
+    scanSymbolsSample: Array.isArray(lastUniverseDiagnostics.scanSymbolsSample)
+      ? lastUniverseDiagnostics.scanSymbolsSample.slice(0, 10)
+      : [],
   };
 }
 
@@ -1341,8 +1350,10 @@ let lastUniverseDiagnostics = {
   dynamicRejectedUnsupportedCount: 0,
   dynamicRejectedDuplicateCount: 0,
   acceptedSymbolsCount: null,
+  rankedAcceptedSymbolsCount: null,
   scanSymbolsCount: null,
   acceptedSymbolsSample: [],
+  rankedAcceptedSymbolsSample: [],
   dynamicAcceptedSymbolsCount: 0,
   dynamicAcceptedSymbolsSample: [],
   fallbackOccurred: false,
@@ -5385,9 +5396,11 @@ async function loadSupportedCryptoPairs({ force = false } = {}) {
       dynamicRejectedMalformedCount: dynamicUniverse.stats.malformedCount,
       dynamicRejectedUnsupportedCount: dynamicUniverse.stats.unsupportedCount,
       dynamicRejectedDuplicateCount: dynamicUniverse.stats.duplicateCount,
-      acceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
+      acceptedSymbolsCount: lastUniverseDiagnostics.acceptedSymbolsCount,
+      rankedAcceptedSymbolsCount: lastUniverseDiagnostics.rankedAcceptedSymbolsCount,
       dynamicAcceptedSymbolsCount: dynamicUniverse.stats.acceptedCount,
-      acceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
+      acceptedSymbolsSample: lastUniverseDiagnostics.acceptedSymbolsSample,
+      rankedAcceptedSymbolsSample: lastUniverseDiagnostics.rankedAcceptedSymbolsSample,
       dynamicAcceptedSymbolsSample: dynamicUniverse.symbols.slice(0, 10),
       lastUniverseRefreshAt: supportedCryptoPairsState.lastUpdated,
     };
@@ -15461,11 +15474,11 @@ async function runEntryScanOnce() {
       dynamicUniverseActive: supportedCryptoPairsState.loaded || lastUniverseDiagnostics.dynamicUniverseActive,
       effectiveUniverseMode: lastUniverseDiagnostics.effectiveUniverseMode || 'dynamic_full_universe',
       dynamicTradableSymbolsFound: supportedStats?.tradableCryptoCount ?? lastUniverseDiagnostics.dynamicTradableSymbolsFound,
-      acceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.acceptedSymbolsCount,
+      acceptedSymbolsCount: lastUniverseDiagnostics.acceptedSymbolsCount,
+      rankedAcceptedSymbolsCount: lastUniverseDiagnostics.rankedAcceptedSymbolsCount,
       dynamicAcceptedSymbolsCount: supportedStats?.acceptedCount ?? lastUniverseDiagnostics.dynamicAcceptedSymbolsCount,
-      acceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
-        ? supportedSnapshot.pairs.slice(0, 10)
-        : lastUniverseDiagnostics.acceptedSymbolsSample,
+      acceptedSymbolsSample: lastUniverseDiagnostics.acceptedSymbolsSample,
+      rankedAcceptedSymbolsSample: lastUniverseDiagnostics.rankedAcceptedSymbolsSample,
       dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs) && supportedSnapshot.pairs.length
         ? supportedSnapshot.pairs.slice(0, 10)
         : lastUniverseDiagnostics.dynamicAcceptedSymbolsSample,
@@ -15779,6 +15792,7 @@ async function runEntryScanOnce() {
       dynamicRejectedUnsupportedCount: dynamicUniverseStats?.unsupportedCount ?? 0,
       dynamicRejectedDuplicateCount: dynamicUniverseStats?.duplicateCount ?? 0,
       acceptedSymbolsCount: prioritizedSymbols.length,
+      rankedAcceptedSymbolsCount: prioritizedSymbols.length,
       scanSymbolsCount: scanSymbols.length,
       dynamicAcceptedSymbolsCount: dynamicUniverseStats?.acceptedCount ?? 0,
       universeSymbolCap: effectiveUniverseCap,
@@ -15791,6 +15805,7 @@ async function runEntryScanOnce() {
         droppedByCapCount: Math.max(0, prioritizedSymbols.length - scanSymbols.length),
       },
       acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+      rankedAcceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
       scanSymbolsSample: scanSymbols.slice(0, 10),
       dynamicAcceptedSymbolsSample: Array.isArray(supportedSnapshot?.pairs)
         ? supportedSnapshot.pairs.slice(0, 10)

@@ -888,6 +888,22 @@ app.get('/dashboard', async (req, res) => {
 
     const latestEquity = toFiniteNumberOrNull(account?.equity) ?? toFiniteNumberOrNull(account?.portfolio_value);
     const weekly = equitySnapshots.getWeeklyChangePct(latestEquity, nowMs);
+    const rankedAcceptedSymbolsCount = toFiniteNumberOrNull(
+      universeDiagnostics?.rankedAcceptedSymbolsCount ?? universeDiagnostics?.acceptedSymbolsCount,
+    );
+    const dynamicAcceptedSymbolsCount = toFiniteNumberOrNull(universeDiagnostics?.dynamicAcceptedSymbolsCount);
+    const scanSymbolsCount = toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount);
+    const rankedAcceptedSymbolsSample = Array.isArray(universeDiagnostics?.rankedAcceptedSymbolsSample)
+      ? universeDiagnostics.rankedAcceptedSymbolsSample.slice(0, 10)
+      : (Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
+        ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
+        : []);
+    const dynamicAcceptedSymbolsSample = Array.isArray(universeDiagnostics?.dynamicAcceptedSymbolsSample)
+      ? universeDiagnostics.dynamicAcceptedSymbolsSample.slice(0, 10)
+      : [];
+    const scanSymbolsSample = Array.isArray(universeDiagnostics?.scanSymbolsSample)
+      ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
+      : [];
 
     res.json({
       ok: true,
@@ -904,18 +920,18 @@ app.get('/dashboard', async (req, res) => {
         effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
         dynamicUniverseActive,
         dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-        acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
-        scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
+        acceptedSymbolsCount: rankedAcceptedSymbolsCount,
+        rankedAcceptedSymbolsCount,
+        dynamicAcceptedSymbolsCount,
+        scanSymbolsCount,
         universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
         configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
         configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
         universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
-        acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
-          ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
-          : [],
-        scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
-          ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
-          : [],
+        acceptedSymbolsSample: rankedAcceptedSymbolsSample,
+        rankedAcceptedSymbolsSample,
+        dynamicAcceptedSymbolsSample,
+        scanSymbolsSample,
         fallbackOccurred,
         fallbackReason: universeDiagnostics?.fallbackReason || null,
         engineState: getEngineStateSnapshot(),
@@ -964,14 +980,14 @@ app.get('/dashboard', async (req, res) => {
           backendReachable: true,
           authConfigured: Boolean(process.env.API_TOKEN),
           dynamicUniverseActive,
-          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
-          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
-          acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
-            ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
-            : [],
-          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
-            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
-            : [],
+          acceptedSymbolsCount: rankedAcceptedSymbolsCount,
+          rankedAcceptedSymbolsCount,
+          dynamicAcceptedSymbolsCount,
+          scanSymbolsCount,
+          acceptedSymbolsSample: rankedAcceptedSymbolsSample,
+          rankedAcceptedSymbolsSample,
+          dynamicAcceptedSymbolsSample,
+          scanSymbolsSample,
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
           warmupInProgress: Boolean(predictorWarmup?.inProgress),
@@ -1031,18 +1047,18 @@ app.get('/dashboard', async (req, res) => {
           effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
           dynamicUniverseActive,
           dynamicTradableSymbolsFound: Number(universeDiagnostics?.dynamicTradableSymbolsFound || 0),
-          acceptedSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.acceptedSymbolsCount),
-          scanSymbolsCount: toFiniteNumberOrNull(universeDiagnostics?.scanSymbolsCount),
+          acceptedSymbolsCount: rankedAcceptedSymbolsCount,
+          rankedAcceptedSymbolsCount,
+          dynamicAcceptedSymbolsCount,
+          scanSymbolsCount,
           universeSymbolCap: Number(universeDiagnostics?.universeSymbolCap || 0) || null,
           configuredUniverseCap: Number(universeDiagnostics?.configuredUniverseCap || 0) || null,
           configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
           universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
-          acceptedSymbolsSample: Array.isArray(universeDiagnostics?.acceptedSymbolsSample)
-            ? universeDiagnostics.acceptedSymbolsSample.slice(0, 10)
-            : [],
-          scanSymbolsSample: Array.isArray(universeDiagnostics?.scanSymbolsSample)
-            ? universeDiagnostics.scanSymbolsSample.slice(0, 10)
-            : [],
+          acceptedSymbolsSample: rankedAcceptedSymbolsSample,
+          rankedAcceptedSymbolsSample,
+          dynamicAcceptedSymbolsSample,
+          scanSymbolsSample,
           fallbackOccurred,
           fallbackReason: universeDiagnostics?.fallbackReason || null,
           engineState: getEngineStateSnapshot(),
@@ -1650,22 +1666,24 @@ async function bootstrapTrading() {
   console.log('bootstrap_start');
   logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
+  const emitStartupTruthSummaryOnce = () => {
+    if (startupTruthLogged) return;
+    const baseStatus = getAlpacaBaseStatus();
+    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
+    const warmup = getPredictorWarmupSnapshot();
+    emitStartupTruthSummary(console.log, {
+      authStatus,
+      baseStatus,
+      universeDiagnostics,
+      warmup,
+      runtimeConfig,
+      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
+      env: process.env,
+    });
+    startupTruthLogged = true;
+  };
   if (!authStatus.alpacaAuthOk) {
-    if (!startupTruthLogged) {
-      const baseStatus = getAlpacaBaseStatus();
-      const universeDiagnostics = getUniverseDiagnosticsSnapshot();
-      const warmup = getPredictorWarmupSnapshot();
-      emitStartupTruthSummary(console.log, {
-        authStatus,
-        baseStatus,
-        universeDiagnostics,
-        warmup,
-        runtimeConfig,
-        runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
-        env: process.env,
-      });
-      startupTruthLogged = true;
-    }
+    emitStartupTruthSummaryOnce();
     console.warn('startup_blocked_missing_alpaca_auth', {
       missing: authStatus.missing,
       checkedKeyVars: authStatus.checkedKeyVars,
@@ -1673,6 +1691,9 @@ async function bootstrapTrading() {
     });
     return;
   }
+  // Emit startup truth immediately on successful auth so startup tests and
+  // dashboards do not race later async bootstrap steps.
+  emitStartupTruthSummaryOnce();
 
   let inventoryOk = false;
   try {
@@ -1724,21 +1745,7 @@ async function bootstrapTrading() {
   } else {
     console.log('trading_disabled_skip_entry_exit');
   }
-  if (!startupTruthLogged) {
-    const baseStatus = getAlpacaBaseStatus();
-    const universeDiagnostics = getUniverseDiagnosticsSnapshot();
-    const warmup = getPredictorWarmupSnapshot();
-    emitStartupTruthSummary(console.log, {
-      authStatus,
-      baseStatus,
-      universeDiagnostics,
-      warmup,
-      runtimeConfig,
-      runtimeEntryUniverseModeRaw: runtimeConfig.entryUniverseModeRaw,
-      env: process.env,
-    });
-    startupTruthLogged = true;
-  }
+  emitStartupTruthSummaryOnce();
   console.log('bootstrap_done');
 }
 

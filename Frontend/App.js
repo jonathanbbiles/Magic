@@ -625,14 +625,13 @@ function AppInner() {
   const entryScanBlockedBy = String(meta?.universe?.entryScanBlockedBy || '').toLowerCase();
   const universeZeroReason = String(meta?.universe?.universeZeroReason || '').toLowerCase();
   const isWarmingUp = String(engineState || '').toLowerCase() === 'warming_up';
-  const topSkipReasons = entryScan?.topSkipReasons || meta?.topSkipReasons || {};
-  const netEdgeGateSkips = toNum(topSkipReasons?.net_edge_gate) ?? 0;
   const backendAuthIssue = typeof error === 'string' && /http\s+(401|403)/i.test(error);
   const currentEntryScanProgress = meta?.currentEntryScanProgress ?? truth?.currentEntryScanProgress ?? {};
-  const scanInProgress = ['scanning_symbols', 'starting'].includes(
-    String(currentEntryScanProgress?.state || '').toLowerCase(),
-  );
+  const currentScanState = String(currentEntryScanProgress?.state || '').toLowerCase();
+  const scanInProgress = Boolean(currentScanState) && !['idle', 'aborted', 'completed'].includes(currentScanState);
   const lastEntryScanSummary = meta?.lastEntryScanSummary ?? truth?.lastEntryScanSummary ?? {};
+  const lastCompletedTopSkipReasons = lastEntryScanSummary?.topSkipReasons || {};
+  const netEdgeGateSkips = toNum(lastCompletedTopSkipReasons?.net_edge_gate) ?? 0;
   const lastCompletedUniverseReason = String(
     lastEntryScanSummary?.extra?.universeZeroReason
     || lastEntryScanSummary?.extra?.reasonDetail
@@ -643,7 +642,9 @@ function AppInner() {
   const hasPlaceholderUniverseCounts = (scanSymbolsCount == null || scanSymbolsCount === 0)
     && (acceptedSymbolsCount == null || acceptedSymbolsCount === 0);
   const universeSummary = hasRealUniverseCount && hasScanCount
-    ? `Scanning ${scanSymbolsCount} of ${acceptedSymbolsCount}`
+    ? (scanInProgress
+      ? `Scanning ${scanSymbolsCount} of ${acceptedSymbolsCount}`
+      : `Selected ${scanSymbolsCount} of ${acceptedSymbolsCount}`)
     : entryScanBlockedBy === 'universe_empty'
       ? 'Universe empty after backend filters'
     : isWarmingUp && hasPlaceholderUniverseCounts
@@ -661,17 +662,23 @@ function AppInner() {
             ? 'Waiting for fresh market data'
             : 'Universe empty after hydration'
         )
-      : scanInProgress && lastCompletedUniverseReason && netEdgeGateSkips <= 0
+      : scanInProgress
+        ? (
+          currentScanState === 'prefetching_market_data'
+            ? 'Prefetching market data'
+            : 'Scanning in progress'
+        )
+      : netEdgeGateSkips > 0
+        ? 'Strategy skipped entry (net edge gate)'
+      : lastCompletedUniverseReason
         ? (
           lastCompletedUniverseReason.includes('fresh_marketdata')
             ? 'Waiting for fresh market data'
             : lastCompletedUniverseReason.includes('healthy_spread')
               ? 'Waiting for healthy spread'
-              : 'Scanning in progress'
+              : 'Scan completed'
         )
-      : netEdgeGateSkips > 0
-        ? 'Strategy skipped entry (net edge gate)'
-        : 'Scanning normally';
+      : 'Scanning normally';
 
   // Full diagnostics + logs bundle for copy
   const copyFullBundle = useCallback(async () => {
