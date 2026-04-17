@@ -14,7 +14,17 @@ function buildStartupTruthSummary({
     dynamicUniverseActive: Boolean(universeDiagnostics?.dynamicUniverseActive),
     requestedUniverseMode: universeDiagnostics?.envRequestedUniverseMode || runtimeEntryUniverseModeRaw || null,
     effectiveUniverseMode: universeDiagnostics?.effectiveUniverseMode || null,
-    acceptedSymbolsCount: Number(universeDiagnostics?.acceptedSymbolsCount || 0),
+    acceptedSymbolsCount: Number(
+      universeDiagnostics?.rankedAcceptedSymbolsCount
+      ?? universeDiagnostics?.acceptedSymbolsCount
+      ?? 0,
+    ),
+    rankedAcceptedSymbolsCount: Number(
+      universeDiagnostics?.rankedAcceptedSymbolsCount
+      ?? universeDiagnostics?.acceptedSymbolsCount
+      ?? 0,
+    ),
+    dynamicAcceptedSymbolsCount: Number(universeDiagnostics?.dynamicAcceptedSymbolsCount || 0),
     scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
     universeSymbolCap: Number.isFinite(Number(universeDiagnostics?.universeSymbolCap))
       ? Number(universeDiagnostics.universeSymbolCap)
