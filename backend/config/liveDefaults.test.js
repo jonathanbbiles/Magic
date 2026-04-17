@@ -65,7 +65,7 @@ withEnv({}, () => {
   assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PROB_TO_ENTER_TIER2, '0.52');
   assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
   assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '20');
-  assert.equal(LIVE_CRITICAL_DEFAULTS.EV_MIN_BPS, '30');
+  assert.equal(LIVE_CRITICAL_DEFAULTS.EV_MIN_BPS, '5');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_MAX_AGE_MS, '15000');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS, '15000');
   assert.equal(LIVE_CRITICAL_DEFAULTS.ORDERBOOK_SPARSE_REQUIRE_QUOTE_FRESH_MS, '5000');
@@ -98,7 +98,7 @@ withEnv({}, () => {
     assert.match(sourceText, /MIN_PROB_TO_ENTER_TIER2=0.52/);
     assert.match(sourceText, /EXIT_NET_PROFIT_AFTER_FEES_BPS=45/);
     assert.match(sourceText, /PROFIT_BUFFER_BPS=20/);
-    assert.match(sourceText, /EV_MIN_BPS=30/);
+    assert.match(sourceText, /EV_MIN_BPS=5/);
   }
   assert.match(envExample, /MIN_PROB_TO_ENTER=0.48/);
   assert.match(envExample, /ENTRY_UNIVERSE_MAX_SYMBOLS=/);
