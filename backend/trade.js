@@ -1334,6 +1334,11 @@ let lastEntryScanSummary = null;
 let lastPredictorCandidatesSummary = null;
 let lastEntrySkipReasonsBySymbol = {};
 let firstReadyScanLogged = false;
+let lastUniverseStartupSummaryAtMs = 0;
+let lastUniverseStartupSummarySignature = null;
+let lastUniverseDynamicProductionOptInAtMs = 0;
+const UNIVERSE_STARTUP_SUMMARY_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const UNIVERSE_DYNAMIC_PRODUCTION_OPT_IN_MIN_INTERVAL_MS = 60 * 60 * 1000;
 let lastUniverseDiagnostics = {
   envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
   effectiveUniverseMode: null,
@@ -2300,17 +2305,35 @@ async function computeEntrySignal(symbol, opts = {}) {
   };
 
   const forceRefreshStaleQuoteOnce = async () => {
+    const priorAgeMs = quoteAgeMs;
     const refreshed = await getEntryScanQuoteWithPrimaryRetry(asset.symbol, {
       maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
       forceRefresh: true,
       bypassCache: true,
     }).catch(() => null);
     if (!refreshed) return false;
+    const refreshedTsMs = normalizeQuoteTsMs(refreshed?.tsMs);
+    const refreshedAgeMs = Number.isFinite(refreshedTsMs)
+      ? Math.max(0, Date.now() - refreshedTsMs)
+      : null;
+    if (
+      Number.isFinite(refreshedAgeMs) &&
+      Number.isFinite(priorAgeMs) &&
+      refreshedAgeMs > priorAgeMs
+    ) {
+      console.log('entry_quote_late_refresh_rejected_older', {
+        symbol: asset.symbol,
+        priorQuoteAgeMs: priorAgeMs,
+        refreshedQuoteAgeMs: refreshedAgeMs,
+        refreshedQuoteSource: refreshed?.source || null,
+      });
+      return false;
+    }
     quote = refreshed;
-    quoteTsMs = normalizeQuoteTsMs(quote?.tsMs);
+    quoteTsMs = refreshedTsMs;
     quoteReceivedAtMs = Number.isFinite(Number(quote?.receivedAtMs)) ? Number(quote.receivedAtMs) : null;
     quoteSource = quote?.source || quoteSource;
-    quoteAgeMs = Number.isFinite(quoteTsMs) ? Math.max(0, Date.now() - quoteTsMs) : null;
+    quoteAgeMs = refreshedAgeMs;
     return true;
   };
   const scanStartedAtMs = Number(opts?.scanTiming?.scanStartedAtMs);
@@ -8738,10 +8761,18 @@ function applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs })
   return effectiveMaxAgeMsFinal;
 }
 
+const tradeFallbackHopelesslyStaleUntilMs = new Map();
+const TRADE_FALLBACK_HOPELESS_STALE_COOLDOWN_MS = 60_000;
+const TRADE_FALLBACK_HOPELESS_STALE_FACTOR = 5;
+
 async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : ENTRY_QUOTE_MAX_AGE_MS;
   const isCrypto = isCryptoSymbol(symbol);
   const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
+  const hopelessUntilMs = Number(tradeFallbackHopelesslyStaleUntilMs.get(symbol) || 0);
+  if (hopelessUntilMs > nowMs) {
+    return null;
+  }
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
   const url = isCrypto
     ? buildAlpacaUrl({
@@ -8797,6 +8828,12 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
     return null;
   }
   if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
+    if (ageMs >= effectiveMaxAgeMsFinal * TRADE_FALLBACK_HOPELESS_STALE_FACTOR) {
+      tradeFallbackHopelesslyStaleUntilMs.set(
+        symbol,
+        nowMs + TRADE_FALLBACK_HOPELESS_STALE_COOLDOWN_MS,
+      );
+    }
     logSkip('stale_quote', buildStaleQuoteLogMeta({
       symbol,
       source: 'trade_fallback',
@@ -8807,6 +8844,8 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
     }));
     return null;
   }
+
+  tradeFallbackHopelesslyStaleUntilMs.delete(symbol);
 
   return {
     bid: price,
@@ -11998,9 +12037,10 @@ async function manageExitStates() {
     if (nowMs - lastExitRepairAtMs >= EXIT_REPAIR_INTERVAL_MS) {
       await repairOrphanExitsSafe();
       lastExitRepairAtMs = nowMs;
-    } else {
+    } else if (exitState.size > 0) {
       console.log('exit_repair_skip_interval', {
         nextInMs: EXIT_REPAIR_INTERVAL_MS - (nowMs - lastExitRepairAtMs),
+        trackedExits: exitState.size,
       });
     }
     const now = nowMs;
@@ -16004,27 +16044,44 @@ async function runEntryScanOnce() {
       allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
       nodeEnv: NODE_ENV,
     });
-    console.log('entry_universe_startup_summary', {
-      requestedMode: ENTRY_UNIVERSE_MODE,
-      effectiveMode: universeMode,
-      acceptedSymbolsCount: prioritizedSymbols.length,
-      scanSymbolsCount: scanSymbols.length,
-      dynamicUniverseActive: universeMode.startsWith('dynamic'),
-      acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
-      scanSymbolsSample: scanSymbols.slice(0, 10),
-      dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
-      configuredPrimaryCount: configuredUniverse.primaryCount,
-      configuredSecondaryCount: configuredUniverse.secondaryCount,
-      stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
-      lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
-      warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
-      warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
-      fallbackOccurred: Boolean(fallbackReason),
-      fallbackReason,
-      secondaryQuoteEnabled: false,
-      secondaryQuoteRouterEnabled: false,
-      secondaryQuoteRouterProvider: null,
-    });
+    const universeStartupSummarySignature = [
+      ENTRY_UNIVERSE_MODE,
+      universeMode,
+      prioritizedSymbols.length,
+      scanSymbols.length,
+      Boolean(fallbackReason),
+      fallbackReason || '',
+    ].join('|');
+    const nowMsForStartupLog = Date.now();
+    const shouldEmitStartupSummary = (
+      universeStartupSummarySignature !== lastUniverseStartupSummarySignature
+      || (nowMsForStartupLog - lastUniverseStartupSummaryAtMs) >= UNIVERSE_STARTUP_SUMMARY_MIN_INTERVAL_MS
+    );
+    if (shouldEmitStartupSummary) {
+      console.log('entry_universe_startup_summary', {
+        requestedMode: ENTRY_UNIVERSE_MODE,
+        effectiveMode: universeMode,
+        acceptedSymbolsCount: prioritizedSymbols.length,
+        scanSymbolsCount: scanSymbols.length,
+        dynamicUniverseActive: universeMode.startsWith('dynamic'),
+        acceptedSymbolsSample: prioritizedSymbols.slice(0, 10),
+        scanSymbolsSample: scanSymbols.slice(0, 10),
+        dynamicTradableSymbolsFound: dynamicUniverseStats?.tradableCryptoCount ?? null,
+        configuredPrimaryCount: configuredUniverse.primaryCount,
+        configuredSecondaryCount: configuredUniverse.secondaryCount,
+        stableSymbolsExcludedCount: normalizedUniverse.length - filteredSymbols.length,
+        lastUniverseRefreshAt: supportedSnapshot?.lastUpdated || null,
+        warmupChunkSize: ENTRY_PREFETCH_CHUNK_SIZE,
+        warmupConcurrency: PREDICTOR_WARMUP_PREFETCH_CONCURRENCY,
+        fallbackOccurred: Boolean(fallbackReason),
+        fallbackReason,
+        secondaryQuoteEnabled: false,
+        secondaryQuoteRouterEnabled: false,
+        secondaryQuoteRouterProvider: null,
+      });
+      lastUniverseStartupSummaryAtMs = nowMsForStartupLog;
+      lastUniverseStartupSummarySignature = universeStartupSummarySignature;
+    }
     if (fallbackReason) {
       console.warn('entry_universe_fallback_active', {
         fallbackReason,
@@ -16065,12 +16122,16 @@ async function runEntryScanOnce() {
       });
     }
     if (NODE_ENV === 'production' && ENTRY_UNIVERSE_MODE !== 'configured' && ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION) {
-      console.warn('entry_universe_dynamic_production_opt_in', {
-        nodeEnv: NODE_ENV,
-        envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
-        effectiveUniverseMode: universeMode,
-        allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
-      });
+      const nowMsForOptInLog = Date.now();
+      if ((nowMsForOptInLog - lastUniverseDynamicProductionOptInAtMs) >= UNIVERSE_DYNAMIC_PRODUCTION_OPT_IN_MIN_INTERVAL_MS) {
+        console.warn('entry_universe_dynamic_production_opt_in', {
+          nodeEnv: NODE_ENV,
+          envRequestedUniverseMode: ENTRY_UNIVERSE_MODE,
+          effectiveUniverseMode: universeMode,
+          allowDynamicUniverseInProduction: ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION,
+        });
+        lastUniverseDynamicProductionOptInAtMs = nowMsForOptInLog;
+      }
     }
     const universeSize = scanSymbols.length;
     const isDynamicMode = universeMode.startsWith('dynamic');
