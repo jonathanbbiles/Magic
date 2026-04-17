@@ -85,6 +85,7 @@ const {
   buildEntryUniverse,
   buildDynamicCryptoUniverseFromAssets,
   rankDynamicUniverseByExecutionQuality,
+  resolveDynamicUniverseRankingWithHydration,
   deriveDynamicUniverseEmptyReason,
 } = require('./modules/entryUniversePolicy');
 const { createSymbolHealthTracker } = require('./modules/symbolHealth');
@@ -553,6 +554,85 @@ function noteStaleQuoteSkip(symbol, options = {}) {
     reason: options?.reason || 'stale_quote_primary',
     quoteAgeMs: Number.isFinite(quoteAgeMs) ? quoteAgeMs : null,
   });
+}
+
+function normalizeStaleSkipReason(skipReason) {
+  const normalized = String(skipReason || '').toLowerCase();
+  if (normalized.startsWith('stale_quote')) return normalized;
+  if (normalized === 'provider_quote_stale_after_refresh') return normalized;
+  if (normalized === 'quote_stale_regime_gate') return normalized;
+  return null;
+}
+
+function applyEntrySkipHealthMutation(symbol, { skipReason, why, meta } = {}) {
+  const signalMeta = meta && typeof meta === 'object' ? meta : {};
+  const staleQuoteSkipCounted = shouldCountEntryStaleQuoteSkip({ skipReason, why });
+  let failureMutationCount = 0;
+  let staleFailureRecorded = false;
+
+  if (staleQuoteSkipCounted) {
+    noteStaleQuoteSkip(symbol, {
+      reason: signalMeta.staleReasonCode || signalMeta.reason || skipReason || why || 'stale_quote_primary',
+      quoteAgeMs: signalMeta.quoteAgeMs,
+      cooldownMs: signalMeta.cooldownMs,
+    });
+    failureMutationCount += 1;
+    staleFailureRecorded = true;
+  }
+
+  if (shouldRecordEntryHealthFailure(skipReason)) {
+    const staleReason = normalizeStaleSkipReason(skipReason);
+    if (!(staleQuoteSkipCounted && staleReason)) {
+      symbolHealthTracker.recordFailure(symbol, skipReason, signalMeta);
+      failureMutationCount += 1;
+    }
+  } else if (
+    shouldCountSparseFallbackReject({ marketDataEval: signalMeta })
+    || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signalMeta?.sparseRetry })
+  ) {
+    symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signalMeta);
+    failureMutationCount += 1;
+  } else {
+    symbolHealthTracker.noteHealthy(symbol);
+  }
+
+  return {
+    staleQuoteSkipCounted,
+    staleFailureRecorded,
+    failureMutationCount,
+  };
+}
+
+function selectRotatingSeedSymbols(symbols, {
+  cap,
+  stream = 'entry_eligibility',
+} = {}) {
+  const normalized = Array.isArray(symbols) ? symbols.filter(Boolean) : [];
+  if (normalized.length === 0) {
+    return { symbols: [], offsetStart: 0, offsetEnd: 0, capUsed: 0, totalSymbols: 0 };
+  }
+  const resolvedCap = Math.max(1, Math.min(normalized.length, Math.trunc(Number(cap) || normalized.length)));
+  const currentOffset = stream === 'entry_scan_prefetch'
+    ? entryScanPrefetchSeedRotationOffset
+    : entryEligibilitySeedRotationOffset;
+  const offsetStart = Math.max(0, currentOffset % normalized.length);
+  const selected = [];
+  for (let i = 0; i < resolvedCap; i += 1) {
+    selected.push(normalized[(offsetStart + i) % normalized.length]);
+  }
+  const offsetEnd = (offsetStart + resolvedCap) % normalized.length;
+  if (stream === 'entry_scan_prefetch') {
+    entryScanPrefetchSeedRotationOffset = offsetEnd;
+  } else {
+    entryEligibilitySeedRotationOffset = offsetEnd;
+  }
+  return {
+    symbols: selected,
+    offsetStart,
+    offsetEnd,
+    capUsed: resolvedCap,
+    totalSymbols: normalized.length,
+  };
 }
 
 function clearStaleQuoteSkipState(symbol) {
@@ -4790,6 +4870,8 @@ const marketDataState = {
 let lastBarsPrefetchMs = 0;
 let lastQuotesPrefetchMs = 0;
 let lastOrderbooksPrefetchMs = 0;
+let entryEligibilitySeedRotationOffset = 0;
+let entryScanPrefetchSeedRotationOffset = 0;
 let lastPrefetchedBars = {
   bars1mBySymbol: new Map(),
   bars5mBySymbol: new Map(),
@@ -14772,6 +14854,57 @@ function buildBarsMapFromBatch(symbols, barsResp) {
   return barsBySymbol;
 }
 
+async function resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOverride } = {}) {
+  const symbols = Array.isArray(filteredSymbols) ? filteredSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
+  const rankOptions = {
+    executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
+    executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
+    maxSymbols: symbols.length,
+    requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
+    requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
+    quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+    quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+    orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
+  };
+  const getMarketDataMaps = () => {
+    const nowMs = Date.now();
+    return {
+      nowMs,
+      quoteBySymbol: Object.fromEntries(
+        symbols.map((symbol) => {
+          const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
+            nowMs,
+            maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
+          });
+          return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
+        }),
+      ),
+      orderbookBySymbol: Object.fromEntries(
+        symbols.map((symbol) => {
+          const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
+            nowMs,
+            maxAgeMs: ORDERBOOK_MAX_AGE_MS,
+          });
+          return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
+        }),
+      ),
+    };
+  };
+  const resolveOptions = {
+    rankOptions,
+    getMarketDataMaps,
+  };
+  if (hydrateOverride !== null) {
+    resolveOptions.hydrate = async ({ symbols: retrySymbols, reason }) => {
+      if (typeof hydrateOverride === 'function') {
+        return hydrateOverride({ symbols: retrySymbols, reason });
+      }
+      return hydrateEntryEligibilityMarketData(retrySymbols, { reason });
+    };
+  }
+  return resolveDynamicUniverseRankingWithHydration(symbols, resolveOptions);
+}
+
 async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   if (symbols.length === 0) {
@@ -14790,7 +14923,11 @@ async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
   const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
   const ratePressureActive = isUnderRatePressure();
   const effectiveSeedCap = ratePressureActive ? Math.max(4, Math.floor(maxSeedSymbolsPerPass * 0.5)) : maxSeedSymbolsPerPass;
-  const seedSymbols = symbols.slice(0, Math.max(1, effectiveSeedCap));
+  const seedSelection = selectRotatingSeedSymbols(symbols, {
+    cap: Math.max(1, effectiveSeedCap),
+    stream: 'entry_eligibility',
+  });
+  const seedSymbols = seedSelection.symbols;
   const nowMs = Date.now();
   const cooldownSnapshot = entryMarketDataCoordinator.getCooldownSnapshot(nowMs);
   const quoteCooldownActive = !opts.force && ENTRY_PREFETCH_QUOTES && Boolean(cooldownSnapshot.quote);
@@ -14864,6 +15001,11 @@ async function hydrateEntryEligibilityMarketData(scanSymbols, opts = {}) {
     skippedEndpoints: cooldownBlockedEndpoints,
     seededSymbols: seedSymbols.length,
     totalSymbolsObserved: symbols.length,
+    seedRotation: {
+      offsetStart: seedSelection.offsetStart,
+      offsetEnd: seedSelection.offsetEnd,
+      capUsed: seedSelection.capUsed,
+    },
     ratePressureState: getRatePressureState(),
   };
 }
@@ -14885,7 +15027,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
   entryScanPrefetchInFlightPromise = (async () => {
   const symbols = Array.isArray(scanSymbols) ? scanSymbols.map((symbol) => normalizeSymbol(symbol)).filter(Boolean) : [];
   const maxSeedSymbolsPerPass = Math.max(1, Math.trunc(readNumber('PREDICTOR_SEED_MAX_SYMBOLS_PER_PASS', 40)));
-  const seedSymbols = symbols.slice(0, maxSeedSymbolsPerPass);
+  const seedSelection = selectRotatingSeedSymbols(symbols, {
+    cap: maxSeedSymbolsPerPass,
+    stream: 'entry_scan_prefetch',
+  });
+  const seedSymbols = seedSelection.symbols;
   const nowMs = Date.now();
   const barsIntervalActive = !opts.force && (nowMs - lastBarsPrefetchMs < BARS_PREFETCH_INTERVAL_MS);
   const reusableBars = getPrefetchedBarsIfReusable({
@@ -14909,6 +15055,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
       orderbookPrefetchState: ENTRY_PREFETCH_ORDERBOOKS ? 'skipped_no_symbols' : 'skipped_env_disabled',
       prefetchedQuotes: 0,
       prefetchedOrderbooks: 0,
+      seedRotation: {
+        offsetStart: seedSelection.offsetStart,
+        offsetEnd: seedSelection.offsetEnd,
+        capUsed: seedSelection.capUsed,
+      },
     };
   }
 
@@ -15137,6 +15288,11 @@ async function prefetchEntryScanMarketData(scanSymbols, opts = {}) {
     chunkSizeCap: 20,
     seededSymbols: seedSymbols.length,
     totalSymbolsObserved: symbols.length,
+    seedRotation: {
+      offsetStart: seedSelection.offsetStart,
+      offsetEnd: seedSelection.offsetEnd,
+      capUsed: seedSelection.capUsed,
+    },
     prefetchedQuotes,
     prefetchedOrderbooks,
     barsReused: canReuseBars && (!shouldPrefetchBarsWithCooldown || reusableCoverageSymbols.length > 0),
@@ -15477,49 +15633,11 @@ async function runEntryScanOnce() {
       eligibilityHydration = await hydrateEntryEligibilityMarketData(filteredSymbols);
     }
     completeStage('universe_selection');
-    const buildRankingMapsFromScanCache = () => {
-      const nowMs = Date.now();
-      return {
-        nowMs,
-        quoteBySymbol: Object.fromEntries(
-          filteredSymbols.map((symbol) => {
-            const quoteSnapshot = scanMarketDataCache.getQuoteUsable(symbol, {
-              nowMs,
-              maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
-            });
-            return [symbol, quoteSnapshot?.ok && quoteSnapshot?.usable ? (quoteSnapshot.value || null) : null];
-          }),
-        ),
-        orderbookBySymbol: Object.fromEntries(
-          filteredSymbols.map((symbol) => {
-            const orderbookSnapshot = scanMarketDataCache.getOrderbookUsable(symbol, {
-              nowMs,
-              maxAgeMs: ORDERBOOK_MAX_AGE_MS,
-            });
-            return [symbol, orderbookSnapshot?.ok && orderbookSnapshot?.usable ? (orderbookSnapshot.value || null) : null];
-          }),
-        ),
-      };
-    };
-    const rankingMaps = buildRankingMapsFromScanCache();
-    const rankedDynamicUniverse = rankDynamicUniverseByExecutionQuality(filteredSymbols, {
-      executionTier1Symbols: Array.from(EXECUTION_TIER1_SYMBOLS),
-      executionTier2Symbols: Array.from(EXECUTION_TIER2_SYMBOLS),
-      maxSymbols: filteredSymbols.length,
-      requireFreshQuote: ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE,
-      requireOrderbookForTier3: ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3,
-      quoteMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
-      quoteEligibilityMaxAgeMs: ENTRY_QUOTE_MAX_AGE_MS,
-      orderbookEligibilityMaxAgeMs: ORDERBOOK_MAX_AGE_MS,
-      quoteBySymbol: rankingMaps.quoteBySymbol || {},
-      orderbookBySymbol: rankingMaps.orderbookBySymbol || {},
-      nowMs: Number.isFinite(rankingMaps.nowMs) ? rankingMaps.nowMs : Date.now(),
-    });
-    const dynamicRankingResolution = {
-      initialRank: rankedDynamicUniverse,
-      finalRank: rankedDynamicUniverse,
-      hydrationRetry: { attempted: false, triggeredBy: null, recovered: false, result: null },
-    };
+    const dynamicRankingEnabled = ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic');
+    const dynamicRankingResolution = dynamicRankingEnabled
+      ? await resolveDynamicRankingFromScanCache(filteredSymbols)
+      : await resolveDynamicRankingFromScanCache(filteredSymbols, { hydrateOverride: null });
+    const rankedDynamicUniverse = dynamicRankingResolution.finalRank;
     const prioritizedSymbols = (ENTRY_UNIVERSE_MODE === 'dynamic' && universeMode.startsWith('dynamic'))
       ? rankedDynamicUniverse.symbols
       : filteredSymbols.sort((a, b) => {
@@ -16241,18 +16359,15 @@ async function runEntryScanOnce() {
       if (!signal.entryReady) {
         skipped += 1;
         const skipReason = resolveSkipReason(signal.why, signal.meta);
-        if (shouldCountEntryStaleQuoteSkip({ skipReason, why: signal.why })) {
+        const healthMutation = applyEntrySkipHealthMutation(symbol, {
+          skipReason,
+          why: signal.why,
+          meta: signal.meta || {},
+        });
+        if (healthMutation.staleQuoteSkipCounted) {
           entryStaleQuoteSkipCount += 1;
-          noteStaleQuoteSkip(symbol);
         }
         if (signal.why === 'predictor_warmup') signalBlockedByWarmupCount += 1;
-        if (shouldRecordEntryHealthFailure(skipReason)) {
-          symbolHealthTracker.recordFailure(symbol, skipReason, signal.meta || {});
-        } else if (shouldCountSparseFallbackReject({ marketDataEval: signal.meta }) || shouldCountSparseRetryFailureReject({ reason: skipReason, sparseRetryDetails: signal?.meta?.sparseRetry })) {
-          symbolHealthTracker.recordFailure(symbol, 'sparse_fallback_rejected', signal.meta || {});
-        } else {
-          symbolHealthTracker.noteHealthy(symbol);
-        }
         recordSkip(skipReason, symbol, signal.meta || null);
         if (recordBase) {
           recordBase.decision = 'skipped';
@@ -19079,6 +19194,13 @@ module.exports = {
   },
   __testGetEntryScanRerunRequestedForTests: () => entryScanRerunRequested,
   __testExtractStaleQuoteMeta: extractStaleQuoteMeta,
+  __testApplyEntrySkipHealthMutationForTests: applyEntrySkipHealthMutation,
+  __testSelectRotatingSeedSymbolsForTests: selectRotatingSeedSymbols,
+  __testResolveDynamicRankingFromScanCacheForTests: resolveDynamicRankingFromScanCache,
+  __testResetSeedRotationOffsetsForTests: () => {
+    entryEligibilitySeedRotationOffset = 0;
+    entryScanPrefetchSeedRotationOffset = 0;
+  },
   __testGetPrefetchedBarsIfReusableForTests: getPrefetchedBarsIfReusable,
   __testSetLastPrefetchedBarsForTests: ({ bars = null, updatedAtMs = null, symbols = [] } = {}) => {
     lastPrefetchedBars = bars || {
