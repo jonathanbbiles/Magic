@@ -168,6 +168,52 @@ assert.equal(coldCacheRank.eligibilityCounts.totalCount, 6);
 assert.equal(coldCacheRank.eligibilityCounts.freshQuoteCount, 0);
 assert.equal(coldCacheRank.droppedDiagnostics.length, 6);
 
+const tier3OrderbookRequiredRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD', 'PEPE/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: true,
+    quoteMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.04, tsMs: 1700000014000 },
+      'ETH/USD': { bid: 50, ask: 50.03, tsMs: 1700000013500 },
+      'PEPE/USD': { bid: 0.1, ask: 0.10002, tsMs: 1700000014200 },
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+    },
+  },
+);
+assert.deepEqual(tier3OrderbookRequiredRank.symbols, ['BTC/USD', 'ETH/USD']);
+assert.equal(
+  tier3OrderbookRequiredRank.droppedDiagnostics.find((row) => row.symbol === 'PEPE/USD')?.failedOrderbookRecency,
+  true,
+);
+
+const tier3OrderbookOptionalRank = rankDynamicUniverseByExecutionQuality(
+  ['BTC/USD', 'ETH/USD', 'PEPE/USD'],
+  {
+    executionTier1Symbols: ['BTC/USD', 'ETH/USD'],
+    requireFreshQuote: true,
+    requireOrderbookForTier3: false,
+    quoteMaxAgeMs: 15000,
+    nowMs: 1700000015000,
+    quoteBySymbol: {
+      'BTC/USD': { bid: 100, ask: 100.04, tsMs: 1700000014000 },
+      'ETH/USD': { bid: 50, ask: 50.03, tsMs: 1700000013500 },
+      'PEPE/USD': { bid: 0.1, ask: 0.10002, tsMs: 1700000014200 },
+    },
+    orderbookBySymbol: {
+      'BTC/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+      'ETH/USD': { ok: true, orderbook: { tsMs: 1700000014100 } },
+    },
+  },
+);
+assert.deepEqual(tier3OrderbookOptionalRank.symbols, ['BTC/USD', 'ETH/USD', 'PEPE/USD']);
+
 const hydratedRank = rankDynamicUniverseByExecutionQuality(
   ['BTC/USD', 'ETH/USD', 'LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD'],
   {
