@@ -8627,6 +8627,35 @@ async function logExitRealized({
 }) {
   if (!orderId) {
     console.warn('exit_realized_missing_order', { symbol, reasonCode });
+    // Still record an unreconciled closed-trade row so the scorecard reflects
+    // that an exit occurred; P&L stays null until the position is reconciled.
+    const tradeIdUnrecon = tradeForensics.getLatestTradeIdForSymbol(symbol);
+    const latestTradeUnrecon = tradeIdUnrecon ? tradeForensics.getByTradeId(tradeIdUnrecon) : null;
+    closedTradeStats.append({
+      symbol,
+      tradeId: tradeIdUnrecon || null,
+      entryTime: safeIso(latestTradeUnrecon?.fill?.filledAt || latestTradeUnrecon?.tsDecision || exitState.get(symbol)?.entryTime),
+      exitTime: new Date().toISOString(),
+      holdSeconds: Number.isFinite(heldSeconds) ? heldSeconds : null,
+      entryPrice: Number.isFinite(Number(entryPrice)) ? Number(entryPrice) : null,
+      exitPrice: null,
+      qty: null,
+      grossPnlUsd: null,
+      grossPnlBps: null,
+      estimatedFeesUsd: null,
+      netPnlUsd: null,
+      netPnlBps: null,
+      slippageEstimateBps: null,
+      effectiveTargetBps: Number(latestTradeUnrecon?.config?.entryTakeProfitBps) || Number(exitState.get(symbol)?.targetProfitBps) || null,
+      stopDistanceBps: Number(exitState.get(symbol)?.stopDistanceBps) || null,
+      predictorProbability: Number(latestTradeUnrecon?.predictorProbability) || null,
+      evBpsAtEntry: Number(latestTradeUnrecon?.meta?.evBps) || null,
+      entrySpreadBps: Number(entrySpreadBpsUsed) || null,
+      entryQuoteAgeMs: Number(latestTradeUnrecon?.decision?.quoteAgeMs) || null,
+      exitReason: reasonCode || null,
+      exitRoute: 'exit_unreconciled',
+      reconciliationState: 'exit_unreconciled',
+    });
     return;
   }
   const { filledQty, filledAvgPrice } = await waitForFilledOrder({ orderId });
@@ -10410,23 +10439,53 @@ async function submitMarketSell({
   const finalQty = sizeGuard.qty ?? adjustedQty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_market_sell' });
+  // Alpaca crypto rejects market orders with time_in_force=gtc (HTTP 403);
+  // IOC is the accepted TIF for crypto market orders.
+  const marketSellTif = isCryptoSymbol(symbol) ? 'ioc' : 'gtc';
   const payload = {
     symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'market',
-    time_in_force: 'gtc',
+    time_in_force: marketSellTif,
     client_order_id: buildExitClientOrderId(symbol),
   };
-  const response = await placeOrderUnified({
-    symbol,
-    url,
-    payload,
-    label: 'orders_market_sell',
-    reason,
-    context: 'market_sell',
-    intent: 'exit',
-  });
+  let response;
+  try {
+    response = await placeOrderUnified({
+      symbol,
+      url,
+      payload,
+      label: 'orders_market_sell',
+      reason,
+      context: 'market_sell',
+      intent: 'exit',
+    });
+  } catch (err) {
+    const status = err?.statusCode ?? err?.response?.status ?? null;
+    const body = err?.response?.data ?? err?.responseSnippet200 ?? err?.responseSnippet ?? err?.message ?? null;
+    const bodyText = typeof body === 'string' ? body : JSON.stringify(body);
+    if (status === 403) {
+      const normalizedSymbol = normalizePair(symbol);
+      const now = Date.now();
+      const retryAt = now + FORBIDDEN_EXIT_COOLDOWN_MS;
+      forbiddenExitCooldowns.set(normalizedSymbol, retryAt);
+      console.error('market_sell_forbidden', {
+        symbol,
+        canonicalSymbol: normalizedSymbol,
+        reason: 'broker_forbidden',
+        brokerStatus: status,
+        brokerMessage: bodyText,
+        tif: marketSellTif,
+        cooldownMs: FORBIDDEN_EXIT_COOLDOWN_MS,
+        retryAtMs: retryAt,
+        retryAtIso: new Date(retryAt).toISOString(),
+      });
+      return { skipped: true, reason: 'exit_forbidden_cooldown', cooldownUntilMs: retryAt };
+    }
+    console.error('market_sell_error', { symbol, status, body: bodyText });
+    throw err;
+  }
 
   console.log('submit_market_sell', { symbol, qty, reason, exit_reason: reason, orderId: response?.id });
 
