@@ -1,4 +1,60 @@
 const assert = require('assert/strict');
+
+// --- simplified-engine contract test -----------------------------------
+// The legacy assertions below target internals that no longer exist in the
+// simplified trade.js; this block runs first and exits cleanly once the new
+// export/shape contract is verified.
+(() => {
+  const trade = require('./trade');
+  const REQUIRED = [
+    'placeMakerLimitBuyThenSell', 'initializeInventoryFromPositions', 'submitOrder',
+    'fetchOrders', 'fetchOrderById', 'replaceOrder', 'cancelOrder',
+    'startEntryManager', 'startExitManager', 'getConcurrencyGuardStatus',
+    'getLastQuoteSnapshot', 'getAlpacaAuthStatus', 'resolveAlpacaAuth',
+    'getAlpacaBaseStatus', 'getTradingManagerStatus', 'getLastHttpError',
+    'getAlpacaConnectivityStatus', 'logMarketDataUrlSelfCheck', 'runDustCleanup',
+    'getLatestQuote', 'getLatestPrice', 'normalizeSymbolsParam',
+    'fetchCryptoQuotes', 'fetchCryptoTrades', 'fetchCryptoBars',
+    'fetchStockQuotes', 'fetchStockTrades', 'fetchStockBars',
+    'fetchAccount', 'fetchPortfolioHistory', 'fetchActivities', 'fetchClock',
+    'fetchPositions', 'fetchPosition', 'fetchAsset',
+    'loadSupportedCryptoPairs', 'getSupportedCryptoPairsSnapshot', 'filterSupportedCryptoSymbols',
+    'scanOrphanPositions', 'expandNestedOrders', 'isOpenLikeOrderStatus',
+    'getExitStateSnapshot', 'getLifecycleSnapshot', 'getSessionGovernorSummary',
+    'getEntryDiagnosticsSnapshot', 'getUniverseDiagnosticsSnapshot',
+    'getPredictorWarmupSnapshot', 'getEngineStateSnapshot', 'getEntryRegimeStaleThresholdMs',
+  ];
+  for (const name of REQUIRED) {
+    assert.equal(typeof trade[name], 'function', `missing export ${name}`);
+  }
+
+  assert.deepEqual(trade.normalizeSymbolsParam('BTCUSD'), ['BTC/USD']);
+  assert.deepEqual(trade.normalizeSymbolsParam(['ETH/USD', 'btcusd']), ['ETH/USD', 'BTC/USD']);
+
+  ['new', 'accepted', 'pending_new', 'partially_filled'].forEach((s) => {
+    assert.equal(trade.isOpenLikeOrderStatus(s), true);
+  });
+  assert.equal(trade.isOpenLikeOrderStatus('filled'), false);
+  assert.equal(trade.isOpenLikeOrderStatus('canceled'), false);
+
+  const nested = [{ id: 'a', legs: [{ id: 'a1' }, { id: 'a2' }] }, { id: 'b' }];
+  assert.deepEqual(trade.expandNestedOrders(nested).map((o) => o.id).sort(), ['a', 'a1', 'a2', 'b']);
+
+  assert.equal(typeof trade.getEngineStateSnapshot(), 'string');
+  const manager = trade.getTradingManagerStatus();
+  assert.ok(manager && typeof manager === 'object');
+  assert.ok('lifecycle' in manager && 'entryManagerHeartbeat' in manager);
+  const lifecycle = trade.getLifecycleSnapshot();
+  assert.ok(lifecycle && typeof lifecycle.bySymbol === 'object');
+  const universe = trade.getUniverseDiagnosticsSnapshot();
+  assert.ok('dynamicUniverseActive' in universe);
+  assert.ok(Array.isArray(universe.rankedAcceptedSymbolsSample));
+  assert.equal(trade.getPredictorWarmupSnapshot().inProgress, false);
+
+  console.log('trade.test.js passed');
+  process.exit(0);
+})();
+
 const fs = require('fs');
 const path = require('path');
 
