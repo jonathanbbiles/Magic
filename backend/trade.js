@@ -717,6 +717,27 @@ async function scanAndEnter() {
     return;
   }
 
+  // Cash gate: skip the whole scan if available USD won't even cover one
+  // notional trade. Prevents the engine from hammering Alpaca with doomed
+  // buy orders once positions are fully funded.
+  let availableCash = Infinity;
+  try {
+    const account = await fetchAccount();
+    const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
+    const cashNum = Number(cashRaw);
+    if (Number.isFinite(cashNum)) availableCash = cashNum;
+  } catch (err) {
+    // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
+  }
+  if (availableCash < NOTIONAL_PER_TRADE_USD) {
+    bumpSkipReason('insufficient_cash');
+    summary.topSkipReasons = mapToObject(skipReasonCounts);
+    lastEntryScanSummary = summary;
+    lastEntryScanAt = new Date().toISOString();
+    currentScanState = 'idle';
+    return;
+  }
+
   let placed = 0;
   for (const pair of candidates) {
     if (placed >= slotsAvailable) break;
