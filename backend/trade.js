@@ -49,6 +49,20 @@ const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // legacy config module hard-codes 15s, which is too tight for low-volume
 // Alpaca crypto pairs. Env var still overrides.
 const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 60000));
+// Hard spread cap for entries (safety net above the implicit edge-gate bound).
+const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
+
+// --- risk management ----------------------------------------------------
+// Stop-loss: force-exit via market sell when unrealized drawdown breaches this.
+const STOPLOSS_ENABLED = readBoolean('STOPLOSS_ENABLED', true);
+const STOPLOSS_BPS = Math.max(10, readNumber('STOPLOSS_BPS', 150));
+// Max hold: force-exit via market sell once a position is older than this, even at a loss.
+const FORCE_EXIT_ENABLED = readBoolean('FORCE_EXIT_ENABLED', true);
+const MAX_HOLD_SECONDS = Math.max(60, readNumber('MAX_HOLD_SECONDS', 3600));
+// Momentum filter: require the last N 1m closes to have a non-negative slope.
+const MOMENTUM_FILTER_ENABLED = readBoolean('MOMENTUM_FILTER_ENABLED', true);
+const MOMENTUM_BARS = Math.max(2, readNumber('MOMENTUM_BARS', 5));
+const MOMENTUM_MIN_SLOPE_BPS = readNumber('MOMENTUM_MIN_SLOPE_BPS', 0);
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -468,12 +482,89 @@ function filterSupportedCryptoSymbols(symbols) {
   return normalizeSymbolsParam(symbols).filter((s) => allowed.has(s));
 }
 
+// --- asset tick cache / price formatting -------------------------------
+//
+// Alpaca rejects limit prices that don't conform to the symbol's
+// `price_increment`. The old code did `target.toFixed(8).replace(/0+$/, '')`,
+// which emits "0.00002345"-style values that violate tick for low-priced
+// coins → buy fills, sell rejects, position sits naked.
+
+const assetTickCache = new Map(); // pair -> { priceIncrement, minTradeIncrement }
+
+async function getAssetTickInfo(pair) {
+  const cached = assetTickCache.get(pair);
+  if (cached) return cached;
+  let info = { priceIncrement: null, minTradeIncrement: null };
+  try {
+    const asset = await fetchAsset(pair);
+    const priceInc = Number(asset?.price_increment);
+    const minInc = Number(asset?.min_trade_increment);
+    info = {
+      priceIncrement: Number.isFinite(priceInc) && priceInc > 0 ? priceInc : null,
+      minTradeIncrement: Number.isFinite(minInc) && minInc > 0 ? minInc : null,
+    };
+  } catch (_) { /* leave null; roundPriceToTick falls back to magnitude-based decimals */ }
+  assetTickCache.set(pair, info);
+  return info;
+}
+
+function tickDecimals(tick) {
+  if (!Number.isFinite(tick) || tick <= 0) return 8;
+  // Math.log10 of a power-of-10 tick can have FP drift; add a tiny epsilon.
+  const raw = -Math.log10(tick);
+  return Math.max(0, Math.min(10, Math.ceil(raw - 1e-9)));
+}
+
+function roundPriceToTick(price, tick) {
+  if (!Number.isFinite(price) || price <= 0) return null;
+  if (Number.isFinite(tick) && tick > 0) {
+    const rounded = Math.round(price / tick) * tick;
+    return Number(rounded.toFixed(tickDecimals(tick)));
+  }
+  // Fallback: magnitude-based decimals.
+  const abs = Math.abs(price);
+  const decimals = abs >= 100 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 6 : 8;
+  return Number(price.toFixed(decimals));
+}
+
+function formatTickPrice(price, tick) {
+  const rounded = roundPriceToTick(price, tick);
+  if (!Number.isFinite(rounded) || rounded <= 0) return null;
+  return String(rounded);
+}
+
+// --- momentum filter ---------------------------------------------------
+
+async function getRecentMomentum(pair) {
+  try {
+    const payload = await fetchCryptoBars({
+      symbols: [pair],
+      limit: MOMENTUM_BARS + 1,
+      timeframe: '1Min',
+    });
+    const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
+    if (!Array.isArray(bars) || bars.length < 2) {
+      return { ok: false, reason: 'insufficient_bars', slopeBps: null };
+    }
+    const closes = bars.map((b) => Number(b?.c)).filter(Number.isFinite);
+    if (closes.length < 2) return { ok: false, reason: 'no_closes', slopeBps: null };
+    const first = closes[0];
+    const last = closes[closes.length - 1];
+    if (!(first > 0)) return { ok: false, reason: 'bad_first_close', slopeBps: null };
+    const slopeBps = ((last - first) / first) * 10000;
+    return { ok: slopeBps >= MOMENTUM_MIN_SLOPE_BPS, slopeBps, first, last };
+  } catch (err) {
+    return { ok: false, reason: 'bars_fetch_failed', slopeBps: null, error: err?.message };
+  }
+}
+
 // --- engine state -------------------------------------------------------
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
 const exitState = new Map();              // symbol -> { sellOrderId, targetPrice, ... }
 const entryIntentState = new Map();       // symbol -> { state, createdAt, updatedAt, reason }
 const pendingBuys = new Map();            // symbol -> { orderId, submittedAt }
+const positionFirstSeenAt = new Map();    // symbol -> ms epoch at first reconcile observation
 const skipReasonCounts = new Map();
 const rollingSkipReasons = new Map();
 
@@ -756,6 +847,7 @@ async function scanAndEnter() {
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { bumpSkipReason('invalid_quote'); continue; }
+      if (spreadBps > SPREAD_MAX_BPS) { bumpSkipReason('spread_too_wide'); continue; }
 
       const needed = requiredEdgeBps(spreadBps);
       if (DESIRED_NET_PROFIT_BPS < needed) {
@@ -766,12 +858,25 @@ async function scanAndEnter() {
       const ask = Number(quote.ap);
       if (!Number.isFinite(ask) || ask <= 0) { bumpSkipReason('invalid_ask'); continue; }
 
+      if (MOMENTUM_FILTER_ENABLED) {
+        const mom = await getRecentMomentum(pair);
+        if (!mom.ok) {
+          bumpSkipReason(mom.reason || 'momentum_rejected');
+          continue;
+        }
+      }
+
+      // Round buy limit to the asset's price_increment so Alpaca accepts it.
+      const tickInfo = await getAssetTickInfo(pair);
+      const buyLimitStr = formatTickPrice(ask, tickInfo.priceIncrement);
+      if (!buyLimitStr) { bumpSkipReason('invalid_ask'); continue; }
+
       const buyRes = await submitOrder({
         symbol: pair,
         side: 'buy',
         type: 'limit',
         time_in_force: 'gtc',
-        limit_price: ask,
+        limit_price: buyLimitStr,
         notional: NOTIONAL_PER_TRADE_USD.toFixed(2),
       });
       const buyOrder = buyRes?.buy || buyRes;
@@ -845,15 +950,114 @@ function targetPriceFor(avgEntry) {
   return avgEntry * (1 + DESIRED_NET_PROFIT_BPS / 10000);
 }
 
+async function forceMarketSell(pair, qty, reason, existingSellId, avg) {
+  if (existingSellId) {
+    try { await cancelOrder(existingSellId); } catch (_) { /* ignore */ }
+  }
+  let marketRes = null;
+  try {
+    marketRes = await submitOrder({
+      symbol: pair,
+      side: 'sell',
+      type: 'market',
+      time_in_force: 'ioc',
+      qty: String(qty),
+    });
+  } catch (err) {
+    lastExecutionFailure = {
+      at: new Date().toISOString(),
+      symbol: pair,
+      reason: `force_exit_${reason}_failed`,
+      message: err?.errorMessage || err?.message || String(err),
+    };
+    console.warn('force_exit_failed', { symbol: pair, reason, error: err?.errorMessage || err?.message });
+    return null;
+  }
+  const order = marketRes?.id ? marketRes : marketRes?.sell || marketRes?.buy || marketRes;
+  exitState.set(pair, {
+    sellOrderId: order?.id || null,
+    sellOrderLimit: null,
+    targetPrice: null,
+    sellOrderSubmittedAt: order?.submitted_at || new Date().toISOString(),
+    expectedOpenSell: false,
+    brokerOpenSellFound: false,
+    brokerOpenSellQty: qty,
+    reconciliationState: `force_exit_${reason}`,
+    lastReconciliationAction: `force_exit_${reason}`,
+    targetPriceSource: 'force_exit',
+    entryPriceUsed: Number.isFinite(avg) ? avg : null,
+    expectedNetProfitBps: null,
+    minNetProfitBps: null,
+    desiredNetExitBps: null,
+    feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+    requiredExitBpsGross: null,
+    requiredExitBps: null,
+    trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
+    breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
+    profitabilityFloorPrice: null,
+    lastSeenOpenSellAt: new Date().toISOString(),
+    forceExitReason: reason,
+  });
+  entryIntentState.set(pair, {
+    state: 'exiting',
+    createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    rejectionReason: reason,
+  });
+  positionFirstSeenAt.delete(pair);
+  pendingBuys.delete(pair);
+  lastSuccessfulAction = {
+    at: new Date().toISOString(),
+    symbol: pair,
+    action: `force_exit_${reason}`,
+    orderId: order?.id || null,
+  };
+  console.warn('force_exit_submitted', { symbol: pair, reason, qty, orderId: order?.id || null });
+  return order;
+}
+
 async function reconcileExits() {
   const { byPair, openSellByPair } = await buildHeldAndOpenSellsIndex();
   for (const [pair, pos] of byPair.entries()) {
     const qty = Number(pos?.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
+    const avg = Number(pos?.avg_entry_price);
+
+    // Stamp first-seen on first observation so the time-based exit clock starts.
+    if (!positionFirstSeenAt.has(pair)) {
+      const pending = pendingBuys.get(pair);
+      const stamp = Number(pending?.submittedAt)
+        || Date.parse(pos?.created_at || '')
+        || Date.now();
+      positionFirstSeenAt.set(pair, Number.isFinite(stamp) ? stamp : Date.now());
+    }
+    const ageMs = Date.now() - positionFirstSeenAt.get(pair);
+
+    // --- force-exit checks (stop-loss + max-hold) -----------------------
+    if (Number.isFinite(avg) && avg > 0) {
+      const timeBreach = FORCE_EXIT_ENABLED && ageMs > MAX_HOLD_SECONDS * 1000;
+      let stopBreach = false;
+      if (STOPLOSS_ENABLED) {
+        try {
+          const q = await getLatestQuote(pair);
+          const bid = Number(q?.bp);
+          if (Number.isFinite(bid) && bid > 0) {
+            const drawdownBps = ((avg - bid) / avg) * 10000;
+            if (drawdownBps >= STOPLOSS_BPS) stopBreach = true;
+          }
+        } catch (_) { /* soft-fail: if quote fails, skip this tick's stop check */ }
+      }
+      if (stopBreach || timeBreach) {
+        const reason = stopBreach ? 'stop_loss' : 'max_hold';
+        const existingId = openSellByPair.get(pair)?.id || null;
+        await forceMarketSell(pair, qty, reason, existingId, avg);
+        continue;
+      }
+    }
+
     if (openSellByPair.has(pair)) {
       const existing = openSellByPair.get(pair);
       const limit = Number(existing?.limit_price);
-      const avg = Number(pos?.avg_entry_price);
       exitState.set(pair, {
         sellOrderId: existing.id || null,
         sellOrderLimit: Number.isFinite(limit) ? limit : null,
@@ -882,9 +1086,19 @@ async function reconcileExits() {
       continue;
     }
 
-    const avg = Number(pos?.avg_entry_price);
     if (!Number.isFinite(avg) || avg <= 0) continue;
     const target = targetPriceFor(avg);
+    const tickInfo = await getAssetTickInfo(pair);
+    const limitStr = formatTickPrice(target, tickInfo.priceIncrement);
+    if (!limitStr) {
+      lastExecutionFailure = {
+        at: new Date().toISOString(),
+        symbol: pair,
+        reason: 'invalid_target_price',
+        message: `target=${target} tick=${tickInfo.priceIncrement}`,
+      };
+      continue;
+    }
     const qtyStr = String(pos.qty);
     try {
       const sellResult = await submitOrder({
@@ -893,7 +1107,7 @@ async function reconcileExits() {
         type: 'limit',
         time_in_force: 'gtc',
         qty: qtyStr,
-        limit_price: target.toFixed(8).replace(/0+$/, '').replace(/\.$/, ''),
+        limit_price: limitStr,
       });
       const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult?.buy || sellResult;
       exitState.set(pair, {
