@@ -45,7 +45,10 @@ const EXIT_SCAN_INTERVAL_MS = Math.max(5000, readNumber('EXIT_SCAN_INTERVAL_MS',
 // Trading master switch.
 const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // Quote staleness cutoff (ms).
-const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', runtimeConfig.entryQuoteMaxAgeMs || 60000));
+// Note: we intentionally ignore runtimeConfig.entryQuoteMaxAgeMs because the
+// legacy config module hard-codes 15s, which is too tight for low-volume
+// Alpaca crypto pairs. Env var still overrides.
+const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 60000));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
