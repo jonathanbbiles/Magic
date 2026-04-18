@@ -1,9 +1,16 @@
 // Simplified trading engine.
 //
-// Strategy (README contract):
-//   1. Scan Alpaca's crypto universe.
-//   2. For each symbol, enter if desired profit (bps) >= spread + fees + buffer.
-//   3. On fill, post ONE GTC limit sell at avg_entry * (1 + desired/10000) and never touch it.
+// Contract:
+//   1. Scan Alpaca's crypto universe every ENTRY_SCAN_INTERVAL_MS.
+//   2. For each symbol, predict a tiny upward move using linear regression
+//      on recent 1m closes (see getPredictionSignal).
+//   3. If the spread still leaves room for our target net profit, submit a
+//      GTC limit BUY at the current ask.
+//   4. When the buy fills, submit ONE GTC limit SELL at
+//      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
+//      so the user's +0.5% target is AFTER Alpaca's round-trip fees.
+//   5. Never touch the position again. No stop-loss, no max-hold, no force
+//      exits. If a trade sits, it sits. The entry math is the only gate.
 //
 // This module also exposes every HTTP wrapper + snapshot getter that
 // backend/index.js imports, so the dashboard/frontend contract is preserved.
@@ -28,11 +35,16 @@ function readBoolean(name, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(raw);
 }
 
-// Desired net profit over entry, in basis points (SELL limit = entry * (1 + DESIRED/10000)).
-const DESIRED_NET_PROFIT_BPS = Math.max(1, readNumber('DESIRED_NET_PROFIT_BPS', 100));
-// Round-trip Alpaca crypto fees, in basis points.
+// Target NET profit per trade, in basis points. Sell limit is placed at
+// entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
+// +50 bps (0.5%) target is AFTER fees, not before.
+const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 50));
+// Round-trip Alpaca crypto fees, in basis points. Added to the target so the
+// sell limit is set above true break-even.
 const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 60));
-// Safety buffer, in basis points.
+// Gross upward move the sell limit requires above entry.
+const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
+// Safety buffer, in basis points. Used only for the entry edge gate.
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 20));
 // Notional USD per trade.
 const NOTIONAL_PER_TRADE_USD = Math.max(1, readNumber('NOTIONAL_PER_TRADE_USD', 25));
@@ -52,20 +64,13 @@ const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 600
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 
-// --- risk management ----------------------------------------------------
-// Stop-loss: force-exit via market sell when unrealized drawdown breaches this.
-const STOPLOSS_ENABLED = readBoolean('STOPLOSS_ENABLED', true);
-const STOPLOSS_BPS = Math.max(10, readNumber('STOPLOSS_BPS', 150));
-// Max hold: force-exit via market sell once a position is older than this, even at a loss.
-// Default OFF: market-dumping a GTC position at max_hold pays the spread + round-trip
-// fees on every miss, which drains the account. Keep the stop-loss as the only
-// involuntary exit; let the GTC limit sell work until it fills.
-const FORCE_EXIT_ENABLED = readBoolean('FORCE_EXIT_ENABLED', false);
-const MAX_HOLD_SECONDS = Math.max(60, readNumber('MAX_HOLD_SECONDS', 3600));
-// Momentum filter: require the last N 1m closes to have a non-negative slope.
-const MOMENTUM_FILTER_ENABLED = readBoolean('MOMENTUM_FILTER_ENABLED', true);
-const MOMENTUM_BARS = Math.max(2, readNumber('MOMENTUM_BARS', 5));
-const MOMENTUM_MIN_SLOPE_BPS = readNumber('MOMENTUM_MIN_SLOPE_BPS', 0);
+// --- entry prediction ---------------------------------------------------
+// The bot only buys when recent 1m closes form a statistically meaningful
+// uptrend. This is the "entry math" the user trusts: once in, we do not
+// second-guess it (no stop-loss, no max-hold, no force exits).
+const PREDICT_BARS = Math.max(5, readNumber('PREDICT_BARS', 20));
+const PREDICT_MIN_SLOPE_BPS_PER_BAR = readNumber('PREDICT_MIN_SLOPE_BPS_PER_BAR', 2);
+const PREDICT_MIN_R_SQUARED = Math.max(0, readNumber('PREDICT_MIN_R_SQUARED', 0.2));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -536,28 +541,62 @@ function formatTickPrice(price, tick) {
   return String(rounded);
 }
 
-// --- momentum filter ---------------------------------------------------
+// --- entry predictor ----------------------------------------------------
+//
+// Given N recent 1m bars, fit a linear regression to the closes. Accept the
+// symbol only when:
+//   * slope (normalised to bps per bar) is above PREDICT_MIN_SLOPE_BPS_PER_BAR
+//   * coefficient of determination (R^2) is above PREDICT_MIN_R_SQUARED
+//   * the last 3 closes are non-decreasing (short-term confirmation)
+// Together these give a tiny-but-statistically-real "price is rising" signal.
 
-async function getRecentMomentum(pair) {
+async function getPredictionSignal(pair) {
   try {
     const payload = await fetchCryptoBars({
       symbols: [pair],
-      limit: MOMENTUM_BARS + 1,
+      limit: PREDICT_BARS,
       timeframe: '1Min',
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
-    if (!Array.isArray(bars) || bars.length < 2) {
-      return { ok: false, reason: 'insufficient_bars', slopeBps: null };
+    const closes = bars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
+    if (closes.length < PREDICT_BARS) {
+      return { ok: false, reason: 'insufficient_bars' };
     }
-    const closes = bars.map((b) => Number(b?.c)).filter(Number.isFinite);
-    if (closes.length < 2) return { ok: false, reason: 'no_closes', slopeBps: null };
-    const first = closes[0];
-    const last = closes[closes.length - 1];
-    if (!(first > 0)) return { ok: false, reason: 'bad_first_close', slopeBps: null };
-    const slopeBps = ((last - first) / first) * 10000;
-    return { ok: slopeBps >= MOMENTUM_MIN_SLOPE_BPS, slopeBps, first, last };
+
+    const n = closes.length;
+    const meanX = (n - 1) / 2;
+    const meanY = closes.reduce((s, c) => s + c, 0) / n;
+    let num = 0;
+    let denX = 0;
+    let denY = 0;
+    for (let i = 0; i < n; i += 1) {
+      const dx = i - meanX;
+      const dy = closes[i] - meanY;
+      num += dx * dy;
+      denX += dx * dx;
+      denY += dy * dy;
+    }
+    const slope = denX > 0 ? num / denX : 0;
+    const slopeBpsPerBar = meanY > 0 ? (slope / meanY) * 10000 : 0;
+    const rSquared = denX > 0 && denY > 0 ? (num * num) / (denX * denY) : 0;
+
+    const tail = closes.slice(-3);
+    const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]);
+
+    let reason = null;
+    if (slopeBpsPerBar < PREDICT_MIN_SLOPE_BPS_PER_BAR) reason = 'slope_too_flat';
+    else if (rSquared < PREDICT_MIN_R_SQUARED) reason = 'slope_noisy';
+    else if (!shortTermOk) reason = 'short_term_dip';
+
+    return {
+      ok: reason == null,
+      reason,
+      slopeBpsPerBar,
+      rSquared,
+      projectedBps: slopeBpsPerBar * PREDICT_BARS,
+    };
   } catch (err) {
-    return { ok: false, reason: 'bars_fetch_failed', slopeBps: null, error: err?.message };
+    return { ok: false, reason: 'bars_fetch_failed', error: err?.message };
   }
 }
 
@@ -853,7 +892,7 @@ async function scanAndEnter() {
       if (spreadBps > SPREAD_MAX_BPS) { bumpSkipReason('spread_too_wide'); continue; }
 
       const needed = requiredEdgeBps(spreadBps);
-      if (DESIRED_NET_PROFIT_BPS < needed) {
+      if (GROSS_TARGET_BPS < needed) {
         bumpSkipReason('edge_below_required');
         continue;
       }
@@ -861,10 +900,10 @@ async function scanAndEnter() {
       const ask = Number(quote.ap);
       if (!Number.isFinite(ask) || ask <= 0) { bumpSkipReason('invalid_ask'); continue; }
 
-      if (MOMENTUM_FILTER_ENABLED) {
-        const mom = await getRecentMomentum(pair);
-        if (!mom.ok) {
-          bumpSkipReason(mom.reason || 'momentum_rejected');
+      {
+        const sig = await getPredictionSignal(pair);
+        if (!sig.ok) {
+          bumpSkipReason(sig.reason || 'prediction_rejected');
           continue;
         }
       }
@@ -946,77 +985,11 @@ async function getConcurrencyGuardStatus() {
 // --- exit engine --------------------------------------------------------
 //
 // Once a buy fills (we see a position with qty>0 and no open sell order),
-// submit ONE GTC limit sell at avg_entry * (1 + DESIRED_NET_PROFIT_BPS/10000).
+// submit ONE GTC limit sell at avg_entry * (1 + GROSS_TARGET_BPS/10000).
 // After that, never touch it.
 
 function targetPriceFor(avgEntry) {
-  return avgEntry * (1 + DESIRED_NET_PROFIT_BPS / 10000);
-}
-
-async function forceMarketSell(pair, qty, reason, existingSellId, avg) {
-  if (existingSellId) {
-    try { await cancelOrder(existingSellId); } catch (_) { /* ignore */ }
-  }
-  let marketRes = null;
-  try {
-    marketRes = await submitOrder({
-      symbol: pair,
-      side: 'sell',
-      type: 'market',
-      time_in_force: 'ioc',
-      qty: String(qty),
-    });
-  } catch (err) {
-    lastExecutionFailure = {
-      at: new Date().toISOString(),
-      symbol: pair,
-      reason: `force_exit_${reason}_failed`,
-      message: err?.errorMessage || err?.message || String(err),
-    };
-    console.warn('force_exit_failed', { symbol: pair, reason, error: err?.errorMessage || err?.message });
-    return null;
-  }
-  const order = marketRes?.id ? marketRes : marketRes?.sell || marketRes?.buy || marketRes;
-  exitState.set(pair, {
-    sellOrderId: order?.id || null,
-    sellOrderLimit: null,
-    targetPrice: null,
-    sellOrderSubmittedAt: order?.submitted_at || new Date().toISOString(),
-    expectedOpenSell: false,
-    brokerOpenSellFound: false,
-    brokerOpenSellQty: qty,
-    reconciliationState: `force_exit_${reason}`,
-    lastReconciliationAction: `force_exit_${reason}`,
-    targetPriceSource: 'force_exit',
-    entryPriceUsed: Number.isFinite(avg) ? avg : null,
-    expectedNetProfitBps: null,
-    minNetProfitBps: null,
-    desiredNetExitBps: null,
-    feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-    requiredExitBpsGross: null,
-    requiredExitBps: null,
-    trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
-    breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
-    profitabilityFloorPrice: null,
-    lastSeenOpenSellAt: new Date().toISOString(),
-    forceExitReason: reason,
-  });
-  entryIntentState.set(pair, {
-    state: 'exiting',
-    createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    rejectionReason: reason,
-  });
-  positionFirstSeenAt.delete(pair);
-  pendingBuys.delete(pair);
-  lastSuccessfulAction = {
-    at: new Date().toISOString(),
-    symbol: pair,
-    action: `force_exit_${reason}`,
-    orderId: order?.id || null,
-  };
-  console.warn('force_exit_submitted', { symbol: pair, reason, qty, orderId: order?.id || null });
-  return order;
+  return avgEntry * (1 + GROSS_TARGET_BPS / 10000);
 }
 
 async function reconcileExits() {
@@ -1026,7 +999,7 @@ async function reconcileExits() {
     if (!Number.isFinite(qty) || qty <= 0) continue;
     const avg = Number(pos?.avg_entry_price);
 
-    // Stamp first-seen on first observation so the time-based exit clock starts.
+    // Stamp first-seen on first observation so age diagnostics start ticking.
     if (!positionFirstSeenAt.has(pair)) {
       const pending = pendingBuys.get(pair);
       const stamp = Number(pending?.submittedAt)
@@ -1034,29 +1007,10 @@ async function reconcileExits() {
         || Date.now();
       positionFirstSeenAt.set(pair, Number.isFinite(stamp) ? stamp : Date.now());
     }
-    const ageMs = Date.now() - positionFirstSeenAt.get(pair);
 
-    // --- force-exit checks (stop-loss + max-hold) -----------------------
-    if (Number.isFinite(avg) && avg > 0) {
-      const timeBreach = FORCE_EXIT_ENABLED && ageMs > MAX_HOLD_SECONDS * 1000;
-      let stopBreach = false;
-      if (STOPLOSS_ENABLED) {
-        try {
-          const q = await getLatestQuote(pair);
-          const bid = Number(q?.bp);
-          if (Number.isFinite(bid) && bid > 0) {
-            const drawdownBps = ((avg - bid) / avg) * 10000;
-            if (drawdownBps >= STOPLOSS_BPS) stopBreach = true;
-          }
-        } catch (_) { /* soft-fail: if quote fails, skip this tick's stop check */ }
-      }
-      if (stopBreach || timeBreach) {
-        const reason = stopBreach ? 'stop_loss' : 'max_hold';
-        const existingId = openSellByPair.get(pair)?.id || null;
-        await forceMarketSell(pair, qty, reason, existingId, avg);
-        continue;
-      }
-    }
+    // No stop-loss, no max-hold: once the GTC sell is posted, the engine
+    // leaves the position alone until the limit fills. The entry math
+    // decides whether the trade is worth taking.
 
     if (openSellByPair.has(pair)) {
       const existing = openSellByPair.get(pair);
@@ -1073,12 +1027,12 @@ async function reconcileExits() {
         lastReconciliationAction: 'existing_sell_seen',
         targetPriceSource: 'open_orders',
         entryPriceUsed: Number.isFinite(avg) ? avg : null,
-        expectedNetProfitBps: DESIRED_NET_PROFIT_BPS - FEE_BPS_ROUND_TRIP,
-        minNetProfitBps: DESIRED_NET_PROFIT_BPS - FEE_BPS_ROUND_TRIP,
-        desiredNetExitBps: DESIRED_NET_PROFIT_BPS,
+        expectedNetProfitBps: TARGET_NET_PROFIT_BPS,
+        minNetProfitBps: TARGET_NET_PROFIT_BPS,
+        desiredNetExitBps: GROSS_TARGET_BPS,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        requiredExitBpsGross: DESIRED_NET_PROFIT_BPS,
-        requiredExitBps: DESIRED_NET_PROFIT_BPS,
+        requiredExitBpsGross: GROSS_TARGET_BPS,
+        requiredExitBps: GROSS_TARGET_BPS,
         trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         profitabilityFloorPrice: Number.isFinite(avg) ? avg * (1 + (FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS) / 10000) : null,
@@ -1125,12 +1079,12 @@ async function reconcileExits() {
         lastReconciliationAction: 'sell_submitted',
         targetPriceSource: 'computed',
         entryPriceUsed: avg,
-        expectedNetProfitBps: DESIRED_NET_PROFIT_BPS - FEE_BPS_ROUND_TRIP,
-        minNetProfitBps: DESIRED_NET_PROFIT_BPS - FEE_BPS_ROUND_TRIP,
-        desiredNetExitBps: DESIRED_NET_PROFIT_BPS,
+        expectedNetProfitBps: TARGET_NET_PROFIT_BPS,
+        minNetProfitBps: TARGET_NET_PROFIT_BPS,
+        desiredNetExitBps: GROSS_TARGET_BPS,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        requiredExitBpsGross: DESIRED_NET_PROFIT_BPS,
-        requiredExitBps: DESIRED_NET_PROFIT_BPS,
+        requiredExitBpsGross: GROSS_TARGET_BPS,
+        requiredExitBps: GROSS_TARGET_BPS,
         trueBreakevenPrice: avg * (1 + FEE_BPS_ROUND_TRIP / 10000),
         breakevenPrice: avg * (1 + FEE_BPS_ROUND_TRIP / 10000),
         profitabilityFloorPrice: avg * (1 + (FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS) / 10000),
