@@ -57,7 +57,10 @@ const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 const STOPLOSS_ENABLED = readBoolean('STOPLOSS_ENABLED', true);
 const STOPLOSS_BPS = Math.max(10, readNumber('STOPLOSS_BPS', 150));
 // Max hold: force-exit via market sell once a position is older than this, even at a loss.
-const FORCE_EXIT_ENABLED = readBoolean('FORCE_EXIT_ENABLED', true);
+// Default OFF: market-dumping a GTC position at max_hold pays the spread + round-trip
+// fees on every miss, which drains the account. Keep the stop-loss as the only
+// involuntary exit; let the GTC limit sell work until it fills.
+const FORCE_EXIT_ENABLED = readBoolean('FORCE_EXIT_ENABLED', false);
 const MAX_HOLD_SECONDS = Math.max(60, readNumber('MAX_HOLD_SECONDS', 3600));
 // Momentum filter: require the last N 1m closes to have a non-negative slope.
 const MOMENTUM_FILTER_ENABLED = readBoolean('MOMENTUM_FILTER_ENABLED', true);
@@ -442,7 +445,7 @@ let supportedPairsLoading = null;
 // Stablecoins can't realistically move our desired-profit target, so they'd
 // sit on open-sell forever and eat a slot. Exclude the base assets here.
 const STABLECOIN_BASES = new Set([
-  'USDT', 'USDC', 'DAI', 'PYUSD', 'USDP', 'GUSD', 'TUSD', 'BUSD', 'FDUSD', 'LUSD', 'USDD', 'USDE',
+  'USDT', 'USDC', 'USDG', 'DAI', 'PYUSD', 'USDP', 'GUSD', 'TUSD', 'BUSD', 'FDUSD', 'LUSD', 'USDD', 'USDE',
 ]);
 
 async function loadSupportedCryptoPairs() {
