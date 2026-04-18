@@ -45,7 +45,7 @@ const EXIT_SCAN_INTERVAL_MS = Math.max(5000, readNumber('EXIT_SCAN_INTERVAL_MS',
 // Trading master switch.
 const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // Quote staleness cutoff (ms).
-const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', runtimeConfig.entryQuoteMaxAgeMs || 15000));
+const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', runtimeConfig.entryQuoteMaxAgeMs || 60000));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -422,6 +422,12 @@ async function getLatestPrice(symbol) {
 let supportedPairsSnapshot = { pairs: [], lastUpdated: null };
 let supportedPairsLoading = null;
 
+// Stablecoins can't realistically move our desired-profit target, so they'd
+// sit on open-sell forever and eat a slot. Exclude the base assets here.
+const STABLECOIN_BASES = new Set([
+  'USDT', 'USDC', 'DAI', 'PYUSD', 'USDP', 'GUSD', 'TUSD', 'BUSD', 'FDUSD', 'LUSD', 'USDD', 'USDE',
+]);
+
 async function loadSupportedCryptoPairs() {
   if (supportedPairsLoading) return supportedPairsLoading;
   supportedPairsLoading = (async () => {
@@ -435,7 +441,8 @@ async function loadSupportedCryptoPairs() {
       const tradable = (Array.isArray(assets) ? assets : [])
         .filter((a) => a && a.tradable !== false)
         .map((a) => normalizePair(a.symbol))
-        .filter((pair) => pair && pair.endsWith('/USD'));
+        .filter((pair) => pair && pair.endsWith('/USD'))
+        .filter((pair) => !STABLECOIN_BASES.has(pair.split('/')[0]));
       supportedPairsSnapshot = {
         pairs: Array.from(new Set(tradable)),
         lastUpdated: new Date().toISOString(),
@@ -703,6 +710,27 @@ async function scanAndEnter() {
 
   if (slotsAvailable <= 0) {
     bumpSkipReason('concurrency_cap');
+    summary.topSkipReasons = mapToObject(skipReasonCounts);
+    lastEntryScanSummary = summary;
+    lastEntryScanAt = new Date().toISOString();
+    currentScanState = 'idle';
+    return;
+  }
+
+  // Cash gate: skip the whole scan if available USD won't even cover one
+  // notional trade. Prevents the engine from hammering Alpaca with doomed
+  // buy orders once positions are fully funded.
+  let availableCash = Infinity;
+  try {
+    const account = await fetchAccount();
+    const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
+    const cashNum = Number(cashRaw);
+    if (Number.isFinite(cashNum)) availableCash = cashNum;
+  } catch (err) {
+    // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
+  }
+  if (availableCash < NOTIONAL_PER_TRADE_USD) {
+    bumpSkipReason('insufficient_cash');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
     lastEntryScanAt = new Date().toISOString();
