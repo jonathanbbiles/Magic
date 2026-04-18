@@ -34,8 +34,18 @@ const DESIRED_NET_PROFIT_BPS = Math.max(1, readNumber('DESIRED_NET_PROFIT_BPS', 
 const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 60));
 // Safety buffer, in basis points.
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 20));
-// Notional USD per trade.
-const NOTIONAL_PER_TRADE_USD = Math.max(1, readNumber('NOTIONAL_PER_TRADE_USD', 25));
+// Notional sizing: default is dynamic — 10% of portfolio equity, capped at
+// available cash. Set NOTIONAL_PER_TRADE_USD to a positive number to pin a
+// fixed USD size instead (useful for tests / tiny accounts).
+const PORTFOLIO_PCT_PER_TRADE = Math.min(1, Math.max(0.001, readNumber('PORTFOLIO_PCT_PER_TRADE', 0.10)));
+const MIN_TRADE_USD = Math.max(1, readNumber('MIN_TRADE_USD', 1));
+function readPositiveNumberOrNull(name) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+const NOTIONAL_PER_TRADE_USD_OVERRIDE = readPositiveNumberOrNull('NOTIONAL_PER_TRADE_USD');
 // Max simultaneous open positions.
 const MAX_CONCURRENT_POSITIONS = Math.max(1, readNumber('MAX_CONCURRENT_POSITIONS', 10));
 // Scan interval (ms).
@@ -52,14 +62,10 @@ const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 600
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 
-// --- risk management ----------------------------------------------------
-// Stop-loss: force-exit via market sell when unrealized drawdown breaches this.
-const STOPLOSS_ENABLED = readBoolean('STOPLOSS_ENABLED', true);
-const STOPLOSS_BPS = Math.max(10, readNumber('STOPLOSS_BPS', 150));
-// Max hold: force-exit via market sell once a position is older than this, even at a loss.
-const FORCE_EXIT_ENABLED = readBoolean('FORCE_EXIT_ENABLED', true);
-const MAX_HOLD_SECONDS = Math.max(60, readNumber('MAX_HOLD_SECONDS', 3600));
-// Momentum filter: require the last N 1m closes to have a non-negative slope.
+// --- entry quality filter -----------------------------------------------
+// Exits are trust-your-entry: one TP is posted after fill and never touched,
+// so the only remaining knob is entry quality. Skip obvious downtrends by
+// requiring recent 1m bars to show a non-negative slope.
 const MOMENTUM_FILTER_ENABLED = readBoolean('MOMENTUM_FILTER_ENABLED', true);
 const MOMENTUM_BARS = Math.max(2, readNumber('MOMENTUM_BARS', 5));
 const MOMENTUM_MIN_SLOPE_BPS = readNumber('MOMENTUM_MIN_SLOPE_BPS', 0);
@@ -564,7 +570,6 @@ const inventory = new Map();              // symbol -> { qty, avg_entry_price }
 const exitState = new Map();              // symbol -> { sellOrderId, targetPrice, ... }
 const entryIntentState = new Map();       // symbol -> { state, createdAt, updatedAt, reason }
 const pendingBuys = new Map();            // symbol -> { orderId, submittedAt }
-const positionFirstSeenAt = new Map();    // symbol -> ms epoch at first reconcile observation
 const skipReasonCounts = new Map();
 const rollingSkipReasons = new Map();
 
@@ -646,7 +651,9 @@ function getTradingManagerStatus() {
     featureFlags: {},
     lifecycle: getLifecycleSnapshot(),
     sessionGovernor: getSessionGovernorSummary(),
-    sizing: { activeMode: 'fixed_notional', notionalUsd: NOTIONAL_PER_TRADE_USD },
+    sizing: NOTIONAL_PER_TRADE_USD_OVERRIDE != null
+      ? { activeMode: 'fixed_notional', notionalUsd: NOTIONAL_PER_TRADE_USD_OVERRIDE }
+      : { activeMode: 'portfolio_pct', portfolioPctPerTrade: PORTFOLIO_PCT_PER_TRADE, minTradeUsd: MIN_TRADE_USD },
     risk: { tradingHaltedReason: null },
     engine: { state: getEngineStateSnapshot(), updatedAt: engineStateUpdatedAt, reason: engineStateReason || null },
     entryManagerHeartbeat: {
@@ -811,19 +818,21 @@ async function scanAndEnter() {
     return;
   }
 
-  // Cash gate: skip the whole scan if available USD won't even cover one
-  // notional trade. Prevents the engine from hammering Alpaca with doomed
-  // buy orders once positions are fully funded.
-  let availableCash = Infinity;
-  try {
-    const account = await fetchAccount();
-    const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
-    const cashNum = Number(cashRaw);
-    if (Number.isFinite(cashNum)) availableCash = cashNum;
-  } catch (err) {
-    // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
-  }
-  if (availableCash < NOTIONAL_PER_TRADE_USD) {
+  // Sizing gate: compute target notional from portfolio equity (default 10%),
+  // capped at available cash. Bail the whole scan if we can't afford even the
+  // minimum viable trade so we don't hammer Alpaca with doomed buys.
+  let account = null;
+  try { account = await fetchAccount(); } catch (_) { /* soft-fail */ }
+  const cashAtScanStart = Math.max(0, Number(account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power ?? 0));
+  const equity = Math.max(0, Number(account?.equity ?? account?.portfolio_value ?? cashAtScanStart));
+  const targetPerTrade = NOTIONAL_PER_TRADE_USD_OVERRIDE != null
+    ? NOTIONAL_PER_TRADE_USD_OVERRIDE
+    : equity * PORTFOLIO_PCT_PER_TRADE;
+  summary.cashAtScanStart = cashAtScanStart;
+  summary.equityAtScanStart = equity;
+  summary.targetPerTrade = targetPerTrade;
+
+  if (cashAtScanStart < MIN_TRADE_USD || targetPerTrade <= 0) {
     bumpSkipReason('insufficient_cash');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
@@ -833,8 +842,12 @@ async function scanAndEnter() {
   }
 
   let placed = 0;
+  let cashUsedThisScan = 0;
   for (const pair of candidates) {
     if (placed >= slotsAvailable) break;
+    const remainingCash = Math.max(0, cashAtScanStart - cashUsedThisScan);
+    const notional = Math.min(remainingCash, targetPerTrade);
+    if (notional < MIN_TRADE_USD) { bumpSkipReason('insufficient_cash'); break; }
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
@@ -877,11 +890,12 @@ async function scanAndEnter() {
         type: 'limit',
         time_in_force: 'gtc',
         limit_price: buyLimitStr,
-        notional: NOTIONAL_PER_TRADE_USD.toFixed(2),
+        notional: notional.toFixed(2),
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {
-        pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt: Date.now(), limit: ask });
+        cashUsedThisScan += notional;
+        pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt: Date.now(), limit: ask, notional });
         entryIntentState.set(pair, {
           state: 'pending_fill',
           createdAt: new Date().toISOString(),
@@ -942,78 +956,13 @@ async function getConcurrencyGuardStatus() {
 
 // --- exit engine --------------------------------------------------------
 //
-// Once a buy fills (we see a position with qty>0 and no open sell order),
-// submit ONE GTC limit sell at avg_entry * (1 + DESIRED_NET_PROFIT_BPS/10000).
-// After that, never touch it.
+// Philosophy: trust-the-entry. Once a buy fills (we see a position with qty>0
+// and no open sell order), submit ONE GTC limit sell at
+// avg_entry * (1 + DESIRED_NET_PROFIT_BPS/10000). After that, NEVER touch it.
+// No stop-loss, no time-based force-exit, no repricing.
 
 function targetPriceFor(avgEntry) {
   return avgEntry * (1 + DESIRED_NET_PROFIT_BPS / 10000);
-}
-
-async function forceMarketSell(pair, qty, reason, existingSellId, avg) {
-  if (existingSellId) {
-    try { await cancelOrder(existingSellId); } catch (_) { /* ignore */ }
-  }
-  let marketRes = null;
-  try {
-    marketRes = await submitOrder({
-      symbol: pair,
-      side: 'sell',
-      type: 'market',
-      time_in_force: 'ioc',
-      qty: String(qty),
-    });
-  } catch (err) {
-    lastExecutionFailure = {
-      at: new Date().toISOString(),
-      symbol: pair,
-      reason: `force_exit_${reason}_failed`,
-      message: err?.errorMessage || err?.message || String(err),
-    };
-    console.warn('force_exit_failed', { symbol: pair, reason, error: err?.errorMessage || err?.message });
-    return null;
-  }
-  const order = marketRes?.id ? marketRes : marketRes?.sell || marketRes?.buy || marketRes;
-  exitState.set(pair, {
-    sellOrderId: order?.id || null,
-    sellOrderLimit: null,
-    targetPrice: null,
-    sellOrderSubmittedAt: order?.submitted_at || new Date().toISOString(),
-    expectedOpenSell: false,
-    brokerOpenSellFound: false,
-    brokerOpenSellQty: qty,
-    reconciliationState: `force_exit_${reason}`,
-    lastReconciliationAction: `force_exit_${reason}`,
-    targetPriceSource: 'force_exit',
-    entryPriceUsed: Number.isFinite(avg) ? avg : null,
-    expectedNetProfitBps: null,
-    minNetProfitBps: null,
-    desiredNetExitBps: null,
-    feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-    requiredExitBpsGross: null,
-    requiredExitBps: null,
-    trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
-    breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
-    profitabilityFloorPrice: null,
-    lastSeenOpenSellAt: new Date().toISOString(),
-    forceExitReason: reason,
-  });
-  entryIntentState.set(pair, {
-    state: 'exiting',
-    createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    rejectionReason: reason,
-  });
-  positionFirstSeenAt.delete(pair);
-  pendingBuys.delete(pair);
-  lastSuccessfulAction = {
-    at: new Date().toISOString(),
-    symbol: pair,
-    action: `force_exit_${reason}`,
-    orderId: order?.id || null,
-  };
-  console.warn('force_exit_submitted', { symbol: pair, reason, qty, orderId: order?.id || null });
-  return order;
 }
 
 async function reconcileExits() {
@@ -1022,38 +971,6 @@ async function reconcileExits() {
     const qty = Number(pos?.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
     const avg = Number(pos?.avg_entry_price);
-
-    // Stamp first-seen on first observation so the time-based exit clock starts.
-    if (!positionFirstSeenAt.has(pair)) {
-      const pending = pendingBuys.get(pair);
-      const stamp = Number(pending?.submittedAt)
-        || Date.parse(pos?.created_at || '')
-        || Date.now();
-      positionFirstSeenAt.set(pair, Number.isFinite(stamp) ? stamp : Date.now());
-    }
-    const ageMs = Date.now() - positionFirstSeenAt.get(pair);
-
-    // --- force-exit checks (stop-loss + max-hold) -----------------------
-    if (Number.isFinite(avg) && avg > 0) {
-      const timeBreach = FORCE_EXIT_ENABLED && ageMs > MAX_HOLD_SECONDS * 1000;
-      let stopBreach = false;
-      if (STOPLOSS_ENABLED) {
-        try {
-          const q = await getLatestQuote(pair);
-          const bid = Number(q?.bp);
-          if (Number.isFinite(bid) && bid > 0) {
-            const drawdownBps = ((avg - bid) / avg) * 10000;
-            if (drawdownBps >= STOPLOSS_BPS) stopBreach = true;
-          }
-        } catch (_) { /* soft-fail: if quote fails, skip this tick's stop check */ }
-      }
-      if (stopBreach || timeBreach) {
-        const reason = stopBreach ? 'stop_loss' : 'max_hold';
-        const existingId = openSellByPair.get(pair)?.id || null;
-        await forceMarketSell(pair, qty, reason, existingId, avg);
-        continue;
-      }
-    }
 
     if (openSellByPair.has(pair)) {
       const existing = openSellByPair.get(pair);
@@ -1168,9 +1085,25 @@ async function placeMakerLimitBuyThenSell(symbol) {
   if (!Number.isFinite(ask) || ask <= 0) {
     return { ok: false, skipped: true, reason: 'no_ask_available' };
   }
+  let account = null;
+  try { account = await fetchAccount(); } catch (_) { /* soft-fail */ }
+  const cash = Math.max(0, Number(account?.cash ?? account?.buying_power ?? 0));
+  const equity = Math.max(0, Number(account?.equity ?? account?.portfolio_value ?? cash));
+  const target = NOTIONAL_PER_TRADE_USD_OVERRIDE != null
+    ? NOTIONAL_PER_TRADE_USD_OVERRIDE
+    : equity * PORTFOLIO_PCT_PER_TRADE;
+  const notional = Math.min(cash, target);
+  if (notional < MIN_TRADE_USD) {
+    return { ok: false, skipped: true, reason: 'insufficient_cash', cash, target };
+  }
+  const tickInfo = await getAssetTickInfo(pair);
+  const buyLimitStr = formatTickPrice(ask, tickInfo.priceIncrement);
+  if (!buyLimitStr) {
+    return { ok: false, skipped: true, reason: 'invalid_ask' };
+  }
   const buyRes = await submitOrder({
     symbol: pair, side: 'buy', type: 'limit', time_in_force: 'gtc',
-    limit_price: ask, notional: NOTIONAL_PER_TRADE_USD.toFixed(2),
+    limit_price: buyLimitStr, notional: notional.toFixed(2),
   });
   return { ok: true, buy: buyRes?.buy || buyRes, sell: null };
 }
