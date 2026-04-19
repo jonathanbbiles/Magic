@@ -46,8 +46,8 @@ const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 60));
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 20));
-// Notional USD per trade.
-const NOTIONAL_PER_TRADE_USD = Math.max(1, readNumber('NOTIONAL_PER_TRADE_USD', 25));
+// Fraction of account equity to deploy per trade (e.g. 0.10 = 10%).
+const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10));
 // Max simultaneous open positions.
 const MAX_CONCURRENT_POSITIONS = Math.max(1, readNumber('MAX_CONCURRENT_POSITIONS', 10));
 // Scan interval (ms).
@@ -688,7 +688,7 @@ function getTradingManagerStatus() {
     featureFlags: {},
     lifecycle: getLifecycleSnapshot(),
     sessionGovernor: getSessionGovernorSummary(),
-    sizing: { activeMode: 'fixed_notional', notionalUsd: NOTIONAL_PER_TRADE_USD },
+    sizing: { activeMode: 'percent_of_equity', pct: PORTFOLIO_SIZING_PCT },
     risk: { tradingHaltedReason: null },
     engine: { state: getEngineStateSnapshot(), updatedAt: engineStateUpdatedAt, reason: engineStateReason || null },
     entryManagerHeartbeat: {
@@ -853,19 +853,32 @@ async function scanAndEnter() {
     return;
   }
 
-  // Cash gate: skip the whole scan if available USD won't even cover one
-  // notional trade. Prevents the engine from hammering Alpaca with doomed
-  // buy orders once positions are fully funded.
+  // Size this scan's trades as PORTFOLIO_SIZING_PCT of current equity, then
+  // gate the scan on available cash so we don't send doomed buy orders.
   let availableCash = Infinity;
+  let tradeNotional = null;
   try {
     const account = await fetchAccount();
     const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
     const cashNum = Number(cashRaw);
     if (Number.isFinite(cashNum)) availableCash = cashNum;
+    const equityRaw = account?.equity ?? account?.portfolio_value;
+    const equityNum = Number(equityRaw);
+    if (Number.isFinite(equityNum) && equityNum > 0) {
+      tradeNotional = equityNum * PORTFOLIO_SIZING_PCT;
+    }
   } catch (err) {
     // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
   }
-  if (availableCash < NOTIONAL_PER_TRADE_USD) {
+  if (!Number.isFinite(tradeNotional) || tradeNotional <= 0) {
+    bumpSkipReason('sizing_unavailable');
+    summary.topSkipReasons = mapToObject(skipReasonCounts);
+    lastEntryScanSummary = summary;
+    lastEntryScanAt = new Date().toISOString();
+    currentScanState = 'idle';
+    return;
+  }
+  if (availableCash < tradeNotional) {
     bumpSkipReason('insufficient_cash');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
@@ -919,7 +932,7 @@ async function scanAndEnter() {
         type: 'limit',
         time_in_force: 'gtc',
         limit_price: buyLimitStr,
-        notional: NOTIONAL_PER_TRADE_USD.toFixed(2),
+        notional: tradeNotional.toFixed(2),
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {
@@ -1125,9 +1138,16 @@ async function placeMakerLimitBuyThenSell(symbol) {
   if (!Number.isFinite(ask) || ask <= 0) {
     return { ok: false, skipped: true, reason: 'no_ask_available' };
   }
+  const account = await fetchAccount().catch(() => null);
+  const equityRaw = account?.equity ?? account?.portfolio_value;
+  const equityNum = Number(equityRaw);
+  if (!Number.isFinite(equityNum) || equityNum <= 0) {
+    return { ok: false, skipped: true, reason: 'sizing_unavailable' };
+  }
+  const tradeNotional = equityNum * PORTFOLIO_SIZING_PCT;
   const buyRes = await submitOrder({
     symbol: pair, side: 'buy', type: 'limit', time_in_force: 'gtc',
-    limit_price: ask, notional: NOTIONAL_PER_TRADE_USD.toFixed(2),
+    limit_price: ask, notional: tradeNotional.toFixed(2),
   });
   return { ok: true, buy: buyRes?.buy || buyRes, sell: null };
 }
