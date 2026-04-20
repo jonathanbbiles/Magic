@@ -48,6 +48,10 @@ const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 20));
 // Fraction of account equity to deploy per trade (e.g. 0.10 = 10%).
 const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10));
+// Floor below which we won't send a buy (dust). Alpaca's crypto min notional
+// is typically $1; keep a small default so the last slot can still fill even
+// when cash has drifted just under 10% of equity.
+const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD', 1));
 // Max simultaneous open positions.
 const MAX_CONCURRENT_POSITIONS = Math.max(1, readNumber('MAX_CONCURRENT_POSITIONS', 10));
 // Scan interval (ms).
@@ -854,9 +858,10 @@ async function scanAndEnter() {
   }
 
   // Size this scan's trades as PORTFOLIO_SIZING_PCT of current equity, then
-  // gate the scan on available cash so we don't send doomed buy orders.
+  // clamp to available cash so the last slot can still fill when cash has
+  // drifted just under the 10% target (e.g. held positions appreciated).
   let availableCash = Infinity;
-  let tradeNotional = null;
+  let targetNotional = null;
   try {
     const account = await fetchAccount();
     const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
@@ -865,12 +870,12 @@ async function scanAndEnter() {
     const equityRaw = account?.equity ?? account?.portfolio_value;
     const equityNum = Number(equityRaw);
     if (Number.isFinite(equityNum) && equityNum > 0) {
-      tradeNotional = equityNum * PORTFOLIO_SIZING_PCT;
+      targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
     }
   } catch (err) {
     // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
   }
-  if (!Number.isFinite(tradeNotional) || tradeNotional <= 0) {
+  if (!Number.isFinite(targetNotional) || targetNotional <= 0) {
     bumpSkipReason('sizing_unavailable');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
@@ -878,7 +883,11 @@ async function scanAndEnter() {
     currentScanState = 'idle';
     return;
   }
-  if (availableCash < tradeNotional) {
+  const tradeNotional = Math.min(
+    targetNotional,
+    Number.isFinite(availableCash) ? availableCash : targetNotional,
+  );
+  if (tradeNotional < MIN_TRADE_NOTIONAL_USD) {
     bumpSkipReason('insufficient_cash');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
@@ -1144,7 +1153,13 @@ async function placeMakerLimitBuyThenSell(symbol) {
   if (!Number.isFinite(equityNum) || equityNum <= 0) {
     return { ok: false, skipped: true, reason: 'sizing_unavailable' };
   }
-  const tradeNotional = equityNum * PORTFOLIO_SIZING_PCT;
+  const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
+  const cashNum = Number(cashRaw);
+  const availableCash = Number.isFinite(cashNum) ? cashNum : Infinity;
+  const tradeNotional = Math.min(equityNum * PORTFOLIO_SIZING_PCT, availableCash);
+  if (tradeNotional < MIN_TRADE_NOTIONAL_USD) {
+    return { ok: false, skipped: true, reason: 'insufficient_cash' };
+  }
   const buyRes = await submitOrder({
     symbol: pair, side: 'buy', type: 'limit', time_in_force: 'gtc',
     limit_price: ask, notional: tradeNotional.toFixed(2),
