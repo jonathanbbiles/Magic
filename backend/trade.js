@@ -82,20 +82,20 @@ const PREDICT_MIN_R_SQUARED = Math.max(0, readNumber('PREDICT_MIN_R_SQUARED', 0.
 
 // Reject entries when 1m return volatility (bps, stddev) exceeds this cap.
 // A high value before entry is strongly associated with post-entry reversal.
-const VOLATILITY_MAX_BPS = Math.max(10, readNumber('VOLATILITY_MAX_BPS', 250));
+const VOLATILITY_MAX_BPS = Math.max(10, readNumber('VOLATILITY_MAX_BPS', 100));
 
 // Higher-timeframe confirmation. Require recent 5m bars not to be in a
 // clearly established downtrend before accepting a 1m entry signal.
 const HTF_FILTER_ENABLED = readBoolean('HTF_FILTER_ENABLED', true);
 const HTF_TIMEFRAME = String(process.env.HTF_TIMEFRAME || '5Min');
 const HTF_BARS = Math.max(5, readNumber('HTF_BARS', 12));
-const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', -2);
+const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
 
 // Expected-value gate. Require probability-weighted net edge (after fees and
 // slippage buffers) to clear this bar before we submit a buy. Entry-only —
 // sell behavior is unchanged.
 const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
-const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 10);
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 20);
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
 const FILL_PROB_MIN = Math.max(0, Math.min(1, readNumber('FILL_PROB_MIN', 0.35)));
