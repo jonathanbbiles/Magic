@@ -17,6 +17,10 @@
 
 const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
+const {
+  computeNetEdgeBps,
+  resolveEntryFillProbability,
+} = require('./modules/tradeGuards');
 
 const runtimeConfig = getRuntimeConfig(process.env);
 
@@ -75,6 +79,26 @@ const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 const PREDICT_BARS = Math.max(5, readNumber('PREDICT_BARS', 20));
 const PREDICT_MIN_SLOPE_BPS_PER_BAR = readNumber('PREDICT_MIN_SLOPE_BPS_PER_BAR', 2);
 const PREDICT_MIN_R_SQUARED = Math.max(0, readNumber('PREDICT_MIN_R_SQUARED', 0.2));
+
+// Reject entries when 1m return volatility (bps, stddev) exceeds this cap.
+// A high value before entry is strongly associated with post-entry reversal.
+const VOLATILITY_MAX_BPS = Math.max(10, readNumber('VOLATILITY_MAX_BPS', 250));
+
+// Higher-timeframe confirmation. Require recent 5m bars not to be in a
+// clearly established downtrend before accepting a 1m entry signal.
+const HTF_FILTER_ENABLED = readBoolean('HTF_FILTER_ENABLED', true);
+const HTF_TIMEFRAME = String(process.env.HTF_TIMEFRAME || '5Min');
+const HTF_BARS = Math.max(5, readNumber('HTF_BARS', 12));
+const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', -2);
+
+// Expected-value gate. Require probability-weighted net edge (after fees and
+// slippage buffers) to clear this bar before we submit a buy. Entry-only —
+// sell behavior is unchanged.
+const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 10);
+const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
+const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
+const FILL_PROB_MIN = Math.max(0, Math.min(1, readNumber('FILL_PROB_MIN', 0.35)));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -587,6 +611,22 @@ async function getPredictionSignal(pair) {
     const tail = closes.slice(-3);
     const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]);
 
+    // Volatility of 1m bar-to-bar returns, expressed in bps. Used by the
+    // entry vol-cap gate; does not affect the sell-side logic.
+    let volatilityBps = null;
+    if (closes.length >= 2) {
+      const returns = [];
+      for (let i = 1; i < closes.length; i += 1) {
+        const prev = closes[i - 1];
+        if (prev > 0) returns.push((closes[i] - prev) / prev);
+      }
+      if (returns.length >= 2) {
+        const meanR = returns.reduce((s, r) => s + r, 0) / returns.length;
+        const varR = returns.reduce((s, r) => s + (r - meanR) ** 2, 0) / (returns.length - 1);
+        volatilityBps = Math.sqrt(Math.max(0, varR)) * 10000;
+      }
+    }
+
     let reason = null;
     if (slopeBpsPerBar < PREDICT_MIN_SLOPE_BPS_PER_BAR) reason = 'slope_too_flat';
     else if (rSquared < PREDICT_MIN_R_SQUARED) reason = 'slope_noisy';
@@ -598,9 +638,48 @@ async function getPredictionSignal(pair) {
       slopeBpsPerBar,
       rSquared,
       projectedBps: slopeBpsPerBar * PREDICT_BARS,
+      volatilityBps,
     };
   } catch (err) {
     return { ok: false, reason: 'bars_fetch_failed', error: err?.message };
+  }
+}
+
+// Higher-timeframe confirmation. Fits a linear regression to the last
+// HTF_BARS bars at HTF_TIMEFRAME (default 5m x 12 = 1h) and rejects when the
+// slope is clearly negative. Catches the case where a faint 1m uptick is
+// actually a bounce inside a larger downtrend.
+async function getHigherTimeframeSignal(pair) {
+  if (!HTF_FILTER_ENABLED) return { ok: true, reason: 'disabled' };
+  try {
+    const payload = await fetchCryptoBars({
+      symbols: [pair],
+      limit: HTF_BARS,
+      timeframe: HTF_TIMEFRAME,
+    });
+    const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const closes = bars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
+    if (closes.length < HTF_BARS) return { ok: false, reason: 'htf_insufficient_bars' };
+
+    const n = closes.length;
+    const meanX = (n - 1) / 2;
+    const meanY = closes.reduce((s, c) => s + c, 0) / n;
+    let num = 0;
+    let denX = 0;
+    for (let i = 0; i < n; i += 1) {
+      const dx = i - meanX;
+      num += dx * (closes[i] - meanY);
+      denX += dx * dx;
+    }
+    const slope = denX > 0 ? num / denX : 0;
+    const slopeBpsPerBar = meanY > 0 ? (slope / meanY) * 10000 : 0;
+
+    if (slopeBpsPerBar < HTF_MIN_SLOPE_BPS_PER_BAR) {
+      return { ok: false, reason: 'htf_downtrend', slopeBpsPerBar };
+    }
+    return { ok: true, slopeBpsPerBar };
+  } catch (err) {
+    return { ok: false, reason: 'htf_fetch_failed', error: err?.message };
   }
 }
 
@@ -922,10 +1001,50 @@ async function scanAndEnter() {
       const ask = Number(quote.ap);
       if (!Number.isFinite(ask) || ask <= 0) { bumpSkipReason('invalid_ask'); continue; }
 
-      {
-        const sig = await getPredictionSignal(pair);
-        if (!sig.ok) {
-          bumpSkipReason(sig.reason || 'prediction_rejected');
+      const sig = await getPredictionSignal(pair);
+      if (!sig.ok) {
+        bumpSkipReason(sig.reason || 'prediction_rejected');
+        continue;
+      }
+
+      // Reject overheated symbols — high 1m return volatility before entry
+      // is strongly associated with the post-entry reversals the user saw.
+      if (Number.isFinite(sig.volatilityBps) && sig.volatilityBps > VOLATILITY_MAX_BPS) {
+        bumpSkipReason('volatility_too_high');
+        continue;
+      }
+
+      // Higher-timeframe confirmation: don't buy a 1m bounce inside a 5m
+      // downtrend.
+      const htf = await getHigherTimeframeSignal(pair);
+      if (!htf.ok) {
+        bumpSkipReason(htf.reason || 'htf_rejected');
+        continue;
+      }
+
+      // Probability-weighted expected net edge, using the unused guards in
+      // tradeGuards.js. Does not alter sell pricing — this only gates entry.
+      if (NET_EDGE_GATE_ENABLED) {
+        const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
+        const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
+        // Map regression fit quality (R^2) to a crude fill/target-hit
+        // probability proxy; clamp away from 1 so confidence has to be earned.
+        const predictorProbability = 0.5 + 0.5 * Math.max(0, Math.min(1, Number(sig.rSquared) || 0));
+        const { fillProbability } = resolveEntryFillProbability({
+          predictorProbability,
+          liquidityScore: 1,
+          minFillProbability: FILL_PROB_MIN,
+        });
+        const { netEdgeBps } = computeNetEdgeBps({
+          expectedMoveBps,
+          feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+          entrySlippageBufferBps: ENTRY_SLIPPAGE_BPS,
+          exitSlippageBufferBps: EXIT_SLIPPAGE_BPS,
+          adverseSpreadCostBps: spreadBps,
+          fillProbability,
+        });
+        if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
+          bumpSkipReason('net_edge_below_min');
           continue;
         }
       }
