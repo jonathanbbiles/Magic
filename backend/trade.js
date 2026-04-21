@@ -17,10 +17,8 @@
 
 const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
-const {
-  computeNetEdgeBps,
-  resolveEntryFillProbability,
-} = require('./modules/tradeGuards');
+const { computeNetEdgeBps } = require('./modules/tradeGuards');
+const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
 
 const runtimeConfig = getRuntimeConfig(process.env);
 
@@ -608,6 +606,8 @@ async function getPredictionSignal(pair) {
     const slopeBpsPerBar = meanY > 0 ? (slope / meanY) * 10000 : 0;
     const rSquared = denX > 0 && denY > 0 ? (num * num) / (denX * denY) : 0;
 
+    const slopeTStat = slopeTStatFromOls({ slope, denX, denY, rSquared, n });
+
     const tail = closes.slice(-3);
     const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]);
 
@@ -637,6 +637,7 @@ async function getPredictionSignal(pair) {
       reason,
       slopeBpsPerBar,
       rSquared,
+      slopeTStat,
       projectedBps: slopeBpsPerBar * PREDICT_BARS,
       volatilityBps,
     };
@@ -1022,19 +1023,18 @@ async function scanAndEnter() {
         continue;
       }
 
-      // Probability-weighted expected net edge, using the unused guards in
-      // tradeGuards.js. Does not alter sell pricing — this only gates entry.
+      // Probability-weighted expected net edge. Does not alter sell pricing —
+      // this only gates entry.
       if (NET_EDGE_GATE_ENABLED) {
         const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
         const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
-        // Map regression fit quality (R^2) to a crude fill/target-hit
-        // probability proxy; clamp away from 1 so confidence has to be earned.
-        const predictorProbability = 0.5 + 0.5 * Math.max(0, Math.min(1, Number(sig.rSquared) || 0));
-        const { fillProbability } = resolveEntryFillProbability({
-          predictorProbability,
-          liquidityScore: 1,
-          minFillProbability: FILL_PROB_MIN,
-        });
+        // Probability that the historical 1m slope reflects a real uptrend
+        // rather than noise: logistic CDF of the OLS slope t-statistic. This
+        // replaces the previous 0.5 + 0.5*R^2 proxy, which conflated fit
+        // linearity with direction. There is no live orderbook measurement on
+        // the entry path, so we do not adjust for liquidity here; the
+        // FILL_PROB_MIN floor still applies.
+        const fillProbability = slopeProbability(sig.slopeTStat, { min: FILL_PROB_MIN, max: 1 });
         const { netEdgeBps } = computeNetEdgeBps({
           expectedMoveBps,
           feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
