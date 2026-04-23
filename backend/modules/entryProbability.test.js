@@ -80,7 +80,9 @@ function olsStats(closes) {
   assert.equal(slopeProbability(NaN), 0.5);
 }
 
-// 6. Floor clamp: a FILL_PROB_MIN-style floor is respected even for negative t.
+// 6. Floor / ceiling clamp still works on the helper (trade.js no longer uses
+// the floor — the net-edge gate is the real threshold — but the helper keeps
+// the option for callers that want explicit bounds).
 {
   assert.equal(slopeProbability(-10, { min: 0.35 }), 0.35);
   assert.equal(slopeProbability(10, { max: 0.9 }), 0.9);
