@@ -19,6 +19,8 @@ const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
 const { computeNetEdgeBps } = require('./modules/tradeGuards');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
+const tradeForensics = require('./modules/tradeForensics');
+const closedTradeStats = require('./modules/closedTradeStats');
 
 const runtimeConfig = getRuntimeConfig(process.env);
 
@@ -72,11 +74,10 @@ const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 
 // --- entry prediction ---------------------------------------------------
 // The bot only buys when recent 1m closes form a statistically meaningful
-// uptrend. This is the "entry math" the user trusts: once in, we do not
-// second-guess it (no stop-loss, no max-hold, no force exits).
+// uptrend. The net-edge gate below (slope t-stat → logistic CDF → expected-
+// edge inequality) is the real filter; it subsumes the old slope-floor and
+// R^2-floor gates. Only a cheap short-term-dip sanity check runs alongside.
 const PREDICT_BARS = Math.max(5, readNumber('PREDICT_BARS', 20));
-const PREDICT_MIN_SLOPE_BPS_PER_BAR = readNumber('PREDICT_MIN_SLOPE_BPS_PER_BAR', 2);
-const PREDICT_MIN_R_SQUARED = Math.max(0, readNumber('PREDICT_MIN_R_SQUARED', 0.2));
 
 // Reject entries when 1m return volatility (bps, stddev) exceeds this cap.
 // A high value before entry is strongly associated with post-entry reversal.
@@ -96,7 +97,6 @@ const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
 const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 20);
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
-const FILL_PROB_MIN = Math.max(0, Math.min(1, readNumber('FILL_PROB_MIN', 0.35)));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -569,12 +569,13 @@ function formatTickPrice(price, tick) {
 
 // --- entry predictor ----------------------------------------------------
 //
-// Given N recent 1m bars, fit a linear regression to the closes. Accept the
-// symbol only when:
-//   * slope (normalised to bps per bar) is above PREDICT_MIN_SLOPE_BPS_PER_BAR
-//   * coefficient of determination (R^2) is above PREDICT_MIN_R_SQUARED
-//   * the last 3 closes are non-decreasing (short-term confirmation)
-// Together these give a tiny-but-statistically-real "price is rising" signal.
+// Given N recent 1m bars, fit a linear regression to the closes and emit
+// slope, R^2, and the slope t-statistic. The net-edge gate downstream is
+// the authoritative filter — it requires probability-weighted expected
+// edge to clear MIN_NET_EDGE_BPS after fees and slippage, which implicitly
+// demands both a meaningful slope and a clean fit. The only extra check
+// here is that the last 3 closes are non-decreasing (current-candle
+// direction sanity), which is a different signal from the t-stat.
 
 async function getPredictionSignal(pair) {
   try {
@@ -627,10 +628,7 @@ async function getPredictionSignal(pair) {
       }
     }
 
-    let reason = null;
-    if (slopeBpsPerBar < PREDICT_MIN_SLOPE_BPS_PER_BAR) reason = 'slope_too_flat';
-    else if (rSquared < PREDICT_MIN_R_SQUARED) reason = 'slope_noisy';
-    else if (!shortTermOk) reason = 'short_term_dip';
+    const reason = shortTermOk ? null : 'short_term_dip';
 
     return {
       ok: reason == null,
@@ -691,6 +689,7 @@ const exitState = new Map();              // symbol -> { sellOrderId, targetPric
 const entryIntentState = new Map();       // symbol -> { state, createdAt, updatedAt, reason }
 const pendingBuys = new Map();            // symbol -> { orderId, submittedAt }
 const positionFirstSeenAt = new Map();    // symbol -> ms epoch at first reconcile observation
+const tradePredictions = new Map();       // symbol -> { tradeId, submittedAt, prediction, buyFillObserved, actualEntryPrice }
 const skipReasonCounts = new Map();
 const rollingSkipReasons = new Map();
 
@@ -1024,25 +1023,26 @@ async function scanAndEnter() {
       }
 
       // Probability-weighted expected net edge. Does not alter sell pricing —
-      // this only gates entry.
+      // this only gates entry. expectedMoveBps is the uncapped projection
+      // capped at the actual sell limit, because we can't realise more than
+      // that anyway. fillProbability is the logistic CDF of the OLS slope
+      // t-statistic (principled replacement for the old 0.5+0.5*R^2 proxy);
+      // no floor clamp — the gate itself is the real threshold, and a clamp
+      // would inflate low-signal probabilities dishonestly.
+      const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
+      const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
+      const fillProbability = slopeProbability(sig.slopeTStat);
+      const edge = computeNetEdgeBps({
+        expectedMoveBps,
+        feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+        entrySlippageBufferBps: ENTRY_SLIPPAGE_BPS,
+        exitSlippageBufferBps: EXIT_SLIPPAGE_BPS,
+        adverseSpreadCostBps: spreadBps,
+        fillProbability,
+      });
+      const netEdgeBps = edge.netEdgeBps;
+
       if (NET_EDGE_GATE_ENABLED) {
-        const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
-        const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
-        // Probability that the historical 1m slope reflects a real uptrend
-        // rather than noise: logistic CDF of the OLS slope t-statistic. This
-        // replaces the previous 0.5 + 0.5*R^2 proxy, which conflated fit
-        // linearity with direction. There is no live orderbook measurement on
-        // the entry path, so we do not adjust for liquidity here; the
-        // FILL_PROB_MIN floor still applies.
-        const fillProbability = slopeProbability(sig.slopeTStat, { min: FILL_PROB_MIN, max: 1 });
-        const { netEdgeBps } = computeNetEdgeBps({
-          expectedMoveBps,
-          feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-          entrySlippageBufferBps: ENTRY_SLIPPAGE_BPS,
-          exitSlippageBufferBps: EXIT_SLIPPAGE_BPS,
-          adverseSpreadCostBps: spreadBps,
-          fillProbability,
-        });
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
           bumpSkipReason('net_edge_below_min');
           continue;
@@ -1064,16 +1064,73 @@ async function scanAndEnter() {
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {
-        pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt: Date.now(), limit: ask });
+        const submittedAt = Date.now();
+        const nowIso = new Date().toISOString();
+        const prediction = {
+          buyOrderId: buyOrder.id,
+          buyLimit: Number(buyLimitStr),
+          askAtSubmit: ask,
+          tradeNotional,
+          spreadBps,
+          quoteAgeMs: ageMs,
+          slopeBpsPerBar: Number.isFinite(sig.slopeBpsPerBar) ? sig.slopeBpsPerBar : null,
+          rSquared: Number.isFinite(sig.rSquared) ? sig.rSquared : null,
+          slopeTStat: Number.isFinite(sig.slopeTStat) ? sig.slopeTStat : null,
+          volatilityBps: Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null,
+          projectedBps,            // uncapped projection (#5)
+          expectedMoveBps,         // capped at GROSS_TARGET_BPS (what the edge gate used)
+          fillProbability,
+          netEdgeBps,
+          feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+          entrySlippageBps: ENTRY_SLIPPAGE_BPS,
+          exitSlippageBps: EXIT_SLIPPAGE_BPS,
+          grossTargetBps: GROSS_TARGET_BPS,
+          targetNetProfitBps: TARGET_NET_PROFIT_BPS,
+          htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
+        };
+        pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
+        tradePredictions.set(pair, {
+          tradeId: buyOrder.id,
+          submittedAt,
+          prediction,
+          buyFillObserved: false,
+          actualEntryPrice: null,
+        });
+        try {
+          tradeForensics.append({
+            tradeId: buyOrder.id,
+            symbol: pair,
+            phase: 'entry_submitted',
+            ts: nowIso,
+            ...prediction,
+          });
+        } catch (err) {
+          console.warn('forensics_entry_append_failed', { symbol: pair, error: err?.message });
+        }
         entryIntentState.set(pair, {
           state: 'pending_fill',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          createdAt: nowIso,
+          updatedAt: nowIso,
           rejectionReason: null,
+          prediction,
+        });
+        console.log('entry_submitted', {
+          symbol: pair,
+          tradeId: buyOrder.id,
+          buyLimit: prediction.buyLimit,
+          notional: tradeNotional,
+          spreadBps,
+          slopeTStat: prediction.slopeTStat,
+          fillProbability,
+          projectedBps,
+          expectedMoveBps,
+          netEdgeBps,
+          volatilityBps: prediction.volatilityBps,
+          htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
         });
         summary.entered += 1;
         summary.acceptedSymbols.push(pair);
-        lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'buy_submitted', orderId: buyOrder.id };
+        lastSuccessfulAction = { at: nowIso, symbol: pair, action: 'buy_submitted', orderId: buyOrder.id };
         placed += 1;
       } else {
         bumpSkipReason('buy_rejected');
@@ -1147,6 +1204,29 @@ async function reconcileExits() {
         || Date.parse(pos?.created_at || '')
         || Date.now();
       positionFirstSeenAt.set(pair, Number.isFinite(stamp) ? stamp : Date.now());
+    }
+
+    // Buy-fill observation: the first time we see this position after a
+    // submit, stamp the actual entry price onto the prediction record so we
+    // can later compare predicted-vs-realised.
+    const pred = tradePredictions.get(pair);
+    if (pred && !pred.buyFillObserved && Number.isFinite(avg) && avg > 0) {
+      pred.buyFillObserved = true;
+      pred.actualEntryPrice = avg;
+      pred.buyFilledAt = new Date().toISOString();
+      const entrySlipActualBps = Number.isFinite(pred.prediction?.buyLimit) && pred.prediction.buyLimit > 0
+        ? ((avg - pred.prediction.buyLimit) / pred.prediction.buyLimit) * 10000
+        : null;
+      try {
+        tradeForensics.update(pred.tradeId, {
+          phase: 'buy_filled',
+          actualEntryPrice: avg,
+          buyFilledAt: pred.buyFilledAt,
+          entrySlippageActualBps: entrySlipActualBps,
+        });
+      } catch (err) {
+        console.warn('forensics_buy_fill_update_failed', { symbol: pair, error: err?.message });
+      }
     }
 
     // No stop-loss, no max-hold: once the GTC sell is posted, the engine
@@ -1239,6 +1319,87 @@ async function reconcileExits() {
       lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'sell_submit_failed', message: err?.errorMessage || err?.message || String(err) };
       console.warn('exit_sell_failed', { symbol: pair, error: err?.errorMessage || err?.message });
     }
+  }
+
+  // Close detection: any pair we had exitState for but that's no longer a
+  // held position means the limit sell filled. Emit a closed_trade record so
+  // realised edge can be compared against the entry-time prediction.
+  for (const [pair, state] of Array.from(exitState.entries())) {
+    if (byPair.has(pair)) continue;
+    const pred = tradePredictions.get(pair);
+    const entry = Number(state?.entryPriceUsed);
+    const exit = Number(state?.targetPrice);
+    const closedAt = new Date().toISOString();
+    if (pred && Number.isFinite(entry) && entry > 0 && Number.isFinite(exit) && exit > 0) {
+      const grossBps = ((exit - entry) / entry) * 10000;
+      const netBps = grossBps - FEE_BPS_ROUND_TRIP;
+      const notional = Number(pred.prediction?.tradeNotional) || 0;
+      const grossPnlUsd = (grossBps * notional) / 10000;
+      const netPnlUsd = (netBps * notional) / 10000;
+      const holdSeconds = Math.max(0, (Date.now() - Number(pred.submittedAt || 0)) / 1000);
+      try {
+        closedTradeStats.append({
+          tradeId: pred.tradeId,
+          symbol: pair,
+          netPnlUsd,
+          grossPnlUsd,
+          holdSeconds,
+          entrySpreadBps: pred.prediction?.spreadBps ?? null,
+          entryQuoteAgeMs: pred.prediction?.quoteAgeMs ?? null,
+          exitReason: 'tp_limit',
+          // Predicted vs realised — the whole point of #6:
+          predictedNetEdgeBps: pred.prediction?.netEdgeBps ?? null,
+          predictedExpectedMoveBps: pred.prediction?.expectedMoveBps ?? null,
+          predictedProjectedBps: pred.prediction?.projectedBps ?? null,
+          predictedFillProbability: pred.prediction?.fillProbability ?? null,
+          predictedSlopeTStat: pred.prediction?.slopeTStat ?? null,
+          realizedGrossBps: grossBps,
+          realizedNetBps: netBps,
+        });
+      } catch (err) {
+        console.warn('closed_trade_stats_append_failed', { symbol: pair, error: err?.message });
+      }
+      try {
+        tradeForensics.update(pred.tradeId, {
+          phase: 'closed',
+          closedAt,
+          exitReason: 'tp_limit',
+          realizedGrossBps: grossBps,
+          realizedNetBps: netBps,
+          realizedGrossPnlUsd: grossPnlUsd,
+          realizedNetPnlUsd: netPnlUsd,
+          holdSeconds,
+        });
+      } catch (err) {
+        console.warn('forensics_close_update_failed', { symbol: pair, error: err?.message });
+      }
+      console.log('trade_closed', {
+        symbol: pair,
+        tradeId: pred.tradeId,
+        grossBps: grossBps.toFixed(2),
+        netBps: netBps.toFixed(2),
+        predictedNetEdgeBps: pred.prediction?.netEdgeBps,
+        holdSeconds: holdSeconds.toFixed(0),
+      });
+    } else if (positionFirstSeenAt.has(pair)) {
+      // Position we observed (e.g. on restart) but never had a prediction for.
+      // Still emit a minimal closed-trade record so the scorecard counts it.
+      try {
+        closedTradeStats.append({
+          symbol: pair,
+          netPnlUsd: null,
+          grossPnlUsd: null,
+          holdSeconds: null,
+          exitReason: 'tp_limit_untracked',
+        });
+      } catch (err) {
+        console.warn('closed_trade_stats_append_failed', { symbol: pair, error: err?.message });
+      }
+    }
+    exitState.delete(pair);
+    tradePredictions.delete(pair);
+    positionFirstSeenAt.delete(pair);
+    entryIntentState.delete(pair);
   }
 }
 
