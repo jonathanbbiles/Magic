@@ -4,6 +4,8 @@ const {
   foldForensics,
   bucketIndex,
   bucketLabel,
+  quantile,
+  GROSS_TARGET_BPS,
 } = require('./reconcile_predictions');
 
 // bucketIndex edges
@@ -84,6 +86,72 @@ assert.equal(bucketLabel(7), '[0.70, 0.80)');
   assert.equal(s.totals.submitted, 1);
   assert.equal(s.totals.closed, 1);
   assert.equal(s.totals.stillOpen, 0);
+}
+
+// quantile helper
+assert.equal(quantile([], 0.5), null, 'empty input -> null');
+assert.equal(quantile([5], 0.5), 5, 'single value -> itself at any q');
+assert.equal(quantile([1, 2, 3, 4], 0.5), 2.5, 'median of 4 values is interpolated');
+assert.equal(quantile([1, 2, 3, 4, 5], 0.5), 3, 'median of 5 values is the middle');
+assert.equal(quantile([1, 2, 3, 4, 5], 0.25), 2, 'P25 of 1..5');
+assert.equal(quantile([1, 2, 3, 4, 5], 0.75), 4, 'P75 of 1..5');
+assert.equal(quantile([10, 2, 1, 4, 3], 0.5), 3, 'quantile sorts input before picking');
+
+// Time-to-fill calibration: closed trades with slope + hold produce ratios.
+// Constructed case: implied = GROSS_TARGET_BPS / slope; actual = holdSeconds / 60.
+// Three trades, one each of on-model / stretched / over-promised.
+{
+  const slope = 4; // bps/min -> implied minutes = 110 / 4 = 27.5
+  const impliedMinutes = GROSS_TARGET_BPS / slope;
+  const forensics = [
+    { tradeId: 'on-model', symbol: 'BTC/USD', phase: 'entry_submitted', fillProbability: 0.95, slopeBpsPerBar: slope },
+    { type: 'update', tradeId: 'on-model', patch: { phase: 'closed', realizedNetBps: 50 } },
+    { tradeId: 'stretched', symbol: 'ETH/USD', phase: 'entry_submitted', fillProbability: 0.92, slopeBpsPerBar: slope },
+    { type: 'update', tradeId: 'stretched', patch: { phase: 'closed', realizedNetBps: 50 } },
+    { tradeId: 'over', symbol: 'SOL/USD', phase: 'entry_submitted', fillProbability: 0.90, slopeBpsPerBar: slope },
+    { type: 'update', tradeId: 'over', patch: { phase: 'closed', realizedNetBps: 50 } },
+  ];
+  const closedRows = [
+    // ratio = actualMinutes / 27.5; pick holdSeconds for ratios 1.0, 2.0, 4.0.
+    { tradeId: 'on-model', symbol: 'BTC/USD', predictedFillProbability: 0.95,
+      predictedSlopeBpsPerBar: slope, holdSeconds: impliedMinutes * 60 * 1.0, realizedNetBps: 50 },
+    { tradeId: 'stretched', symbol: 'ETH/USD', predictedFillProbability: 0.92,
+      predictedSlopeBpsPerBar: slope, holdSeconds: impliedMinutes * 60 * 2.0, realizedNetBps: 50 },
+    { tradeId: 'over', symbol: 'SOL/USD', predictedFillProbability: 0.90,
+      predictedSlopeBpsPerBar: slope, holdSeconds: impliedMinutes * 60 * 4.0, realizedNetBps: 50 },
+  ];
+  const s = reconcile({ forensics, closedRows });
+  assert.ok(s.timeToFill, 'timeToFill block should exist');
+  assert.equal(s.timeToFill.samples, 3);
+  assert.equal(s.timeToFill.bucketOnModel, 1, 'ratio=1.0 is on-model (<1.5)');
+  assert.equal(s.timeToFill.bucketStretched, 1, 'ratio=2.0 is stretched (1.5 <= r < 3)');
+  assert.equal(s.timeToFill.bucketOverPromised, 1, 'ratio=4.0 is over-promised (>=3)');
+  assert.equal(s.timeToFill.medianRatio, 2, 'median of {1, 2, 4} is 2');
+  assert.equal(s.timeToFill.medianImpliedMinutes, impliedMinutes);
+}
+
+// Trades with no slope or no hold data should be excluded from timeToFill.
+{
+  const forensics = [
+    { tradeId: 'no-slope', symbol: 'BTC/USD', phase: 'entry_submitted', fillProbability: 0.8 },
+    { type: 'update', tradeId: 'no-slope', patch: { phase: 'closed', realizedNetBps: 50 } },
+  ];
+  const closedRows = [
+    { tradeId: 'no-slope', symbol: 'BTC/USD', predictedFillProbability: 0.8,
+      predictedSlopeBpsPerBar: null, holdSeconds: 1800, realizedNetBps: 50 },
+  ];
+  const s = reconcile({ forensics, closedRows });
+  assert.equal(s.timeToFill.samples, 0, 'missing slope -> excluded from time-to-fill');
+}
+
+// Open positions (no close update) must not contribute to timeToFill.
+{
+  const forensics = [
+    { tradeId: 'still-open', symbol: 'BTC/USD', phase: 'entry_submitted', fillProbability: 0.8, slopeBpsPerBar: 4 },
+  ];
+  const s = reconcile({ forensics, closedRows: [] });
+  assert.equal(s.totals.stillOpen, 1);
+  assert.equal(s.timeToFill.samples, 0, 'open positions excluded from time-to-fill');
 }
 
 console.log('reconcile_predictions tests passed');
