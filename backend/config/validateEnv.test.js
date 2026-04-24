@@ -229,4 +229,58 @@ withEnv({
   assert.throws(() => validateEnv(), /conflicts with sparse fallback symbols in tier2: SOL\/USD/);
 });
 
+function captureWarnings(fn) {
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args);
+  try {
+    fn();
+  } finally {
+    console.warn = originalWarn;
+  }
+  return warnings;
+}
+
+function findEntryUniverseModeWarning(warnings) {
+  return warnings.find((entry) =>
+    entry[0] === 'config_warning' && entry[1]?.field === 'ENTRY_UNIVERSE_MODE'
+  );
+}
+
+// Dynamic universe with default tier-1-tight gates -> warning fires.
+withEnv({
+  ENTRY_UNIVERSE_MODE: 'dynamic',
+  ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'true',
+  SPREAD_MAX_BPS: '30',
+  ENTRY_QUOTE_MAX_AGE_MS: '15000',
+}, () => {
+  const warnings = captureWarnings(() => validateEnv());
+  const warn = findEntryUniverseModeWarning(warnings);
+  assert.ok(warn, 'expected dynamic + tight gates to emit the mismatch warning');
+  assert.equal(warn[1].tightSpread, true);
+  assert.equal(warn[1].tightQuote, true);
+});
+
+// Dynamic universe with relaxed gates -> warning stays silent (user made a deliberate choice).
+withEnv({
+  ENTRY_UNIVERSE_MODE: 'dynamic',
+  ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION: 'true',
+  SPREAD_MAX_BPS: '80',
+  ENTRY_QUOTE_MAX_AGE_MS: '60000',
+}, () => {
+  const warnings = captureWarnings(() => validateEnv());
+  assert.equal(findEntryUniverseModeWarning(warnings), undefined);
+});
+
+// Configured universe -> warning never fires regardless of gate tightness.
+withEnv({
+  ENTRY_UNIVERSE_MODE: 'configured',
+  ENTRY_SYMBOLS_PRIMARY: 'BTC/USD',
+  SPREAD_MAX_BPS: '30',
+  ENTRY_QUOTE_MAX_AGE_MS: '15000',
+}, () => {
+  const warnings = captureWarnings(() => validateEnv());
+  assert.equal(findEntryUniverseModeWarning(warnings), undefined);
+});
+
 console.log('validate env tests passed');

@@ -255,20 +255,26 @@ For stable live deployments, also set:
 
 ## Live example profile
 
-`backend/.env.live.example` now reflects production intent:
-- dynamic universe scanning (`ENTRY_UNIVERSE_MODE=dynamic`)
-- dynamic universe enabled in production with explicit opt-in (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`)
-- stablecoin exclusion disabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=false`)
-- `EXECUTION_TIER3_DEFAULT=true` and `ENTRY_TIER3_MIN_PORTFOLIO_USD=0` so dynamic tier3 is not suppressed by portfolio minimum
-- `ENTRY_UNIVERSE_MAX_SYMBOLS=` leaves dynamic scanning uncapped unless explicitly configured
+`backend/.env.live.example` now reflects the recommended production posture:
+- **configured universe scanning** (`ENTRY_UNIVERSE_MODE=configured`), so scans only hit the six liquid primary pairs whose spreads and quote cadence actually clear the entry gates
+- dynamic universe is **not opted-in for production** (`ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`)
+- stablecoin exclusion disabled by default (`ENTRY_UNIVERSE_EXCLUDE_STABLES=false`) — stablecoin bases like `USDG` are already hard-excluded in `STABLECOIN_BASES`
+- `EXECUTION_TIER3_DEFAULT=true` and `ENTRY_TIER3_MIN_PORTFOLIO_USD=0` so dynamic tier3 is not suppressed by portfolio minimum **if** dynamic mode is explicitly enabled
+- `ENTRY_UNIVERSE_MAX_SYMBOLS=` leaves scanning uncapped unless explicitly configured
 - conservative scan cadence/prefetch/rate-limit settings remain unchanged
+
+Dynamic mode is only appropriate after you have deliberately loosened
+`SPREAD_MAX_BPS` and `ENTRY_QUOTE_MAX_AGE_MS` to accommodate long-tail alt
+liquidity. Running dynamic with the default tier-1 gates results in 100%
+pre-math rejections (`spread_too_wide` / `stale_quote` / `insufficient_bars`)
+and zero entries.
 
 ## Render deployment sync
 
 Changing `backend/.env.live.example` in git **does not** update deployed Render environment variables automatically.
 After merging, manually copy these values into Render:
 
-- `ENTRY_UNIVERSE_MODE=dynamic`
+- `ENTRY_UNIVERSE_MODE=configured`
 - `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
@@ -290,11 +296,11 @@ After merging, manually copy these values into Render:
 - `PREDICTOR_WARMUP_FALLBACK_BUDGET_PER_SCAN=4`
 - `PREDICTOR_WARMUP_PREFETCH_CONCURRENCY=1`
 - `MARKETDATA_RATE_LIMIT_COOLDOWN_MS=15000`
-- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=true`
+- `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`
 - `SECONDARY_QUOTE_ENABLED=false` (deprecated; secondary quote providers are disabled in the live entry path)
 - `QUOTE_RETRY=2`
 
-If production logs do not show `dynamic_full_universe` after deploy, the Render environment is still wrong.
+After deploy, verify `effectiveUniverseMode=configured` and `scanSymbolsCount=6` in the `startup_truth_summary` log line. If it still reports `dynamic`, the Render environment was not updated.
 
 Do not store real secrets in git-tracked files. Keep `API_TOKEN`, `APCA_API_KEY_ID`, and `APCA_API_SECRET_KEY` only in Render env vars.
 
@@ -302,7 +308,7 @@ Do not store real secrets in git-tracked files. Keep `API_TOKEN`, `APCA_API_KEY_
 
 Intended live non-secret env values:
 
-- `ENTRY_UNIVERSE_MODE=dynamic`
+- `ENTRY_UNIVERSE_MODE=configured`
 - `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`

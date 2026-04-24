@@ -468,6 +468,34 @@ const validateEnv = () => {
       });
     }
 
+    // Entry gates in trade.js (SPREAD_MAX_BPS, ENTRY_QUOTE_MAX_AGE_MS) are
+    // calibrated for tier-1 liquidity (BTC/ETH-class). If the user is in
+    // dynamic universe mode -- which scans the full tradable crypto list,
+    // including long-tail alts with 50-200 bps spreads and sparse quotes --
+    // those gates will reject everything except the handful of liquid pairs,
+    // and the bot will never enter. This check is the signature that this
+    // user hit in production (0/33 scans entered for hours). Surface it loudly
+    // at startup so the next deploy's log makes the mismatch obvious.
+    const entryGateSpreadMaxBps = parseFiniteNumberEnv('SPREAD_MAX_BPS', 30);
+    const entryGateQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_QUOTE_MAX_AGE_MS', 60000);
+    if (runtimeSummary.entryUniverseModeEffective === 'dynamic') {
+      const tightSpread = entryGateSpreadMaxBps <= 35;
+      const tightQuote = entryGateQuoteMaxAgeMs <= 20000;
+      if (tightSpread || tightQuote) {
+        console.warn('config_warning', {
+          field: 'ENTRY_UNIVERSE_MODE',
+          message:
+            'Dynamic universe mode with tier-1-tight entry gates will reject most long-tail symbols and starve entries. '
+            + 'Either set ENTRY_UNIVERSE_MODE=configured (recommended) or relax SPREAD_MAX_BPS / ENTRY_QUOTE_MAX_AGE_MS.',
+          entryUniverseModeEffective: runtimeSummary.entryUniverseModeEffective,
+          spreadMaxBps: entryGateSpreadMaxBps,
+          entryQuoteMaxAgeMs: entryGateQuoteMaxAgeMs,
+          tightSpread,
+          tightQuote,
+        });
+      }
+    }
+
     console.log('config_guardrails', {
       regime: {
         maxSpreadBps: regimeMaxSpreadBps,
