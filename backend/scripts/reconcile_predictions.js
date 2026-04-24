@@ -29,6 +29,10 @@ const fs = require('fs');
 const path = require('path');
 
 const TARGET_NET_PROFIT_BPS = 50;
+// Gross move a filled winner realises: TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP.
+// Used to convert the entry-time OLS slope (bps/minute) into "minutes the signal
+// implied the limit should fill in" = GROSS_TARGET_BPS / slopeBpsPerBar.
+const GROSS_TARGET_BPS = 110;
 
 function parseArgs(argv) {
   const out = { dataDir: null, since: null, json: false, help: false };
@@ -107,6 +111,18 @@ function mean(xs) {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
 }
 
+// Linear-interpolated quantile. q in [0, 1].
+function quantile(xs, q) {
+  const arr = xs.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (!arr.length) return null;
+  if (arr.length === 1) return arr[0];
+  const pos = (arr.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return arr[lo];
+  return arr[lo] + (arr[hi] - arr[lo]) * (pos - lo);
+}
+
 function bucketIndex(prob, buckets = 10) {
   if (!Number.isFinite(prob)) return null;
   const idx = Math.min(buckets - 1, Math.max(0, Math.floor(prob * buckets)));
@@ -163,6 +179,11 @@ function reconcile({ forensics, closedRows }) {
           rec.expectedMoveBps
           ?? closed?.predictedExpectedMoveBps
           ?? null,
+        predictedSlopeBpsPerBar:
+          rec.slopeBpsPerBar
+          ?? closed?.predictedSlopeBpsPerBar
+          ?? null,
+        holdSeconds: closed?.holdSeconds ?? rec.holdSeconds ?? null,
         realizedNetBps:
           rec.realizedNetBps
           ?? closed?.realizedNetBps
@@ -182,6 +203,8 @@ function reconcile({ forensics, closedRows }) {
       predictedFillProbability: closed.predictedFillProbability ?? null,
       predictedNetEdgeBps: closed.predictedNetEdgeBps ?? null,
       predictedExpectedMoveBps: closed.predictedExpectedMoveBps ?? null,
+      predictedSlopeBpsPerBar: closed.predictedSlopeBpsPerBar ?? null,
+      holdSeconds: closed.holdSeconds ?? null,
       realizedNetBps: closed.realizedNetBps ?? null,
       isClosed: true,
     });
@@ -246,6 +269,57 @@ function reconcile({ forensics, closedRows }) {
     };
   });
 
+  // Time-to-fill calibration. The entry signal's projected-minutes-to-fill is
+  // GROSS_TARGET_BPS / slopeBpsPerBar (1m bars -> minutes). Compare against the
+  // actual time the position took to close. Ratio >> 1 means the signal's
+  // implied horizon was much shorter than reality -- i.e., fillProbability is
+  // over-promising the payoff timing. This is the probability-vs-payoff
+  // mismatch made concrete.
+  //
+  // Only closed trades with a positive slope and a recorded holdSeconds
+  // contribute. Open positions are excluded -- their "actual" time-to-fill is
+  // still unknown, so including them would understate the true ratio.
+  const timeToFillSamples = [];
+  for (const t of trades) {
+    if (!t.isClosed) continue;
+    const slope = Number(t.predictedSlopeBpsPerBar);
+    const hold = Number(t.holdSeconds);
+    if (!Number.isFinite(slope) || slope <= 0) continue;
+    if (!Number.isFinite(hold) || hold < 0) continue;
+    const impliedMinutes = GROSS_TARGET_BPS / slope;
+    const actualMinutes = hold / 60;
+    const ratio = impliedMinutes > 0 ? actualMinutes / impliedMinutes : null;
+    if (!Number.isFinite(ratio)) continue;
+    timeToFillSamples.push({
+      tradeId: t.tradeId,
+      symbol: t.symbol,
+      slopeBpsPerBar: slope,
+      impliedMinutes,
+      actualMinutes,
+      ratio,
+    });
+  }
+  const ratios = timeToFillSamples.map((s) => s.ratio);
+  const impliedMinutesList = timeToFillSamples.map((s) => s.impliedMinutes);
+  const actualMinutesList = timeToFillSamples.map((s) => s.actualMinutes);
+  // Bucket thresholds: <1.5x implied = on-model; 1.5-3x = stretched; >=3x =
+  // over-promised. These are readable operational cutoffs, not a statistical
+  // claim -- they make "how far off is the predictor" visible at a glance.
+  const bucketOnModel = ratios.filter((r) => r < 1.5).length;
+  const bucketStretched = ratios.filter((r) => r >= 1.5 && r < 3).length;
+  const bucketOverPromised = ratios.filter((r) => r >= 3).length;
+  const timeToFill = {
+    samples: timeToFillSamples.length,
+    medianImpliedMinutes: quantile(impliedMinutesList, 0.5),
+    medianActualMinutes: quantile(actualMinutesList, 0.5),
+    medianRatio: quantile(ratios, 0.5),
+    p25Ratio: quantile(ratios, 0.25),
+    p75Ratio: quantile(ratios, 0.75),
+    bucketOnModel,
+    bucketStretched,
+    bucketOverPromised,
+  };
+
   return {
     totals: {
       submitted,
@@ -257,6 +331,7 @@ function reconcile({ forensics, closedRows }) {
     },
     calibration,
     breakEven,
+    timeToFill,
   };
 }
 
@@ -302,12 +377,32 @@ function renderText(summary) {
     );
   }
   lines.push('');
+  const tt = summary.timeToFill || {};
+  lines.push('Time-to-fill calibration (closed trades with recorded slope)');
+  if (!tt.samples) {
+    lines.push('  (no closed trades with slopeBpsPerBar recorded yet)');
+  } else {
+    lines.push(`  samples:                     ${tt.samples}`);
+    lines.push(`  median implied minutes:      ${fmtNum(tt.medianImpliedMinutes, 1)}`);
+    lines.push(`  median actual minutes:       ${fmtNum(tt.medianActualMinutes, 1)}`);
+    lines.push(`  ratio actual/implied P25:    ${fmtNum(tt.p25Ratio)}`);
+    lines.push(`  ratio actual/implied median: ${fmtNum(tt.medianRatio)}`);
+    lines.push(`  ratio actual/implied P75:    ${fmtNum(tt.p75Ratio)}`);
+    const pct = (n) => tt.samples ? fmtPct(n / tt.samples, 0) : '—';
+    lines.push(`  on-model  (ratio <1.5):      ${String(tt.bucketOnModel).padStart(3)}  (${pct(tt.bucketOnModel)})`);
+    lines.push(`  stretched (1.5 <= r < 3):    ${String(tt.bucketStretched).padStart(3)}  (${pct(tt.bucketStretched)})`);
+    lines.push(`  over-promised (r >= 3):      ${String(tt.bucketOverPromised).padStart(3)}  (${pct(tt.bucketOverPromised)})`);
+  }
+  lines.push('');
   lines.push('Notes:');
   lines.push('  - Closed rows assume TP_LIMIT exits at +TARGET_NET_PROFIT_BPS (50 bps net).');
   lines.push('  - "Still open" positions have no realised price yet; the break-even');
   lines.push('    table lets you see expectancy under a range of eventual loss');
   lines.push('    assumptions. With no stop-loss, the actual loss tail is unbounded.');
   lines.push('  - Calibration gap > 0 means the predictor is OVER-confident in that bucket.');
+  lines.push('  - Time-to-fill implied = GROSS_TARGET_BPS / slopeBpsPerBar (minutes if the');
+  lines.push('    observed slope held). Ratio >> 1 means the signal horizon was much shorter');
+  lines.push('    than the realised fill time. Excludes still-open positions.');
   return lines.join('\n');
 }
 
@@ -354,7 +449,7 @@ Options:
   console.log(renderText(summary));
 }
 
-module.exports = { reconcile, foldForensics, bucketIndex, bucketLabel };
+module.exports = { reconcile, foldForensics, bucketIndex, bucketLabel, quantile, GROSS_TARGET_BPS };
 
 if (require.main === module) {
   main();

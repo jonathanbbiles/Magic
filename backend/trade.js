@@ -1362,6 +1362,7 @@ async function reconcileExits() {
           predictedProjectedBps: pred.prediction?.projectedBps ?? null,
           predictedFillProbability: pred.prediction?.fillProbability ?? null,
           predictedSlopeTStat: pred.prediction?.slopeTStat ?? null,
+          predictedSlopeBpsPerBar: pred.prediction?.slopeBpsPerBar ?? null,
           realizedGrossBps: grossBps,
           realizedNetBps: netBps,
         });
