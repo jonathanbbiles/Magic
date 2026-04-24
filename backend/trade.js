@@ -94,7 +94,7 @@ const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
 // slippage buffers) to clear this bar before we submit a buy. Entry-only —
 // sell behavior is unchanged.
 const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
-const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 20);
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 10);
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
 
@@ -1032,12 +1032,21 @@ async function scanAndEnter() {
       const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
       const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
       const fillProbability = slopeProbability(sig.slopeTStat);
+      // Gate costs: fees (60 bps round-trip) are always paid when both legs
+      // fill. Entry slippage (5 bps) is real — buy limits can lift into the
+      // book. Exit slippage is zero: the exit is a pre-placed GTC maker limit
+      // at entry * 1.0110, which fills at that exact price or not at all.
+      // Adverse spread cost is zero for gate purposes: the exit limit is set
+      // relative to the ask we paid, so realised gross on fill is exactly
+      // GROSS_TARGET_BPS independent of spread. Spread's real effect is on
+      // fill probability (wider spread -> less likely to reach the limit),
+      // which fillProbability already captures via the slope t-stat.
       const edge = computeNetEdgeBps({
         expectedMoveBps,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
         entrySlippageBufferBps: ENTRY_SLIPPAGE_BPS,
-        exitSlippageBufferBps: EXIT_SLIPPAGE_BPS,
-        adverseSpreadCostBps: spreadBps,
+        exitSlippageBufferBps: 0,
+        adverseSpreadCostBps: 0,
         fillProbability,
       });
       const netEdgeBps = edge.netEdgeBps;
