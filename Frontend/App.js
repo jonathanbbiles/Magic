@@ -3,7 +3,6 @@ import Constants from 'expo-constants';
 import {
   ActivityIndicator,
   AppState,
-  FlatList,
   Platform,
   Pressable,
   RefreshControl,
@@ -389,7 +388,6 @@ function LogsPanel({ logsRef, appActiveRef }) {
   const [filter, setFilter] = useState('all');
   const [logError, setLogError] = useState(null);
   const lastTsRef = useRef(0);
-  const scrollRef = useRef(null);
 
   // Expose logs to parent via ref for the combined copy bundle
   useEffect(() => {
@@ -1032,14 +1030,12 @@ const s = StyleSheet.create({
   filterChipText: { color: theme.colors.secondary, fontSize: 11, fontWeight: '700' },
   filterChipTextActive: { color: '#fff' },
   logsScrollInline: {
-    maxHeight: 400,
     backgroundColor: theme.colors.surface,
     borderRadius: theme.radius.md,
     borderWidth: 1,
     borderColor: theme.colors.border,
     padding: theme.spacing.sm,
     marginBottom: theme.spacing.sm,
-    overflow: 'scroll',
   },
   logsEmpty: { color: theme.colors.muted, fontSize: 12, padding: 16, textAlign: 'center' },
   logLine: { fontSize: 11, lineHeight: 16, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },

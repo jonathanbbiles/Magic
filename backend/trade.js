@@ -17,7 +17,6 @@
 
 const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
-const { computeNetEdgeBps } = require('./modules/tradeGuards');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -1023,33 +1022,31 @@ async function scanAndEnter() {
       }
 
       // Probability-weighted expected net edge. Does not alter sell pricing —
-      // this only gates entry. expectedMoveBps is the uncapped projection
-      // capped at the actual sell limit, because we can't realise more than
-      // that anyway. fillProbability is the logistic CDF of the OLS slope
-      // t-statistic (principled replacement for the old 0.5+0.5*R^2 proxy);
-      // no floor clamp — the gate itself is the real threshold, and a clamp
-      // would inflate low-signal probabilities dishonestly.
+      // this only gates entry. fillProbability is the logistic CDF of the OLS
+      // slope t-statistic (principled replacement for the old 0.5+0.5*R^2
+      // proxy); no floor clamp — the gate itself is the real threshold.
+      //
+      // Realized P&L per buy submission (matches reconcile script's model):
+      //   - exit limit fills (prob ≈ fillProbability):
+      //       net = TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS
+      //     The exit limit is placed at entry × (1 + GROSS_TARGET_BPS/10000),
+      //     which already covers round-trip fees, so the per-win realised net
+      //     is TARGET_NET_PROFIT_BPS by construction — independent of how big
+      //     the slope projection was.
+      //   - exit limit does not fill (prob ≈ 1 − fillProbability):
+      //       net = 0  (position sits, capital tied up but no realised loss).
+      //
+      // Therefore E[net] = fillProbability × (TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS).
+      // The previous formula subtracted fees unconditionally outside the
+      // probability multiplication, which double-counted them (they were
+      // already netted out of TARGET_NET_PROFIT_BPS) and pushed the gate's
+      // breakeven fill probability up to ~0.68 — a t-stat threshold rare
+      // enough that it was blocking nearly every candidate.
       const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
       const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
       const fillProbability = slopeProbability(sig.slopeTStat);
-      // Gate costs: fees (60 bps round-trip) are always paid when both legs
-      // fill. Entry slippage (5 bps) is real — buy limits can lift into the
-      // book. Exit slippage is zero: the exit is a pre-placed GTC maker limit
-      // at entry * 1.0110, which fills at that exact price or not at all.
-      // Adverse spread cost is zero for gate purposes: the exit limit is set
-      // relative to the ask we paid, so realised gross on fill is exactly
-      // GROSS_TARGET_BPS independent of spread. Spread's real effect is on
-      // fill probability (wider spread -> less likely to reach the limit),
-      // which fillProbability already captures via the slope t-stat.
-      const edge = computeNetEdgeBps({
-        expectedMoveBps,
-        feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        entrySlippageBufferBps: ENTRY_SLIPPAGE_BPS,
-        exitSlippageBufferBps: 0,
-        adverseSpreadCostBps: 0,
-        fillProbability,
-      });
-      const netEdgeBps = edge.netEdgeBps;
+      const realizedWinBps = Math.max(0, TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS);
+      const netEdgeBps = realizedWinBps * fillProbability;
 
       if (NET_EDGE_GATE_ENABLED) {
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
