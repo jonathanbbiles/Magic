@@ -376,13 +376,12 @@ const expectedEdge = computeExpectedNetEdgeBps({
 });
 assert.equal(expectedEdge.expectedNetEdgeBps, 51);
 
-// Pins the live entry-gate math. trade.js calls computeNetEdgeBps with
-// exitSlippageBufferBps: 0 and adverseSpreadCostBps: 0 -- the exit is a GTC
-// maker limit (no slippage) and spread is already baked into the entry price.
-// Under TARGET_NET_PROFIT_BPS=50 + FEE_BPS_ROUND_TRIP=60 (GROSS_TARGET_BPS=110)
-// with ENTRY_SLIPPAGE_BPS=5 and MIN_NET_EDGE_BPS=10 the breakeven fill
-// probability for the gate is (10 + 60 + 5) / 110 = 0.6818... Verify that
-// realistic probabilities cross the gate and weak ones do not.
+// Algebraic regression on computeNetEdgeBps. Note: trade.js no longer uses
+// this function for the live entry gate -- it switched to the conditional
+// model fillProbability * (TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS) after
+// recognising that the unconditional fee subtraction here double-counts fees
+// that are only paid when both legs fill. These assertions just pin the
+// arithmetic of the shared utility for any other caller.
 const liveGateBelowThreshold = computeNetEdgeBps({
   expectedMoveBps: 110,
   feeBpsRoundTrip: 60,
@@ -391,7 +390,7 @@ const liveGateBelowThreshold = computeNetEdgeBps({
   adverseSpreadCostBps: 0,
   fillProbability: 0.68,
 });
-// (110 * 0.68) - 60 - 5 - 0 = 9.8, just under MIN_NET_EDGE_BPS = 10.
+// (110 * 0.68) - 60 - 5 - 0 = 9.8.
 assert.ok(liveGateBelowThreshold.netEdgeBps < 10);
 
 const liveGateAboveThreshold = computeNetEdgeBps({
@@ -402,13 +401,11 @@ const liveGateAboveThreshold = computeNetEdgeBps({
   adverseSpreadCostBps: 0,
   fillProbability: 0.73,
 });
-// (110 * 0.73) - 60 - 5 - 0 = 15.3, clears MIN_NET_EDGE_BPS = 10.
+// (110 * 0.73) - 60 - 5 - 0 = 15.3.
 assert.ok(liveGateAboveThreshold.netEdgeBps >= 10);
 
-// Regression guard: if the caller ever re-adds exit slippage or adverse
-// spread, the required fillProbability for the same expected move jumps
-// sharply. Assert the current zero-cost configuration delivers an edge the
-// old configuration (10 bps exit slip + 15 bps spread) would not.
+// Re-adding exit slippage or adverse-spread cost subtracts more, lowering
+// netEdgeBps for the same expected move and fill probability.
 const oldGateSameInputs = computeNetEdgeBps({
   expectedMoveBps: 110,
   feeBpsRoundTrip: 60,
