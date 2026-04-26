@@ -1048,6 +1048,18 @@ async function scanAndEnter() {
       const realizedWinBps = Math.max(0, TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS);
       const netEdgeBps = realizedWinBps * fillProbability;
 
+      // Directional sanity check. The EV gate below multiplies a fixed
+      // realised-win bps by fillProbability = logistic_cdf(slopeTStat). For a
+      // small-magnitude negative t-stat, fillProbability lands near 0.45 and
+      // the EV product can still clear MIN_NET_EDGE_BPS — i.e. the gate would
+      // submit a long even when the OLS fit predicts a downward move (CRV/USD
+      // production case: slopeTStat=-0.18, expectedMoveBps=-0.92, netEdge=20).
+      // Block long entries when the 1m model predicts down (or flat).
+      if (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0) {
+        bumpSkipReason('slope_not_positive');
+        continue;
+      }
+
       if (NET_EDGE_GATE_ENABLED) {
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
           bumpSkipReason('net_edge_below_min');
