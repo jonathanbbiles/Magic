@@ -8,7 +8,7 @@
 //      GTC limit BUY at the current ask.
 //   4. When the buy fills, submit ONE GTC limit SELL at
 //      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
-//      so the user's +0.5% target is AFTER Alpaca's round-trip fees.
+//      so the user's +0.25% target is AFTER Alpaca's round-trip fees.
 //   5. Never touch the position again. No stop-loss, no max-hold, no force
 //      exits. If a trade sits, it sits. The entry math is the only gate.
 //
@@ -40,11 +40,12 @@ function readBoolean(name, fallback) {
 
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
-// +50 bps (0.5%) target is AFTER fees, not before.
-const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 50));
-// Round-trip Alpaca crypto fees, in basis points. Added to the target so the
-// sell limit is set above true break-even.
-const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 60));
+// +25 bps (0.25%) target is AFTER fees, not before.
+const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 25));
+// Round-trip Alpaca crypto fees, in basis points. Default reflects taker
+// entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
+// above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
+const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 40));
 // Gross upward move the sell limit requires above entry.
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
