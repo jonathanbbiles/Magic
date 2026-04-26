@@ -28,11 +28,11 @@
 const fs = require('fs');
 const path = require('path');
 
-const TARGET_NET_PROFIT_BPS = 50;
+const TARGET_NET_PROFIT_BPS = 25;
 // Gross move a filled winner realises: TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP.
 // Used to convert the entry-time OLS slope (bps/minute) into "minutes the signal
 // implied the limit should fill in" = GROSS_TARGET_BPS / slopeBpsPerBar.
-const GROSS_TARGET_BPS = 110;
+const GROSS_TARGET_BPS = 65;
 
 function parseArgs(argv) {
   const out = { dataDir: null, since: null, json: false, help: false };
@@ -395,7 +395,7 @@ function renderText(summary) {
   }
   lines.push('');
   lines.push('Notes:');
-  lines.push('  - Closed rows assume TP_LIMIT exits at +TARGET_NET_PROFIT_BPS (50 bps net).');
+  lines.push('  - Closed rows assume TP_LIMIT exits at +TARGET_NET_PROFIT_BPS (25 bps net).');
   lines.push('  - "Still open" positions have no realised price yet; the break-even');
   lines.push('    table lets you see expectancy under a range of eventual loss');
   lines.push('    assumptions. With no stop-loss, the actual loss tail is unbounded.');
