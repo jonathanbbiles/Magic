@@ -52,7 +52,13 @@ const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 40));
 // Gross upward move the sell limit requires above entry.
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
-const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 20));
+// The gate requires GROSS_TARGET_BPS >= spread + FEE_BPS_ROUND_TRIP + buffer,
+// which simplifies to spread <= TARGET_NET_PROFIT_BPS - PROFIT_BUFFER_BPS.
+// With TARGET=25 and buffer=5, the effective spread headroom is 20 bps —
+// inside the explicit SPREAD_MAX_BPS=30 hard cap, while letting the full
+// 6-pair universe (not just BTC) clear the gate during normal book conditions.
+// MIN_NET_EDGE_BPS remains the real EV filter on top of this.
+const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 5));
 // Fraction of account equity to deploy per trade (e.g. 0.10 = 10%).
 const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10));
 // Floor below which we won't send a buy (dust). Alpaca's crypto min notional

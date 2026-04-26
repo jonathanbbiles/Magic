@@ -103,7 +103,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | --- | --- | --- |
 | `TARGET_NET_PROFIT_BPS` | `25` | Net profit target after fees (25 bps = 0.25%). |
 | `FEE_BPS_ROUND_TRIP` | `40` | Assumed Alpaca round-trip: ~25 bps taker entry + ~15 bps maker exit. |
-| `PROFIT_BUFFER_BPS` | `20` | Cushion used in entry edge gate. |
+| `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 25 bps target the effective entry spread headroom is 20 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
 | `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
