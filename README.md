@@ -10,8 +10,9 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture **0.25% net profit** per trade after fees.
+- Recycle stuck positions: if the take-profit doesn't fill within 2 minutes, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
-- Never carry catastrophic risk via leverage, panic exits, or stop-out cascades — at the explicit cost of letting a losing trade sit indefinitely until it recovers or is closed manually.
+- Concurrency is bounded by available cash, not a fixed slot count.
 
 ---
 
@@ -25,9 +26,11 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    With current defaults (25 bps net + 40 bps fees) that's `entry × 1.0065`.
-5. **Walk away.** No stop-loss, no max-hold, no force-exit. If the limit doesn't fill, the position sits.
+5. **2-minute break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 120 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
 
-That's the entire strategy. Everything else in the codebase is plumbing, telemetry, and safety rails around those five steps.
+There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
+
+Everything else in the codebase is plumbing, telemetry, and safety rails around those five steps.
 
 ---
 
@@ -103,8 +106,8 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `PROFIT_BUFFER_BPS` | `20` | Cushion used in entry edge gate. |
 | `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
-| `MAX_CONCURRENT_POSITIONS` | `10` | Hard cap on simultaneous open positions. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
+| `BREAKEVEN_TIMEOUT_MS` | `120000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Floor: 30 000. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
 
@@ -160,14 +163,13 @@ See `.github/workflows/ci.yml`.
 
 ## What the bot does NOT do (intentional)
 
-- **No stop-loss.** A losing position sits until price recovers or an operator closes it manually.
-- **No max-hold or time-based exit.** Limits are GTC; they sit forever.
+- **No stop-loss.** A position never closes below break-even-after-fees. If the price drops below entry and stays there, the break-even sell stays parked until the price comes back.
 - **No leverage.**
 - **No averaging down or pyramiding.**
 - **No cross-symbol correlation guard.** The 6-pair primary universe can become 6× long the same beta.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
-If you want any of these, they need to be built. Don't assume a knob in `.env.example` is wired until you confirm.
+The 2-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
 
 ---
 

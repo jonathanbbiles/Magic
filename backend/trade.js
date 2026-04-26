@@ -9,8 +9,11 @@
 //   4. When the buy fills, submit ONE GTC limit SELL at
 //      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
 //      so the user's +0.25% target is AFTER Alpaca's round-trip fees.
-//   5. Never touch the position again. No stop-loss, no max-hold, no force
-//      exits. If a trade sits, it sits. The entry math is the only gate.
+//   5. If the take-profit doesn't fill within BREAKEVEN_TIMEOUT_MS (default
+//      2 minutes from when the position was first observed), cancel the GTC
+//      sell and replace it with a sell at break-even-after-fees
+//      (entry * (1 + FEE_BPS_ROUND_TRIP/10000)). That guarantees zero net
+//      profit but recycles the slot so the engine keeps trading.
 //
 // This module also exposes every HTTP wrapper + snapshot getter that
 // backend/index.js imports, so the dashboard/frontend contract is preserved.
@@ -56,8 +59,15 @@ const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10
 // is typically $1; keep a small default so the last slot can still fill even
 // when cash has drifted just under 10% of equity.
 const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD', 1));
-// Max simultaneous open positions.
-const MAX_CONCURRENT_POSITIONS = Math.max(1, readNumber('MAX_CONCURRENT_POSITIONS', 10));
+// Concurrency is now bounded by available cash, not a fixed slot count: the
+// engine opens as many positions as PORTFOLIO_SIZING_PCT of equity will fund,
+// one per symbol. There is intentionally no MAX_CONCURRENT_POSITIONS cap.
+
+// If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
+// being first observed, cancel the TP and replace it at break-even-after-fees
+// so the slot recycles. Default 2 minutes; floor at 30 s to stay above broker
+// round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 120000));
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -914,27 +924,19 @@ async function scanAndEnter() {
     return;
   }
 
+  // One concurrent position per symbol; total concurrency is bounded only by
+  // available cash (clamped below by MIN_TRADE_NOTIONAL_USD).
   const candidates = universe.filter((pair) => !held.has(pair) && !openBuyPairs.has(pair));
-  const slotsAvailable = Math.max(0, MAX_CONCURRENT_POSITIONS - held.size);
   const summary = {
     ts: new Date().toISOString(),
     universeSize: universe.length,
     heldCount: held.size,
-    slotsAvailable,
+    slotsAvailable: candidates.length,
     evaluated: 0,
     entered: 0,
     topSkipReasons: {},
     acceptedSymbols: [],
   };
-
-  if (slotsAvailable <= 0) {
-    bumpSkipReason('concurrency_cap');
-    summary.topSkipReasons = mapToObject(skipReasonCounts);
-    lastEntryScanSummary = summary;
-    lastEntryScanAt = new Date().toISOString();
-    currentScanState = 'idle';
-    return;
-  }
 
   // Size this scan's trades as PORTFOLIO_SIZING_PCT of current equity, then
   // clamp to available cash so the last slot can still fill when cash has
@@ -977,7 +979,6 @@ async function scanAndEnter() {
 
   let placed = 0;
   for (const pair of candidates) {
-    if (placed >= slotsAvailable) break;
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
@@ -1192,9 +1193,9 @@ async function getConcurrencyGuardStatus() {
     openPositions,
     openOrders,
     activeSlotsUsed: openPositions.length,
-    capMaxEnv: MAX_CONCURRENT_POSITIONS,
-    capMaxEffective: MAX_CONCURRENT_POSITIONS,
-    capEnabled: true,
+    capMaxEnv: null,
+    capMaxEffective: null,
+    capEnabled: false,
     lastScanAt: lastEntryScanAt,
   };
 }
@@ -1255,6 +1256,8 @@ async function reconcileExits() {
     if (openSellByPair.has(pair)) {
       const existing = openSellByPair.get(pair);
       const limit = Number(existing?.limit_price);
+      const priorState = exitState.get(pair) || {};
+      const breakevenAttachedPrior = priorState.breakevenAttached === true;
       exitState.set(pair, {
         sellOrderId: existing.id || null,
         sellOrderLimit: Number.isFinite(limit) ? limit : null,
@@ -1263,23 +1266,83 @@ async function reconcileExits() {
         expectedOpenSell: true,
         brokerOpenSellFound: true,
         brokerOpenSellQty: Number(existing.qty) || qty,
-        reconciliationState: 'open_sell_found',
-        lastReconciliationAction: 'existing_sell_seen',
+        reconciliationState: breakevenAttachedPrior ? 'breakeven_attached' : 'open_sell_found',
+        lastReconciliationAction: breakevenAttachedPrior ? 'breakeven_sell_seen' : 'existing_sell_seen',
         targetPriceSource: 'open_orders',
         entryPriceUsed: Number.isFinite(avg) ? avg : null,
-        expectedNetProfitBps: TARGET_NET_PROFIT_BPS,
-        minNetProfitBps: TARGET_NET_PROFIT_BPS,
-        desiredNetExitBps: GROSS_TARGET_BPS,
+        expectedNetProfitBps: breakevenAttachedPrior ? 0 : TARGET_NET_PROFIT_BPS,
+        minNetProfitBps: breakevenAttachedPrior ? 0 : TARGET_NET_PROFIT_BPS,
+        desiredNetExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        requiredExitBpsGross: GROSS_TARGET_BPS,
-        requiredExitBps: GROSS_TARGET_BPS,
+        requiredExitBpsGross: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
+        requiredExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
         trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         profitabilityFloorPrice: Number.isFinite(avg) ? avg * (1 + (FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS) / 10000) : null,
         lastSeenOpenSellAt: new Date().toISOString(),
+        breakevenAttached: breakevenAttachedPrior,
+        breakevenAttachedAt: priorState.breakevenAttachedAt || null,
       });
       entryIntentState.set(pair, { state: 'managing', createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString(), rejectionReason: null });
       pendingBuys.delete(pair);
+
+      // Break-even reset: if the take-profit has been parked for at least
+      // BREAKEVEN_TIMEOUT_MS without filling, cancel it and replace with a
+      // sell at entry * (1 + FEE_BPS_ROUND_TRIP/10000). Net PnL = 0 after
+      // fees, slot recycles. Runs at most once per position.
+      if (!breakevenAttachedPrior && Number.isFinite(avg) && avg > 0 && existing?.id) {
+        const firstSeen = positionFirstSeenAt.get(pair);
+        const ageMs = Number.isFinite(firstSeen) ? Date.now() - firstSeen : 0;
+        if (ageMs >= BREAKEVEN_TIMEOUT_MS) {
+          try {
+            await cancelOrder(existing.id);
+            const breakevenPrice = avg * (1 + FEE_BPS_ROUND_TRIP / 10000);
+            const tickInfo = await getAssetTickInfo(pair);
+            const limitStr = formatTickPrice(breakevenPrice, tickInfo.priceIncrement);
+            if (limitStr) {
+              const sellResult = await submitOrder({
+                symbol: pair,
+                side: 'sell',
+                type: 'limit',
+                time_in_force: 'gtc',
+                qty: String(qty),
+                limit_price: limitStr,
+              });
+              const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
+              const submittedAt = sellOrder?.submitted_at || new Date().toISOString();
+              exitState.set(pair, {
+                ...exitState.get(pair),
+                sellOrderId: sellOrder?.id || null,
+                sellOrderLimit: breakevenPrice,
+                targetPrice: breakevenPrice,
+                sellOrderSubmittedAt: submittedAt,
+                reconciliationState: 'breakeven_attached',
+                lastReconciliationAction: 'breakeven_replace',
+                targetPriceSource: 'breakeven_replace',
+                expectedNetProfitBps: 0,
+                minNetProfitBps: 0,
+                desiredNetExitBps: FEE_BPS_ROUND_TRIP,
+                requiredExitBpsGross: FEE_BPS_ROUND_TRIP,
+                requiredExitBps: FEE_BPS_ROUND_TRIP,
+                breakevenAttached: true,
+                breakevenAttachedAt: submittedAt,
+                lastSeenOpenSellAt: submittedAt,
+              });
+              lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'breakeven_replace', orderId: sellOrder?.id || null };
+              console.log('exit_breakeven_replace', {
+                symbol: pair,
+                breakevenPrice,
+                ageSeconds: Math.round(ageMs / 1000),
+                cancelledOrderId: existing.id,
+                newOrderId: sellOrder?.id || null,
+              });
+            }
+          } catch (err) {
+            lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'breakeven_replace_failed', message: err?.errorMessage || err?.message || String(err) };
+            console.warn('exit_breakeven_failed', { symbol: pair, error: err?.errorMessage || err?.message });
+          }
+        }
+      }
       continue;
     }
 
@@ -1356,6 +1419,7 @@ async function reconcileExits() {
       const grossPnlUsd = (grossBps * notional) / 10000;
       const netPnlUsd = (netBps * notional) / 10000;
       const holdSeconds = Math.max(0, (Date.now() - Number(pred.submittedAt || 0)) / 1000);
+      const exitReason = state?.breakevenAttached ? 'breakeven_limit' : 'tp_limit';
       try {
         closedTradeStats.append({
           tradeId: pred.tradeId,
@@ -1365,7 +1429,7 @@ async function reconcileExits() {
           holdSeconds,
           entrySpreadBps: pred.prediction?.spreadBps ?? null,
           entryQuoteAgeMs: pred.prediction?.quoteAgeMs ?? null,
-          exitReason: 'tp_limit',
+          exitReason,
           // Predicted vs realised — the whole point of #6:
           predictedNetEdgeBps: pred.prediction?.netEdgeBps ?? null,
           predictedExpectedMoveBps: pred.prediction?.expectedMoveBps ?? null,
@@ -1383,7 +1447,7 @@ async function reconcileExits() {
         tradeForensics.update(pred.tradeId, {
           phase: 'closed',
           closedAt,
-          exitReason: 'tp_limit',
+          exitReason,
           realizedGrossBps: grossBps,
           realizedNetBps: netBps,
           realizedGrossPnlUsd: grossPnlUsd,
@@ -1398,6 +1462,7 @@ async function reconcileExits() {
         tradeId: pred.tradeId,
         grossBps: grossBps.toFixed(2),
         netBps: netBps.toFixed(2),
+        exitReason,
         predictedNetEdgeBps: pred.prediction?.netEdgeBps,
         holdSeconds: holdSeconds.toFixed(0),
       });
