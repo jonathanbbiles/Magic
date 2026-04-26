@@ -74,10 +74,9 @@ const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS
 const EXIT_SCAN_INTERVAL_MS = Math.max(5000, readNumber('EXIT_SCAN_INTERVAL_MS', 15000));
 // Trading master switch.
 const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
-// Quote staleness cutoff (ms).
-// Note: we intentionally ignore runtimeConfig.entryQuoteMaxAgeMs because the
-// legacy config module hard-codes 15s, which is too tight for low-volume
-// Alpaca crypto pairs. Env var still overrides.
+// Quote staleness cutoff (ms). Default of 60s matches the README and
+// LIVE_CRITICAL_DEFAULTS; tighter values starve entries on low-volume Alpaca
+// crypto pairs.
 const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 60000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
