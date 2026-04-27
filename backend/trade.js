@@ -525,33 +525,6 @@ async function loadSupportedCryptoPairs() {
 
 function getSupportedCryptoPairsSnapshot() { return supportedPairsSnapshot; }
 
-// Resolve the symbol list the scanner should iterate this tick. In
-// `configured` mode (production-safe per README), restrict to
-// ENTRY_SYMBOLS_PRIMARY (+ secondary if opted in) intersected with Alpaca's
-// tradable list — this prevents the scanner from spraying gates over 30+
-// long-tail alts where stale quotes and 30+ bps spreads dominate. In
-// `dynamic` mode, fall back to everything Alpaca returns.
-function buildScanUniverse() {
-  const tradable = supportedPairsSnapshot.pairs || [];
-  if (runtimeConfig.entryUniverseModeEffective !== 'configured') {
-    return tradable.slice();
-  }
-  const allowed = new Set(tradable);
-  const seen = new Set();
-  const out = [];
-  const push = (pair) => {
-    if (!pair || seen.has(pair)) return;
-    if (allowed.size && !allowed.has(pair)) return;
-    seen.add(pair);
-    out.push(pair);
-  };
-  (runtimeConfig.configuredPrimarySymbols || []).forEach(push);
-  if (runtimeConfig.entrySymbolsIncludeSecondary) {
-    (runtimeConfig.configuredSecondarySymbols || []).forEach(push);
-  }
-  return out;
-}
-
 function filterSupportedCryptoSymbols(symbols) {
   const allowed = new Set(supportedPairsSnapshot.pairs || []);
   if (!allowed.size) return normalizeSymbolsParam(symbols);
@@ -846,23 +819,20 @@ function getEntryDiagnosticsSnapshot() {
 }
 
 function getUniverseDiagnosticsSnapshot() {
-  const tradable = supportedPairsSnapshot.pairs || [];
-  const scanned = buildScanUniverse();
-  const effectiveMode = runtimeConfig.entryUniverseModeEffective || 'dynamic';
-  const dynamicActive = effectiveMode !== 'configured';
+  const pairs = supportedPairsSnapshot.pairs || [];
   return {
     envRequestedUniverseMode: runtimeConfig.entryUniverseModeRaw || 'dynamic',
-    effectiveUniverseMode: effectiveMode,
-    dynamicUniverseActive: dynamicActive,
-    dynamicTradableSymbolsFound: tradable.length,
-    rankedAcceptedSymbolsCount: scanned.length,
-    acceptedSymbolsCount: scanned.length,
-    dynamicAcceptedSymbolsCount: dynamicActive ? scanned.length : 0,
-    scanSymbolsCount: scanned.length,
-    rankedAcceptedSymbolsSample: scanned.slice(0, 10),
-    acceptedSymbolsSample: scanned.slice(0, 10),
-    dynamicAcceptedSymbolsSample: dynamicActive ? scanned.slice(0, 10) : [],
-    scanSymbolsSample: scanned.slice(0, 10),
+    effectiveUniverseMode: 'dynamic',
+    dynamicUniverseActive: true,
+    dynamicTradableSymbolsFound: pairs.length,
+    rankedAcceptedSymbolsCount: pairs.length,
+    acceptedSymbolsCount: pairs.length,
+    dynamicAcceptedSymbolsCount: pairs.length,
+    scanSymbolsCount: pairs.length,
+    rankedAcceptedSymbolsSample: pairs.slice(0, 10),
+    acceptedSymbolsSample: pairs.slice(0, 10),
+    dynamicAcceptedSymbolsSample: pairs.slice(0, 10),
+    scanSymbolsSample: pairs.slice(0, 10),
     universeSymbolCap: null,
     configuredUniverseCap: null,
     configuredUniverseCapSource: null,
@@ -945,7 +915,11 @@ async function scanAndEnter() {
   skipReasonCounts.clear();
 
   await loadSupportedCryptoPairs();
-  const universe = buildScanUniverse();
+  // Universe = every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
+  // returned by /v2/assets. There is no further filtering on `which symbols
+  // to look at` — only the per-symbol gates inside the loop (spread, quote
+  // freshness, predicted edge, etc.) decide whether to actually trade.
+  const universe = (supportedPairsSnapshot.pairs || []).slice();
   currentScanUniverseSize = universe.length;
 
   let held, openBuyPairs;

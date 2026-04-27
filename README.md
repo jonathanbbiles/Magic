@@ -18,7 +18,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ## The whole strategy in 5 lines
 
-1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the configured Alpaca crypto universe (default: `BTC/USD, ETH/USD, SOL/USD, AVAX/USD, LINK/USD, UNI/USD`).
+1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols. There is intentionally no whitelist or universe cap; the only filter on what the scanner *looks at* is "is this a USD-quoted, non-stablecoin crypto pair tradable on Alpaca?". Per-symbol gates inside the loop (spread, quote freshness, net-edge, etc.) decide whether to actually trade.
 2. For each symbol, fit a linear regression on the last `PREDICT_BARS` (default 20) one-minute closes. Convert the slope's t-statistic to an upward probability via the logistic CDF.
 3. If the symbol clears the spread gate, the higher-timeframe slope filter, and the net-edge gate, place a **GTC limit BUY at the current ask**.
 4. When the buy fills, immediately place **one GTC limit SELL** at:
@@ -128,9 +128,9 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Universe
 | Var | What it does |
 | --- | --- |
-| `ENTRY_UNIVERSE_MODE` | Default `configured` (production-safe). Set to `dynamic` to scan every active Alpaca crypto pair instead of the primary list. In `configured` mode the scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (intersected with Alpaca's tradable list); in `dynamic` mode it scans every pair Alpaca returns. |
-| `ENTRY_SYMBOLS_PRIMARY` | Comma-separated, e.g. `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`. |
-| `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `false`. Set `true` only to intentionally enable dynamic in production. |
+| `ENTRY_UNIVERSE_MODE` | Default `dynamic` — scanner uses **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`. The toggle still exists as an escape hatch: setting it to `configured` restricts the scan to `ENTRY_SYMBOLS_PRIMARY`. **By design there is no universe whitelist beyond "is it crypto on Alpaca?".** |
+| `ENTRY_SYMBOLS_PRIMARY` | Only used when `ENTRY_UNIVERSE_MODE=configured`. Ignored under the default `dynamic` mode. |
+| `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `true` so the production bot can run dynamic without an opt-in. The runtime validator only blocks production startup if mode is `dynamic` AND this flag is `false`. |
 
 ### Toggles
 | Var | Default | What it does |
@@ -166,7 +166,8 @@ See `.github/workflows/ci.yml`.
 - **No stop-loss.** A position never closes below break-even-after-fees. If the price drops below entry and stays there, the break-even sell stays parked until the price comes back.
 - **No leverage.**
 - **No averaging down or pyramiding.**
-- **No cross-symbol correlation guard.** The 6-pair primary universe can become 6× long the same beta.
+- **No universe whitelist.** Default mode is `dynamic`: every active Alpaca crypto pair (USD-quoted, ex-stablecoins) is in scope. Per-symbol gates (spread, quote freshness, predicted edge) decide what actually trades.
+- **No cross-symbol correlation guard.** With 30+ pairs in scope, the engine can become long the same beta on multiple symbols simultaneously.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
 The 2-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
@@ -179,9 +180,9 @@ The production instance runs on Render. Before pointing the bot at a funded acco
 
 1. Set every secret (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `API_TOKEN`) directly in the Render env. Never in git.
 2. `npm run check:runtime-env` to validate config.
-3. Confirm `ENTRY_UNIVERSE_MODE=configured` and `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false` unless dynamic is intentional.
+3. Leave `ENTRY_UNIVERSE_MODE` unset (default `dynamic`) so the scanner uses every active Alpaca crypto pair. Set `ENTRY_UNIVERSE_MODE=configured` only if you want to intentionally restrict the scan to `ENTRY_SYMBOLS_PRIMARY`.
 4. After deploy, `GET /debug/runtime-config` (token-protected) is the source of truth for what the live process actually sees.
-5. Verify `effectiveUniverseMode=configured` and `scanSymbolsCount=6` in the `startup_truth_summary` log line.
+5. Verify `effectiveUniverseMode=dynamic` and `scanSymbolsCount` matches Alpaca's active crypto count (typically 30+) in the `startup_truth_summary` log line.
 
 Operational details, the full env-var reference, and tuning notes live in `backend/README.md`.
 

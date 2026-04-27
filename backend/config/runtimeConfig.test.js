@@ -109,8 +109,8 @@ withEnv({}, () => {
   assert.equal(cfg.sparseStaleToleranceMs, 15000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 5000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 15000);
-  assert.equal(cfg.entryUniverseModeEffective, 'configured');
-  assert.equal(cfg.allowDynamicUniverseInProduction, false);
+  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
+  assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
   assert.equal(summary.entryUniverseMaxSymbols, null);
