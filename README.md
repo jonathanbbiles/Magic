@@ -128,7 +128,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Universe
 | Var | What it does |
 | --- | --- |
-| `ENTRY_UNIVERSE_MODE` | `configured` (production-safe) or `dynamic`. |
+| `ENTRY_UNIVERSE_MODE` | Default `configured` (production-safe). Set to `dynamic` to scan every active Alpaca crypto pair instead of the primary list. In `configured` mode the scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (intersected with Alpaca's tradable list); in `dynamic` mode it scans every pair Alpaca returns. |
 | `ENTRY_SYMBOLS_PRIMARY` | Comma-separated, e.g. `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`. |
 | `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `false`. Set `true` only to intentionally enable dynamic in production. |
 
