@@ -25,6 +25,7 @@ const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 
 const runtimeConfig = getRuntimeConfig(process.env);
+const { computeCorrelationMatrix } = require('./modules/correlation');
 
 // --- env / config ---------------------------------------------------------
 
@@ -65,6 +66,13 @@ const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10
 // is typically $1; keep a small default so the last slot can still fill even
 // when cash has drifted just under 10% of equity.
 const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD', 1));
+const MAX_RISK_PER_TRADE_PCT = Math.max(0, readNumber('MAX_RISK_PER_TRADE_PCT', 0.01));
+const ATR_STOP_MULTIPLIER = Math.max(1, readNumber('ATR_STOP_MULTIPLIER', 2));
+const CORRELATION_LIMIT = Math.max(0, Math.min(1, readNumber('ENTRY_CORRELATION_LIMIT', 0.7)));
+const CORRELATION_SIZE_REDUCTION = Math.max(0, Math.min(1, readNumber('ENTRY_CORRELATION_SIZE_REDUCTION', 0.5)));
+const PORTFOLIO_HEAT_LIMIT_PCT = Math.max(0, readNumber('PORTFOLIO_HEAT_LIMIT_PCT', 0.07));
+const MAINTENANCE_MARGIN_BUFFER_PCT = Math.max(0, readNumber('MAINTENANCE_MARGIN_BUFFER_PCT', 0.2));
+const GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT = Math.max(0, readNumber('GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT', 0.05));
 // Concurrency is now bounded by available cash, not a fixed slot count: the
 // engine opens as many positions as PORTFOLIO_SIZING_PCT of equity will fund,
 // one per symbol. There is intentionally no MAX_CONCURRENT_POSITIONS cap.
@@ -724,6 +732,7 @@ let lastExecutionFailure = null;
 let engineState = 'booting';
 let engineStateUpdatedAt = null;
 let engineStateReason = null;
+let peakObservedEquityUsd = null;
 
 function setEngineState(state, reason) {
   engineState = state;
@@ -870,6 +879,30 @@ function requiredEdgeBps(spreadBps) {
   return Math.max(0, spreadBps || 0) + FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS;
 }
 
+const MICRO_USD_SCALE = 1_000_000n;
+function usdToMicro(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return BigInt(Math.round(n * Number(MICRO_USD_SCALE)));
+}
+function microToUsd(micro) {
+  if (typeof micro !== 'bigint') return null;
+  return Number(micro) / Number(MICRO_USD_SCALE);
+}
+function computeAtrFromBars(bars) {
+  if (!Array.isArray(bars) || bars.length < 2) return null;
+  const trs = [];
+  let prevClose = Number(bars[0]?.c);
+  for (let i = 1; i < bars.length; i += 1) {
+    const h = Number(bars[i]?.h); const l = Number(bars[i]?.l); const c = Number(bars[i]?.c);
+    if (![h, l, c, prevClose].every(Number.isFinite) || l <= 0 || h <= 0) return null;
+    const tr = Math.max(h - l, Math.abs(h - prevClose), Math.abs(l - prevClose));
+    trs.push(tr); prevClose = c;
+  }
+  if (!trs.length) return null;
+  return trs.reduce((s, v) => s + v, 0) / trs.length;
+}
+
 async function initializeInventoryFromPositions() {
   inventory.clear();
   const positions = await fetchPositions();
@@ -961,6 +994,16 @@ async function scanAndEnter() {
     const equityNum = Number(equityRaw);
     if (Number.isFinite(equityNum) && equityNum > 0) {
       targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
+      peakObservedEquityUsd = (peakObservedEquityUsd == null) ? equityNum : Math.max(peakObservedEquityUsd, equityNum);
+      const drawdown = peakObservedEquityUsd > 0 ? (peakObservedEquityUsd - equityNum) / peakObservedEquityUsd : 0;
+      if (drawdown >= GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT) {
+        bumpSkipReason('global_drawdown_circuit_breaker');
+        summary.topSkipReasons = mapToObject(skipReasonCounts);
+        lastEntryScanSummary = summary;
+        lastEntryScanAt = new Date().toISOString();
+        currentScanState = 'idle';
+        return;
+      }
     }
   } catch (err) {
     // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
@@ -1009,7 +1052,10 @@ async function scanAndEnter() {
       }
 
       const ask = Number(quote.ap);
+      const bid = Number(quote.bp);
       if (!Number.isFinite(ask) || ask <= 0) { bumpSkipReason('invalid_ask'); continue; }
+      if (!Number.isFinite(bid) || bid <= 0) { bumpSkipReason('invalid_bid'); continue; }
+      const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
       const sig = await getPredictionSignal(pair);
       if (!sig.ok) {
@@ -1058,6 +1104,11 @@ async function scanAndEnter() {
       const fillProbability = slopeProbability(sig.slopeTStat);
       const realizedWinBps = Math.max(0, TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS);
       const netEdgeBps = realizedWinBps * fillProbability;
+      const modeledSlippageBps = ENTRY_SLIPPAGE_BPS;
+      if (projectedBps < (spreadCostBps + modeledSlippageBps)) {
+        bumpSkipReason('alpha_below_execution_cost');
+        continue;
+      }
 
       // Directional sanity check. The EV gate below multiplies a fixed
       // realised-win bps by fillProbability = logistic_cdf(slopeTStat). For a
@@ -1078,6 +1129,41 @@ async function scanAndEnter() {
         }
       }
 
+      const atrBarsPayload = await fetchCryptoBars({ symbols: [pair], limit: 15, timeframe: '1Min' });
+      const atrBars = atrBarsPayload?.bars?.[pair] || atrBarsPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+      const atr = computeAtrFromBars(atrBars);
+      if (!Number.isFinite(atr) || atr <= 0) { bumpSkipReason('atr_unavailable'); continue; }
+      const stopDistance = atr * ATR_STOP_MULTIPLIER;
+      if (stopDistance < (2 * atr)) { bumpSkipReason('stop_too_tight_vs_atr'); continue; }
+      const riskUsd = tradeNotional * (stopDistance / ask);
+      const equityEstimate = targetNotional / PORTFOLIO_SIZING_PCT;
+      if (!Number.isFinite(equityEstimate) || equityEstimate <= 0) { bumpSkipReason('equity_unavailable'); continue; }
+      if ((riskUsd / equityEstimate) > MAX_RISK_PER_TRADE_PCT) { bumpSkipReason('risk_gt_1pct'); continue; }
+      if ((riskUsd / equityEstimate) > PORTFOLIO_HEAT_LIMIT_PCT) { bumpSkipReason('portfolio_heat_exceeded'); continue; }
+
+      const positions = await fetchPositions();
+      const symbols = [pair];
+      const priceSeries = {};
+      const candidateBars = await fetchCryptoBars({ symbols: [pair], limit: 30, timeframe: '1Day' });
+      priceSeries[pair] = (candidateBars?.bars?.[pair] || candidateBars?.bars?.[toAlpacaSymbol(pair)] || []).map((b) => Number(b?.c)).filter((v) => Number.isFinite(v));
+      for (const pos of positions) {
+        const s = normalizePair(pos?.symbol);
+        if (!s || s === pair) continue;
+        symbols.push(s);
+        const pBars = await fetchCryptoBars({ symbols: [s], limit: 30, timeframe: '1Day' });
+        priceSeries[s] = (pBars?.bars?.[s] || pBars?.bars?.[toAlpacaSymbol(s)] || []).map((b) => Number(b?.c)).filter((v) => Number.isFinite(v));
+      }
+      const corrMatrix = computeCorrelationMatrix(priceSeries);
+      const maxCorr = symbols.slice(1).reduce((m, s) => {
+        const v = corrMatrix?.[pair]?.[s];
+        return Number.isFinite(v) ? Math.max(m, v) : m;
+      }, -1);
+      const correlated = Number.isFinite(maxCorr) && maxCorr > CORRELATION_LIMIT;
+      const effectiveNotional = correlated ? (tradeNotional * CORRELATION_SIZE_REDUCTION) : tradeNotional;
+      if (correlated && effectiveNotional < MIN_TRADE_NOTIONAL_USD) { bumpSkipReason('correlation_rejected'); continue; }
+      const liqDistance = equityEstimate - (riskUsd * 2);
+      if (liqDistance <= (equityEstimate * MAINTENANCE_MARGIN_BUFFER_PCT)) { bumpSkipReason('maintenance_margin_guard'); continue; }
+
       // Round buy limit to the asset's price_increment so Alpaca accepts it.
       const tickInfo = await getAssetTickInfo(pair);
       const buyLimitStr = formatTickPrice(ask, tickInfo.priceIncrement);
@@ -1089,7 +1175,7 @@ async function scanAndEnter() {
         type: 'limit',
         time_in_force: 'gtc',
         limit_price: buyLimitStr,
-        notional: tradeNotional.toFixed(2),
+        notional: effectiveNotional.toFixed(2),
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {
@@ -1099,7 +1185,7 @@ async function scanAndEnter() {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
           askAtSubmit: ask,
-          tradeNotional,
+          tradeNotional: effectiveNotional,
           spreadBps,
           quoteAgeMs: ageMs,
           slopeBpsPerBar: Number.isFinite(sig.slopeBpsPerBar) ? sig.slopeBpsPerBar : null,
@@ -1147,7 +1233,7 @@ async function scanAndEnter() {
           symbol: pair,
           tradeId: buyOrder.id,
           buyLimit: prediction.buyLimit,
-          notional: tradeNotional,
+          notional: effectiveNotional,
           spreadBps,
           slopeTStat: prediction.slopeTStat,
           fillProbability,
