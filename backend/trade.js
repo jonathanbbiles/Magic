@@ -23,6 +23,7 @@ const { getRuntimeConfig } = require('./config/runtimeConfig');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
+const { applyDrawdownBrake, calculateRiskBasedNotional } = require('./modules/riskSizing');
 
 const runtimeConfig = getRuntimeConfig(process.env);
 const { computeCorrelationMatrix } = require('./modules/correlation');
@@ -608,7 +609,8 @@ async function getPredictionSignal(pair) {
       timeframe: '1Min',
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
-    const closes = bars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
+    const closedBars = bars.slice(0, -1);
+    const closes = closedBars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
     if (closes.length < PREDICT_BARS) {
       return { ok: false, reason: 'insufficient_bars' };
     }
@@ -680,7 +682,8 @@ async function getHigherTimeframeSignal(pair) {
       timeframe: HTF_TIMEFRAME,
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
-    const closes = bars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
+    const closedBars = bars.slice(0, -1);
+    const closes = closedBars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
     if (closes.length < HTF_BARS) return { ok: false, reason: 'htf_insufficient_bars' };
 
     const n = closes.length;
@@ -733,6 +736,7 @@ let engineState = 'booting';
 let engineStateUpdatedAt = null;
 let engineStateReason = null;
 let peakObservedEquityUsd = null;
+let entryHaltUntilMs = 0;
 
 function setEngineState(state, reason) {
   engineState = state;
@@ -941,6 +945,7 @@ async function buildHeldAndOpenSellsIndex() {
 
 async function scanAndEnter() {
   if (!TRADING_ENABLED) return;
+  if (entryHaltUntilMs > Date.now()) { bumpSkipReason('drawdown_hard_halt_active'); return; }
   currentScanState = 'scanning';
   currentScanStartedAt = new Date().toISOString();
   currentScanLastProgressAt = currentScanStartedAt;
@@ -996,6 +1001,16 @@ async function scanAndEnter() {
       targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
       peakObservedEquityUsd = (peakObservedEquityUsd == null) ? equityNum : Math.max(peakObservedEquityUsd, equityNum);
       const drawdown = peakObservedEquityUsd > 0 ? (peakObservedEquityUsd - equityNum) / peakObservedEquityUsd : 0;
+      const drawdownBrake = applyDrawdownBrake(MAX_RISK_PER_TRADE_PCT, drawdown);
+      if (drawdownBrake.haltEntries) {
+        entryHaltUntilMs = Date.now() + (24 * 60 * 60 * 1000);
+        bumpSkipReason('drawdown_hard_halt_24h');
+        summary.topSkipReasons = mapToObject(skipReasonCounts);
+        lastEntryScanSummary = summary;
+        lastEntryScanAt = new Date().toISOString();
+        currentScanState = 'idle';
+        return;
+      }
       if (drawdown >= GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT) {
         bumpSkipReason('global_drawdown_circuit_breaker');
         summary.topSkipReasons = mapToObject(skipReasonCounts);
@@ -1130,14 +1145,20 @@ async function scanAndEnter() {
       }
 
       const atrBarsPayload = await fetchCryptoBars({ symbols: [pair], limit: 15, timeframe: '1Min' });
-      const atrBars = atrBarsPayload?.bars?.[pair] || atrBarsPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+      const atrBars = (atrBarsPayload?.bars?.[pair] || atrBarsPayload?.bars?.[toAlpacaSymbol(pair)] || []).slice(0, -1);
       const atr = computeAtrFromBars(atrBars);
       if (!Number.isFinite(atr) || atr <= 0) { bumpSkipReason('atr_unavailable'); continue; }
       const stopDistance = atr * ATR_STOP_MULTIPLIER;
       if (stopDistance < (2 * atr)) { bumpSkipReason('stop_too_tight_vs_atr'); continue; }
-      const riskUsd = tradeNotional * (stopDistance / ask);
       const equityEstimate = targetNotional / PORTFOLIO_SIZING_PCT;
       if (!Number.isFinite(equityEstimate) || equityEstimate <= 0) { bumpSkipReason('equity_unavailable'); continue; }
+      const drawdown = peakObservedEquityUsd > 0 ? (peakObservedEquityUsd - equityEstimate) / peakObservedEquityUsd : 0;
+      const drawdownBrake = applyDrawdownBrake(MAX_RISK_PER_TRADE_PCT, drawdown);
+      const stopPrice = ask - stopDistance;
+      const riskSizing = calculateRiskBasedNotional({ equityUsd: equityEstimate, riskPct: drawdownBrake.riskPct, entryPrice: ask, stopPrice });
+      if (!riskSizing || !Number.isFinite(riskSizing.notionalUsd) || riskSizing.notionalUsd <= 0) { bumpSkipReason('risk_sizing_unavailable'); continue; }
+      const effectiveNotionalCap = Math.min(tradeNotional, riskSizing.notionalUsd);
+      const riskUsd = riskSizing.riskUsd;
       if ((riskUsd / equityEstimate) > MAX_RISK_PER_TRADE_PCT) { bumpSkipReason('risk_gt_1pct'); continue; }
       if ((riskUsd / equityEstimate) > PORTFOLIO_HEAT_LIMIT_PCT) { bumpSkipReason('portfolio_heat_exceeded'); continue; }
 
@@ -1159,7 +1180,7 @@ async function scanAndEnter() {
         return Number.isFinite(v) ? Math.max(m, v) : m;
       }, -1);
       const correlated = Number.isFinite(maxCorr) && maxCorr > CORRELATION_LIMIT;
-      const effectiveNotional = correlated ? (tradeNotional * CORRELATION_SIZE_REDUCTION) : tradeNotional;
+      const effectiveNotional = correlated ? (effectiveNotionalCap * CORRELATION_SIZE_REDUCTION) : effectiveNotionalCap;
       if (correlated && effectiveNotional < MIN_TRADE_NOTIONAL_USD) { bumpSkipReason('correlation_rejected'); continue; }
       const liqDistance = equityEstimate - (riskUsd * 2);
       if (liqDistance <= (equityEstimate * MAINTENANCE_MARGIN_BUFFER_PCT)) { bumpSkipReason('maintenance_margin_guard'); continue; }
