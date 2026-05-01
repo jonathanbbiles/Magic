@@ -10,7 +10,7 @@
 //      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
 //      so the user's +0.25% target is AFTER Alpaca's round-trip fees.
 //   5. If the take-profit doesn't fill within BREAKEVEN_TIMEOUT_MS (default
-//      2 minutes from when the position was first observed), cancel the GTC
+//      3 minutes from when the position was first observed), cancel the GTC
 //      sell and replace it with a sell at break-even-after-fees
 //      (entry * (1 + FEE_BPS_ROUND_TRIP/10000)). That guarantees zero net
 //      profit but recycles the slot so the engine keeps trading.
@@ -72,10 +72,12 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
 // being first observed, cancel the TP and replace it at break-even-after-fees
-// so the slot recycles. Default 90 s (lowered from 120 s so stuck capital
-// recycles faster and more entries fit per day); floor at 30 s to stay above
-// broker round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 90000));
+// so the slot recycles. Default 180 s (raised from 90 s — slot capital is tied
+// up the same way whether the resting order is TP or break-even, so a longer
+// TP window converts more positions into wins instead of forced break-evens
+// when the +0.60 % gross move arrives just past the 90 s mark). Floor at 30 s
+// to stay above broker round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 180000));
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
