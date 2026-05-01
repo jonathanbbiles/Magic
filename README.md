@@ -9,8 +9,8 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 ## Goals
 
 - Find tiny upward drifts in liquid crypto pairs.
-- Capture **0.25% net profit** per trade after fees.
-- Recycle stuck positions: if the take-profit doesn't fill within 2 minutes, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
+- Capture **0.20% net profit** per trade after fees.
+- Recycle stuck positions: if the take-profit doesn't fill within 90 seconds, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
 
@@ -25,8 +25,8 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    ```
    entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
    ```
-   With current defaults (25 bps net + 40 bps fees) that's `entry × 1.0065`.
-5. **2-minute break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 120 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
+   With current defaults (20 bps net + 40 bps fees) that's `entry × 1.0060`.
+5. **90-second break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 90 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -101,13 +101,13 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Strategy economics (defaults in parentheses)
 | Var | Default | What it does |
 | --- | --- | --- |
-| `TARGET_NET_PROFIT_BPS` | `25` | Net profit target after fees (25 bps = 0.25%). |
+| `TARGET_NET_PROFIT_BPS` | `20` | Net profit target after fees (20 bps = 0.20%). Lowered from 25 bps so the TP fills more often per day. |
 | `FEE_BPS_ROUND_TRIP` | `40` | Assumed Alpaca round-trip: ~25 bps taker entry + ~15 bps maker exit. |
-| `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 25 bps target the effective entry spread headroom is 20 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
+| `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 20 bps target the effective entry spread headroom is 15 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
 | `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
-| `BREAKEVEN_TIMEOUT_MS` | `120000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Floor: 30 000. |
+| `BREAKEVEN_TIMEOUT_MS` | `90000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Lowered from 120 000 ms to recycle stuck capital faster. Floor: 30 000. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
 
@@ -170,7 +170,7 @@ See `.github/workflows/ci.yml`.
 - **No cross-symbol correlation guard.** With 30+ pairs in scope, the engine can become long the same beta on multiple symbols simultaneously.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
-The 2-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
+The 90-second break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
 
 ---
 
