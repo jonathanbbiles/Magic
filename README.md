@@ -104,7 +104,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `TARGET_NET_PROFIT_BPS` | `25` | Net profit target after fees (25 bps = 0.25%). |
 | `FEE_BPS_ROUND_TRIP` | `40` | Assumed Alpaca round-trip: ~25 bps taker entry + ~15 bps maker exit. |
 | `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 25 bps target the effective entry spread headroom is 20 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
-| `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
+| `MIN_NET_EDGE_BPS` | `15` | Minimum expected net edge to clear before buying. With `TARGET_NET_PROFIT_BPS=25` and `ENTRY_SLIPPAGE_BPS=5`, this requires `fillProbability ≥ 0.75` (i.e. `slopeTStat ≳ 1.1`) — a statistically meaningful uptrend, not just any positive number. Lowering this back to 10 reverts to the looser "any positive slope" gate. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
 | `BREAKEVEN_TIMEOUT_MS` | `120000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Floor: 30 000. |
@@ -119,10 +119,10 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `ENTRY_QUOTE_MAX_AGE_MS` | `60000` | Reject quotes staler than this. |
 | `SPREAD_MAX_BPS` | `30` | Skip symbols whose spread exceeds this. |
 | `PREDICT_BARS` | `20` | Bars used in the entry OLS regression. |
-| `VOLATILITY_MAX_BPS` | `100` | Skip if realized vol exceeds this. |
+| `VOLATILITY_MAX_BPS` | `60` | Skip if 1m realized vol (stddev of bar-to-bar returns, bps) exceeds this. Whippy regimes produce post-entry reversals — keeping this tight is one of the few real defenses against bad buys, given there is no stop-loss. |
 | `HTF_FILTER_ENABLED` | `true` | Gate on higher-timeframe slope. |
 | `HTF_BARS` | `12` | HTF lookback. |
-| `HTF_MIN_SLOPE_BPS_PER_BAR` | `0` | HTF slope floor. |
+| `HTF_MIN_SLOPE_BPS_PER_BAR` | `1` | HTF (5m) slope floor in bps per bar. `0` accepts any non-negative slope (flat counts); `1` requires the 5m chart to actually be drifting up, not just sideways. |
 | `HTTP_TIMEOUT_MS` | `10000` | Per-request HTTP timeout. |
 
 ### Universe
