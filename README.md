@@ -10,7 +10,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture **0.20% net profit** per trade after fees.
-- Recycle stuck positions: if the take-profit doesn't fill within 90 seconds, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
+- Recycle stuck positions: if the take-profit doesn't fill within 180 seconds, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
 
@@ -26,7 +26,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    With current defaults (20 bps net + 40 bps fees) that's `entry × 1.0060`.
-5. **90-second break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 90 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
+5. **180-second break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 180 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -107,7 +107,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
-| `BREAKEVEN_TIMEOUT_MS` | `90000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Lowered from 120 000 ms to recycle stuck capital faster. Floor: 30 000. |
+| `BREAKEVEN_TIMEOUT_MS` | `180000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Raised from 90 000 ms because slot capital is tied up the same way whether the resting order is the TP or the break-even sell, so a longer TP window converts more positions into wins instead of forced break-evens. Floor: 30 000. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
 
