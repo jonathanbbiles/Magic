@@ -598,9 +598,11 @@ function formatTickPrice(price, tick) {
 
 async function getPredictionSignal(pair) {
   try {
+    // Request PREDICT_BARS+1 so that after dropping the (likely in-progress)
+    // most recent bar there are still PREDICT_BARS closed bars to fit on.
     const payload = await fetchCryptoBars({
       symbols: [pair],
-      limit: PREDICT_BARS,
+      limit: PREDICT_BARS + 1,
       timeframe: '1Min',
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
@@ -671,9 +673,11 @@ async function getPredictionSignal(pair) {
 async function getHigherTimeframeSignal(pair) {
   if (!HTF_FILTER_ENABLED) return { ok: true, reason: 'disabled' };
   try {
+    // Request HTF_BARS+1 so that after dropping the in-progress bar we still
+    // have HTF_BARS closed bars for the slope fit.
     const payload = await fetchCryptoBars({
       symbols: [pair],
-      limit: HTF_BARS,
+      limit: HTF_BARS + 1,
       timeframe: HTF_TIMEFRAME,
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
@@ -1639,4 +1643,7 @@ module.exports = {
   getPredictorWarmupSnapshot,
   getEngineStateSnapshot,
   getEntryRegimeStaleThresholdMs,
+  // exposed for regression tests of the bar-fetch / prediction pipeline
+  getPredictionSignal,
+  getHigherTimeframeSignal,
 };
