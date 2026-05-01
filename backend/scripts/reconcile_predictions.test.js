@@ -6,6 +6,7 @@ const {
   bucketLabel,
   quantile,
   GROSS_TARGET_BPS,
+  TARGET_NET_PROFIT_BPS,
 } = require('./reconcile_predictions');
 
 // bucketIndex edges
@@ -56,10 +57,11 @@ assert.equal(bucketLabel(7), '[0.70, 0.80)');
   assert.equal(s.breakEven.length, 6);
   const row50 = s.breakEven.find((r) => r.assumedAvgOpenLossBps === 50);
   assert(row50, 'expected a row for L=50');
-  // expectancy = (2/3)*25 - (1/3)*50 = 16.667 - 16.667 = 0
-  assert.ok(Math.abs(row50.expectancyBpsPerTrade) < 1e-9, 'hit rate 2/3 + L=50 should break even');
-  // Break-even hit rate for L=50, TARGET=25: 50/75 = 0.6667
-  assert.ok(Math.abs(row50.breakEvenHitRate - 50 / 75) < 1e-9);
+  // expectancy = hitRate * TARGET - (1 - hitRate) * L
+  const expectedExpectancy = (2 / 3) * TARGET_NET_PROFIT_BPS - (1 / 3) * 50;
+  assert.ok(Math.abs(row50.expectancyBpsPerTrade - expectedExpectancy) < 1e-9, 'expectancy must match TARGET-based formula');
+  // Break-even hit rate = L / (L + TARGET)
+  assert.ok(Math.abs(row50.breakEvenHitRate - 50 / (50 + TARGET_NET_PROFIT_BPS)) < 1e-9);
 
   // Calibration: bucket at ~0.75-0.80 should have 2 closed / 3 trades only if
   // all three share that decile. With probs 0.80, 0.75, 0.72, we get two
@@ -101,7 +103,7 @@ assert.equal(quantile([10, 2, 1, 4, 3], 0.5), 3, 'quantile sorts input before pi
 // Constructed case: implied = GROSS_TARGET_BPS / slope; actual = holdSeconds / 60.
 // Three trades, one each of on-model / stretched / over-promised.
 {
-  const slope = 4; // bps/min -> implied minutes = GROSS_TARGET_BPS / slope (65 / 4 = 16.25)
+  const slope = 4; // bps/min -> implied minutes = GROSS_TARGET_BPS / slope (60 / 4 = 15)
   const impliedMinutes = GROSS_TARGET_BPS / slope;
   const forensics = [
     { tradeId: 'on-model', symbol: 'BTC/USD', phase: 'entry_submitted', fillProbability: 0.95, slopeBpsPerBar: slope },

@@ -43,8 +43,9 @@ function readBoolean(name, fallback) {
 
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
-// +25 bps (0.25%) target is AFTER fees, not before.
-const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 25));
+// +20 bps (0.20%) target is AFTER fees, not before. Lowered from 25 bps to
+// raise the TP fill rate and clear more wins per day on a normal market.
+const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 20));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
 // entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
 // above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
@@ -54,9 +55,9 @@ const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
 // The gate requires GROSS_TARGET_BPS >= spread + FEE_BPS_ROUND_TRIP + buffer,
 // which simplifies to spread <= TARGET_NET_PROFIT_BPS - PROFIT_BUFFER_BPS.
-// With TARGET=25 and buffer=5, the effective spread headroom is 20 bps —
-// inside the explicit SPREAD_MAX_BPS=30 hard cap, while letting the full
-// 6-pair universe (not just BTC) clear the gate during normal book conditions.
+// With TARGET=20 and buffer=5, the effective spread headroom is 15 bps —
+// inside the explicit SPREAD_MAX_BPS=30 hard cap, while still letting most
+// liquid pairs clear the gate during normal book conditions.
 // MIN_NET_EDGE_BPS remains the real EV filter on top of this.
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 5));
 // Fraction of account equity to deploy per trade (e.g. 0.10 = 10%).
@@ -71,9 +72,10 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
 // being first observed, cancel the TP and replace it at break-even-after-fees
-// so the slot recycles. Default 2 minutes; floor at 30 s to stay above broker
-// round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 120000));
+// so the slot recycles. Default 90 s (lowered from 120 s so stuck capital
+// recycles faster and more entries fit per day); floor at 30 s to stay above
+// broker round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 90000));
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
