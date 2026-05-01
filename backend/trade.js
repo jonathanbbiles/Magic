@@ -23,10 +23,8 @@ const { getRuntimeConfig } = require('./config/runtimeConfig');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
-const { applyDrawdownBrake, calculateRiskBasedNotional } = require('./modules/riskSizing');
 
 const runtimeConfig = getRuntimeConfig(process.env);
-const { computeCorrelationMatrix } = require('./modules/correlation');
 
 // --- env / config ---------------------------------------------------------
 
@@ -67,13 +65,6 @@ const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10
 // is typically $1; keep a small default so the last slot can still fill even
 // when cash has drifted just under 10% of equity.
 const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD', 1));
-const MAX_RISK_PER_TRADE_PCT = Math.max(0, readNumber('MAX_RISK_PER_TRADE_PCT', 0.01));
-const ATR_STOP_MULTIPLIER = Math.max(1, readNumber('ATR_STOP_MULTIPLIER', 2));
-const CORRELATION_LIMIT = Math.max(0, Math.min(1, readNumber('ENTRY_CORRELATION_LIMIT', 0.7)));
-const CORRELATION_SIZE_REDUCTION = Math.max(0, Math.min(1, readNumber('ENTRY_CORRELATION_SIZE_REDUCTION', 0.5)));
-const PORTFOLIO_HEAT_LIMIT_PCT = Math.max(0, readNumber('PORTFOLIO_HEAT_LIMIT_PCT', 0.07));
-const MAINTENANCE_MARGIN_BUFFER_PCT = Math.max(0, readNumber('MAINTENANCE_MARGIN_BUFFER_PCT', 0.2));
-const GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT = Math.max(0, readNumber('GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT', 0.05));
 // Concurrency is now bounded by available cash, not a fixed slot count: the
 // engine opens as many positions as PORTFOLIO_SIZING_PCT of equity will fund,
 // one per symbol. There is intentionally no MAX_CONCURRENT_POSITIONS cap.
@@ -735,8 +726,6 @@ let lastExecutionFailure = null;
 let engineState = 'booting';
 let engineStateUpdatedAt = null;
 let engineStateReason = null;
-let peakObservedEquityUsd = null;
-let entryHaltUntilMs = 0;
 
 function setEngineState(state, reason) {
   engineState = state;
@@ -883,30 +872,6 @@ function requiredEdgeBps(spreadBps) {
   return Math.max(0, spreadBps || 0) + FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS;
 }
 
-const MICRO_USD_SCALE = 1_000_000n;
-function usdToMicro(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  return BigInt(Math.round(n * Number(MICRO_USD_SCALE)));
-}
-function microToUsd(micro) {
-  if (typeof micro !== 'bigint') return null;
-  return Number(micro) / Number(MICRO_USD_SCALE);
-}
-function computeAtrFromBars(bars) {
-  if (!Array.isArray(bars) || bars.length < 2) return null;
-  const trs = [];
-  let prevClose = Number(bars[0]?.c);
-  for (let i = 1; i < bars.length; i += 1) {
-    const h = Number(bars[i]?.h); const l = Number(bars[i]?.l); const c = Number(bars[i]?.c);
-    if (![h, l, c, prevClose].every(Number.isFinite) || l <= 0 || h <= 0) return null;
-    const tr = Math.max(h - l, Math.abs(h - prevClose), Math.abs(l - prevClose));
-    trs.push(tr); prevClose = c;
-  }
-  if (!trs.length) return null;
-  return trs.reduce((s, v) => s + v, 0) / trs.length;
-}
-
 async function initializeInventoryFromPositions() {
   inventory.clear();
   const positions = await fetchPositions();
@@ -945,7 +910,6 @@ async function buildHeldAndOpenSellsIndex() {
 
 async function scanAndEnter() {
   if (!TRADING_ENABLED) return;
-  if (entryHaltUntilMs > Date.now()) { bumpSkipReason('drawdown_hard_halt_active'); return; }
   currentScanState = 'scanning';
   currentScanStartedAt = new Date().toISOString();
   currentScanLastProgressAt = currentScanStartedAt;
@@ -999,26 +963,6 @@ async function scanAndEnter() {
     const equityNum = Number(equityRaw);
     if (Number.isFinite(equityNum) && equityNum > 0) {
       targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
-      peakObservedEquityUsd = (peakObservedEquityUsd == null) ? equityNum : Math.max(peakObservedEquityUsd, equityNum);
-      const drawdown = peakObservedEquityUsd > 0 ? (peakObservedEquityUsd - equityNum) / peakObservedEquityUsd : 0;
-      const drawdownBrake = applyDrawdownBrake(MAX_RISK_PER_TRADE_PCT, drawdown);
-      if (drawdownBrake.haltEntries) {
-        entryHaltUntilMs = Date.now() + (24 * 60 * 60 * 1000);
-        bumpSkipReason('drawdown_hard_halt_24h');
-        summary.topSkipReasons = mapToObject(skipReasonCounts);
-        lastEntryScanSummary = summary;
-        lastEntryScanAt = new Date().toISOString();
-        currentScanState = 'idle';
-        return;
-      }
-      if (drawdown >= GLOBAL_CIRCUIT_BREAKER_DRAWDOWN_PCT) {
-        bumpSkipReason('global_drawdown_circuit_breaker');
-        summary.topSkipReasons = mapToObject(skipReasonCounts);
-        lastEntryScanSummary = summary;
-        lastEntryScanAt = new Date().toISOString();
-        currentScanState = 'idle';
-        return;
-      }
     }
   } catch (err) {
     // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
@@ -1144,46 +1088,11 @@ async function scanAndEnter() {
         }
       }
 
-      const atrBarsPayload = await fetchCryptoBars({ symbols: [pair], limit: 15, timeframe: '1Min' });
-      const atrBars = (atrBarsPayload?.bars?.[pair] || atrBarsPayload?.bars?.[toAlpacaSymbol(pair)] || []).slice(0, -1);
-      const atr = computeAtrFromBars(atrBars);
-      if (!Number.isFinite(atr) || atr <= 0) { bumpSkipReason('atr_unavailable'); continue; }
-      const stopDistance = atr * ATR_STOP_MULTIPLIER;
-      if (stopDistance < (2 * atr)) { bumpSkipReason('stop_too_tight_vs_atr'); continue; }
-      const equityEstimate = targetNotional / PORTFOLIO_SIZING_PCT;
-      if (!Number.isFinite(equityEstimate) || equityEstimate <= 0) { bumpSkipReason('equity_unavailable'); continue; }
-      const drawdown = peakObservedEquityUsd > 0 ? (peakObservedEquityUsd - equityEstimate) / peakObservedEquityUsd : 0;
-      const drawdownBrake = applyDrawdownBrake(MAX_RISK_PER_TRADE_PCT, drawdown);
-      const stopPrice = ask - stopDistance;
-      const riskSizing = calculateRiskBasedNotional({ equityUsd: equityEstimate, riskPct: drawdownBrake.riskPct, entryPrice: ask, stopPrice });
-      if (!riskSizing || !Number.isFinite(riskSizing.notionalUsd) || riskSizing.notionalUsd <= 0) { bumpSkipReason('risk_sizing_unavailable'); continue; }
-      const effectiveNotionalCap = Math.min(tradeNotional, riskSizing.notionalUsd);
-      const riskUsd = riskSizing.riskUsd;
-      if ((riskUsd / equityEstimate) > MAX_RISK_PER_TRADE_PCT) { bumpSkipReason('risk_gt_1pct'); continue; }
-      if ((riskUsd / equityEstimate) > PORTFOLIO_HEAT_LIMIT_PCT) { bumpSkipReason('portfolio_heat_exceeded'); continue; }
-
-      const positions = await fetchPositions();
-      const symbols = [pair];
-      const priceSeries = {};
-      const candidateBars = await fetchCryptoBars({ symbols: [pair], limit: 30, timeframe: '1Day' });
-      priceSeries[pair] = (candidateBars?.bars?.[pair] || candidateBars?.bars?.[toAlpacaSymbol(pair)] || []).map((b) => Number(b?.c)).filter((v) => Number.isFinite(v));
-      for (const pos of positions) {
-        const s = normalizePair(pos?.symbol);
-        if (!s || s === pair) continue;
-        symbols.push(s);
-        const pBars = await fetchCryptoBars({ symbols: [s], limit: 30, timeframe: '1Day' });
-        priceSeries[s] = (pBars?.bars?.[s] || pBars?.bars?.[toAlpacaSymbol(s)] || []).map((b) => Number(b?.c)).filter((v) => Number.isFinite(v));
-      }
-      const corrMatrix = computeCorrelationMatrix(priceSeries);
-      const maxCorr = symbols.slice(1).reduce((m, s) => {
-        const v = corrMatrix?.[pair]?.[s];
-        return Number.isFinite(v) ? Math.max(m, v) : m;
-      }, -1);
-      const correlated = Number.isFinite(maxCorr) && maxCorr > CORRELATION_LIMIT;
-      const effectiveNotional = correlated ? (effectiveNotionalCap * CORRELATION_SIZE_REDUCTION) : effectiveNotionalCap;
-      if (correlated && effectiveNotional < MIN_TRADE_NOTIONAL_USD) { bumpSkipReason('correlation_rejected'); continue; }
-      const liqDistance = equityEstimate - (riskUsd * 2);
-      if (liqDistance <= (equityEstimate * MAINTENANCE_MARGIN_BUFFER_PCT)) { bumpSkipReason('maintenance_margin_guard'); continue; }
+      // Notional sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available
+      // cash. The README documents this as the only sizing rule — no phantom
+      // stop-loss-based risk sizing, no correlation guard, no drawdown brake,
+      // no maintenance-margin guard. Concurrency is bounded by cash, period.
+      const effectiveNotional = tradeNotional;
 
       // Round buy limit to the asset's price_increment so Alpaca accepts it.
       const tickInfo = await getAssetTickInfo(pair);
