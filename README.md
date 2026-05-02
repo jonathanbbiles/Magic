@@ -10,7 +10,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture **0.20% net profit** per trade after fees.
-- Recycle stuck positions: if the take-profit doesn't fill within 180 seconds, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
+- Recycle stuck positions: if the take-profit doesn't fill within 10 minutes, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
 
@@ -18,7 +18,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ## The whole strategy in 5 lines
 
-1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols. There is intentionally no whitelist or universe cap; the only filter on what the scanner *looks at* is "is this a USD-quoted, non-stablecoin crypto pair tradable on Alpaca?". Per-symbol gates inside the loop (spread, quote freshness, net-edge, etc.) decide whether to actually trade.
+1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the entry universe. By default `ENTRY_UNIVERSE_MODE=configured`, which restricts the scan to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI). Setting `ENTRY_UNIVERSE_MODE=dynamic` instead scans **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols. The configured default exists because the per-symbol gates (`SPREAD_MAX_BPS=30`, `ENTRY_QUOTE_MAX_AGE_MS=60000`) are calibrated for tier-1 liquidity; running them against the long-tail dynamic universe rejects almost everything for stale quotes or wide spreads and starves entries.
 2. For each symbol, fit a linear regression on the last `PREDICT_BARS` (default 20) one-minute closes. Convert the slope's t-statistic to an upward probability via the logistic CDF.
 3. If the symbol clears the spread gate, the higher-timeframe slope filter, and the net-edge gate, place a **GTC limit BUY at the current ask**.
 4. When the buy fills, immediately place **one GTC limit SELL** at:
@@ -26,7 +26,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    With current defaults (20 bps net + 40 bps fees) that's `entry × 1.0060`.
-5. **180-second break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 180 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
+5. **10-minute break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 600 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -107,7 +107,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MIN_NET_EDGE_BPS` | `10` | Minimum expected net edge to clear before buying. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
-| `BREAKEVEN_TIMEOUT_MS` | `180000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Raised from 90 000 ms because slot capital is tied up the same way whether the resting order is the TP or the break-even sell, so a longer TP window converts more positions into wins instead of forced break-evens. Floor: 30 000. |
+| `BREAKEVEN_TIMEOUT_MS` | `600000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Raised from 180 000 ms because the prior 3-minute window was empirically converting most predicted-positive trades to flat break-even fills before their +0.60 % gross move had time to develop. Slot capital is tied up the same way whether the resting order is the TP or the break-even sell, so a longer TP window strictly improves expectancy. Floor: 30 000. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
 
@@ -128,9 +128,9 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Universe
 | Var | What it does |
 | --- | --- |
-| `ENTRY_UNIVERSE_MODE` | Default `dynamic` — scanner uses **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`. The toggle still exists as an escape hatch: setting it to `configured` restricts the scan to `ENTRY_SYMBOLS_PRIMARY`. **By design there is no universe whitelist beyond "is it crypto on Alpaca?".** |
-| `ENTRY_SYMBOLS_PRIMARY` | Only used when `ENTRY_UNIVERSE_MODE=configured`. Ignored under the default `dynamic` mode. |
-| `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `true` so the production bot can run dynamic without an opt-in. The runtime validator only blocks production startup if mode is `dynamic` AND this flag is `false`. |
+| `ENTRY_UNIVERSE_MODE` | Default `configured` — scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI by default). Set to `dynamic` to scan **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`. The configured default exists because the entry gates (`SPREAD_MAX_BPS`, `ENTRY_QUOTE_MAX_AGE_MS`) are calibrated for tier-1 liquidity — running dynamic mode against long-tail alts results in nearly everything being rejected for stale quotes or wide spreads, starving entries. |
+| `ENTRY_SYMBOLS_PRIMARY` | The configured-mode universe. Default `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`. Ignored when `ENTRY_UNIVERSE_MODE=dynamic`. |
+| `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `true` so production can opt into dynamic without an extra flag. The runtime validator only blocks production startup if mode is `dynamic` AND this flag is `false`. |
 
 ### Toggles
 | Var | Default | What it does |
@@ -166,11 +166,10 @@ See `.github/workflows/ci.yml`.
 - **No stop-loss.** A position never closes below break-even-after-fees. If the price drops below entry and stays there, the break-even sell stays parked until the price comes back.
 - **No leverage.**
 - **No averaging down or pyramiding.**
-- **No universe whitelist.** Default mode is `dynamic`: every active Alpaca crypto pair (USD-quoted, ex-stablecoins) is in scope. Per-symbol gates (spread, quote freshness, predicted edge) decide what actually trades.
-- **No cross-symbol correlation guard.** With 30+ pairs in scope, the engine can become long the same beta on multiple symbols simultaneously.
+- **No cross-symbol correlation guard.** When `ENTRY_UNIVERSE_MODE=dynamic` and 30+ pairs are in scope, the engine can become long the same beta on multiple symbols simultaneously.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
-The 90-second break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
+The 10-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
 
 ---
 
@@ -180,9 +179,9 @@ The production instance runs on Render. Before pointing the bot at a funded acco
 
 1. Set every secret (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `API_TOKEN`) directly in the Render env. Never in git.
 2. `npm run check:runtime-env` to validate config.
-3. Leave `ENTRY_UNIVERSE_MODE` unset (default `dynamic`) so the scanner uses every active Alpaca crypto pair. Set `ENTRY_UNIVERSE_MODE=configured` only if you want to intentionally restrict the scan to `ENTRY_SYMBOLS_PRIMARY`.
+3. Leave `ENTRY_UNIVERSE_MODE` unset (default `configured`) so the scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (BTC/ETH/SOL/AVAX/LINK/UNI). Set `ENTRY_UNIVERSE_MODE=dynamic` only if you have explicitly relaxed `SPREAD_MAX_BPS` and `ENTRY_QUOTE_MAX_AGE_MS` enough to accept long-tail liquidity.
 4. After deploy, `GET /debug/runtime-config` (token-protected) is the source of truth for what the live process actually sees.
-5. Verify `effectiveUniverseMode=dynamic` and `scanSymbolsCount` matches Alpaca's active crypto count (typically 30+) in the `startup_truth_summary` log line.
+5. Verify `effectiveUniverseMode=configured` and `scanSymbolsCount` matches the configured primary count (6 by default) in the `startup_truth_summary` log line.
 
 Operational details, the full env-var reference, and tuning notes live in `backend/README.md`.
 

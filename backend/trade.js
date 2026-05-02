@@ -10,7 +10,7 @@
 //      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
 //      so the user's +0.25% target is AFTER Alpaca's round-trip fees.
 //   5. If the take-profit doesn't fill within BREAKEVEN_TIMEOUT_MS (default
-//      3 minutes from when the position was first observed), cancel the GTC
+//      10 minutes from when the position was first observed), cancel the GTC
 //      sell and replace it with a sell at break-even-after-fees
 //      (entry * (1 + FEE_BPS_ROUND_TRIP/10000)). That guarantees zero net
 //      profit but recycles the slot so the engine keeps trading.
@@ -72,12 +72,12 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
 // being first observed, cancel the TP and replace it at break-even-after-fees
-// so the slot recycles. Default 180 s (raised from 90 s — slot capital is tied
-// up the same way whether the resting order is TP or break-even, so a longer
-// TP window converts more positions into wins instead of forced break-evens
-// when the +0.60 % gross move arrives just past the 90 s mark). Floor at 30 s
-// to stay above broker round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 180000));
+// so the slot recycles. Default 600 s (raised from 180 s — slot capital is
+// tied up the same way whether the resting order is TP or break-even, and the
+// 180 s window was empirically converting most predicted-positive trades into
+// flat break-even fills before their +0.60 % gross move had time to develop).
+// Floor at 30 s to stay above broker round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 600000));
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -829,20 +829,30 @@ function getEntryDiagnosticsSnapshot() {
 }
 
 function getUniverseDiagnosticsSnapshot() {
-  const pairs = supportedPairsSnapshot.pairs || [];
+  const tradable = supportedPairsSnapshot.pairs || [];
+  const effectiveMode = runtimeConfig.entryUniverseModeEffective === 'configured'
+    ? 'configured'
+    : 'dynamic';
+  let scanSymbols;
+  if (effectiveMode === 'configured') {
+    const allowed = new Set(tradable);
+    scanSymbols = (runtimeConfig.configuredPrimarySymbols || []).filter((s) => allowed.has(s));
+  } else {
+    scanSymbols = tradable.slice();
+  }
   return {
-    envRequestedUniverseMode: runtimeConfig.entryUniverseModeRaw || 'dynamic',
-    effectiveUniverseMode: 'dynamic',
-    dynamicUniverseActive: true,
-    dynamicTradableSymbolsFound: pairs.length,
-    rankedAcceptedSymbolsCount: pairs.length,
-    acceptedSymbolsCount: pairs.length,
-    dynamicAcceptedSymbolsCount: pairs.length,
-    scanSymbolsCount: pairs.length,
-    rankedAcceptedSymbolsSample: pairs.slice(0, 10),
-    acceptedSymbolsSample: pairs.slice(0, 10),
-    dynamicAcceptedSymbolsSample: pairs.slice(0, 10),
-    scanSymbolsSample: pairs.slice(0, 10),
+    envRequestedUniverseMode: runtimeConfig.entryUniverseModeRaw || effectiveMode,
+    effectiveUniverseMode: effectiveMode,
+    dynamicUniverseActive: effectiveMode === 'dynamic',
+    dynamicTradableSymbolsFound: tradable.length,
+    rankedAcceptedSymbolsCount: scanSymbols.length,
+    acceptedSymbolsCount: scanSymbols.length,
+    dynamicAcceptedSymbolsCount: effectiveMode === 'dynamic' ? scanSymbols.length : 0,
+    scanSymbolsCount: scanSymbols.length,
+    rankedAcceptedSymbolsSample: scanSymbols.slice(0, 10),
+    acceptedSymbolsSample: scanSymbols.slice(0, 10),
+    dynamicAcceptedSymbolsSample: effectiveMode === 'dynamic' ? scanSymbols.slice(0, 10) : [],
+    scanSymbolsSample: scanSymbols.slice(0, 10),
     universeSymbolCap: null,
     configuredUniverseCap: null,
     configuredUniverseCapSource: null,
@@ -925,11 +935,22 @@ async function scanAndEnter() {
   skipReasonCounts.clear();
 
   await loadSupportedCryptoPairs();
-  // Universe = every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
-  // returned by /v2/assets. There is no further filtering on `which symbols
-  // to look at` — only the per-symbol gates inside the loop (spread, quote
-  // freshness, predicted edge, etc.) decide whether to actually trade.
-  const universe = (supportedPairsSnapshot.pairs || []).slice();
+  // Universe selection:
+  //   - dynamic  → every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
+  //               returned by /v2/assets.
+  //   - configured → only ENTRY_SYMBOLS_PRIMARY (intersected with the tradable
+  //                  set, so dead symbols can't sneak in).
+  // Per-symbol gates inside the loop (spread, quote freshness, predicted edge,
+  // etc.) still decide whether to actually trade.
+  const allTradable = supportedPairsSnapshot.pairs || [];
+  let universe;
+  if (runtimeConfig.entryUniverseModeEffective === 'configured') {
+    const allowed = new Set(allTradable);
+    const primary = runtimeConfig.configuredPrimarySymbols || [];
+    universe = primary.filter((s) => allowed.has(s));
+  } else {
+    universe = allTradable.slice();
+  }
   currentScanUniverseSize = universe.length;
 
   let held, openBuyPairs;
