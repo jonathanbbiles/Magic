@@ -1646,4 +1646,5 @@ module.exports = {
   // exposed for regression tests of the bar-fetch / prediction pipeline
   getPredictionSignal,
   getHigherTimeframeSignal,
+  scanAndEnter,
 };
