@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Constants from 'expo-constants';
 import {
+  createRuntimeOverrideStorage,
+  createMemoryAdapter,
+  createLocalStorageAdapter,
+} from './runtimeOverrideStorage';
+import {
   ActivityIndicator,
   AppState,
   Platform,
@@ -12,6 +17,7 @@ import {
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 
@@ -116,8 +122,28 @@ function resolveBackendConfig() {
 }
 
 const BACKEND_CONFIG = resolveBackendConfig();
-const BASE_URL = BACKEND_CONFIG.baseUrl;
-const API_TOKEN = BACKEND_CONFIG.apiToken;
+const RUNTIME_OVERRIDE_STORAGE_KEY = 'mm.frontend.runtimeOverride.v1';
+
+function pickRuntimeAdapter() {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window?.localStorage) {
+    return createLocalStorageAdapter(RUNTIME_OVERRIDE_STORAGE_KEY, window.localStorage);
+  }
+  return createMemoryAdapter();
+}
+
+const runtimeConfigStore = createRuntimeOverrideStorage({
+  adapter: pickRuntimeAdapter(),
+  defaults: { baseUrl: BACKEND_CONFIG.baseUrl, apiToken: BACKEND_CONFIG.apiToken },
+});
+
+function getRuntimeConfig() {
+  return runtimeConfigStore.get();
+}
+
+function setRuntimeConfig(next) {
+  return runtimeConfigStore.set(next || {});
+}
+
 const FETCH_TIMEOUT_MS = 20000;
 
 // ---------------------------------------------------------------------------
@@ -127,20 +153,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeHeaders() {
   const h = { Accept: 'application/json' };
-  if (API_TOKEN) {
-    h.Authorization = `Bearer ${API_TOKEN}`;
-    h['x-api-key'] = API_TOKEN;
+  const { apiToken } = getRuntimeConfig();
+  if (apiToken) {
+    h.Authorization = `Bearer ${apiToken}`;
+    h['x-api-key'] = apiToken;
   }
   return h;
 }
 
 async function apiFetch(path) {
-  if (!BASE_URL) {
+  const { baseUrl } = getRuntimeConfig();
+  if (!baseUrl) {
     const e = new Error('Missing EXPO_PUBLIC_BACKEND_URL');
     e.status = 503;
     throw e;
   }
-  const url = `${String(BASE_URL).replace(/\/$/, '')}${path}`;
+  const url = `${String(baseUrl).replace(/\/$/, '')}${path}`;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   let res;
@@ -308,6 +336,71 @@ function PositionCard({ position }) {
           <Text style={s.posVal}>{usd(toNum(position?.sell?.activeLimit) ?? toNum(position?.bot?.targetPrice))}</Text>
         </View>
       </View>
+    </View>
+  );
+}
+
+function SettingsCard({ config, onSave, onClear, compact }) {
+  const [baseUrlDraft, setBaseUrlDraft] = useState(config.baseUrl || '');
+  const [apiTokenDraft, setApiTokenDraft] = useState(config.apiToken || '');
+  const [revealToken, setRevealToken] = useState(false);
+
+  useEffect(() => {
+    setBaseUrlDraft(config.baseUrl || '');
+    setApiTokenDraft(config.apiToken || '');
+  }, [config.baseUrl, config.apiToken]);
+
+  return (
+    <View style={[s.card, compact && { marginTop: theme.spacing.md }]}>
+      <Text style={s.cardTitle}>Backend connection</Text>
+      <Text style={s.settingsHint}>
+        {compact
+          ? 'Backend rejected the request. Paste the token Render exposes as API_TOKEN.'
+          : 'Override at runtime — useful when the backend rotates API_TOKEN on Render.'}
+      </Text>
+      <Text style={s.settingsLabel}>Backend URL</Text>
+      <TextInput
+        value={baseUrlDraft}
+        onChangeText={setBaseUrlDraft}
+        placeholder="https://magic-lw8t.onrender.com"
+        placeholderTextColor={theme.colors.muted}
+        autoCapitalize="none"
+        autoCorrect={false}
+        keyboardType={Platform.OS === 'ios' ? 'url' : 'default'}
+        style={s.settingsInput}
+      />
+      <Text style={s.settingsLabel}>API token</Text>
+      <View style={s.settingsTokenRow}>
+        <TextInput
+          value={apiTokenDraft}
+          onChangeText={setApiTokenDraft}
+          placeholder="Backend API_TOKEN"
+          placeholderTextColor={theme.colors.muted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          secureTextEntry={!revealToken}
+          style={[s.settingsInput, { flex: 1, marginBottom: 0 }]}
+        />
+        <Pressable onPress={() => setRevealToken((v) => !v)} style={s.smallBtn}>
+          <Text style={s.smallBtnText}>{revealToken ? 'Hide' : 'Show'}</Text>
+        </Pressable>
+      </View>
+      <View style={s.settingsActions}>
+        <Pressable
+          style={[s.smallBtn, s.settingsPrimary]}
+          onPress={() => onSave({ baseUrl: baseUrlDraft.trim(), apiToken: apiTokenDraft.trim() })}
+        >
+          <Text style={[s.smallBtnText, s.settingsPrimaryText]}>Save & retry</Text>
+        </Pressable>
+        <Pressable style={s.smallBtn} onPress={onClear}>
+          <Text style={s.smallBtnText}>Clear override</Text>
+        </Pressable>
+      </View>
+      {Platform.OS !== 'web' ? (
+        <Text style={s.settingsHint}>
+          Saved for this app session. Restart Expo and the override clears.
+        </Text>
+      ) : null}
     </View>
   );
 }
@@ -495,7 +588,8 @@ const TABS = [
 ];
 
 function AppInner() {
-  const backendConfigured = Boolean(BASE_URL);
+  const [config, setConfigState] = useState(getRuntimeConfig);
+  const backendConfigured = Boolean(config.baseUrl);
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -535,7 +629,15 @@ function AppInner() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [backendConfigured]);
+  }, [backendConfigured, config.baseUrl, config.apiToken]);
+
+  const applyRuntimeConfig = useCallback((next) => {
+    const updated = setRuntimeConfig(next);
+    setConfigState(updated);
+    setError(null);
+    setDashboard(null);
+    setLoading(true);
+  }, []);
 
   useEffect(() => {
     if (!backendConfigured) {
@@ -738,12 +840,19 @@ function AppInner() {
       ) : null}
 
       {!backendConfigured ? (
-        <View style={s.configBlocker}>
-          <Text style={s.configBlockerTitle}>Backend URL required</Text>
-          <Text style={s.configBlockerText}>
-            Set EXPO_PUBLIC_BACKEND_URL (or expo extra.backendUrl) and reload Expo.
-          </Text>
-        </View>
+        <ScrollView style={s.scrollBody}>
+          <View style={s.configBlocker}>
+            <Text style={s.configBlockerTitle}>Backend URL required</Text>
+            <Text style={s.configBlockerText}>
+              Set EXPO_PUBLIC_BACKEND_URL (or expo extra.backendUrl), or paste the URL below.
+            </Text>
+          </View>
+          <SettingsCard
+            config={config}
+            onSave={(next) => applyRuntimeConfig(next)}
+            onClear={() => applyRuntimeConfig({ baseUrl: '', apiToken: '' })}
+          />
+        </ScrollView>
       ) : null}
 
       {backendConfigured && tab === 'overview' ? (
@@ -755,6 +864,15 @@ function AppInner() {
             <View style={s.errorBanner}>
               <Text style={s.errorBannerText}>{error}</Text>
             </View>
+          ) : null}
+
+          {backendAuthIssue ? (
+            <SettingsCard
+              compact
+              config={config}
+              onSave={(next) => applyRuntimeConfig(next)}
+              onClear={() => applyRuntimeConfig({ baseUrl: '', apiToken: '' })}
+            />
           ) : null}
 
           {loading && !dashboard ? <ActivityIndicator color={theme.colors.accent} style={{ marginTop: 32 }} /> : null}
@@ -845,6 +963,12 @@ function AppInner() {
           style={s.scrollBody}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => load({ isRefresh: true })} />}
         >
+          <SettingsCard
+            config={config}
+            onSave={(next) => applyRuntimeConfig(next)}
+            onClear={() => applyRuntimeConfig({ baseUrl: '', apiToken: '' })}
+          />
+
           <Pressable onPress={copyFullBundle} style={[s.smallBtn, { alignSelf: 'flex-start', marginBottom: 8 }]}>
             <Text style={s.smallBtnText}>Copy full bundle</Text>
           </Pressable>
@@ -1008,6 +1132,25 @@ const s = StyleSheet.create({
     paddingVertical: 4,
   },
   smallBtnText: { color: theme.colors.accent, fontSize: 11, fontWeight: '700' },
+
+  // Settings card
+  settingsLabel: { color: theme.colors.muted, fontSize: 11, fontWeight: '700', marginTop: 8, marginBottom: 4 },
+  settingsHint: { color: theme.colors.secondary, fontSize: 11, marginBottom: 6 },
+  settingsInput: {
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+    backgroundColor: theme.colors.surfaceAlt,
+    borderRadius: theme.radius.sm,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+    color: theme.colors.text,
+    marginBottom: 4,
+  },
+  settingsTokenRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  settingsActions: { flexDirection: 'row', gap: 8, marginTop: theme.spacing.sm },
+  settingsPrimary: { backgroundColor: theme.colors.accent, borderColor: theme.colors.accent },
+  settingsPrimaryText: { color: '#fff' },
 
   // Logs (inline within diagnostics tab)
   logsInline: { marginBottom: theme.spacing.sm },
