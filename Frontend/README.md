@@ -45,6 +45,18 @@ Backend/Frontend auth key mapping:
 - Expo token env var: `EXPO_PUBLIC_API_TOKEN`
 - Expo backend URL env var: `EXPO_PUBLIC_BACKEND_URL`
 
+## Runtime override
+
+If the backend rotates `API_TOKEN` (e.g. after a Render redeploy) and the bundled
+Expo app no longer authenticates, the dashboard renders an inline **Backend
+connection** card whenever it sees an HTTP 401/403. Paste the new backend URL
+and `API_TOKEN` and tap **Save & retry** — subsequent `/dashboard` polls use
+the override. The same card always lives at the top of the **Diag & Logs** tab.
+
+Persistence:
+- **Web:** override is saved in `localStorage` (key `mm.frontend.runtimeOverride.v1`).
+- **Native (iOS/Android):** override survives until Expo cold-restarts; paste again after a restart, or rebuild with `EXPO_PUBLIC_API_TOKEN` set for permanent fix.
+
 ## Networking notes
 
 The app includes a built-in default backend base URL fallback (`https://magic-lw8t.onrender.com`) for diagnostics.
