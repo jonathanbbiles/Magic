@@ -835,8 +835,15 @@ function getUniverseDiagnosticsSnapshot() {
     : 'dynamic';
   let scanSymbols;
   if (effectiveMode === 'configured') {
-    const allowed = new Set(tradable);
-    scanSymbols = (runtimeConfig.configuredPrimarySymbols || []).filter((s) => allowed.has(s));
+    const primary = runtimeConfig.configuredPrimarySymbols || [];
+    if (tradable.length > 0) {
+      const allowed = new Set(tradable);
+      scanSymbols = primary.filter((s) => allowed.has(s));
+    } else {
+      // Mirror scanAndEnter: when /v2/assets has never returned, the
+      // configured primary list is the universe.
+      scanSymbols = primary.slice();
+    }
   } else {
     scanSymbols = tradable.slice();
   }
@@ -945,9 +952,17 @@ async function scanAndEnter() {
   const allTradable = supportedPairsSnapshot.pairs || [];
   let universe;
   if (runtimeConfig.entryUniverseModeEffective === 'configured') {
-    const allowed = new Set(allTradable);
     const primary = runtimeConfig.configuredPrimarySymbols || [];
-    universe = primary.filter((s) => allowed.has(s));
+    if (allTradable.length > 0) {
+      const allowed = new Set(allTradable);
+      universe = primary.filter((s) => allowed.has(s));
+    } else {
+      // /v2/assets has never returned successfully (cold-boot Alpaca outage).
+      // The configured primary list is hardcoded and known-good, so trust it
+      // rather than starving every scan with an empty universe.
+      universe = primary.slice();
+      bumpSkipReason('supported_pairs_unavailable_used_configured_primary');
+    }
   } else {
     universe = allTradable.slice();
   }
