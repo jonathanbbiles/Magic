@@ -4,7 +4,7 @@ const {
   createRuntimeOverrideStorage,
   createMemoryAdapter,
   createLocalStorageAdapter,
-} = require('./runtimeOverrideStorage');
+} = require('./runtimeOverrideStorage.js');
 import {
   ActivityIndicator,
   AppState,
