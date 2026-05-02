@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Constants from 'expo-constants';
-import {
+const {
   createRuntimeOverrideStorage,
   createMemoryAdapter,
   createLocalStorageAdapter,
-} from './runtimeOverrideStorage';
+} = require('./runtimeOverrideStorage');
 import {
   ActivityIndicator,
   AppState,
