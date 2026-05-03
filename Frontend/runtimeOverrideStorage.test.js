@@ -5,7 +5,7 @@ const {
   createRuntimeOverrideStorage,
   createMemoryAdapter,
   createLocalStorageAdapter,
-} = require('./runtimeOverrideStorage.js');
+} = require('./runtimeOverrideStorage');
 
 function fakeLocalStorage() {
   const map = new Map();
