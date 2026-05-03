@@ -356,7 +356,13 @@ const parseCorsRegexes = (raw) =>
     .filter(Boolean);
 
 const isPublicEndpoint = (req) =>
-  req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth' || req.path === '/debug/status');
+  req.method === 'GET' && (
+    req.path === '/health'
+    || req.path === '/debug/auth'
+    || req.path === '/debug/status'
+    || req.path === '/dashboard'
+    || req.path === '/debug/logs'
+  );
 
 const serializeError = (error, fallbackMessage = 'Request failed') => {
   const statusCode = Number.isFinite(error?.statusCode)
