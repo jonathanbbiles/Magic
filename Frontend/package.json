@@ -9,8 +9,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "node scripts/lint.js",
-    "check": "node scripts/check.js",
-    "test": "node runtimeOverrideStorage.test.js"
+    "check": "node scripts/check.js"
   },
   "dependencies": {
     "expo": "~53.0.0",
