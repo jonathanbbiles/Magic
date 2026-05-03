@@ -1,10 +1,81 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Constants from 'expo-constants';
-const {
-  createRuntimeOverrideStorage,
-  createMemoryAdapter,
-  createLocalStorageAdapter,
-} = require('./runtimeOverrideStorage');
+// Inlined from runtimeOverrideStorage.js: kept here so the Metro/EAS bundler
+// does not need to resolve a separate local CommonJS module (which has been
+// failing in EAS Update with `module://runtimeOverrideStorage.js.js`).
+// The standalone file is retained for the Node-based test suite.
+const __mmTrim = (value) => String(value == null ? '' : value).trim();
+function createRuntimeOverrideStorage({ adapter, defaults }) {
+  const safeDefaults = {
+    baseUrl: __mmTrim(defaults && defaults.baseUrl),
+    apiToken: __mmTrim(defaults && defaults.apiToken),
+  };
+  const readPersisted = () => {
+    if (!adapter || typeof adapter.get !== 'function') return {};
+    try {
+      const raw = adapter.get();
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+  const writePersisted = (override) => {
+    if (!adapter) return;
+    try {
+      const hasValue = Boolean(override && (override.baseUrl || override.apiToken));
+      if (hasValue && typeof adapter.set === 'function') {
+        adapter.set(JSON.stringify({
+          baseUrl: __mmTrim(override.baseUrl) || undefined,
+          apiToken: __mmTrim(override.apiToken) || undefined,
+        }));
+      } else if (typeof adapter.remove === 'function') {
+        adapter.remove();
+      }
+    } catch {
+      // ignore
+    }
+  };
+  const persisted = readPersisted();
+  const state = {
+    baseUrl: __mmTrim(persisted.baseUrl) || safeDefaults.baseUrl,
+    apiToken: __mmTrim(persisted.apiToken) || safeDefaults.apiToken,
+  };
+  function get() {
+    return { baseUrl: state.baseUrl, apiToken: state.apiToken };
+  }
+  function set(next) {
+    const nextBaseUrl = __mmTrim(next && next.baseUrl);
+    const nextApiToken = __mmTrim(next && next.apiToken);
+    state.baseUrl = nextBaseUrl || safeDefaults.baseUrl;
+    state.apiToken = nextApiToken;
+    writePersisted({ baseUrl: nextBaseUrl, apiToken: nextApiToken });
+    return get();
+  }
+  return { get, set };
+}
+function createMemoryAdapter() {
+  let value = null;
+  return {
+    get() { return value; },
+    set(v) { value = String(v); },
+    remove() { value = null; },
+  };
+}
+function createLocalStorageAdapter(key, storage) {
+  return {
+    get() {
+      try { return storage.getItem(key); } catch { return null; }
+    },
+    set(value) {
+      try { storage.setItem(key, value); } catch { /* ignore */ }
+    },
+    remove() {
+      try { storage.removeItem(key); } catch { /* ignore */ }
+    },
+  };
+}
 import {
   ActivityIndicator,
   AppState,
