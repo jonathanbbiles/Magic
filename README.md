@@ -96,7 +96,7 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `APCA_API_SECRET_KEY` | Alpaca secret (or `ALPACA_SECRET_KEY`, `ALPACA_API_SECRET_KEY`). |
 | `TRADE_BASE` | Must be `https://api.alpaca.markets` in production. Paper endpoints rejected. |
 | `DATA_BASE` | `https://data.alpaca.markets`. |
-| `API_TOKEN` | Required in production for HTTP route protection. |
+| `API_TOKEN` | Required in production. Protects every mutating endpoint (`/buy`, `/trade`, `POST /orders`, `DELETE /orders/:id`) and most debug endpoints. The frontend's read-only endpoints (`GET /dashboard`, `GET /debug/logs`) plus `GET /health`, `GET /debug/auth`, `GET /debug/status` are public so the diagnostic Expo app works without bundling a token. Trading endpoints stay locked. |
 
 ### Strategy economics (defaults in parentheses)
 | Var | Default | What it does |
