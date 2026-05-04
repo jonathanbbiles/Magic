@@ -50,7 +50,7 @@ function readBoolean(name, fallback) {
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
 // +20 bps (0.20%) target is AFTER fees, not before. Lowered from 25 bps to
 // raise the TP fill rate and clear more wins per day on a normal market.
-const TARGET_NET_PROFIT_BPS = Math.max(1, readNumber('TARGET_NET_PROFIT_BPS', 20));
+const TARGET_NET_PROFIT_BPS = Math.min(5, Math.max(2, readNumber('TARGET_NET_PROFIT_BPS', 3)));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
 // entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
 // above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
@@ -65,6 +65,10 @@ const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // liquid pairs clear the gate during normal book conditions.
 // MIN_NET_EDGE_BPS remains the real EV filter on top of this.
 const PROFIT_BUFFER_BPS = Math.max(0, readNumber('PROFIT_BUFFER_BPS', 5));
+const DYNAMIC_BUFFER_MIN_BPS = Math.max(0, readNumber('DYNAMIC_BUFFER_MIN_BPS', 2));
+const DYNAMIC_BUFFER_MAX_BPS = Math.max(DYNAMIC_BUFFER_MIN_BPS, readNumber('DYNAMIC_BUFFER_MAX_BPS', 5));
+const LOW_VOL_BPS = Math.max(1, readNumber('LOW_VOL_BPS', 20));
+const HIGH_VOL_BPS = Math.max(LOW_VOL_BPS + 1, readNumber('HIGH_VOL_BPS', 80));
 // Fraction of account equity to deploy per trade (e.g. 0.10 = 10%).
 const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10));
 // Floor below which we won't send a buy (dust). Alpaca's crypto min notional
@@ -97,6 +101,14 @@ const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 60000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
+const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', 20));
+const SPREAD_SHOCK_MAX_BPS = Math.max(SPREAD_ENTRY_MAX_BPS, readNumber('SPREAD_SHOCK_MAX_BPS', 30));
+const MAX_SLIPPAGE_ESTIMATE_BPS = Math.max(0, readNumber('MAX_SLIPPAGE_ESTIMATE_BPS', 5));
+const MICRO_MOMENTUM_TICKS = Math.max(3, readNumber('MICRO_MOMENTUM_TICKS', 4));
+const MICRO_EMA_LENGTH = Math.max(3, readNumber('MICRO_EMA_LENGTH', 6));
+const MICRO_MEAN_REVERSION_MIN_DEV_BPS = Math.max(0.1, readNumber('MICRO_MEAN_REVERSION_MIN_DEV_BPS', 2));
+const TIGHT_QUOTE_MAX_BPS = Math.max(1, readNumber('TIGHT_QUOTE_MAX_BPS', 12));
+const STABLE_QUOTE_VOL_MAX_BPS = Math.max(0.1, readNumber('STABLE_QUOTE_VOL_MAX_BPS', 8));
 
 // --- entry prediction ---------------------------------------------------
 // The bot only buys when recent 1m closes form a statistically meaningful
@@ -812,6 +824,11 @@ function bumpSkipReason(reason) {
   rollingSkipReasons.set(reason, (rollingSkipReasons.get(reason) || 0) + 1);
 }
 
+function rejectTrade(pair, reason, details = {}) {
+  bumpSkipReason(reason);
+  console.log('entry_rejected', { symbol: pair, reason, ...details });
+}
+
 function mapToObject(m) {
   const out = {};
   for (const [k, v] of m.entries()) out[k] = v;
@@ -958,8 +975,59 @@ function quoteTimestampMs(quote) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-function requiredEdgeBps(spreadBps) {
-  return Math.max(0, spreadBps || 0) + FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS;
+function getDynamicBufferBps(volatilityBps) {
+  const vol = Number(volatilityBps);
+  if (!Number.isFinite(vol)) return DYNAMIC_BUFFER_MAX_BPS;
+  if (vol <= LOW_VOL_BPS) return DYNAMIC_BUFFER_MIN_BPS;
+  if (vol >= HIGH_VOL_BPS) return DYNAMIC_BUFFER_MAX_BPS;
+  const t = (vol - LOW_VOL_BPS) / (HIGH_VOL_BPS - LOW_VOL_BPS);
+  return DYNAMIC_BUFFER_MIN_BPS + ((DYNAMIC_BUFFER_MAX_BPS - DYNAMIC_BUFFER_MIN_BPS) * t);
+}
+
+function requiredEdgeBps(spreadBps, volatilityBps) {
+  return Math.max(0, spreadBps || 0) + FEE_BPS_ROUND_TRIP + getDynamicBufferBps(volatilityBps);
+}
+
+function shouldEnterTrade({ spreadBps, slippageEstimateBps, volatilityBps, ask, bid, closes = [] } = {}) {
+  if (!Number.isFinite(spreadBps)) return { ok: false, reason: 'invalid_spread' };
+  if (spreadBps > SPREAD_ENTRY_MAX_BPS) return { ok: false, reason: 'spread_above_entry_max' };
+  if (spreadBps > SPREAD_SHOCK_MAX_BPS) return { ok: false, reason: 'spread_shock' };
+  if (Number.isFinite(slippageEstimateBps) && slippageEstimateBps > MAX_SLIPPAGE_ESTIMATE_BPS) {
+    return { ok: false, reason: 'slippage_too_high' };
+  }
+  if (Number.isFinite(volatilityBps) && volatilityBps > VOLATILITY_MAX_BPS) {
+    return { ok: false, reason: 'volatility_spike' };
+  }
+
+  const recent = closes.slice(-Math.max(MICRO_MOMENTUM_TICKS, MICRO_EMA_LENGTH));
+  const momentumWindow = recent.slice(-MICRO_MOMENTUM_TICKS);
+  let upMoves = 0;
+  for (let i = 1; i < momentumWindow.length; i += 1) {
+    if (momentumWindow[i] > momentumWindow[i - 1]) upMoves += 1;
+  }
+  const momentumConfirm = momentumWindow.length >= 3 && upMoves >= Math.ceil((momentumWindow.length - 1) * 0.7);
+
+  const emaAlpha = 2 / (MICRO_EMA_LENGTH + 1);
+  let ema = recent[0];
+  for (let i = 1; i < recent.length; i += 1) ema = (recent[i] * emaAlpha) + (ema * (1 - emaAlpha));
+  const last = recent[recent.length - 1];
+  const meanReversionDevBps = Number.isFinite(last) && Number.isFinite(ema) && ema > 0
+    ? ((ema - last) / ema) * 10000
+    : null;
+  const meanReversionConfirm = Number.isFinite(meanReversionDevBps) && meanReversionDevBps >= MICRO_MEAN_REVERSION_MIN_DEV_BPS;
+
+  const stableQuoteConfirm = Number.isFinite(spreadBps) &&
+    spreadBps <= TIGHT_QUOTE_MAX_BPS &&
+    Number.isFinite(volatilityBps) &&
+    volatilityBps <= STABLE_QUOTE_VOL_MAX_BPS &&
+    Number.isFinite(ask) &&
+    Number.isFinite(bid) &&
+    ask > bid;
+
+  if (!momentumConfirm && !meanReversionConfirm && !stableQuoteConfirm) {
+    return { ok: false, reason: 'micro_signal_missing' };
+  }
+  return { ok: true, momentumConfirm, meanReversionConfirm, stableQuoteConfirm };
 }
 
 async function initializeInventoryFromPositions() {
@@ -1105,36 +1173,41 @@ async function scanAndEnter() {
     try {
       const payload = await fetchCryptoQuotes({ symbols: [pair] });
       const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
-      if (!quote) { bumpSkipReason('no_quote'); continue; }
+      if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
       const ageMs = Date.now() - (quoteTimestampMs(quote) || 0);
-      if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { bumpSkipReason('stale_quote'); continue; }
+      if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
 
       const spreadBps = computeSpreadBps(quote);
-      if (spreadBps == null) { bumpSkipReason('invalid_quote'); continue; }
-      if (spreadBps > SPREAD_MAX_BPS) { bumpSkipReason('spread_too_wide'); continue; }
-
-      const needed = requiredEdgeBps(spreadBps);
-      if (GROSS_TARGET_BPS < needed) {
-        bumpSkipReason('edge_below_required');
-        continue;
-      }
+      if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
+      if (spreadBps > SPREAD_MAX_BPS) { rejectTrade(pair, 'spread_too_wide', { spreadBps }); continue; }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
-      if (!Number.isFinite(ask) || ask <= 0) { bumpSkipReason('invalid_ask'); continue; }
-      if (!Number.isFinite(bid) || bid <= 0) { bumpSkipReason('invalid_bid'); continue; }
+      if (!Number.isFinite(ask) || ask <= 0) { rejectTrade(pair, 'invalid_ask'); continue; }
+      if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
       const sig = await getPredictionSignal(pair);
       if (!sig.ok) {
-        bumpSkipReason(sig.reason || 'prediction_rejected');
+        rejectTrade(pair, sig.reason || 'prediction_rejected');
+        continue;
+      }
+      const needed = requiredEdgeBps(spreadBps, sig.volatilityBps);
+      if (GROSS_TARGET_BPS < needed) {
+        rejectTrade(pair, 'edge_below_required', { spreadBps, needed, dynamicBufferBps: getDynamicBufferBps(sig.volatilityBps) });
         continue;
       }
 
-      // Reject overheated symbols — high 1m return volatility before entry
-      // is strongly associated with the post-entry reversals the user saw.
-      if (Number.isFinite(sig.volatilityBps) && sig.volatilityBps > VOLATILITY_MAX_BPS) {
-        bumpSkipReason('volatility_too_high');
+      const entryGate = shouldEnterTrade({
+        spreadBps,
+        slippageEstimateBps: ENTRY_SLIPPAGE_BPS,
+        volatilityBps: sig.volatilityBps,
+        ask,
+        bid,
+        closes: sig.closes || [],
+      });
+      if (!entryGate.ok) {
+        rejectTrade(pair, entryGate.reason, { spreadBps, volatilityBps: sig.volatilityBps });
         continue;
       }
 
@@ -1142,7 +1215,7 @@ async function scanAndEnter() {
       // downtrend.
       const htf = await getHigherTimeframeSignal(pair);
       if (!htf.ok) {
-        bumpSkipReason(htf.reason || 'htf_rejected');
+        rejectTrade(pair, htf.reason || 'htf_rejected');
         continue;
       }
 
@@ -1191,12 +1264,12 @@ async function scanAndEnter() {
         minNetEdgeBps: MIN_NET_EDGE_BPS,
       });
       if (ENFORCE_GROSS_TARGET_FLOOR && GROSS_TARGET_BPS < minGrossFloor.minGrossTargetBps) {
-        bumpSkipReason('gross_target_below_friction_floor');
+        rejectTrade(pair, 'gross_target_below_friction_floor', { minGrossTargetBps: minGrossFloor.minGrossTargetBps });
         continue;
       }
 
       if (projectedBps < (spreadCostBps + modeledSlippageBps)) {
-        bumpSkipReason('alpha_below_execution_cost');
+        rejectTrade(pair, 'alpha_below_execution_cost');
         continue;
       }
 
@@ -1206,13 +1279,13 @@ async function scanAndEnter() {
       // even when the OLS fit predicted a downward move. Block long entries
       // when the 1m model predicts down (or flat).
       if (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0) {
-        bumpSkipReason('slope_not_positive');
+        rejectTrade(pair, 'slope_not_positive');
         continue;
       }
 
       if (NET_EDGE_GATE_ENABLED) {
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
-          bumpSkipReason('net_edge_below_min');
+          rejectTrade(pair, 'net_edge_below_min', { netEdgeBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
           continue;
         }
       }
@@ -1228,7 +1301,7 @@ async function scanAndEnter() {
         assumedStuckLossBps: STUCK_LOSS_ASSUMED_BPS,
       });
       if (HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
-        bumpSkipReason('honest_ev_below_min');
+        rejectTrade(pair, 'honest_ev_below_min', { honestEvBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
         continue;
       }
 
@@ -1241,7 +1314,7 @@ async function scanAndEnter() {
       // Round buy limit to the asset's price_increment so Alpaca accepts it.
       const tickInfo = await getAssetTickInfo(pair);
       const buyLimitStr = formatTickPrice(ask, tickInfo.priceIncrement);
-      if (!buyLimitStr) { bumpSkipReason('invalid_ask'); continue; }
+      if (!buyLimitStr) { rejectTrade(pair, 'invalid_ask'); continue; }
 
       const buyRes = await submitOrder({
         symbol: pair,
@@ -1335,11 +1408,11 @@ async function scanAndEnter() {
         lastSuccessfulAction = { at: nowIso, symbol: pair, action: 'buy_submitted', orderId: buyOrder.id };
         placed += 1;
       } else {
-        bumpSkipReason('buy_rejected');
+        rejectTrade(pair, 'buy_rejected');
       }
     } catch (err) {
       lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'buy_failed', message: err?.errorMessage || err?.message || String(err) };
-      bumpSkipReason('buy_error');
+      rejectTrade(pair, 'buy_error', { message: err?.message || String(err) });
     }
   }
 
