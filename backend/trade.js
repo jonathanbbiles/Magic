@@ -112,8 +112,22 @@ const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
 // Expected-value gate. Require probability-weighted net edge (after fees and
 // slippage buffers) to clear this bar before we submit a buy. Entry-only —
 // sell behavior is unchanged.
+//
+// With realizedWinBps = TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS = 15 and a
+// fillProbability sourced from logistic_cdf(slopeTStat), MIN_NET_EDGE_BPS=10
+// required p ≥ 0.667 ⇒ slopeTStat ≥ ~0.69, which on a 20-bar 1m OLS over
+// tier-1 crypto fires only on rare clean uptrends and starved daily entries
+// (production instance was averaging well under the 10 wins/day target).
+// Lowering the floor to 5 makes the EV gate require p ≥ 0.333, which is
+// already subsumed by the slope_not_positive guard (p > 0.5 ⇔ t > 0). The
+// alpha_below_execution_cost guard (projected move ≥ spread + slippage)
+// continues to enforce a per-trade economic floor, and the static GTC
+// take-profit ensures realised wins are still entry × (1 + 60bps gross /
+// 10000) regardless of how marginal the predicted slope was. Combined with
+// the 10-min break-even reset, no positive-slope candidate that beats its
+// own execution costs is excluded from entry by EV math any more.
 const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
-const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 10);
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 5);
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
 
