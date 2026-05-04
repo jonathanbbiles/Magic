@@ -21,6 +21,11 @@
 const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
+const {
+  barrierHitProbability,
+  estimateExpectedNetBps,
+  computeMinimumGrossTargetBps,
+} = require('./modules/entryEconomics');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 
@@ -130,6 +135,50 @@ const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
 const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 5);
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
+
+// --- corrected entry economics (see backend/modules/entryEconomics.js) ----
+//
+// The OLS slope t-statistic the predictor returns measures how statistically
+// significant the past slope was, NOT the forward probability that the
+// take-profit fills inside the breakeven-timeout window. Using
+// logistic_cdf(slopeTStat) as `fillProbability` is wrong, and combined with
+// the no-stop-loss exit structure it makes the EV gate optimistic by
+// construction (every non-fill is treated as 0 P&L when in reality stuck
+// positions accumulate negative MTM). The simulator at
+// backend/scripts/simulate_strategy.js shows expectancy turns sharply
+// negative under flat / adverse drift even though the live engine's EV gate
+// reports +5 bps for the same candidates.
+//
+// Two corrections are applied, both gated by env flags so live behaviour
+// can be rolled back instantly:
+//   1. CORRECTED_FILL_PROB_ENABLED: replace the logistic-CDF proxy with a
+//      forward-looking GBM barrier-hitting probability using the recent
+//      slope as drift μ and recent realised vol as σ. This is still cheap
+//      (one Φ evaluation) and produces a probability that actually answers
+//      "what's the chance the TP fills in the next BARRIER_HORIZON_BARS?".
+//   2. ENFORCE_GROSS_TARGET_FLOOR: refuse trades whose GTC target cannot
+//      pay for spread + entry slippage + exit slippage + fees + min-net.
+//      This is a pure cost equation — no probabilistic assumption — and
+//      is the floor the user explicitly asked us to enforce.
+//
+// HONEST_EV_GATE_ENABLED is opt-in (default OFF) because it requires an
+// estimate of the average MTM loss on stuck positions, which is regime-
+// dependent. When ON, it computes:
+//     E[net] = hitProb × TARGET_NET_PROFIT_BPS - (1 - hitProb) × STUCK_LOSS_ASSUMED_BPS
+// and skips trades whose honest expectancy is below MIN_NET_EDGE_BPS.
+// Defaults are deliberately conservative: 100 bps stuck-loss assumption is
+// the median 1-week MTM hit on a flat-drift simulated stuck position.
+const CORRECTED_FILL_PROB_ENABLED = readBoolean('CORRECTED_FILL_PROB_ENABLED', true);
+const ENFORCE_GROSS_TARGET_FLOOR = readBoolean('ENFORCE_GROSS_TARGET_FLOOR', true);
+const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', false);
+const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 100));
+// Horizon (in 1-minute bars) over which we expect the take-profit to fill.
+// Defaults to BREAKEVEN_TIMEOUT_MS in minutes — i.e., the same window after
+// which the engine would otherwise replace the TP with a break-even sell.
+const BARRIER_HORIZON_BARS = Math.max(1, readNumber(
+  'BARRIER_HORIZON_BARS',
+  Math.max(1, Math.round(BREAKEVEN_TIMEOUT_MS / 60000)),
+));
 
 // --- Alpaca base URLs / auth ---------------------------------------------
 
@@ -1095,45 +1144,65 @@ async function scanAndEnter() {
         continue;
       }
 
-      // Probability-weighted expected net edge. Does not alter sell pricing —
-      // this only gates entry. fillProbability is the logistic CDF of the OLS
-      // slope t-statistic (principled replacement for the old 0.5+0.5*R^2
-      // proxy); no floor clamp — the gate itself is the real threshold.
+      // Probability-weighted expected net edge.
       //
-      // Realized P&L per buy submission (matches reconcile script's model):
-      //   - exit limit fills (prob ≈ fillProbability):
-      //       net = TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS
-      //     The exit limit is placed at entry × (1 + GROSS_TARGET_BPS/10000),
-      //     which already covers round-trip fees, so the per-win realised net
-      //     is TARGET_NET_PROFIT_BPS by construction — independent of how big
-      //     the slope projection was.
-      //   - exit limit does not fill (prob ≈ 1 − fillProbability):
-      //       net = 0  (position sits, capital tied up but no realised loss).
+      // Two probability proxies live side-by-side here so the change is
+      // reversible: the legacy `slopeProbabilityLegacy` is the logistic CDF
+      // of the OLS slope t-statistic — a measure of how significant the past
+      // slope was, not the forward chance the TP fills. The corrected
+      // `fillProbability` uses the closed-form GBM barrier-hitting formula
+      // (see entryEconomics.js) with the recent slope as drift and the
+      // recent realised vol as σ over BARRIER_HORIZON_BARS. That value
+      // actually answers the question the EV gate is trying to ask.
       //
-      // Therefore E[net] = fillProbability × (TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS).
-      // The previous formula subtracted fees unconditionally outside the
-      // probability multiplication, which double-counted them (they were
-      // already netted out of TARGET_NET_PROFIT_BPS) and pushed the gate's
-      // breakeven fill probability up to ~0.68 — a t-stat threshold rare
-      // enough that it was blocking nearly every candidate.
+      // CORRECTED_FILL_PROB_ENABLED selects which one feeds the gate.
+      // Default: corrected. Both are logged for parity tracking.
       const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
       const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
-      const fillProbability = slopeProbability(sig.slopeTStat);
+      const driftBpsPerBar = Number.isFinite(sig.slopeBpsPerBar) ? sig.slopeBpsPerBar : 0;
+      const volBpsPerBar = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
+      const slopeProbabilityLegacy = slopeProbability(sig.slopeTStat);
+      // Barrier the bid must hit for the TP to fill, expressed as bps from
+      // mid_t0: half-spread + entry slippage budget + gross-target + half
+      // spread on the way out (the SELL needs the bid to reach the limit).
+      const tpBarrierBpsFromMid = (spreadCostBps / 2) + ENTRY_SLIPPAGE_BPS + GROSS_TARGET_BPS + (spreadCostBps / 2);
+      const barrierFillProbability = barrierHitProbability({
+        barrierBps: tpBarrierBpsFromMid,
+        driftBpsPerBar,
+        volBpsPerBar,
+        horizonBars: BARRIER_HORIZON_BARS,
+      });
+      const fillProbability = CORRECTED_FILL_PROB_ENABLED ? barrierFillProbability : slopeProbabilityLegacy;
       const realizedWinBps = Math.max(0, TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS);
       const netEdgeBps = realizedWinBps * fillProbability;
       const modeledSlippageBps = ENTRY_SLIPPAGE_BPS;
+
+      // Cost-floor gate: refuse trades whose static GTC target cannot
+      // economically beat the round-trip friction. This is a deterministic
+      // accounting check — no probabilistic assumption — and answers the
+      // user-mandated "the system rejects trades that cannot beat costs".
+      const minGrossFloor = computeMinimumGrossTargetBps({
+        spreadBps: spreadCostBps,
+        entrySlippageBps: ENTRY_SLIPPAGE_BPS,
+        exitSlippageBps: EXIT_SLIPPAGE_BPS,
+        feeRoundTripBps: FEE_BPS_ROUND_TRIP,
+        minNetEdgeBps: MIN_NET_EDGE_BPS,
+      });
+      if (ENFORCE_GROSS_TARGET_FLOOR && GROSS_TARGET_BPS < minGrossFloor.minGrossTargetBps) {
+        bumpSkipReason('gross_target_below_friction_floor');
+        continue;
+      }
+
       if (projectedBps < (spreadCostBps + modeledSlippageBps)) {
         bumpSkipReason('alpha_below_execution_cost');
         continue;
       }
 
-      // Directional sanity check. The EV gate below multiplies a fixed
-      // realised-win bps by fillProbability = logistic_cdf(slopeTStat). For a
-      // small-magnitude negative t-stat, fillProbability lands near 0.45 and
-      // the EV product can still clear MIN_NET_EDGE_BPS — i.e. the gate would
-      // submit a long even when the OLS fit predicts a downward move (CRV/USD
-      // production case: slopeTStat=-0.18, expectedMoveBps=-0.92, netEdge=20).
-      // Block long entries when the 1m model predicts down (or flat).
+      // Directional sanity check. With the legacy proxy a small-magnitude
+      // negative t-stat produced fillProbability ≈ 0.45 and the EV product
+      // still cleared MIN_NET_EDGE_BPS — i.e. the gate would submit a long
+      // even when the OLS fit predicted a downward move. Block long entries
+      // when the 1m model predicts down (or flat).
       if (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0) {
         bumpSkipReason('slope_not_positive');
         continue;
@@ -1144,6 +1213,21 @@ async function scanAndEnter() {
           bumpSkipReason('net_edge_below_min');
           continue;
         }
+      }
+
+      // Honest EV gate: charges the no-fill branch a non-zero MTM loss so
+      // the asymmetric "no stop-loss + GTC TP only" structure is priced
+      // honestly. Off by default — the assumption is regime-dependent —
+      // but available so operators can flip it on with a stuck-loss they
+      // believe in. See backend/scripts/simulate_strategy.js for guidance.
+      const honestEvBps = estimateExpectedNetBps({
+        hitProbability: fillProbability,
+        targetNetBps: TARGET_NET_PROFIT_BPS,
+        assumedStuckLossBps: STUCK_LOSS_ASSUMED_BPS,
+      });
+      if (HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
+        bumpSkipReason('honest_ev_below_min');
+        continue;
       }
 
       // Notional sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available
@@ -1183,7 +1267,14 @@ async function scanAndEnter() {
           projectedBps,            // uncapped projection (#5)
           expectedMoveBps,         // capped at GROSS_TARGET_BPS (what the edge gate used)
           fillProbability,
+          fillProbabilityLegacy: slopeProbabilityLegacy,
+          fillProbabilitySource: CORRECTED_FILL_PROB_ENABLED ? 'barrier_hit' : 'slope_logistic_cdf',
+          barrierHorizonBars: BARRIER_HORIZON_BARS,
+          tpBarrierBpsFromMid,
           netEdgeBps,
+          honestEvBps,
+          stuckLossAssumedBps: STUCK_LOSS_ASSUMED_BPS,
+          minGrossTargetFloorBps: minGrossFloor.minGrossTargetBps,
           feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
           entrySlippageBps: ENTRY_SLIPPAGE_BPS,
           exitSlippageBps: EXIT_SLIPPAGE_BPS,
@@ -1225,9 +1316,15 @@ async function scanAndEnter() {
           spreadBps,
           slopeTStat: prediction.slopeTStat,
           fillProbability,
+          fillProbabilityLegacy: slopeProbabilityLegacy,
+          fillProbabilitySource: prediction.fillProbabilitySource,
+          tpBarrierBpsFromMid,
+          barrierHorizonBars: BARRIER_HORIZON_BARS,
           projectedBps,
           expectedMoveBps,
           netEdgeBps,
+          honestEvBps,
+          minGrossTargetFloorBps: minGrossFloor.minGrossTargetBps,
           volatilityBps: prediction.volatilityBps,
           htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
         });

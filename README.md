@@ -55,11 +55,28 @@ Everything else in the codebase is plumbing, telemetry, and safety rails around 
 ## The math, briefly
 
 - **Entry signal** (`backend/modules/entryProbability.js`): OLS slope on recent 1m closes → t-statistic → logistic CDF for `pUp` ∈ [0, 1].
+- **Forward fill probability** (`backend/modules/entryEconomics.js`, default ON via `CORRECTED_FILL_PROB_ENABLED`): closed-form GBM barrier-hitting probability that the bid will reach the take-profit price within `BARRIER_HORIZON_BARS` (default = `BREAKEVEN_TIMEOUT_MS` in minutes), using the OLS slope as drift μ and recent realised 1m volatility as σ. Replaces the previous `logistic_cdf(slopeTStat)` proxy, which measured *significance of the past slope* rather than the forward chance the TP fills. Set `CORRECTED_FILL_PROB_ENABLED=false` to roll back.
+- **Cost floor** (`ENFORCE_GROSS_TARGET_FLOOR`, default ON): refuse trades whose static `GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP` is below `spread + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS + FEE_BPS_ROUND_TRIP + MIN_NET_EDGE_BPS`. Pure accounting: trades that cannot beat their own friction never enter, regardless of signal strength.
 - **Net edge gate** (`backend/modules/tradeGuards.js`): expected `(targetNetBps − slippageBps) × fillProbability` must clear `MIN_NET_EDGE_BPS`.
+- **Honest-EV gate** (`HONEST_EV_GATE_ENABLED`, default OFF): when on, charges the non-fill branch an assumed `STUCK_LOSS_ASSUMED_BPS` MTM penalty so the EV calculation reflects the strategy's asymmetric "no stop-loss" structure rather than treating every miss as 0 P&L. Off by default because the assumption is regime-dependent — flip it on once you've calibrated against `node backend/scripts/simulate_strategy.js`.
 - **Spread gate**: skip if `spreadBps > SPREAD_MAX_BPS`.
 - **HTF filter**: optional second-timeframe slope sanity check (`HTF_*` knobs).
 - **Volatility gate**: skip if realized vol exceeds `VOLATILITY_MAX_BPS`.
 - **Exit price**: a static GTC limit, never a stop or trailing exit.
+
+### Diagnosing expectancy
+
+Two scripts exist to answer "is this strategy actually profitable?":
+
+```sh
+cd backend
+npm run reconcile                                    # compare predicted vs realised on live forensics data
+node scripts/simulate_strategy.js                    # closed-form Monte Carlo across drift/vol regimes
+node scripts/simulate_strategy.js --regime=adverse   # single-regime detail
+node scripts/simulate_strategy.js --json             # machine-readable for charts
+```
+
+The simulator's headline finding under live defaults (target 20 bps net, 40 bps fees, 10-min break-even timeout, 12 bps/min realised vol): expectancy is **strongly negative under flat or adverse drift** because the no-stop-loss design parks capital in stuck positions whose MTM keeps decaying. Only sustained positive drift produces a small positive expectancy (~+1 bps per trade at +0.5 bps/min drift). This is the math justification for the corrected fill-probability model and the cost-floor gate above.
 
 ---
 
@@ -110,6 +127,11 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `BREAKEVEN_TIMEOUT_MS` | `600000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Raised from 180 000 ms because the prior 3-minute window was empirically converting most predicted-positive trades to flat break-even fills before their +0.60 % gross move had time to develop. Slot capital is tied up the same way whether the resting order is the TP or the break-even sell, so a longer TP window strictly improves expectancy. Floor: 30 000. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
+| `CORRECTED_FILL_PROB_ENABLED` | `true` | Use the closed-form GBM barrier-hitting probability (`backend/modules/entryEconomics.js`) as `fillProbability` in the EV gate. When `false`, falls back to the legacy `logistic_cdf(slopeTStat)` proxy. Both values are still logged in `entry_submitted` for parity tracking. |
+| `ENFORCE_GROSS_TARGET_FLOOR` | `true` | Refuse trades whose static `GROSS_TARGET_BPS` is below `spread + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS + FEE_BPS_ROUND_TRIP + MIN_NET_EDGE_BPS`. Pure cost accounting — trades that cannot pay for their own friction never enter. Skip reason: `gross_target_below_friction_floor`. |
+| `HONEST_EV_GATE_ENABLED` | `false` | When `true`, the EV calculation charges the non-fill branch a `STUCK_LOSS_ASSUMED_BPS` penalty so the asymmetric "no stop-loss" structure is priced honestly (`E[net] = p·targetNet − (1−p)·stuckLoss`). Off by default because the stuck-loss assumption is regime-dependent. Skip reason: `honest_ev_below_min`. |
+| `STUCK_LOSS_ASSUMED_BPS` | `100` | Bps of MTM loss assumed for positions that don't recover above break-even. Only consulted when `HONEST_EV_GATE_ENABLED=true`. Calibrate by running `node scripts/simulate_strategy.js` and reading `avg_loss` for your target regime. |
+| `BARRIER_HORIZON_BARS` | `BREAKEVEN_TIMEOUT_MS / 60000` | Number of 1-minute bars used as the horizon in the barrier-hitting probability. Defaults to the break-even timeout in minutes — answers "how likely is the TP to fill before we'd otherwise replace it with a break-even sell?". |
 
 ### Scanner / data
 | Var | Default | What it does |
@@ -170,6 +192,23 @@ See `.github/workflows/ci.yml`.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
 The 10-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
+
+### Known structural limitation of "no stop-loss + GTC TP only"
+
+Honest expectancy of the live strategy under realistic 1-minute crypto volatility (σ ≈ 12 bps/min) is **negative in flat or adverse drift regimes**, even though the engine *appears* loss-free because no realised loss is ever booked. Stuck positions accumulate negative MTM that the engine never crystallises. The simulator at `backend/scripts/simulate_strategy.js` quantifies this:
+
+| Regime | Drift (bps/min) | TP fill rate | Stuck rate | Expectancy (bps/trade) |
+| --- | --- | --- | --- | --- |
+| benign | +0.5 | 5.5% | 0.0% | +1.00 |
+| flat | 0 | 4.2% | 3.7% | −49 |
+| adverse | −0.5 | 3.4% | 33.7% | −1382 |
+| quiet | 0 (σ=6) | 0.0% | 7.1% | −51 |
+| wild | 0 (σ=25) | 28.5% | 2.4% | −55 |
+
+(20 000 trials per regime, default fees/spread.) The cost-floor gate and corrected fill probability raise the bar entries must clear — they do not change the structural payoff. Three options if expectancy keeps coming back negative in production:
+1. Widen `TARGET_NET_PROFIT_BPS` materially (e.g., 50–80 bps) so winners pay for the stuck tail. The simulator shows this *alone* is insufficient — fill rates collapse roughly proportionally.
+2. Enable `HONEST_EV_GATE_ENABLED=true` with a `STUCK_LOSS_ASSUMED_BPS` you trust, accepting that this will starve entries in any regime that isn't trending up.
+3. Add a real stop-loss (cap downside on stuck positions). Requires explicit user authorization per `CLAUDE.md`; not implemented here.
 
 ---
 
