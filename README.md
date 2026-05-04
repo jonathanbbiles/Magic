@@ -18,7 +18,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ## The whole strategy in 5 lines
 
-1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the entry universe. By default `ENTRY_UNIVERSE_MODE=configured`, which restricts the scan to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI). Setting `ENTRY_UNIVERSE_MODE=dynamic` instead scans **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols. The configured default exists because the per-symbol gates (`SPREAD_MAX_BPS=30`, `ENTRY_QUOTE_MAX_AGE_MS=60000`) are calibrated for tier-1 liquidity; running them against the long-tail dynamic universe rejects almost everything for stale quotes or wide spreads and starves entries.
+1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the entry universe. By default `ENTRY_UNIVERSE_MODE=dynamic`, which scans **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols — and lets the per-symbol gates downstream do the actual filtering. Setting `ENTRY_UNIVERSE_MODE=configured` instead restricts the scan to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI by default). Note that the per-symbol gates (`SPREAD_MAX_BPS=30`, `ENTRY_QUOTE_MAX_AGE_MS=60000`) are calibrated for tier-1 liquidity; in dynamic mode they reject long-tail alts for stale quotes or wide spreads, so the *effective* trade set tends to be tier-1-equivalent symbols (BTC/ETH-class) even though the scan walks the full universe. Raise `SPREAD_MAX_BPS` / `ENTRY_QUOTE_MAX_AGE_MS` to extend reach to thinner pairs.
 2. For each symbol, fit a linear regression on the last `PREDICT_BARS` (default 20) one-minute closes. Convert the slope's t-statistic to an upward probability via the logistic CDF.
 3. If the symbol clears the spread gate, the higher-timeframe slope filter, and the net-edge gate, place a **GTC limit BUY at the current ask**.
 4. When the buy fills, immediately place **one GTC limit SELL** at:
@@ -128,8 +128,8 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Universe
 | Var | What it does |
 | --- | --- |
-| `ENTRY_UNIVERSE_MODE` | Default `configured` — scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI by default). Set to `dynamic` to scan **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`. The configured default exists because the entry gates (`SPREAD_MAX_BPS`, `ENTRY_QUOTE_MAX_AGE_MS`) are calibrated for tier-1 liquidity — running dynamic mode against long-tail alts results in nearly everything being rejected for stale quotes or wide spreads, starving entries. |
-| `ENTRY_SYMBOLS_PRIMARY` | The configured-mode universe. Default `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`. Ignored when `ENTRY_UNIVERSE_MODE=dynamic`. |
+| `ENTRY_UNIVERSE_MODE` | Default `dynamic` — scanner walks **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`, typically 30+ symbols. Per-symbol entry gates (`SPREAD_MAX_BPS`, `ENTRY_QUOTE_MAX_AGE_MS`) are tier-1-tight by default, so long-tail alts get rejected and the effective live trade set is BTC/ETH-class pairs even though the scan is wide. Set to `configured` to restrict the scan to `ENTRY_SYMBOLS_PRIMARY` instead — useful when you want explicit control over which symbols are even considered. To extend reach to thinner pairs while staying in dynamic mode, raise `SPREAD_MAX_BPS` / `ENTRY_QUOTE_MAX_AGE_MS`. |
+| `ENTRY_SYMBOLS_PRIMARY` | The configured-mode universe. Default `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`. Ignored when `ENTRY_UNIVERSE_MODE=dynamic` (the default). |
 | `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `true` so production can opt into dynamic without an extra flag. The runtime validator only blocks production startup if mode is `dynamic` AND this flag is `false`. |
 
 ### Toggles
@@ -179,9 +179,9 @@ The production instance runs on Render. Before pointing the bot at a funded acco
 
 1. Set every secret (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `API_TOKEN`) directly in the Render env. Never in git.
 2. `npm run check:runtime-env` to validate config.
-3. Leave `ENTRY_UNIVERSE_MODE` unset (default `configured`) so the scanner restricts to `ENTRY_SYMBOLS_PRIMARY` (BTC/ETH/SOL/AVAX/LINK/UNI). Set `ENTRY_UNIVERSE_MODE=dynamic` only if you have explicitly relaxed `SPREAD_MAX_BPS` and `ENTRY_QUOTE_MAX_AGE_MS` enough to accept long-tail liquidity.
+3. Leave `ENTRY_UNIVERSE_MODE` unset (default `dynamic`) so the scanner walks every active Alpaca USD-quoted crypto pair minus stablecoins. The tier-1-tight `SPREAD_MAX_BPS=30` / `ENTRY_QUOTE_MAX_AGE_MS=60000` gates filter the long tail, so the effective live trade set converges on liquid pairs (BTC/ETH-class). Set `ENTRY_UNIVERSE_MODE=configured` only if you want to lock the scan to a specific symbol list (`ENTRY_SYMBOLS_PRIMARY`). The boot warning `config_warning field=ENTRY_UNIVERSE_MODE` is informational under the default posture: it just means you have not relaxed the spread/freshness gates beyond their tier-1 calibration.
 4. After deploy, `GET /debug/runtime-config` (token-protected) is the source of truth for what the live process actually sees.
-5. Verify `effectiveUniverseMode=configured` and `scanSymbolsCount` matches the configured primary count (6 by default) in the `startup_truth_summary` log line.
+5. Verify `effectiveUniverseMode=dynamic` and `scanSymbolsCount` reports a number on the order of all active Alpaca crypto USD pairs (typically 30+) in the `startup_truth_summary` log line. If you switched to `configured`, expect `scanSymbolsCount` to match `ENTRY_SYMBOLS_PRIMARY` length.
 
 Operational details, the full env-var reference, and tuning notes live in `backend/README.md`.
 

@@ -468,14 +468,15 @@ const validateEnv = () => {
       });
     }
 
-    // Entry gates in trade.js (SPREAD_MAX_BPS, ENTRY_QUOTE_MAX_AGE_MS) are
-    // calibrated for tier-1 liquidity (BTC/ETH-class). If the user is in
-    // dynamic universe mode -- which scans the full tradable crypto list,
-    // including long-tail alts with 50-200 bps spreads and sparse quotes --
-    // those gates will reject everything except the handful of liquid pairs,
-    // and the bot will never enter. This check is the signature that this
-    // user hit in production (0/33 scans entered for hours). Surface it loudly
-    // at startup so the next deploy's log makes the mismatch obvious.
+    // Dynamic universe mode is the documented production default — the scanner
+    // walks every active Alpaca crypto pair (USD-quoted, ex-stablecoins) and
+    // lets per-symbol entry gates in trade.js do the actual filtering. The
+    // SPREAD_MAX_BPS and ENTRY_QUOTE_MAX_AGE_MS gates are intentionally
+    // tier-1-tight: long-tail alts (50-200 bps spreads, sparse quotes) get
+    // rejected by design, leaving only liquid pairs as actual entry
+    // candidates. We still surface this combination as a warning so an
+    // operator who has actively tightened the gates below the documented
+    // defaults sees that they are narrowing the live trade set even further.
     const entryGateSpreadMaxBps = parseFiniteNumberEnv('SPREAD_MAX_BPS', 30);
     const entryGateQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_QUOTE_MAX_AGE_MS', 60000);
     if (runtimeSummary.entryUniverseModeEffective === 'dynamic') {
@@ -485,8 +486,11 @@ const validateEnv = () => {
         console.warn('config_warning', {
           field: 'ENTRY_UNIVERSE_MODE',
           message:
-            'Dynamic universe mode with tier-1-tight entry gates will reject most long-tail symbols and starve entries. '
-            + 'Either set ENTRY_UNIVERSE_MODE=configured (recommended) or relax SPREAD_MAX_BPS / ENTRY_QUOTE_MAX_AGE_MS.',
+            'Dynamic universe mode with tier-1-tight entry gates: long-tail crypto pairs will be filtered '
+            + 'out by SPREAD_MAX_BPS / ENTRY_QUOTE_MAX_AGE_MS, leaving liquid pairs (BTC/ETH-class) as the '
+            + 'effective trade set. To extend reach to long-tail symbols, raise SPREAD_MAX_BPS / '
+            + 'ENTRY_QUOTE_MAX_AGE_MS. To restrict scope explicitly, set ENTRY_UNIVERSE_MODE=configured '
+            + 'and populate ENTRY_SYMBOLS_PRIMARY.',
           entryUniverseModeEffective: runtimeSummary.entryUniverseModeEffective,
           spreadMaxBps: entryGateSpreadMaxBps,
           entryQuoteMaxAgeMs: entryGateQuoteMaxAgeMs,
