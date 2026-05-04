@@ -10,7 +10,8 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture **0.20% net profit** per trade after fees.
-- Recycle stuck positions: if the take-profit doesn't fill within 10 minutes, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
+- Cap downside with a real stop-loss: if price falls 1.00% below entry, flatten with a market sell.
+- Recycle stuck positions: if the take-profit doesn't fill within 4 hours, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
 
@@ -26,7 +27,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    With current defaults (20 bps net + 40 bps fees) that's `entry × 1.0060`.
-5. **10-minute break-even reset.** If the take-profit hasn't filled within `BREAKEVEN_TIMEOUT_MS` (default 600 000 ms) of the position being first observed, the engine cancels the TP and reposts a sell at `entry × (1 + FEE_BPS_ROUND_TRIP / 10000)` — break-even after fees. Net PnL is exactly 0, the slot recycles, and the engine moves on. This runs at most once per position.
+5. **Stop-loss + break-even reset.** After fill, the engine monitors risk continuously. If live bid falls to `entry × (1 − STOP_LOSS_BPS/10000)` (default 1.00%), it cancels the resting sell and exits immediately with a market sell (`IOC`). If stop-loss never triggers and TP still has not filled within `BREAKEVEN_TIMEOUT_MS` (default 14 400 000 ms = 4 hours), the engine cancels TP and reposts break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP / 10000)`).
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -124,7 +125,9 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MIN_NET_EDGE_BPS` | `5` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`, where `fillProbability = logistic_cdf(slopeTStat)`. Lowered from 10 because with default `TARGET_NET_PROFIT_BPS=20` and `ENTRY_SLIPPAGE_BPS=5` the prior `10` floor required `slopeTStat ≥ ~0.69` (≈ p ≥ 0.667), which on a 20-bar 1 m OLS over tier-1 crypto fires only on rare clean uptrends and starved the daily entry rate. At `5`, the EV check becomes `p ≥ 0.333` (subsumed by the existing slope-positive guard, which requires `p > 0.5`), so the binding economic gate becomes `alpha_below_execution_cost` — projected move ≥ spread + entry slippage. Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
-| `BREAKEVEN_TIMEOUT_MS` | `600000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Raised from 180 000 ms because the prior 3-minute window was empirically converting most predicted-positive trades to flat break-even fills before their +0.60 % gross move had time to develop. Slot capital is tied up the same way whether the resting order is the TP or the break-even sell, so a longer TP window strictly improves expectancy. Floor: 30 000. |
+| `BREAKEVEN_TIMEOUT_MS` | `14400000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Default is 4 hours to let small-drift setups actually reach target before fallback. Floor: 30 000. |
+| `STOP_LOSS_ENABLED` | `true` | Enables hard downside cap in exit manager. When on, bot monitors live bid and force-exits if stop is breached. |
+| `STOP_LOSS_BPS` | `100` | Stop-loss distance below entry (bps). At default 100 bps, exit triggers near -1.00% from average entry. |
 | `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
 | `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
 | `CORRECTED_FILL_PROB_ENABLED` | `true` | Use the closed-form GBM barrier-hitting probability (`backend/modules/entryEconomics.js`) as `fillProbability` in the EV gate. When `false`, falls back to the legacy `logistic_cdf(slopeTStat)` proxy. Both values are still logged in `entry_submitted` for parity tracking. |
@@ -185,15 +188,15 @@ See `.github/workflows/ci.yml`.
 
 ## What the bot does NOT do (intentional)
 
-- **No stop-loss.** A position never closes below break-even-after-fees. If the price drops below entry and stays there, the break-even sell stays parked until the price comes back.
+- **No trailing stop.** The stop is static (`STOP_LOSS_BPS` below entry), not adaptive.
 - **No leverage.**
 - **No averaging down or pyramiding.**
 - **No cross-symbol correlation guard.** When `ENTRY_UNIVERSE_MODE=dynamic` and 30+ pairs are in scope, the engine can become long the same beta on multiple symbols simultaneously.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
-The 10-minute break-even reset is the engine's only post-fill exit lever. If you need a true stop-loss (sell *below* entry to cap downside), it needs to be built; it does not exist today.
+The 4-hour break-even reset and static stop-loss are the two post-fill exit levers.
 
-### Known structural limitation of "no stop-loss + GTC TP only"
+### Known structural limitation of "small TP + long-hold tail"
 
 Honest expectancy of the live strategy under realistic 1-minute crypto volatility (σ ≈ 12 bps/min) is **negative in flat or adverse drift regimes**, even though the engine *appears* loss-free because no realised loss is ever booked. Stuck positions accumulate negative MTM that the engine never crystallises. The simulator at `backend/scripts/simulate_strategy.js` quantifies this:
 
@@ -208,7 +211,7 @@ Honest expectancy of the live strategy under realistic 1-minute crypto volatilit
 (20 000 trials per regime, default fees/spread.) The cost-floor gate and corrected fill probability raise the bar entries must clear — they do not change the structural payoff. Three options if expectancy keeps coming back negative in production:
 1. Widen `TARGET_NET_PROFIT_BPS` materially (e.g., 50–80 bps) so winners pay for the stuck tail. The simulator shows this *alone* is insufficient — fill rates collapse roughly proportionally.
 2. Enable `HONEST_EV_GATE_ENABLED=true` with a `STUCK_LOSS_ASSUMED_BPS` you trust, accepting that this will starve entries in any regime that isn't trending up.
-3. Add a real stop-loss (cap downside on stuck positions). Requires explicit user authorization per `CLAUDE.md`; not implemented here.
+3. Tighten `STOP_LOSS_BPS` and/or shorten `BREAKEVEN_TIMEOUT_MS` for faster loss realization and capital recycling in adverse regimes.
 
 ---
 

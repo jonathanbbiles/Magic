@@ -83,6 +83,8 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 // flat break-even fills before their +0.60 % gross move had time to develop).
 // Floor at 30 s to stay above broker round-trip latency.
 const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 600000));
+const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
+const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -1429,9 +1431,45 @@ async function reconcileExits() {
       }
     }
 
-    // No stop-loss, no max-hold: once the GTC sell is posted, the engine
-    // leaves the position alone until the limit fills. The entry math
-    // decides whether the trade is worth taking.
+    // Risk cap: optional stop-loss. If the live bid is below entry by
+    // STOP_LOSS_BPS, we immediately flatten with a market sell.
+
+    if (STOP_LOSS_ENABLED && Number.isFinite(avg) && avg > 0) {
+      const quote = await getLatestQuote(pair).catch(() => null);
+      const bid = Number(quote?.bp);
+      const stopPrice = avg * (1 - STOP_LOSS_BPS / 10000);
+      if (Number.isFinite(bid) && bid > 0 && bid <= stopPrice) {
+        const existing = openSellByPair.get(pair);
+        try {
+          if (existing?.id) await cancelOrder(existing.id);
+          const sellResult = await submitOrder({
+            symbol: pair,
+            side: 'sell',
+            type: 'market',
+            time_in_force: 'ioc',
+            qty: String(qty),
+          });
+          const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
+          const triggeredAt = sellOrder?.submitted_at || new Date().toISOString();
+          exitState.set(pair, {
+            ...exitState.get(pair),
+            sellOrderId: sellOrder?.id || null,
+            targetPrice: stopPrice,
+            sellOrderSubmittedAt: triggeredAt,
+            reconciliationState: 'stop_loss_triggered',
+            lastReconciliationAction: 'stop_loss_market_sell',
+            expectedNetProfitBps: -STOP_LOSS_BPS,
+            minNetProfitBps: -STOP_LOSS_BPS,
+          });
+          lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'stop_loss_market_sell', orderId: sellOrder?.id || null };
+          console.log('exit_stop_loss_triggered', { symbol: pair, bid, stopPrice, stopLossBps: STOP_LOSS_BPS, cancelledOrderId: existing?.id || null, newOrderId: sellOrder?.id || null });
+          continue;
+        } catch (err) {
+          lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'stop_loss_failed', message: err?.errorMessage || err?.message || String(err) };
+          console.warn('exit_stop_loss_failed', { symbol: pair, error: err?.errorMessage || err?.message });
+        }
+      }
+    }
 
     if (openSellByPair.has(pair)) {
       const existing = openSellByPair.get(pair);
