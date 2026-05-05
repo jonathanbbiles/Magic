@@ -110,7 +110,11 @@ const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS'
 // valid candidates in normal-but-noisy live books; the tighter economics and
 // microstructure gates still run afterwards (entry-max, EV, alpha, etc.).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 60));
-const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', 20));
+// Keep the microstructure spread gate aligned with the primary spread cap by
+// default; the economics gates below (execution-cost floor, alpha, EV) are the
+// intended profitability filters. A lower hidden default here can starve entry
+// attempts before those profitability checks run.
+const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', SPREAD_MAX_BPS));
 const SPREAD_SHOCK_MAX_BPS = Math.max(SPREAD_ENTRY_MAX_BPS, readNumber('SPREAD_SHOCK_MAX_BPS', 30));
 const MAX_SLIPPAGE_ESTIMATE_BPS = Math.max(0, readNumber('MAX_SLIPPAGE_ESTIMATE_BPS', 5));
 const MICRO_MOMENTUM_TICKS = Math.max(3, readNumber('MICRO_MOMENTUM_TICKS', 4));
