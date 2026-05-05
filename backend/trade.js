@@ -1415,8 +1415,17 @@ async function scanAndEnter() {
         continue;
       }
 
-      if (projectedBps < (spreadCostBps + modeledSlippageBps)) {
-        rejectTrade(pair, 'alpha_below_execution_cost');
+      // Legacy alpha-cost gate was frequently the dominant blocker in live
+      // scans even when directional/EV gates were already passing. Keep a
+      // hard block for non-positive projection, but otherwise let the
+      // probability-weighted net-edge gate decide viability.
+      if (!Number.isFinite(projectedBps) || projectedBps <= 0) {
+        rejectTrade(pair, 'alpha_below_execution_cost', {
+          projectedBps,
+          requiredBps: spreadCostBps + modeledSlippageBps,
+          spreadCostBps,
+          modeledSlippageBps,
+        });
         continue;
       }
 
