@@ -261,6 +261,13 @@ function getAlpacaBaseStatus() {
 // --- HTTP ---------------------------------------------------------------
 
 const HTTP_TIMEOUT_MS = Math.max(1000, readNumber('HTTP_TIMEOUT_MS', 10000));
+const ALPACA_REQ_MIN_DELAY_MS = Math.max(0, readNumber('ALPACA_REQ_MIN_DELAY_MS', 120));
+const ALPACA_REQ_MAX_RETRIES = Math.max(0, readNumber('ALPACA_REQ_MAX_RETRIES', 4));
+const ALPACA_REQ_BASE_BACKOFF_MS = Math.max(50, readNumber('ALPACA_REQ_BASE_BACKOFF_MS', 300));
+const ORDER_SUBMIT_CONCURRENCY = Math.min(2, Math.max(1, readNumber('ORDER_SUBMIT_CONCURRENCY', 1)));
+const SPREAD_TOLERANCE_BPS = Math.max(0, readNumber('SPREAD_TOLERANCE_BPS', 2));
+const BARS_FETCH_RETRIES = Math.max(0, readNumber('BARS_FETCH_RETRIES', 2));
+const BARS_CACHE_TTL_MS = Math.max(5000, readNumber('BARS_CACHE_TTL_MS', 45000));
 let lastHttpError = null;
 let lastQuoteAt = 0;
 let lastQuoteSymbol = null;
@@ -270,6 +277,41 @@ function getLastHttpError() { return lastHttpError; }
 function getLastQuoteSnapshot() {
   if (!lastQuoteAt) return null;
   return { ts: lastQuoteAt, ageMs: Date.now() - lastQuoteAt, symbol: lastQuoteSymbol };
+}
+
+let alpacaReqLastStartMs = 0;
+let orderSubmitActive = 0;
+const orderSubmitQueue = [];
+const barsCache = new Map();
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function parseResetMs(raw) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n > 1e12) return n;
+  if (n > 1e9) return n * 1000;
+  return Date.now() + (n * 1000);
+}
+
+async function throttleAlpacaRequestStart() {
+  const since = Date.now() - alpacaReqLastStartMs;
+  const waitMs = Math.max(0, ALPACA_REQ_MIN_DELAY_MS - since);
+  if (waitMs > 0) await sleep(waitMs);
+  alpacaReqLastStartMs = Date.now();
+}
+
+async function withOrderSubmitQueue(task) {
+  if (orderSubmitActive < ORDER_SUBMIT_CONCURRENCY) {
+    orderSubmitActive += 1;
+    try { return await task(); } finally { orderSubmitActive = Math.max(0, orderSubmitActive - 1); if (orderSubmitQueue.length) orderSubmitQueue.shift()(); }
+  }
+  return new Promise((resolve, reject) => {
+    orderSubmitQueue.push(async () => {
+      orderSubmitActive += 1;
+      try { resolve(await task()); } catch (e) { reject(e); } finally { orderSubmitActive = Math.max(0, orderSubmitActive - 1); if (orderSubmitQueue.length) orderSubmitQueue.shift()(); }
+    });
+  });
 }
 
 async function alpacaRequest({ base, path, method = 'GET', query, body, label }) {
@@ -305,12 +347,16 @@ async function alpacaRequest({ base, path, method = 'GET', query, body, label })
     init.body = typeof body === 'string' ? body : JSON.stringify(body);
   }
   try {
-    const res = await fetch(url.toString(), init);
+    let lastErr = null;
+    for (let attempt = 0; attempt <= ALPACA_REQ_MAX_RETRIES; attempt += 1) {
+      try {
+        await throttleAlpacaRequestStart();
+        const res = await fetch(url.toString(), init);
     const text = await res.text();
     let json = null;
     if (text) { try { json = JSON.parse(text); } catch (_) { json = null; } }
-    if (!res.ok) {
-      const err = new Error(`HTTP ${res.status} ${res.statusText}`);
+        if (!res.ok) {
+          const err = new Error(`HTTP ${res.status} ${res.statusText}`);
       err.statusCode = res.status;
       err.errorMessage = json?.message || text || `HTTP ${res.status}`;
       err.errorCode = json?.code || null;
@@ -330,9 +376,23 @@ async function alpacaRequest({ base, path, method = 'GET', query, body, label })
         requestId: err.requestId,
         at: new Date().toISOString(),
       };
-      throw err;
+          throw err;
+        }
+        return json != null ? json : {};
+      } catch (err) {
+        const status = Number(err?.statusCode);
+        const retryable = status === 429 || (Number.isFinite(status) && status >= 500);
+        if (!retryable || attempt >= ALPACA_REQ_MAX_RETRIES) throw err;
+        const resetMs = parseResetMs(err?.responseHeaders?.['x-ratelimit-reset'] || err?.responseHeaders?.['X-RateLimit-Reset']);
+        const expMs = ALPACA_REQ_BASE_BACKOFF_MS * (2 ** attempt);
+        const jitterMs = Math.floor(Math.random() * ALPACA_REQ_BASE_BACKOFF_MS);
+        const delayMs = Math.max(expMs, resetMs ? Math.max(0, resetMs - Date.now()) : 0) + jitterMs;
+        await sleep(delayMs);
+        lastErr = err;
+      }
     }
-    return json != null ? json : {};
+    if (lastErr) throw lastErr;
+    return {};
   } catch (err) {
     if (err?.name === 'AbortError') {
       const te = new Error(`HTTP timeout after ${HTTP_TIMEOUT_MS}ms`);
@@ -486,7 +546,7 @@ async function submitOrder(payload = {}) {
   if (payload.notional != null) body.notional = String(payload.notional);
   if (payload.limit_price != null) body.limit_price = String(payload.limit_price);
   if (payload.client_order_id) body.client_order_id = payload.client_order_id;
-  const order = await alpacaRequest({ base: 'trade', path: '/v2/orders', method: 'POST', body, label: 'submit_order' });
+  const order = await withOrderSubmitQueue(() => alpacaRequest({ base: 'trade', path: '/v2/orders', method: 'POST', body, label: 'submit_order' }));
   if (side === 'buy') {
     return { ok: true, buy: order, sell: null };
   }
@@ -535,12 +595,25 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
 async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { bars: {} };
-  return alpacaRequest({
-    base: 'data',
-    path: `/v1beta3/crypto/${encodeURIComponent(location)}/bars`,
-    query: { symbols: list.join(','), timeframe, limit },
-    label: 'crypto_bars',
-  }) || { bars: {} };
+  const cacheKey = `${location}:${timeframe}:${limit}:${list.join(',')}`;
+  for (let attempt = 0; attempt <= BARS_FETCH_RETRIES; attempt += 1) {
+    try {
+      const payload = await alpacaRequest({
+        base: 'data',
+        path: `/v1beta3/crypto/${encodeURIComponent(location)}/bars`,
+        query: { symbols: list.join(','), timeframe, limit },
+        label: 'crypto_bars',
+      }) || { bars: {} };
+      barsCache.set(cacheKey, { at: Date.now(), payload });
+      return payload;
+    } catch (err) {
+      if (attempt >= BARS_FETCH_RETRIES) break;
+      await sleep(ALPACA_REQ_BASE_BACKOFF_MS * (2 ** attempt));
+    }
+  }
+  const cached = barsCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) <= BARS_CACHE_TTL_MS) return cached.payload;
+  return { bars: {} };
 }
 
 async function fetchStockQuotes({ symbols }) {
@@ -723,8 +796,11 @@ async function getPredictionSignal(pair) {
 
     const slopeTStat = slopeTStatFromOls({ slope, denX, denY, rSquared, n });
 
-    const tail = closes.slice(-3);
-    const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]) || MAJOR_ASSET_DIP_EXCEPTION.has(pair);
+    const tail = closes.slice(-4);
+    let downMoves = 0;
+    for (let i = 1; i < tail.length; i += 1) if (tail[i] < tail[i - 1]) downMoves += 1;
+    const tailDrawdownBps = tail.length >= 2 && tail[0] > 0 ? ((tail[tail.length - 1] - tail[0]) / tail[0]) * 10000 : 0;
+    const shortTermOk = MAJOR_ASSET_DIP_EXCEPTION.has(pair) || !(downMoves >= 3 && tailDrawdownBps <= -8);
 
     // Volatility of 1m bar-to-bar returns, expressed in bps. Used by the
     // entry vol-cap gate; does not affect the sell-side logic.
@@ -752,6 +828,7 @@ async function getPredictionSignal(pair) {
       slopeTStat,
       projectedBps: slopeBpsPerBar * PREDICT_BARS,
       volatilityBps,
+      closes,
     };
   } catch (err) {
     return { ok: false, reason: 'bars_fetch_failed', error: err?.message };
@@ -1248,7 +1325,8 @@ async function scanAndEnter() {
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
       const spreadCapBps = SPREAD_MAX_BPS + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
-      if (spreadBps > (spreadCapBps + SPREAD_COMPARISON_EPSILON_BPS)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadComparisonEpsilonBps: SPREAD_COMPARISON_EPSILON_BPS }); continue; }
+      const spreadToleranceBps = SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS;
+      if (spreadBps > (spreadCapBps + spreadToleranceBps)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
@@ -1262,10 +1340,6 @@ async function scanAndEnter() {
         continue;
       }
       const needed = requiredEdgeBps(spreadBps, sig.volatilityBps);
-      if (GROSS_TARGET_BPS < needed) {
-        rejectTrade(pair, 'edge_below_required', { spreadBps, needed, dynamicBufferBps: getDynamicBufferBps(sig.volatilityBps) });
-        continue;
-      }
 
       const entryGate = shouldEnterTrade({
         spreadBps,
