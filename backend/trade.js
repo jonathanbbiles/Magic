@@ -101,15 +101,15 @@ const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS
 const EXIT_SCAN_INTERVAL_MS = Math.max(5000, readNumber('EXIT_SCAN_INTERVAL_MS', 15000));
 // Trading master switch.
 const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
-// Quote staleness cutoff (ms). Default of 60s matches the README and
-// LIVE_CRITICAL_DEFAULTS; tighter values starve entries on low-volume Alpaca
-// crypto pairs.
-const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000));
+// Quote staleness cutoff (ms). Default 180s plus a 30s grace window to
+// tolerate provider timestamp lag while still rejecting clearly stale quotes.
+const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 180000));
+const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS', 30000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
-// Default raised to 40 bps so the hard guardrail no longer blocks otherwise
+// Default raised to 60 bps so the hard guardrail no longer blocks otherwise
 // valid candidates in normal-but-noisy live books; the tighter economics and
 // microstructure gates still run afterwards (entry-max, EV, alpha, etc.).
-const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 40));
+const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 60));
 const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', 20));
 const SPREAD_SHOCK_MAX_BPS = Math.max(SPREAD_ENTRY_MAX_BPS, readNumber('SPREAD_SHOCK_MAX_BPS', 30));
 const MAX_SLIPPAGE_ESTIMATE_BPS = Math.max(0, readNumber('MAX_SLIPPAGE_ESTIMATE_BPS', 5));
@@ -1243,7 +1243,7 @@ async function scanAndEnter() {
         // Some venues occasionally publish delayed quote timestamps despite
         // updating bid/ask. If the quote moved since the previous scan, avoid
         // classifying it as stale solely due to provider timestamp lag.
-      } else if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
+      } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
