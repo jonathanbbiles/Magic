@@ -104,7 +104,7 @@ const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // Quote staleness cutoff (ms). Default of 60s matches the README and
 // LIVE_CRITICAL_DEFAULTS; tighter values starve entries on low-volume Alpaca
 // crypto pairs.
-const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 60000));
+const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
 const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', 20));
@@ -117,6 +117,7 @@ const TIGHT_QUOTE_MAX_BPS = Math.max(1, readNumber('TIGHT_QUOTE_MAX_BPS', 12));
 const STABLE_QUOTE_VOL_MAX_BPS = Math.max(0.1, readNumber('STABLE_QUOTE_VOL_MAX_BPS', 8));
 const SPREAD_CANARY_EXTRA_BPS = Math.max(0, readNumber('SPREAD_CANARY_EXTRA_BPS', 0));
 const SPREAD_CANARY_SYMBOLS = new Set(readList('SPREAD_CANARY_SYMBOLS', []));
+const SPREAD_COMPARISON_EPSILON_BPS = Math.max(0, readNumber('SPREAD_COMPARISON_EPSILON_BPS', 0.5));
 const REJECTION_WINDOW_MS = Math.max(60000, readNumber('ENTRY_REJECTION_WINDOW_MS', 600000));
 const MAJOR_ASSET_DIP_EXCEPTION = new Set(readList('MAJOR_ASSET_DIP_EXCEPTION', ['BTC/USD', 'ETH/USD', 'SOL/USD']));
 
@@ -1218,7 +1219,7 @@ async function scanAndEnter() {
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
       const spreadCapBps = SPREAD_MAX_BPS + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
-      if (spreadBps > spreadCapBps) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps }); continue; }
+      if (spreadBps > (spreadCapBps + SPREAD_COMPARISON_EPSILON_BPS)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadComparisonEpsilonBps: SPREAD_COMPARISON_EPSILON_BPS }); continue; }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
