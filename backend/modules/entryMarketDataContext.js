@@ -148,8 +148,17 @@ function buildEntryMarketDataContext({ scanId, prefetchedBars = null } = {}) {
       sparseFallbackAttempts: 0,
       sparseFallbackAccepts: 0,
       sparseFallbackRejects: 0,
+      quoteFreshSymbols: 0,
+      quoteStaleSymbols: 0,
     },
   };
+}
+
+function logQuoteFreshnessScanStats(context) {
+  console.log('quote_freshness_scan_stats', {
+    stale_symbol_count: Number(context?.stats?.quoteStaleSymbols || 0),
+    fresh_symbol_count: Number(context?.stats?.quoteFreshSymbols || 0),
+  });
 }
 
 function resolveBarsSeries(prefetchedBars, symbol, timeframeKey) {
@@ -233,21 +242,9 @@ async function getOrFetchSymbolMarketData({
   );
 
   if (!result.quote || forceQuoteRefresh || shouldRefreshForQuoteAge) {
-    const cachedQuote = !forceQuoteRefresh
-      ? resolveTradingUsableCache('quote', normalizedQuoteReuseMaxAgeMs)
-      : null;
+    const cachedQuote = !forceQuoteRefresh ? resolveTradingUsableCache('quote', normalizedQuoteReuseMaxAgeMs) : null;
     const cacheQuoteRejectedForReuse = Boolean(cachedQuote?.ok && !cachedQuote?.usable);
     const enforceFreshQuoteFetch = Boolean(forceQuoteRefresh || shouldRefreshForQuoteAge || cacheQuoteRejectedForReuse);
-    if (cachedQuote?.ok && cachedQuote?.usable) {
-      result.quoteResult = {
-        ok: true,
-        state: 'cache_layer_usable',
-        value: cachedQuote.value,
-        ageMs: cachedQuote.ageMs,
-        cacheReuseThresholdMs: normalizedQuoteReuseMaxAgeMs,
-      };
-      result.quote = cachedQuote.value;
-    } else {
     const quoteResult = await coordinator.get({
       endpoint: 'quote',
       key: normalizedSymbol,
@@ -260,33 +257,23 @@ async function getOrFetchSymbolMarketData({
       }),
     });
     result.quoteResult = quoteResult;
-      if (quoteResult.ok) {
-        result.quote = quoteResult.value;
-        if ((shouldRefreshForQuoteAge || cacheQuoteRejectedForReuse) && !forceQuoteRefresh) {
-          result.quoteResult = {
-            ...quoteResult,
-            reuseRefreshForced: true,
-            reuseRefreshReason: 'quote_reuse_headroom',
-            ageAtEvaluationMs: cacheQuoteRejectedForReuse ? cachedQuote?.ageMs : existingQuoteAgeMs,
-            cacheReuseThresholdMs: normalizedQuoteReuseMaxAgeMs,
-          };
-        }
-        if (marketDataCache?.upsertQuote) {
-          marketDataCache.upsertQuote(normalizedSymbol, quoteResult.value, quoteResult.value?.tsMs || Date.now());
-        }
-      } else if (shouldFallbackToUsableCache(quoteResult)) {
-        const fallbackQuote = resolveTradingUsableCache('quote', normalizedQuoteReuseMaxAgeMs);
-        if (fallbackQuote?.ok && fallbackQuote?.usable) {
-          result.quoteResult = {
-            ok: true,
-            state: 'cache_fallback_after_failure',
-            value: fallbackQuote.value,
-            ageMs: fallbackQuote.ageMs,
-            cacheReuseThresholdMs: normalizedQuoteReuseMaxAgeMs,
-          };
-          result.quote = fallbackQuote.value;
-        }
+    if (quoteResult.ok) {
+      result.quote = quoteResult.value;
+      if ((shouldRefreshForQuoteAge || cacheQuoteRejectedForReuse) && !forceQuoteRefresh) {
+        result.quoteResult = {
+          ...quoteResult,
+          reuseRefreshForced: true,
+          reuseRefreshReason: 'quote_reuse_headroom',
+          ageAtEvaluationMs: cacheQuoteRejectedForReuse ? cachedQuote?.ageMs : existingQuoteAgeMs,
+          cacheReuseThresholdMs: normalizedQuoteReuseMaxAgeMs,
+        };
       }
+      if (marketDataCache?.upsertQuote) {
+        marketDataCache.upsertQuote(normalizedSymbol, quoteResult.value, quoteResult.value?.tsMs || Date.now());
+      }
+    } else {
+      if (marketDataCache?.upsertQuote) marketDataCache.upsertQuote(normalizedSymbol, null, Date.now());
+      console.log('quote_fetch_failed', { symbol: normalizedSymbol });
     }
   }
 
@@ -403,6 +390,15 @@ async function getOrFetchSymbolMarketData({
   }
 
   context.symbolData.set(normalizedSymbol, result);
+  const quoteFetchStatus = result.quoteResult?.ok ? 'success' : 'failure';
+  console.log('quote_processed', {
+    symbol: normalizedSymbol,
+    quote_age_ms: result.quoteResult?.ageMs ?? null,
+    cache_hit: Boolean(result.quoteResult && result.quoteResult.state !== 'fresh'),
+    fetch_status: quoteFetchStatus,
+  });
+  context.stats.quoteFreshSymbols = (context.stats.quoteFreshSymbols || 0) + (quoteFetchStatus === 'success' ? 1 : 0);
+  context.stats.quoteStaleSymbols = (context.stats.quoteStaleSymbols || 0) + (quoteFetchStatus === 'failure' ? 1 : 0);
 
   for (const response of [result.quoteResult, result.orderbookResult]) {
     if (!response) continue;
@@ -428,4 +424,5 @@ module.exports = {
   createRequestCoordinator,
   buildEntryMarketDataContext,
   getOrFetchSymbolMarketData,
+  logQuoteFreshnessScanStats,
 };

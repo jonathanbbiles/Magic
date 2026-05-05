@@ -1,6 +1,7 @@
 const { normalizePair } = require('../symbolUtils');
 
 const TF_KEYS = ['1m', '5m', '15m'];
+const MAX_QUOTE_AGE_MS = 10000;
 
 function normalizeTsMs(value, fallback = Date.now()) {
   const n = Number(value);
@@ -24,8 +25,6 @@ function createMarketDataCache(config = {}) {
     if (!bySymbol.has(normalized)) {
       bySymbol.set(normalized, {
         quote: null,
-        quoteTsMs: 0,
-        quoteUpdatedAtMs: 0,
         orderbook: null,
         orderbookTsMs: 0,
         orderbookUpdatedAtMs: 0,
@@ -36,12 +35,18 @@ function createMarketDataCache(config = {}) {
     return bySymbol.get(normalized);
   }
 
-  function upsertQuote(symbol, quote, tsMs = Date.now()) {
+function upsertQuote(symbol, quote, tsMs = Date.now()) {
     const row = ensure(symbol);
-    if (!row || !quote) return;
-    row.quote = { ...quote };
-    row.quoteTsMs = normalizeTsMs(tsMs, Date.now());
-    row.quoteUpdatedAtMs = Date.now();
+    if (!row) return;
+    if (!quote) {
+      row.quote = { data: null, timestamp: Date.now(), fetchStatus: 'failure' };
+      return;
+    }
+    row.quote = {
+      data: { ...quote },
+      timestamp: normalizeTsMs(tsMs, Date.now()),
+      fetchStatus: 'success',
+    };
   }
 
   function upsertOrderbook(symbol, orderbook, tsMs = Date.now()) {
@@ -62,9 +67,16 @@ function createMarketDataCache(config = {}) {
 
   function getQuote(symbol, nowMs = Date.now()) {
     const row = bySymbol.get(normalizePair(symbol));
-    if (!row?.quote) return { ok: false, reason: 'quote_missing', value: null, ageMs: null };
-    const ageMs = Math.max(0, nowMs - normalizeTsMs(row.quoteTsMs, row.quoteUpdatedAtMs));
-    return { ok: true, value: { ...row.quote }, ageMs, fresh: ageMs <= quoteTtlMs };
+    const entry = row?.quote;
+    if (!entry) return { ok: false, reason: 'quote_missing', value: null, ageMs: null, fetchStatus: null };
+    const ageMs = Math.max(0, nowMs - normalizeTsMs(entry.timestamp, nowMs));
+    if (entry.fetchStatus !== 'success') {
+      return { ok: false, reason: 'quote_fetch_failed', value: null, ageMs, fetchStatus: entry.fetchStatus || 'failure' };
+    }
+    if (ageMs > MAX_QUOTE_AGE_MS) {
+      return { ok: false, reason: 'quote_stale', value: null, ageMs, fetchStatus: entry.fetchStatus };
+    }
+    return { ok: true, value: { ...entry.data }, ageMs, fresh: ageMs <= quoteTtlMs, fetchStatus: entry.fetchStatus };
   }
 
   function getQuoteUsable(symbol, { nowMs = Date.now(), maxAgeMs } = {}) {
@@ -144,4 +156,5 @@ function createMarketDataCache(config = {}) {
 
 module.exports = {
   createMarketDataCache,
+  MAX_QUOTE_AGE_MS,
 };

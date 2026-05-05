@@ -21,7 +21,7 @@ assert.equal(tradingUsableQuote.fresh, false, 'small TTL freshness remains stric
 assert.equal(tradingUsableQuote.usable, true, 'trading usability can still be true within maxAge');
 
 const staleTradingQuote = cache.getQuoteUsable('BTC/USD', { nowMs: now + 35000, maxAgeMs: 30000 });
-assert.equal(staleTradingQuote.ok, true);
-assert.equal(staleTradingQuote.usable, false, 'cache accessor should not reuse data past requested trading max age');
+assert.equal(staleTradingQuote.ok, false);
+assert.equal(staleTradingQuote.reason, 'quote_stale', 'hard quote freshness should block old cache entries');
 
 console.log('marketDataCache.test.js passed');

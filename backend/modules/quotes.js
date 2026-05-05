@@ -1,5 +1,6 @@
 const lastFetchBySymbol = new Map();
 let primaryFetcher = null;
+const MAX_QUOTE_AGE_MS = 10000;
 
 function setPrimaryQuoteFetcher(fetcher) {
   primaryFetcher = typeof fetcher === 'function' ? fetcher : null;
@@ -45,9 +46,10 @@ async function getBestQuote(symbol, opts = {}) {
   }
   lastFetchBySymbol.set(symbol, Date.now());
 
-  const maxAgeMs = Number.isFinite(Number(opts.maxAgeMs)) ? Number(opts.maxAgeMs) : readNumber('MAX_QUOTE_AGE_MS', 30000);
+  const maxAgeMs = Number.isFinite(Number(opts.maxAgeMs)) ? Number(opts.maxAgeMs) : readNumber('MAX_QUOTE_AGE_MS', MAX_QUOTE_AGE_MS);
   const primary = await getPrimaryQuote(symbol, opts).catch(() => null);
   if (!primary || !Number.isFinite(Number(primary.bid)) || !Number.isFinite(Number(primary.ask))) {
+    console.log('quote_fetch_failed', { symbol });
     return null;
   }
   const primaryTs = Number.isFinite(Number(primary.tsMs)) ? Number(primary.tsMs) : Date.now();
