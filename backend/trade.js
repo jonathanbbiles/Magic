@@ -264,6 +264,7 @@ const HTTP_TIMEOUT_MS = Math.max(1000, readNumber('HTTP_TIMEOUT_MS', 10000));
 let lastHttpError = null;
 let lastQuoteAt = 0;
 let lastQuoteSymbol = null;
+const lastQuoteFingerprintBySymbol = new Map();
 
 function getLastHttpError() { return lastHttpError; }
 function getLastQuoteSnapshot() {
@@ -1009,10 +1010,26 @@ function computeSpreadBps(quote) {
 }
 
 function quoteTimestampMs(quote) {
-  const t = quote?.t || quote?.timestamp || null;
-  if (!t) return null;
-  const ms = Date.parse(t);
-  return Number.isFinite(ms) ? ms : null;
+  const candidates = [quote?.t, quote?.timestamp, quote?.ax, quote?.bx, quote?.as, quote?.bs];
+  let best = null;
+  for (const raw of candidates) {
+    if (raw == null || raw === '') continue;
+    let ms = null;
+    if (typeof raw === 'number' || /^[0-9]+$/.test(String(raw))) {
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 0) {
+        if (n > 1e17) ms = Math.floor(n / 1e6); // ns
+        else if (n > 1e14) ms = Math.floor(n / 1e3); // µs
+        else if (n > 1e11) ms = Math.floor(n); // ms
+        else if (n > 1e9) ms = Math.floor(n * 1000); // s
+      }
+    } else {
+      const parsed = Date.parse(raw);
+      if (Number.isFinite(parsed)) ms = parsed;
+    }
+    if (Number.isFinite(ms) && ms > 0) best = best == null ? ms : Math.max(best, ms);
+  }
+  return Number.isFinite(best) ? best : null;
 }
 
 function getDynamicBufferBps(volatilityBps) {
@@ -1216,8 +1233,17 @@ async function scanAndEnter() {
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
       const quoteTsMs = quoteTimestampMs(quote) || 0;
       if (quoteTsMs > 0) lastQuoteUpdateBySymbol.set(pair, quoteTsMs);
-      const ageMs = Date.now() - quoteTsMs;
-      if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
+      const nowMs = Date.now();
+      const ageMs = nowMs - quoteTsMs;
+      const quoteFingerprint = `${Number(quote.bp)}:${Number(quote.ap)}:${quoteTsMs}`;
+      const previousFingerprint = lastQuoteFingerprintBySymbol.get(pair) || null;
+      const quoteLooksNew = previousFingerprint !== quoteFingerprint;
+      lastQuoteFingerprintBySymbol.set(pair, quoteFingerprint);
+      if (ageMs > QUOTE_MAX_AGE_MS && quoteLooksNew) {
+        // Some venues occasionally publish delayed quote timestamps despite
+        // updating bid/ask. If the quote moved since the previous scan, avoid
+        // classifying it as stale solely due to provider timestamp lag.
+      } else if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
