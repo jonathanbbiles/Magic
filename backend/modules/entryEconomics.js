@@ -118,10 +118,13 @@ function estimateExpectedNetBps({ hitProbability, targetNetBps, assumedStuckLoss
  * The smallest GROSS target (in bps) such that, after deducting all
  * frictions on both sides, at least `minNetEdgeBps` of net P&L survives:
  *
- *   gross >= spread + slipIn + slipOut + feeRoundTrip + minNetEdgeBps
+ *   gross >= slipIn + slipOut + feeRoundTrip + minNetEdgeBps
  *
  * The live engine pins the GTC sell limit at entry × (1 + gross / 10000).
- * If the pin is below this floor, taking the trade is nominally impossible
+ * Because this is measured from entry fill (ask) to exit limit fill, spread is
+ * not a deterministic P&L debit here; spread risk is handled in separate
+ * spread/alpha probability gates. If the pin is below this floor, taking the
+ * trade is nominally impossible
  * — even a perfect fill would lose money. Refuse it.
  *
  * Returns:
@@ -139,7 +142,7 @@ function computeMinimumGrossTargetBps({
   const slipOut = Math.max(0, Number(exitSlippageBps) || 0);
   const fees = Math.max(0, Number(feeRoundTripBps) || 0);
   const minNet = Math.max(0, Number(minNetEdgeBps) || 0);
-  const minGrossTargetBps = spread + slipIn + slipOut + fees + minNet;
+  const minGrossTargetBps = slipIn + slipOut + fees + minNet;
   return {
     minGrossTargetBps,
     components: { spread, slipIn, slipOut, feeRoundTrip: fees, minNet },
