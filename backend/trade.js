@@ -106,7 +106,10 @@ const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // crypto pairs.
 const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
-const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
+// Default raised to 40 bps so the hard guardrail no longer blocks otherwise
+// valid candidates in normal-but-noisy live books; the tighter economics and
+// microstructure gates still run afterwards (entry-max, EV, alpha, etc.).
+const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 40));
 const SPREAD_ENTRY_MAX_BPS = Math.max(1, readNumber('SPREAD_ENTRY_MAX_BPS', 20));
 const SPREAD_SHOCK_MAX_BPS = Math.max(SPREAD_ENTRY_MAX_BPS, readNumber('SPREAD_SHOCK_MAX_BPS', 30));
 const MAX_SLIPPAGE_ESTIMATE_BPS = Math.max(0, readNumber('MAX_SLIPPAGE_ESTIMATE_BPS', 5));
