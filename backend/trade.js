@@ -1155,7 +1155,7 @@ function shouldEnterTrade({ spreadBps, slippageEstimateBps, volatilityBps, ask, 
   const meanReversionConfirm = Number.isFinite(meanReversionDevBps) && meanReversionDevBps >= MICRO_MEAN_REVERSION_MIN_DEV_BPS;
 
   const stableQuoteConfirm = Number.isFinite(spreadBps) &&
-    spreadBps <= TIGHT_QUOTE_MAX_BPS &&
+    spreadBps <= Math.max(TIGHT_QUOTE_MAX_BPS, SPREAD_ENTRY_MAX_BPS) &&
     Number.isFinite(volatilityBps) &&
     volatilityBps <= STABLE_QUOTE_VOL_MAX_BPS &&
     Number.isFinite(ask) &&
