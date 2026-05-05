@@ -54,9 +54,9 @@ function readList(name, fallback = []) {
 
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
-// +20 bps (0.20%) target is AFTER fees, not before. Lowered from 25 bps to
-// raise the TP fill rate and clear more wins per day on a normal market.
-const TARGET_NET_PROFIT_BPS = Math.min(5, Math.max(2, readNumber('TARGET_NET_PROFIT_BPS', 3)));
+// +25 bps (0.25%) target is AFTER fees, not before. Keep this in a
+// realistic live range so the spread+fee entry gate can pass for liquid pairs.
+const TARGET_NET_PROFIT_BPS = Math.min(40, Math.max(20, readNumber('TARGET_NET_PROFIT_BPS', 25)));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
 // entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
 // above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
