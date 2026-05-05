@@ -7,6 +7,12 @@ function buildStartupTruthSummary({
   runtimeEntryUniverseModeRaw,
   env,
 }) {
+  const toOptionalFiniteNumber = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? numericValue : null;
+  };
+
   return {
     alpacaCredentialsPresent: Boolean(authStatus?.alpacaAuthOk),
     effectiveTradeBase: baseStatus?.tradeBase || null,
@@ -26,12 +32,8 @@ function buildStartupTruthSummary({
     ),
     dynamicAcceptedSymbolsCount: Number(universeDiagnostics?.dynamicAcceptedSymbolsCount || 0),
     scanSymbolsCount: Number(universeDiagnostics?.scanSymbolsCount || 0),
-    universeSymbolCap: Number.isFinite(Number(universeDiagnostics?.universeSymbolCap))
-      ? Number(universeDiagnostics.universeSymbolCap)
-      : null,
-    configuredUniverseCap: Number.isFinite(Number(universeDiagnostics?.configuredUniverseCap))
-      ? Number(universeDiagnostics.configuredUniverseCap)
-      : null,
+    universeSymbolCap: toOptionalFiniteNumber(universeDiagnostics?.universeSymbolCap),
+    configuredUniverseCap: toOptionalFiniteNumber(universeDiagnostics?.configuredUniverseCap),
     configuredUniverseCapSource: universeDiagnostics?.configuredUniverseCapSource || null,
     universeCapDiagnostics: universeDiagnostics?.universeCapDiagnostics || null,
     warmupSettings: {

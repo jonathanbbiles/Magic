@@ -155,7 +155,8 @@ const validateEnv = () => {
     }
   };
 
-  if (!process.env.TRADE_BASE) {
+  const tradeBaseExplicitlySet = Boolean(String(process.env.TRADE_BASE || '').trim());
+  if (!tradeBaseExplicitlySet) {
     console.warn('config_warning', {
       field: 'TRADE_BASE',
       message: 'TRADE_BASE not set; falling back to ALPACA_API_BASE or default.',
@@ -165,7 +166,7 @@ const validateEnv = () => {
     });
   }
   const parsedTradeBase = parseUrl(rawTradeBaseSource === 'ALPACA_API_BASE' ? 'ALPACA_API_BASE' : 'TRADE_BASE', effectiveTradeBase);
-  if (nodeEnv === 'production' && !String(process.env.TRADE_BASE || '').trim()) {
+  if (nodeEnv === 'production' && !tradeBaseExplicitlySet) {
     if (String(parsedTradeBase?.hostname || '').toLowerCase() === LIVE_ALPACA_TRADE_HOST) {
       console.warn('config_warning', {
         field: 'TRADE_BASE',
