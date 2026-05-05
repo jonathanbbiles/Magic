@@ -46,6 +46,12 @@ function readBoolean(name, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(raw);
 }
 
+function readList(name, fallback = []) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return fallback.slice();
+  return raw.split(',').map((v) => normalizePair(v.trim()) || v.trim()).filter(Boolean);
+}
+
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
 // +20 bps (0.20%) target is AFTER fees, not before. Lowered from 25 bps to
@@ -109,6 +115,10 @@ const MICRO_EMA_LENGTH = Math.max(3, readNumber('MICRO_EMA_LENGTH', 6));
 const MICRO_MEAN_REVERSION_MIN_DEV_BPS = Math.max(0.1, readNumber('MICRO_MEAN_REVERSION_MIN_DEV_BPS', 2));
 const TIGHT_QUOTE_MAX_BPS = Math.max(1, readNumber('TIGHT_QUOTE_MAX_BPS', 12));
 const STABLE_QUOTE_VOL_MAX_BPS = Math.max(0.1, readNumber('STABLE_QUOTE_VOL_MAX_BPS', 8));
+const SPREAD_CANARY_EXTRA_BPS = Math.max(0, readNumber('SPREAD_CANARY_EXTRA_BPS', 0));
+const SPREAD_CANARY_SYMBOLS = new Set(readList('SPREAD_CANARY_SYMBOLS', []));
+const REJECTION_WINDOW_MS = Math.max(60000, readNumber('ENTRY_REJECTION_WINDOW_MS', 600000));
+const MAJOR_ASSET_DIP_EXCEPTION = new Set(readList('MAJOR_ASSET_DIP_EXCEPTION', ['BTC/USD', 'ETH/USD', 'SOL/USD']));
 
 // --- entry prediction ---------------------------------------------------
 // The bot only buys when recent 1m closes form a statistically meaningful
@@ -709,7 +719,7 @@ async function getPredictionSignal(pair) {
     const slopeTStat = slopeTStatFromOls({ slope, denX, denY, rSquared, n });
 
     const tail = closes.slice(-3);
-    const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]);
+    const shortTermOk = tail.every((v, i, a) => i === 0 || v >= a[i - 1]) || MAJOR_ASSET_DIP_EXCEPTION.has(pair);
 
     // Volatility of 1m bar-to-bar returns, expressed in bps. Used by the
     // entry vol-cap gate; does not affect the sell-side logic.
@@ -794,6 +804,8 @@ const positionFirstSeenAt = new Map();    // symbol -> ms epoch at first reconci
 const tradePredictions = new Map();       // symbol -> { tradeId, submittedAt, prediction, buyFillObserved, actualEntryPrice }
 const skipReasonCounts = new Map();
 const rollingSkipReasons = new Map();
+const rollingSkipByReasonAndSymbol = [];
+const lastQuoteUpdateBySymbol = new Map();
 
 let entryManagerRunning = false;
 let exitManagerRunning = false;
@@ -826,7 +838,29 @@ function bumpSkipReason(reason) {
 
 function rejectTrade(pair, reason, details = {}) {
   bumpSkipReason(reason);
+  rollingSkipByReasonAndSymbol.push({ ts: Date.now(), symbol: pair || 'unknown', reason: reason || 'unknown' });
+  while (rollingSkipByReasonAndSymbol.length > 0 && (Date.now() - rollingSkipByReasonAndSymbol[0].ts) > REJECTION_WINDOW_MS) {
+    rollingSkipByReasonAndSymbol.shift();
+  }
   console.log('entry_rejected', { symbol: pair, reason, ...details });
+}
+
+function getRejectionWindowStats() {
+  const cutoff = Date.now() - REJECTION_WINDOW_MS;
+  while (rollingSkipByReasonAndSymbol.length > 0 && rollingSkipByReasonAndSymbol[0].ts < cutoff) rollingSkipByReasonAndSymbol.shift();
+  const byReason = new Map();
+  const bySymbolReason = new Map();
+  for (const row of rollingSkipByReasonAndSymbol) {
+    byReason.set(row.reason, (byReason.get(row.reason) || 0) + 1);
+    const key = `${row.symbol}::${row.reason}`;
+    bySymbolReason.set(key, (bySymbolReason.get(key) || 0) + 1);
+  }
+  const total = rollingSkipByReasonAndSymbol.length;
+  const reasonPercentages = {};
+  for (const [reason, count] of byReason.entries()) reasonPercentages[reason] = total > 0 ? (count / total) * 100 : 0;
+  const symbolReasonPercentages = {};
+  for (const [key, count] of bySymbolReason.entries()) symbolReasonPercentages[key] = total > 0 ? (count / total) * 100 : 0;
+  return { windowMs: REJECTION_WINDOW_MS, total, reasonPercentages, symbolReasonPercentages };
 }
 
 function mapToObject(m) {
@@ -904,6 +938,8 @@ function getEntryDiagnosticsSnapshot() {
     entryManager: getTradingManagerStatus().entryManagerHeartbeat,
     gating: {},
     quoteFreshness: { maxAgeMs: QUOTE_MAX_AGE_MS, staleEntryQuoteSkips: skipReasonCounts.get('stale_quote') || 0 },
+    rejectionWindow: getRejectionWindowStats(),
+    quoteAgesBySymbolMs: Object.fromEntries(Array.from(lastQuoteUpdateBySymbol.entries()).map(([sym, ts]) => [sym, Date.now() - ts])),
     ratePressureState: null,
     lastSuccessfulAction,
     lastExecutionFailure,
@@ -1174,12 +1210,15 @@ async function scanAndEnter() {
       const payload = await fetchCryptoQuotes({ symbols: [pair] });
       const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
-      const ageMs = Date.now() - (quoteTimestampMs(quote) || 0);
+      const quoteTsMs = quoteTimestampMs(quote) || 0;
+      if (quoteTsMs > 0) lastQuoteUpdateBySymbol.set(pair, quoteTsMs);
+      const ageMs = Date.now() - quoteTsMs;
       if (!Number.isFinite(ageMs) || ageMs > QUOTE_MAX_AGE_MS) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
-      if (spreadBps > SPREAD_MAX_BPS) { rejectTrade(pair, 'spread_too_wide', { spreadBps }); continue; }
+      const spreadCapBps = SPREAD_MAX_BPS + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
+      if (spreadBps > spreadCapBps) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps }); continue; }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
