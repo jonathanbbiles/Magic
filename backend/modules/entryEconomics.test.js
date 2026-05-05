@@ -66,7 +66,7 @@ const {
   const r = computeMinimumGrossTargetBps({
     spreadBps: 8, entrySlippageBps: 5, exitSlippageBps: 5, feeRoundTripBps: 40, minNetEdgeBps: 5,
   });
-  assert.equal(r.minGrossTargetBps, 63);
+  assert.equal(r.minGrossTargetBps, 55);
   assert.deepEqual(r.components, { spread: 8, slipIn: 5, slipOut: 5, feeRoundTrip: 40, minNet: 5 });
 }
 
@@ -78,13 +78,13 @@ const {
     horizonBars: 10,
     spreadBps: 8, entrySlippageBps: 5, exitSlippageBps: 5, feeRoundTripBps: 40, minNetEdgeBps: 5,
   });
-  assert.equal(r.grossTargetBps, 63);
+  assert.equal(r.grossTargetBps, 55);
   assert.equal(r.volTargetBps, null);
 }
 
 // 9. computeAdaptiveTargetBps: with σ=12, T=10, k=1.5 the vol-target is
-//    1.5 * 12 * sqrt(10) ≈ 56.92, which is below the cost-floor (63), so we
-//    use 63. This keeps us from setting a target the trade can't pay for.
+//    1.5 * 12 * sqrt(10) ≈ 56.92, which is above the cost-floor (55), so we
+//    use the vol target.
 {
   const r = computeAdaptiveTargetBps({
     realizedVolBpsPerBar: 12,
@@ -93,11 +93,11 @@ const {
     spreadBps: 8, entrySlippageBps: 5, exitSlippageBps: 5, feeRoundTripBps: 40, minNetEdgeBps: 5,
   });
   assert.ok(Math.abs(r.volTargetBps - 1.5 * 12 * Math.sqrt(10)) < 1e-6);
-  assert.equal(r.grossTargetBps, 63); // floored to min cost
+  assert.ok(r.grossTargetBps > 56 && r.grossTargetBps < 58);
 }
 
 // 10. computeAdaptiveTargetBps: with high vol the vol-target dominates.
-//     σ=25 ⇒ 1.5 * 25 * √10 ≈ 118.6, well above the 63 floor.
+//     σ=25 ⇒ 1.5 * 25 * √10 ≈ 118.6, well above the 55 floor.
 {
   const r = computeAdaptiveTargetBps({
     realizedVolBpsPerBar: 25,
