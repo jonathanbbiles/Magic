@@ -256,6 +256,13 @@ const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
 // also raising TARGET will resurrect the small-target rejection problem.
 const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
 const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 2);
+// Hard floor on the OLS-projected forward move (bps) required to enter.
+// After lowering TARGET_NET_PROFIT_BPS to 8, the EV gate (5 × fillProb ≥ 2,
+// i.e. fillProb ≥ 0.4) lets through trades with sub-3 bps projections —
+// statistically indistinguishable from noise. Default 15 bps ≈ 3× modelled
+// slippage and ~half a fee round-trip, so sub-floor signals never even
+// reach the EV math.
+const MIN_PROJECTED_BPS_TO_ENTER = Math.max(0, readNumber('MIN_PROJECTED_BPS_TO_ENTER', 15));
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 3));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 3));
 
@@ -1583,6 +1590,20 @@ async function scanAndEnter() {
       // when the 1m model predicts down (or flat).
       if (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0) {
         rejectTrade(pair, 'slope_not_positive');
+        continue;
+      }
+
+      // Projection-magnitude floor. After lowering TARGET_NET_PROFIT_BPS to
+      // 8 in PR #362, the EV gate (MIN_NET_EDGE_BPS=2) lets through entries
+      // with sub-3 bps projected moves — essentially noise. Live: BCH was
+      // accepted with projectedBps=2.6 and honestEvBps=-54. Refuse trades
+      // whose projected forward move is below MIN_PROJECTED_BPS_TO_ENTER
+      // (default 15 = ~3× modelled slippage, roughly half a fee round-trip).
+      if (projectedBps < MIN_PROJECTED_BPS_TO_ENTER) {
+        rejectTrade(pair, 'projected_below_min', {
+          projectedBps,
+          minProjectedBps: MIN_PROJECTED_BPS_TO_ENTER,
+        });
         continue;
       }
 
