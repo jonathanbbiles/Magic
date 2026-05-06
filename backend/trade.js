@@ -1816,6 +1816,14 @@ async function reconcileExits() {
           });
           const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
           const triggeredAt = sellOrder?.submitted_at || new Date().toISOString();
+          // Capture the most accurate exit-price estimate available. IOC
+          // market sells sometimes return filled_avg_price immediately on
+          // accept; if not, the live bid at trigger time is a closer estimate
+          // than the stop threshold itself (which the bid breached).
+          const orderFillPrice = Number(sellOrder?.filled_avg_price);
+          const stopLossExitPrice = Number.isFinite(orderFillPrice) && orderFillPrice > 0
+            ? orderFillPrice
+            : (Number.isFinite(bid) && bid > 0 ? bid : stopPrice);
           exitState.set(pair, {
             ...exitState.get(pair),
             sellOrderId: sellOrder?.id || null,
@@ -1825,6 +1833,11 @@ async function reconcileExits() {
             lastReconciliationAction: 'stop_loss_market_sell',
             expectedNetProfitBps: -stopBps,
             minNetProfitBps: -stopBps,
+            stopLossTriggered: true,
+            stopLossTriggeredAt: triggeredAt,
+            stopLossExitPrice,
+            stopLossThresholdPrice: stopPrice,
+            stopLossBpsUsed: stopBps,
           });
           lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'stop_loss_market_sell', orderId: sellOrder?.id || null };
           console.log('exit_stop_loss_triggered', {
@@ -2013,7 +2026,15 @@ async function reconcileExits() {
     if (byPair.has(pair)) continue;
     const pred = tradePredictions.get(pair);
     const entry = Number(state?.entryPriceUsed);
-    const exit = Number(state?.targetPrice);
+    // For stop-loss exits, prefer the recorded actual exit price (live bid
+    // at trigger time, or filled_avg_price if Alpaca returned it on the IOC
+    // market sell). Falls back to targetPrice for TP and break-even closes
+    // where targetPrice IS the fill price by construction (GTC limit fills).
+    const stopLossClose = state?.stopLossTriggered === true;
+    const stopLossExitPrice = Number(state?.stopLossExitPrice);
+    const exit = stopLossClose && Number.isFinite(stopLossExitPrice) && stopLossExitPrice > 0
+      ? stopLossExitPrice
+      : Number(state?.targetPrice);
     const closedAt = new Date().toISOString();
     if (pred && Number.isFinite(entry) && entry > 0 && Number.isFinite(exit) && exit > 0) {
       const grossBps = ((exit - entry) / entry) * 10000;
@@ -2022,7 +2043,15 @@ async function reconcileExits() {
       const grossPnlUsd = (grossBps * notional) / 10000;
       const netPnlUsd = (netBps * notional) / 10000;
       const holdSeconds = Math.max(0, (Date.now() - Number(pred.submittedAt || 0)) / 1000);
-      const exitReason = state?.breakevenAttached ? 'breakeven_limit' : 'tp_limit';
+      // Close-classification precedence: stop_loss → breakeven_limit → tp_limit.
+      // Prior bug: stop-loss exits were silently labeled 'tp_limit' because
+      // the close path only checked breakevenAttached, which inflated
+      // tpFillRate and made the scorecard inconsistent (winRate=0,
+      // tpFillRate=1 simultaneously when a single stop-out fired).
+      let exitReason;
+      if (stopLossClose) exitReason = 'stop_loss';
+      else if (state?.breakevenAttached) exitReason = 'breakeven_limit';
+      else exitReason = 'tp_limit';
       try {
         closedTradeStats.append({
           tradeId: pred.tradeId,
