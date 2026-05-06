@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Constants from 'expo-constants';
-import { LinearGradient } from 'expo-linear-gradient';
 import {
   ActivityIndicator,
   Animated,
@@ -261,6 +260,46 @@ function progressToTarget(pos) {
 }
 
 // ----------------------------------------------------------------------------
+// Gradient — zero-dependency shim. We avoid expo-linear-gradient because
+// pasting App.js straight into Expo Go can fail to resolve native modules.
+// We approximate a soft diagonal gradient by layering two semi-transparent
+// fills on top of a solid base colour. Same prop surface as Gradient
+// (colors[], start, end ignored, style, children) so the rest of the file
+// stays unchanged.
+// ----------------------------------------------------------------------------
+function Gradient({ colors = [], style, children }) {
+  const base = colors[0] || palette.velvet;
+  const tint = colors[1] || base;
+  return (
+    <View style={[style, { backgroundColor: base, overflow: 'hidden' }]}>
+      {tint !== base ? (
+        <View
+          pointerEvents="none"
+          style={{
+            position: 'absolute',
+            top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: tint,
+            opacity: 0.45,
+          }}
+        />
+      ) : null}
+      {tint !== base ? (
+        <View
+          pointerEvents="none"
+          style={{
+            position: 'absolute',
+            top: 0, left: 0, right: '50%', bottom: '50%',
+            backgroundColor: base,
+            opacity: 0.5,
+          }}
+        />
+      ) : null}
+      <View style={{ position: 'relative' }}>{children}</View>
+    </View>
+  );
+}
+
+// ----------------------------------------------------------------------------
 // useTicker — triggers a re-render every interval so live "Xs ago" labels
 // count up smoothly. Pauses when the app is backgrounded (caller passes ref).
 // ----------------------------------------------------------------------------
@@ -447,7 +486,7 @@ function MoneyTile({ portfolioValue, openPL, openPLPct, mood, deltaSinceLast }) 
   const arrow = pl == null ? '·' : pl >= 0 ? '▲' : '▼';
   const arrowColor = pl == null ? palette.gold : pl >= 0 ? palette.emerald : palette.rose;
   return (
-    <LinearGradient
+    <Gradient
       colors={[palette.velvetSoft, palette.velvet]}
       start={{ x: 0, y: 0 }}
       end={{ x: 1, y: 1 }}
@@ -466,7 +505,7 @@ function MoneyTile({ portfolioValue, openPL, openPLPct, mood, deltaSinceLast }) 
           </Text>
         ) : null}
       </View>
-    </LinearGradient>
+    </Gradient>
   );
 }
 
@@ -514,7 +553,7 @@ function CastCard({ position, activeRef }) {
   const targetNetBps = num(position?.bot?.expectedNetProfitBps);
 
   return (
-    <LinearGradient
+    <Gradient
       colors={tone === 'good'
         ? [palette.emeraldPale, palette.velvetSoft]
         : tone === 'bad'
@@ -552,7 +591,7 @@ function CastCard({ position, activeRef }) {
             : '—'}
         </Text>
       </View>
-    </LinearGradient>
+    </Gradient>
   );
 }
 
@@ -643,7 +682,7 @@ function Stage({ data, activeRef, onJumpToCast }) {
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>🔮 ENGINE PULSE</Text>
       </View>
-      <LinearGradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
+      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
         <View style={s.pulseRow}>
           <Text style={s.pulseLabel}>State</Text>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
@@ -671,7 +710,7 @@ function Stage({ data, activeRef, onJumpToCast }) {
             <Text style={{ color: avgLoss != null ? palette.rose : palette.fog }}>{avgLoss != null ? signedUsd(avgLoss) : '—'}</Text>
           </Text>
         </View>
-      </LinearGradient>
+      </Gradient>
 
       {/* Top reject reasons */}
       {skipEntries.length > 0 && (
@@ -777,7 +816,7 @@ function Backstage({ data, activeRef }) {
         <Text style={s.sectionHeaderTitle}>📜 BOX OFFICE</Text>
         <Text style={s.sectionHeaderSub}>scorecard since last restart</Text>
       </View>
-      <LinearGradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
+      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
         <View style={s.boRow}><Text style={s.boLabel}>Closed trades</Text><Text style={s.boValue}>{scorecard?.totalClosedTrades ?? '—'}</Text></View>
         <View style={s.boRow}>
           <Text style={s.boLabel}>Win rate</Text>
@@ -801,7 +840,7 @@ function Backstage({ data, activeRef }) {
         </View>
         <View style={s.boRow}><Text style={s.boLabel}>TP fill rate</Text><Text style={s.boValue}>{scorecard?.tpFillRate != null ? `${(scorecard.tpFillRate * 100).toFixed(0)}%` : '—'}</Text></View>
         <View style={s.boRow}><Text style={s.boLabel}>Median hold</Text><Text style={s.boValue}>{scorecard?.medianHoldSeconds != null ? fmtElapsed(scorecard.medianHoldSeconds * 1000) : '—'}</Text></View>
-      </LinearGradient>
+      </Gradient>
 
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>🚪 SKIP REASONS</Text>
@@ -834,18 +873,18 @@ function Backstage({ data, activeRef }) {
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>🔍 LAST SCAN</Text>
       </View>
-      <LinearGradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
+      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
         <View style={s.boRow}><Text style={s.boLabel}>Universe</Text><Text style={s.boValue}>{lastScan?.universeSize ?? '—'}</Text></View>
         <View style={s.boRow}><Text style={s.boLabel}>Held</Text><Text style={s.boValue}>{lastScan?.heldCount ?? '—'}</Text></View>
         <View style={s.boRow}><Text style={s.boLabel}>Slots open</Text><Text style={[s.boValue, { color: (lastScan?.slotsAvailable ?? 0) > 0 ? palette.emerald : palette.gold }]}>{lastScan?.slotsAvailable ?? '—'}</Text></View>
         <View style={s.boRow}><Text style={s.boLabel}>Evaluated</Text><Text style={s.boValue}>{lastScan?.evaluated ?? '—'}</Text></View>
         <View style={s.boRow}><Text style={s.boLabel}>Entered</Text><Text style={[s.boValue, { color: (lastScan?.entered ?? 0) > 0 ? palette.emerald : palette.fog }]}>{lastScan?.entered ?? '—'}</Text></View>
-      </LinearGradient>
+      </Gradient>
 
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>🎬 LAST ACTION</Text>
       </View>
-      <LinearGradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
+      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
         <View style={s.boRow}><Text style={s.boLabel}>Last success</Text>
           <Text style={[s.boValue, { color: lastSuccess ? palette.emerald : palette.fog, fontSize: 12 }]} numberOfLines={1}>
             {lastSuccess ? `${lastSuccess.symbol} ${lastSuccess.action}` : '—'}
@@ -856,7 +895,7 @@ function Backstage({ data, activeRef }) {
             {lastFailure ? `${lastFailure.reason}: ${lastFailure.message}` : 'none'}
           </Text>
         </View>
-      </LinearGradient>
+      </Gradient>
     </View>
   );
 }
@@ -932,7 +971,7 @@ function Send({ data, logsRef, activeRef }) {
     <View style={s.tabBody}>
       {/* Hero copy button */}
       <Pressable onPress={copyForAI}>
-        <LinearGradient
+        <Gradient
           colors={[palette.magenta, palette.rose]}
           start={{ x: 0, y: 0 }}
           end={{ x: 1, y: 1 }}
@@ -941,7 +980,7 @@ function Send({ data, logsRef, activeRef }) {
           <Text style={s.heroCopyEmoji}>📋✨</Text>
           <Text style={s.heroCopyTitle}>COPY EVERYTHING FOR AI</Text>
           <Text style={s.heroCopySub}>Diagnostics JSON + last {filtered.length} log lines, formatted</Text>
-        </LinearGradient>
+        </Gradient>
       </Pressable>
 
       <View style={s.copyRow}>
