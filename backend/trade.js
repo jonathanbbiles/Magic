@@ -169,6 +169,23 @@ function computeStaircaseExitGrossBps(initialGrossBps, ageMs) {
   return Math.max(breakeven, decayed);
 }
 
+// Resolve the staircase clock anchor for a position. The in-memory
+// positionFirstSeenAt resets on every process restart (PR #351 — to avoid
+// instant break-even snaps right after a deploy), but the broker's GTC sell
+// order survives restarts and its `created_at` proxies the original buy
+// fill. Take the OLDER of (broker created_at age, in-memory first-seen age)
+// so positions opened well before a deploy resume their staircase decay
+// instead of resetting to t=0 on reboot.
+function resolveStaircaseAgeMs(pair, existing) {
+  const candidates = [];
+  const brokerCreatedAt = existing?.created_at ? Date.parse(existing.created_at) : NaN;
+  if (Number.isFinite(brokerCreatedAt)) candidates.push(Date.now() - brokerCreatedAt);
+  const memoryFirstSeen = positionFirstSeenAt.get(pair);
+  if (Number.isFinite(memoryFirstSeen)) candidates.push(Date.now() - memoryFirstSeen);
+  if (candidates.length === 0) return 0;
+  return Math.max(...candidates);
+}
+
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -1955,8 +1972,7 @@ async function reconcileExits() {
       // increments. When STAIRCASE_EXIT_ENABLED=false, falls back to the
       // legacy one-shot break-even-replace at T = BREAKEVEN_TIMEOUT_MS.
       if (STAIRCASE_EXIT_ENABLED && Number.isFinite(avg) && avg > 0 && existing?.id) {
-        const firstSeen = positionFirstSeenAt.get(pair);
-        const ageMs = Number.isFinite(firstSeen) ? Date.now() - firstSeen : 0;
+        const ageMs = resolveStaircaseAgeMs(pair, existing);
         const initialGrossBps = resolveExitGrossBps(pair);
         const desiredGrossBps = computeStaircaseExitGrossBps(initialGrossBps, ageMs);
         const desiredPrice = avg * (1 + desiredGrossBps / 10000);
@@ -2030,9 +2046,9 @@ async function reconcileExits() {
         }
       } else if (!breakevenAttachedPrior && Number.isFinite(avg) && avg > 0 && existing?.id) {
         // Legacy one-shot break-even reset (when staircase is disabled).
-        // Kept verbatim for env-flag rollback safety.
-        const firstSeen = positionFirstSeenAt.get(pair);
-        const ageMs = Number.isFinite(firstSeen) ? Date.now() - firstSeen : 0;
+        // Kept verbatim for env-flag rollback safety. Uses the same
+        // restart-resilient age anchor as the staircase path.
+        const ageMs = resolveStaircaseAgeMs(pair, existing);
         if (ageMs >= BREAKEVEN_TIMEOUT_MS) {
           try {
             await cancelOrder(existing.id);
