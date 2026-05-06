@@ -86,9 +86,11 @@ function buildResponseFor(url) {
   if (path === '/v1beta3/crypto/us/bars') {
     const symbols = (u.searchParams.get('symbols') || '').split(',').filter(Boolean);
     const limit = Number(u.searchParams.get('limit')) || 0;
+    const sort = u.searchParams.get('sort') || 'asc';
     const bars = {};
     for (const s of symbols) {
-      bars[s] = makeBars(limit, { start: 100, step: 0.05 });
+      const arr = makeBars(limit, { start: 100, step: 0.05 });
+      bars[s] = sort === 'desc' ? arr.slice().reverse() : arr;
     }
     return { bars };
   }

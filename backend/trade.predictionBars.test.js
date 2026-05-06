@@ -65,8 +65,12 @@ function installFetchMock(handler) {
       lastUrl = String(urlString);
       const url = new URL(urlString);
       const limit = Number(url.searchParams.get('limit')) || 0;
-      // Mimic Alpaca: returns up to `limit` bars, with the most recent being the in-progress bar.
-      return { bars: { 'BTC/USD': makeBars(limit) } };
+      const sort = url.searchParams.get('sort') || 'asc';
+      // Mimic Alpaca: returns up to `limit` bars, ordered per the sort param.
+      // makeBars() emits chronological (asc); honor sort=desc so callers
+      // requesting newest-first get them in that order, like the real API.
+      const arr = makeBars(limit);
+      return { bars: { 'BTC/USD': sort === 'desc' ? arr.slice().reverse() : arr } };
     });
     try {
       const result = await trade.getPredictionSignal('BTC/USD');
@@ -97,7 +101,9 @@ function installFetchMock(handler) {
       lastUrl = String(urlString);
       const url = new URL(urlString);
       const limit = Number(url.searchParams.get('limit')) || 0;
-      return { bars: { 'BTC/USD': makeBars(limit, { start: 100, step: 0.10 }) } };
+      const sort = url.searchParams.get('sort') || 'asc';
+      const arr = makeBars(limit, { start: 100, step: 0.10 });
+      return { bars: { 'BTC/USD': sort === 'desc' ? arr.slice().reverse() : arr } };
     });
     try {
       const result = await trade.getHigherTimeframeSignal('BTC/USD');
@@ -120,8 +126,10 @@ function installFetchMock(handler) {
     const restore = installFetchMock(async (urlString) => {
       const url = new URL(urlString);
       const limit = Number(url.searchParams.get('limit')) || 0;
-      // Upstream gives us only PREDICT_BARS bars instead of the requested PREDICT_BARS+1.
-      return { bars: { 'BTC/USD': makeBars(Math.min(limit, PREDICT_BARS)) } };
+      const sort = url.searchParams.get('sort') || 'asc';
+      // Upstream gives us only PREDICT_BARS bars instead of the requested limit.
+      const arr = makeBars(Math.min(limit, PREDICT_BARS));
+      return { bars: { 'BTC/USD': sort === 'desc' ? arr.slice().reverse() : arr } };
     });
     try {
       const result = await trade.getPredictionSignal('BTC/USD');
