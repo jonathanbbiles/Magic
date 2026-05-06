@@ -20,7 +20,7 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 - Checked-in env files are templates only: `backend/.env.example`, `backend/.env.live.example`, and `backend/.env.production.example`.
 - `backend/config/liveDefaults.js` defines non-secret live-critical defaults used by runtime parsing, checks, and engine fallbacks.
 - `backend/index.js` does **not** auto-load a production dotenv file by default. Production file loading is local-only and explicit (`LOAD_LOCAL_PRODUCTION_DOTENV=true` with `.env.production.local`).
-- Default production posture is configured universe mode: `ENTRY_UNIVERSE_MODE=configured`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`, and `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`.
+- Default production posture is configured universe mode: `ENTRY_UNIVERSE_MODE=configured`, `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION=false`, and `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD`.
 
 ## Node 22 requirement
 
@@ -275,13 +275,13 @@ Changing `backend/.env.live.example` in git **does not** update deployed Render 
 After merging, manually copy these values into Render:
 
 - `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
 - `ENTRY_UNIVERSE_MAX_SYMBOLS=`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
-- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
+- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD`
 - `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_TIER3_MIN_PORTFOLIO_USD=0`
 - `ENTRY_SCAN_INTERVAL_MS=12000`
@@ -309,13 +309,13 @@ Do not store real secrets in git-tracked files. Keep `API_TOKEN`, `APCA_API_KEY_
 Intended live non-secret env values:
 
 - `ENTRY_UNIVERSE_MODE=configured`
-- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD`
+- `ENTRY_SYMBOLS_PRIMARY=BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD`
 - `ENTRY_SYMBOLS_SECONDARY=`
 - `ENTRY_SYMBOLS_INCLUDE_SECONDARY=false`
 - `ENTRY_UNIVERSE_EXCLUDE_STABLES=false`
 - `ENTRY_UNIVERSE_MAX_SYMBOLS=`
 - `EXECUTION_TIER1_SYMBOLS=BTC/USD,ETH/USD`
-- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD`
+- `EXECUTION_TIER2_SYMBOLS=LINK/USD,AVAX/USD,SOL/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD`
 - `EXECUTION_TIER3_DEFAULT=true`
 - `ENTRY_TIER3_MIN_PORTFOLIO_USD=0`
 - `ENTRY_SCAN_INTERVAL_MS=12000`

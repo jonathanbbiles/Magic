@@ -96,7 +96,10 @@ withEnv({}, () => {
   const cfg = getRuntimeConfig();
   const summary = getRuntimeConfigSummary();
   assert.deepEqual(cfg.executionTier1Symbols, ['BTC/USD', 'ETH/USD']);
-  assert.deepEqual(cfg.executionTier2Symbols, ['LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD']);
+  assert.deepEqual(cfg.executionTier2Symbols, [
+    'LINK/USD', 'AVAX/USD', 'SOL/USD', 'UNI/USD',
+    'DOT/USD', 'ADA/USD', 'XRP/USD', 'DOGE/USD', 'LTC/USD', 'BCH/USD',
+  ]);
   assert.equal(cfg.predictorWarmupMinBars1m, 35);
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
