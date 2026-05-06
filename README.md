@@ -9,7 +9,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 ## Goals
 
 - Find tiny upward drifts in liquid crypto pairs.
-- Capture **0.20% net profit** per trade after fees.
+- Capture a small **net profit** per trade after fees (default **0.15%**, allowed range **0.10%..0.50%**).
 - Cap downside with a real stop-loss: if price falls 1.00% below entry, flatten with a market sell.
 - Recycle stuck positions: if the take-profit doesn't fill within 4 hours, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
@@ -119,17 +119,17 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Strategy economics (defaults in parentheses)
 | Var | Default | What it does |
 | --- | --- | --- |
-| `TARGET_NET_PROFIT_BPS` | `20` | Net profit target after fees (20 bps = 0.20%). Lowered from 25 bps so the TP fills more often per day. |
+| `TARGET_NET_PROFIT_BPS` | `15` | Net profit target after fees (15 bps = 0.15%). Code clamps the configured value to `[10, 50]` bps so this is a true scalper: target small (0.10%..0.50% net), take many bites. Raising to `>50` requires a code change — wider targets fill less often and break the small-win/small-stop symmetry the strategy depends on. |
 | `FEE_BPS_ROUND_TRIP` | `40` | Assumed Alpaca round-trip: ~25 bps taker entry + ~15 bps maker exit. |
 | `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 20 bps target the effective entry spread headroom is 15 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
-| `MIN_NET_EDGE_BPS` | `5` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`, where `fillProbability = logistic_cdf(slopeTStat)`. Lowered from 10 because with default `TARGET_NET_PROFIT_BPS=20` and `ENTRY_SLIPPAGE_BPS=5` the prior `10` floor required `slopeTStat ≥ ~0.69` (≈ p ≥ 0.667), which on a 20-bar 1 m OLS over tier-1 crypto fires only on rare clean uptrends and starved the daily entry rate. At `5`, the EV check becomes `p ≥ 0.333` (subsumed by the existing slope-positive guard, which requires `p > 0.5`), so the binding economic gate becomes `alpha_below_execution_cost` — projected move ≥ spread + entry slippage. Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |
+| `MIN_NET_EDGE_BPS` | `2` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`. With the scalper-friendly defaults (`TARGET=15`, `slip=3`), the EV check is `12 × p ≥ 2` ⇒ p ≥ ~0.17 — comfortably looser than the slope-positive guard (p > 0.5 ⇔ t > 0). The binding economic gate is therefore `alpha_below_execution_cost` (projected move > 0). Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
 | `BREAKEVEN_TIMEOUT_MS` | `14400000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Default is 4 hours to let small-drift setups actually reach target before fallback. Floor: 30 000. |
 | `STOP_LOSS_ENABLED` | `true` | Enables hard downside cap in exit manager. When on, bot monitors live bid and force-exits if stop is breached. |
 | `STOP_LOSS_BPS` | `100` | Stop-loss distance below entry (bps). At default 100 bps, exit triggers near -1.00% from average entry. |
-| `ENTRY_SLIPPAGE_BPS` | `5` | Slippage budget on the entry side. |
-| `EXIT_SLIPPAGE_BPS` | `5` | Slippage budget on the exit side. |
+| `ENTRY_SLIPPAGE_BPS` | `3` | Slippage budget on the entry side. Used in the cost-floor and net-edge gates; lowered from 5 so a 10–15 bps net target can clear the friction floor. |
+| `EXIT_SLIPPAGE_BPS` | `3` | Slippage budget on the exit side. Same rationale as ENTRY_SLIPPAGE_BPS. |
 | `CORRECTED_FILL_PROB_ENABLED` | `true` | Use the closed-form GBM barrier-hitting probability (`backend/modules/entryEconomics.js`) as `fillProbability` in the EV gate. When `false`, falls back to the legacy `logistic_cdf(slopeTStat)` proxy. Both values are still logged in `entry_submitted` for parity tracking. |
 | `ENFORCE_GROSS_TARGET_FLOOR` | `true` | Refuse trades whose static `GROSS_TARGET_BPS` is below `spread + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS + FEE_BPS_ROUND_TRIP + MIN_NET_EDGE_BPS`. Pure cost accounting — trades that cannot pay for their own friction never enter. Skip reason: `gross_target_below_friction_floor`. |
 | `HONEST_EV_GATE_ENABLED` | `false` | When `true`, the EV calculation charges the non-fill branch a `STUCK_LOSS_ASSUMED_BPS` penalty so the asymmetric "no stop-loss" structure is priced honestly (`E[net] = p·targetNet − (1−p)·stuckLoss`). Off by default because the stuck-loss assumption is regime-dependent. Skip reason: `honest_ev_below_min`. |
