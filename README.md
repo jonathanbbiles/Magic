@@ -24,9 +24,9 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 3. If the symbol clears the spread gate, the higher-timeframe slope filter, and the net-edge gate, place a **GTC limit BUY at the current ask**.
 4. When the buy fills, immediately place **one GTC limit SELL** at:
    ```
-   entry × (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
+   entry × (1 + (signalDerivedNetBps + FEE_BPS_ROUND_TRIP) / 10000)
    ```
-   With current defaults (20 bps net + 40 bps fees) that's `entry × 1.0060`.
+   where `signalDerivedNetBps = clamp(projectedBps − FEE_BPS_ROUND_TRIP, TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS)`. The exit target is **per-trade**: a confident signal (high `projectedBps`) gets a bigger TP, a marginal signal falls back to the static `TARGET_NET_PROFIT_BPS` floor (default 15 bps net = `entry × 1.0055`). Set `SIGNAL_SIZED_EXIT_ENABLED=false` to revert to fixed `TARGET_NET_PROFIT_BPS` for every trade.
 5. **Stop-loss + break-even reset.** After fill, the engine monitors risk continuously. If live bid falls to `entry × (1 − STOP_LOSS_BPS/10000)` (default 1.00%), it cancels the resting sell and exits immediately with a market sell (`IOC`). If stop-loss never triggers and TP still has not filled within `BREAKEVEN_TIMEOUT_MS` (default 14 400 000 ms = 4 hours), the engine cancels TP and reposts break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP / 10000)`).
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
@@ -119,7 +119,9 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 ### Strategy economics (defaults in parentheses)
 | Var | Default | What it does |
 | --- | --- | --- |
-| `TARGET_NET_PROFIT_BPS` | `15` | Net profit target after fees (15 bps = 0.15%). Code clamps the configured value to `[10, 50]` bps so this is a true scalper: target small (0.10%..0.50% net), take many bites. Raising to `>50` requires a code change — wider targets fill less often and break the small-win/small-stop symmetry the strategy depends on. |
+| `TARGET_NET_PROFIT_BPS` | `15` | **Floor** for the per-trade exit target after fees (15 bps = 0.15%). When `SIGNAL_SIZED_EXIT_ENABLED=true` (default), each entry's TP is sized from that entry's own `projectedBps` (OLS-based forward move), clamped to `[TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS]`. Confident signals get bigger TPs; marginal signals fall back to this floor. Code clamps the configured floor itself to `[10, 50]` bps. |
+| `SIGNAL_SIZED_EXIT_ENABLED` | `true` | When ON, the GTC sell limit is set per-trade from the entry's `projectedBps`. When OFF, every trade exits at the fixed `TARGET_NET_PROFIT_BPS` regardless of signal strength (legacy behaviour). |
+| `SIGNAL_TARGET_MAX_NET_BPS` | `50` | **Cap** on the per-trade signal-sized net target. Bigger projections than this are clamped down to 50 bps net (= `entry × 1.0090`). Code clamps the configured cap to `[TARGET_NET_PROFIT_BPS, 50]`. |
 | `FEE_BPS_ROUND_TRIP` | `40` | Assumed Alpaca round-trip: ~25 bps taker entry + ~15 bps maker exit. |
 | `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 20 bps target the effective entry spread headroom is 15 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
 | `MIN_NET_EDGE_BPS` | `2` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`. With the scalper-friendly defaults (`TARGET=15`, `slip=3`), the EV check is `12 × p ≥ 2` ⇒ p ≥ ~0.17 — comfortably looser than the slope-positive guard (p > 0.5 ⇔ t > 0). The binding economic gate is therefore `alpha_below_execution_cost` (projected move > 0). Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |

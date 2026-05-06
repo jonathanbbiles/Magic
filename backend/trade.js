@@ -213,6 +213,32 @@ const BARRIER_HORIZON_BARS = Math.max(1, readNumber(
   Math.max(1, Math.round(BREAKEVEN_TIMEOUT_MS / 60000)),
 ));
 
+// --- signal-sized exit -------------------------------------------------------
+//
+// When ON, each entry's TP is sized from that entry's own `projectedBps`
+// (the OLS slope-based forward move estimate), floored at TARGET_NET_PROFIT_BPS
+// and capped at SIGNAL_TARGET_MAX_NET_BPS. Confident signals get bigger TPs;
+// weak signals fall back to the floor (= today's static behavior). Wins are
+// no longer all the same size: the model's own confidence sets each trade's
+// ambition. Off by default in env override paths so it can be flipped without
+// a redeploy if it backfires; default ON because it's the documented intent.
+const SIGNAL_SIZED_EXIT_ENABLED = readBoolean('SIGNAL_SIZED_EXIT_ENABLED', true);
+const SIGNAL_TARGET_MAX_NET_BPS = Math.min(
+  50,
+  Math.max(TARGET_NET_PROFIT_BPS, readNumber('SIGNAL_TARGET_MAX_NET_BPS', 50)),
+);
+
+function deriveSignalTargetNetBps(projectedBps) {
+  if (!SIGNAL_SIZED_EXIT_ENABLED) return TARGET_NET_PROFIT_BPS;
+  const projected = Number(projectedBps);
+  if (!Number.isFinite(projected)) return TARGET_NET_PROFIT_BPS;
+  // projectedBps is the predicted forward move from current mid. To net X bps
+  // after fees, set the TP at X + fees gross. So netSignal = projected - fees.
+  // Then floor at the static scalp target and cap at the configured max.
+  const signalNet = projected - FEE_BPS_ROUND_TRIP;
+  return Math.max(TARGET_NET_PROFIT_BPS, Math.min(SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+}
+
 // --- Alpaca base URLs / auth ---------------------------------------------
 
 const TRADE_BASE = (process.env.TRADE_BASE || process.env.ALPACA_BASE_URL || 'https://api.alpaca.markets').replace(/\/+$/, '');
@@ -1507,6 +1533,12 @@ async function scanAndEnter() {
       if (buyOrder?.id) {
         const submittedAt = Date.now();
         const nowIso = new Date().toISOString();
+        // Per-trade exit target: when SIGNAL_SIZED_EXIT_ENABLED, this trade's
+        // GTC sell sits at entry × (1 + signalDerivedGrossBps/10000) instead
+        // of the global GROSS_TARGET_BPS. Floor = static target (so weak
+        // signals behave exactly like today), cap = SIGNAL_TARGET_MAX_NET_BPS.
+        const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps);
+        const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
@@ -1532,8 +1564,14 @@ async function scanAndEnter() {
           feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
           entrySlippageBps: ENTRY_SLIPPAGE_BPS,
           exitSlippageBps: EXIT_SLIPPAGE_BPS,
-          grossTargetBps: GROSS_TARGET_BPS,
-          targetNetProfitBps: TARGET_NET_PROFIT_BPS,
+          grossTargetBps: signalDerivedGrossBps,        // per-trade gross target used by exit
+          targetNetProfitBps: signalDerivedNetBps,       // per-trade net target used by exit
+          staticGrossTargetBps: GROSS_TARGET_BPS,        // global default, for parity tracking
+          staticTargetNetProfitBps: TARGET_NET_PROFIT_BPS,
+          signalDerivedNetBps,
+          signalDerivedGrossBps,
+          signalSizedExitEnabled: SIGNAL_SIZED_EXIT_ENABLED,
+          signalTargetMaxNetBps: SIGNAL_TARGET_MAX_NET_BPS,
           htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
@@ -1579,6 +1617,9 @@ async function scanAndEnter() {
           netEdgeBps,
           honestEvBps,
           minGrossTargetFloorBps: minGrossFloor.minGrossTargetBps,
+          signalDerivedNetBps,
+          signalDerivedGrossBps,
+          signalSizedExitEnabled: SIGNAL_SIZED_EXIT_ENABLED,
           volatilityBps: prediction.volatilityBps,
           htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
         });
@@ -1637,11 +1678,29 @@ async function getConcurrencyGuardStatus() {
 // --- exit engine --------------------------------------------------------
 //
 // Once a buy fills (we see a position with qty>0 and no open sell order),
-// submit ONE GTC limit sell at avg_entry * (1 + GROSS_TARGET_BPS/10000).
-// After that, never touch it.
+// submit ONE GTC limit sell at avg_entry * (1 + grossBps/10000), where
+// `grossBps` is the per-trade signal-sized target stored on the prediction
+// (or the global GROSS_TARGET_BPS fallback if no prediction is available,
+// e.g. for positions adopted on engine restart).
 
-function targetPriceFor(avgEntry) {
-  return avgEntry * (1 + GROSS_TARGET_BPS / 10000);
+function targetPriceFor(avgEntry, overrideGrossBps) {
+  const candidate = Number(overrideGrossBps);
+  const grossBps = Number.isFinite(candidate) && candidate > 0 ? candidate : GROSS_TARGET_BPS;
+  return avgEntry * (1 + grossBps / 10000);
+}
+
+function resolveExitGrossBps(pair) {
+  const pred = tradePredictions.get(pair);
+  const candidate = Number(pred?.prediction?.signalDerivedGrossBps);
+  if (Number.isFinite(candidate) && candidate > 0) return candidate;
+  return GROSS_TARGET_BPS;
+}
+
+function resolveExitNetBps(pair) {
+  const pred = tradePredictions.get(pair);
+  const candidate = Number(pred?.prediction?.signalDerivedNetBps);
+  if (Number.isFinite(candidate) && candidate > 0) return candidate;
+  return TARGET_NET_PROFIT_BPS;
 }
 
 async function reconcileExits() {
@@ -1747,6 +1806,8 @@ async function reconcileExits() {
       const limit = Number(existing?.limit_price);
       const priorState = exitState.get(pair) || {};
       const breakevenAttachedPrior = priorState.breakevenAttached === true;
+      const observedExitGrossBps = resolveExitGrossBps(pair);
+      const observedExitNetBps = resolveExitNetBps(pair);
       exitState.set(pair, {
         sellOrderId: existing.id || null,
         sellOrderLimit: Number.isFinite(limit) ? limit : null,
@@ -1759,12 +1820,12 @@ async function reconcileExits() {
         lastReconciliationAction: breakevenAttachedPrior ? 'breakeven_sell_seen' : 'existing_sell_seen',
         targetPriceSource: 'open_orders',
         entryPriceUsed: Number.isFinite(avg) ? avg : null,
-        expectedNetProfitBps: breakevenAttachedPrior ? 0 : TARGET_NET_PROFIT_BPS,
-        minNetProfitBps: breakevenAttachedPrior ? 0 : TARGET_NET_PROFIT_BPS,
-        desiredNetExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
+        expectedNetProfitBps: breakevenAttachedPrior ? 0 : observedExitNetBps,
+        minNetProfitBps: breakevenAttachedPrior ? 0 : observedExitNetBps,
+        desiredNetExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : observedExitGrossBps,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        requiredExitBpsGross: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
-        requiredExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : GROSS_TARGET_BPS,
+        requiredExitBpsGross: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : observedExitGrossBps,
+        requiredExitBps: breakevenAttachedPrior ? FEE_BPS_ROUND_TRIP : observedExitGrossBps,
         trueBreakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         breakevenPrice: Number.isFinite(avg) ? avg * (1 + FEE_BPS_ROUND_TRIP / 10000) : null,
         profitabilityFloorPrice: Number.isFinite(avg) ? avg * (1 + (FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS) / 10000) : null,
@@ -1836,7 +1897,9 @@ async function reconcileExits() {
     }
 
     if (!Number.isFinite(avg) || avg <= 0) continue;
-    const target = targetPriceFor(avg);
+    const exitGrossBps = resolveExitGrossBps(pair);
+    const exitNetBps = resolveExitNetBps(pair);
+    const target = targetPriceFor(avg, exitGrossBps);
     const tickInfo = await getAssetTickInfo(pair);
     const limitStr = formatTickPrice(target, tickInfo.priceIncrement);
     if (!limitStr) {
@@ -1871,12 +1934,12 @@ async function reconcileExits() {
         lastReconciliationAction: 'sell_submitted',
         targetPriceSource: 'computed',
         entryPriceUsed: avg,
-        expectedNetProfitBps: TARGET_NET_PROFIT_BPS,
-        minNetProfitBps: TARGET_NET_PROFIT_BPS,
-        desiredNetExitBps: GROSS_TARGET_BPS,
+        expectedNetProfitBps: exitNetBps,
+        minNetProfitBps: exitNetBps,
+        desiredNetExitBps: exitGrossBps,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
-        requiredExitBpsGross: GROSS_TARGET_BPS,
-        requiredExitBps: GROSS_TARGET_BPS,
+        requiredExitBpsGross: exitGrossBps,
+        requiredExitBps: exitGrossBps,
         trueBreakevenPrice: avg * (1 + FEE_BPS_ROUND_TRIP / 10000),
         breakevenPrice: avg * (1 + FEE_BPS_ROUND_TRIP / 10000),
         profitabilityFloorPrice: avg * (1 + (FEE_BPS_ROUND_TRIP + PROFIT_BUFFER_BPS) / 10000),
@@ -1885,7 +1948,14 @@ async function reconcileExits() {
       entryIntentState.set(pair, { state: 'managing', createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString(), rejectionReason: null });
       pendingBuys.delete(pair);
       lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'sell_submitted', orderId: sellOrder?.id || null };
-      console.log('exit_sell_attached', { symbol: pair, target, orderId: sellOrder?.id || null });
+      console.log('exit_sell_attached', {
+        symbol: pair,
+        target,
+        targetGrossBps: exitGrossBps,
+        targetNetBps: exitNetBps,
+        signalSized: exitGrossBps !== GROSS_TARGET_BPS,
+        orderId: sellOrder?.id || null,
+      });
     } catch (err) {
       lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'sell_submit_failed', message: err?.errorMessage || err?.message || String(err) };
       console.warn('exit_sell_failed', { symbol: pair, error: err?.errorMessage || err?.message });
