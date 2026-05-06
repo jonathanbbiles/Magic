@@ -87,12 +87,12 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
 // being first observed, cancel the TP and replace it at break-even-after-fees
-// so the slot recycles. Default 600 s (raised from 180 s — slot capital is
-// tied up the same way whether the resting order is TP or break-even, and the
-// 180 s window was empirically converting most predicted-positive trades into
-// flat break-even fills before their +0.60 % gross move had time to develop).
-// Floor at 30 s to stay above broker round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 600000));
+// so the slot recycles. Default 14_400_000 ms (4 h), matching the README and
+// liveDefaults: this is also the horizon used by BARRIER_HORIZON_BARS for the
+// closed-form fill-probability gate, so a small value collapses fillProbability
+// to ~0 on tier-1 crypto and starves entries via net_edge_below_min. Floor at
+// 30 s to stay above broker round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 14400000));
 const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
 const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
 // Scan interval (ms).
@@ -767,11 +767,15 @@ function formatTickPrice(price, tick) {
 
 async function getPredictionSignal(pair) {
   try {
-    // Request PREDICT_BARS+1 so that after dropping the (likely in-progress)
-    // most recent bar there are still PREDICT_BARS closed bars to fit on.
+    // Request PREDICT_BARS + headroom so that after dropping the (likely
+    // in-progress) most recent bar there are still PREDICT_BARS closed bars to
+    // fit on, even when the upstream occasionally returns one or two fewer
+    // bars than `limit` (observed on /v1beta3/crypto/us/bars). With +1 a
+    // single missing bar yields PREDICT_BARS-1 closes and rejects every
+    // candidate as `insufficient_bars`. +5 is the smallest safe headroom.
     const payload = await fetchCryptoBars({
       symbols: [pair],
-      limit: PREDICT_BARS + 1,
+      limit: PREDICT_BARS + 5,
       timeframe: '1Min',
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
@@ -846,11 +850,12 @@ async function getPredictionSignal(pair) {
 async function getHigherTimeframeSignal(pair) {
   if (!HTF_FILTER_ENABLED) return { ok: true, reason: 'disabled' };
   try {
-    // Request HTF_BARS+1 so that after dropping the in-progress bar we still
-    // have HTF_BARS closed bars for the slope fit.
+    // Request HTF_BARS + headroom so that after dropping the in-progress bar
+    // we still have HTF_BARS closed bars even if upstream short-supplies by a
+    // bar or two (same robustness fix as the 1m predictor above).
     const payload = await fetchCryptoBars({
       symbols: [pair],
-      limit: HTF_BARS + 1,
+      limit: HTF_BARS + 5,
       timeframe: HTF_TIMEFRAME,
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
