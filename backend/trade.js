@@ -1651,9 +1651,28 @@ async function reconcileExits() {
     const avg = Number(pos?.avg_entry_price);
 
     // Stamp first-seen on first observation so age diagnostics start ticking.
-    if (!positionFirstSeenAt.has(pair)) {
+    // Also re-stamp if a new buy cycle has clearly started since the previous
+    // stamp was recorded — detected by tradePredictions.submittedAt being newer
+    // than the stored stamp by more than a small slack. Without this, a
+    // close-then-reopen sequence whose close was missed by the close-detection
+    // loop (e.g. old TP filled and new buy filled between two reconcile polls)
+    // leaves positionFirstSeenAt holding the *previous* position's timestamp.
+    // On the next reconcile, ageMs is computed from that stale stamp, exceeds
+    // BREAKEVEN_TIMEOUT_MS instantly, and the engine cancels the brand-new
+    // +25 bps TP and replaces it with a break-even-after-fees sell that
+    // typically fills immediately — converting a real win into a 0 bps trade.
+    // The `breakeven_limit` close events with `holdSeconds:0` in the logs are
+    // exactly this bug.
+    const predForStamp = tradePredictions.get(pair);
+    const predSubmittedMs = Number(predForStamp?.submittedAt) || 0;
+    const prevStampMs = positionFirstSeenAt.get(pair);
+    const stampIsStale = Number.isFinite(prevStampMs)
+      && predSubmittedMs > 0
+      && predSubmittedMs > prevStampMs + 60000;
+    if (!positionFirstSeenAt.has(pair) || stampIsStale) {
       const pending = pendingBuys.get(pair);
       const stamp = Number(pending?.submittedAt)
+        || (predSubmittedMs > 0 ? predSubmittedMs : 0)
         || Date.parse(pos?.created_at || '')
         || Date.now();
       positionFirstSeenAt.set(pair, Number.isFinite(stamp) ? stamp : Date.now());
