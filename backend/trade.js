@@ -99,6 +99,23 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 14400000));
 const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
 const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
+// Volatility-scaled stop. When ON, each trade's stop distance is sized from
+// the entry-time realised volatility: stopBps ≈ k × σ × √HORIZON. Quiet
+// markets get tight stops, wild markets get loose ones — same risk in
+// σ-units regardless of regime. Floor protects against vol-calc collapse in
+// dead markets; cap is the static STOP_LOSS_BPS so worst case = today.
+const VOL_SCALED_STOP_ENABLED = readBoolean('VOL_SCALED_STOP_ENABLED', true);
+const STOP_LOSS_VOL_K = Math.max(0.1, readNumber('STOP_LOSS_VOL_K', 1.0));
+const STOP_LOSS_HORIZON_BARS = Math.max(1, readNumber('STOP_LOSS_HORIZON_BARS', 60));
+const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 20));
+
+function deriveStopLossBps(volatilityBps) {
+  if (!VOL_SCALED_STOP_ENABLED) return STOP_LOSS_BPS;
+  const sigma = Number(volatilityBps);
+  if (!Number.isFinite(sigma) || sigma <= 0) return STOP_LOSS_BPS;
+  const scaled = STOP_LOSS_VOL_K * sigma * Math.sqrt(STOP_LOSS_HORIZON_BARS);
+  return Math.max(STOP_LOSS_BPS_FLOOR, Math.min(STOP_LOSS_BPS, scaled));
+}
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -1539,6 +1556,8 @@ async function scanAndEnter() {
         // signals behave exactly like today), cap = SIGNAL_TARGET_MAX_NET_BPS.
         const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
+        const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
+        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop);
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
@@ -1572,6 +1591,11 @@ async function scanAndEnter() {
           signalDerivedGrossBps,
           signalSizedExitEnabled: SIGNAL_SIZED_EXIT_ENABLED,
           signalTargetMaxNetBps: SIGNAL_TARGET_MAX_NET_BPS,
+          stopLossBpsResolved: volScaledStopLossBps,
+          staticStopLossBps: STOP_LOSS_BPS,
+          volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
+          stopLossVolK: STOP_LOSS_VOL_K,
+          stopLossHorizonBars: STOP_LOSS_HORIZON_BARS,
           htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
@@ -1620,6 +1644,8 @@ async function scanAndEnter() {
           signalDerivedNetBps,
           signalDerivedGrossBps,
           signalSizedExitEnabled: SIGNAL_SIZED_EXIT_ENABLED,
+          stopLossBpsResolved: volScaledStopLossBps,
+          volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
           volatilityBps: prediction.volatilityBps,
           htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
         });
@@ -1703,6 +1729,13 @@ function resolveExitNetBps(pair) {
   return TARGET_NET_PROFIT_BPS;
 }
 
+function resolveStopLossBps(pair) {
+  const pred = tradePredictions.get(pair);
+  const candidate = Number(pred?.prediction?.stopLossBpsResolved);
+  if (Number.isFinite(candidate) && candidate > 0) return candidate;
+  return STOP_LOSS_BPS;
+}
+
 async function reconcileExits() {
   const { byPair, openSellByPair } = await buildHeldAndOpenSellsIndex();
   for (const [pair, pos] of byPair.entries()) {
@@ -1761,13 +1794,15 @@ async function reconcileExits() {
       }
     }
 
-    // Risk cap: optional stop-loss. If the live bid is below entry by
-    // STOP_LOSS_BPS, we immediately flatten with a market sell.
-
+    // Risk cap: optional stop-loss. The stop distance is per-trade — sized
+    // at entry from realised volatility (vol-scaled), or static if the
+    // prediction record is missing (e.g. position adopted on engine restart).
+    // The static STOP_LOSS_BPS acts as the upper cap, never wider than today.
     if (STOP_LOSS_ENABLED && Number.isFinite(avg) && avg > 0) {
       const quote = await getLatestQuote(pair).catch(() => null);
       const bid = Number(quote?.bp);
-      const stopPrice = avg * (1 - STOP_LOSS_BPS / 10000);
+      const stopBps = resolveStopLossBps(pair);
+      const stopPrice = avg * (1 - stopBps / 10000);
       if (Number.isFinite(bid) && bid > 0 && bid <= stopPrice) {
         const existing = openSellByPair.get(pair);
         try {
@@ -1788,11 +1823,20 @@ async function reconcileExits() {
             sellOrderSubmittedAt: triggeredAt,
             reconciliationState: 'stop_loss_triggered',
             lastReconciliationAction: 'stop_loss_market_sell',
-            expectedNetProfitBps: -STOP_LOSS_BPS,
-            minNetProfitBps: -STOP_LOSS_BPS,
+            expectedNetProfitBps: -stopBps,
+            minNetProfitBps: -stopBps,
           });
           lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'stop_loss_market_sell', orderId: sellOrder?.id || null };
-          console.log('exit_stop_loss_triggered', { symbol: pair, bid, stopPrice, stopLossBps: STOP_LOSS_BPS, cancelledOrderId: existing?.id || null, newOrderId: sellOrder?.id || null });
+          console.log('exit_stop_loss_triggered', {
+            symbol: pair,
+            bid,
+            stopPrice,
+            stopLossBps: stopBps,
+            staticStopLossBps: STOP_LOSS_BPS,
+            volScaled: stopBps !== STOP_LOSS_BPS,
+            cancelledOrderId: existing?.id || null,
+            newOrderId: sellOrder?.id || null,
+          });
           continue;
         } catch (err) {
           lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'stop_loss_failed', message: err?.errorMessage || err?.message || String(err) };
