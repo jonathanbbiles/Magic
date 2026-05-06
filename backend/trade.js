@@ -108,13 +108,24 @@ const VOL_SCALED_STOP_ENABLED = readBoolean('VOL_SCALED_STOP_ENABLED', true);
 const STOP_LOSS_VOL_K = Math.max(0.1, readNumber('STOP_LOSS_VOL_K', 1.0));
 const STOP_LOSS_HORIZON_BARS = Math.max(1, readNumber('STOP_LOSS_HORIZON_BARS', 60));
 const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 20));
+// Buffer below the bid-side spread that the stop must always preserve.
+// The stop check fires when bid <= avg_entry × (1 - stopBps/10000), but
+// avg_entry is the ASK we paid — so the bid sits one spread below ask
+// from the moment the buy fills. If stopBps < spreadBps, the bid is
+// already past the stop on entry and the stop fires instantly. This
+// floor enforces stopBps >= spreadBps + STOP_OVER_SPREAD_BPS so there
+// is always at least N bps of room below the bid before the stop trips.
+const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20));
 
-function deriveStopLossBps(volatilityBps) {
+function deriveStopLossBps(volatilityBps, spreadBps) {
   if (!VOL_SCALED_STOP_ENABLED) return STOP_LOSS_BPS;
   const sigma = Number(volatilityBps);
   if (!Number.isFinite(sigma) || sigma <= 0) return STOP_LOSS_BPS;
   const scaled = STOP_LOSS_VOL_K * sigma * Math.sqrt(STOP_LOSS_HORIZON_BARS);
-  return Math.max(STOP_LOSS_BPS_FLOOR, Math.min(STOP_LOSS_BPS, scaled));
+  const spread = Number(spreadBps);
+  const spreadFloor = Number.isFinite(spread) && spread > 0 ? spread + STOP_OVER_SPREAD_BPS : 0;
+  const minimum = Math.max(STOP_LOSS_BPS_FLOOR, spreadFloor);
+  return Math.max(minimum, Math.min(STOP_LOSS_BPS, scaled));
 }
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
@@ -1557,7 +1568,7 @@ async function scanAndEnter() {
         const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
-        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop);
+        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps);
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
@@ -1596,6 +1607,7 @@ async function scanAndEnter() {
           volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
           stopLossVolK: STOP_LOSS_VOL_K,
           stopLossHorizonBars: STOP_LOSS_HORIZON_BARS,
+          stopOverSpreadBps: STOP_OVER_SPREAD_BPS,
           htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
