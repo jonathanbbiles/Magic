@@ -10,8 +10,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture a small **net profit** per trade after fees (default **0.15%**, allowed range **0.10%..0.50%**).
-- Cap downside with a vol-scaled stop-loss: each trade's stop distance is sized from entry-time volatility, clamped to a floor (20 bps) and a hard cap (`STOP_LOSS_BPS=100`).
-- Recycle stuck positions: if the take-profit doesn't fill within 4 hours, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
+- **Never realise a loss.** The bot does not market-sell into the book. Instead, the resting GTC sell limit is gradually walked DOWN over `BREAKEVEN_TIMEOUT_MS` (default 4 h) from the signal-derived TP toward break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP/10000)`) and pinned there. Worst-case realised P&L per trade is **$0 net** (assuming the limit eventually fills). Hard stop-loss (`STOP_LOSS_ENABLED`) is OFF by default; flip it on if you want the legacy force-exit-on-bid behaviour back.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
 
@@ -27,7 +26,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (signalDerivedNetBps + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    where `signalDerivedNetBps = clamp(projectedBps − FEE_BPS_ROUND_TRIP, TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS)`. The exit target is **per-trade**: a confident signal (high `projectedBps`) gets a bigger TP, a marginal signal falls back to the static `TARGET_NET_PROFIT_BPS` floor (default 15 bps net = `entry × 1.0055`). Set `SIGNAL_SIZED_EXIT_ENABLED=false` to revert to fixed `TARGET_NET_PROFIT_BPS` for every trade.
-5. **Stop-loss + break-even reset.** After fill, the engine monitors risk continuously. The stop distance is **per-trade**, sized at entry from realised volatility: `stopLossBpsResolved ≈ STOP_LOSS_VOL_K × volatilityBps × √STOP_LOSS_HORIZON_BARS`, clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]`. Quiet markets get tight stops (e.g. BTC σ=5 bps/min → ~40 bps stop), wild markets get loose ones (UNI σ=12 → ~95 bps). If live bid falls to `entry × (1 − stopLossBpsResolved/10000)`, the engine cancels the resting sell and exits immediately with a market sell (`IOC`). Set `VOL_SCALED_STOP_ENABLED=false` to revert to the static `STOP_LOSS_BPS` for every trade. If stop-loss never triggers and TP still has not filled within `BREAKEVEN_TIMEOUT_MS` (default 14 400 000 ms = 4 hours), the engine cancels TP and reposts break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP / 10000)`).
+5. **Staircase exit (no realised losses).** From the moment the buy fills, every reconcile cycle (`EXIT_SCAN_INTERVAL_MS`) computes a desired GTC sell limit that decays linearly from the signal-derived TP at fill time toward break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP/10000)`) over `BREAKEVEN_TIMEOUT_MS` (default 4 hours). When the desired price drops at least `STAIRCASE_REPOST_TOLERANCE_BPS` below the resting limit, the engine cancels and reposts at the new lower price. The floor is the break-even-after-fees price — the bot never reposts below it, so every fill yields **≥ $0 net**. A position can stay parked at the break-even limit indefinitely if price never recovers, but no realised loss is ever booked. **Hard stop-loss is OFF by default** (`STOP_LOSS_ENABLED=false`); set it to `true` on Render to re-enable the legacy force-exit-on-bid behaviour with the per-trade vol-scaled stop (`stopLossBpsResolved ≈ STOP_LOSS_VOL_K × volatilityBps × √STOP_LOSS_HORIZON_BARS`, clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]`). When `STAIRCASE_EXIT_ENABLED=false`, the engine falls back to the legacy one-shot break-even reset at `T = BREAKEVEN_TIMEOUT_MS`.
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -127,8 +126,10 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MIN_NET_EDGE_BPS` | `2` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`. With the scalper-friendly defaults (`TARGET=15`, `slip=3`), the EV check is `12 × p ≥ 2` ⇒ p ≥ ~0.17 — comfortably looser than the slope-positive guard (p > 0.5 ⇔ t > 0). The binding economic gate is therefore `alpha_below_execution_cost` (projected move > 0). Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
-| `BREAKEVEN_TIMEOUT_MS` | `14400000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Default is 4 hours to let small-drift setups actually reach target before fallback. Floor: 30 000. |
-| `STOP_LOSS_ENABLED` | `true` | Enables hard downside cap in exit manager. When on, bot monitors live bid and force-exits if stop is breached. |
+| `BREAKEVEN_TIMEOUT_MS` | `14400000` | Time over which the staircase exit decays the GTC sell limit from the signal-derived TP to break-even-after-fees. Default 4 hours. Floor: 30 000. Also used as the fallback one-shot break-even-replace deadline when `STAIRCASE_EXIT_ENABLED=false`. |
+| `STAIRCASE_EXIT_ENABLED` | `true` | When ON (default), each reconcile cycle linearly decays the GTC sell limit from the initial signal-derived TP to break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP/10000)`) over `BREAKEVEN_TIMEOUT_MS`. The floor is hard: the bot never reposts below break-even, so realised P&L per trade is bounded at $0 net. When OFF, falls back to the legacy one-shot break-even-replace at `T = BREAKEVEN_TIMEOUT_MS`. |
+| `STAIRCASE_REPOST_TOLERANCE_BPS` | `3` | Minimum drop (bps) between the resting limit and the staircase-desired limit before the engine cancels and reposts. Prevents churning cancel/repost on tiny age increments. Floor: 0.5. |
+| `STOP_LOSS_ENABLED` | `false` | **OFF by default.** When ON, the exit manager monitors live bid and force-exits with a market `IOC` sell if the stop is breached — i.e. the bot will realise a loss. The default-OFF posture means the staircase exit is the only post-fill risk lever and worst-case realised P&L per trade is $0 net. Flip to `true` on Render only if you accept booking losses for capital recycling. |
 | `STOP_LOSS_BPS` | `100` | **Cap** on the stop-loss distance below entry (bps). When `VOL_SCALED_STOP_ENABLED=true` (default), the actual per-trade stop is sized from entry-time volatility and is usually tighter than this cap. When `VOL_SCALED_STOP_ENABLED=false`, this is the fixed stop for every trade. |
 | `VOL_SCALED_STOP_ENABLED` | `true` | When ON, each trade's stop distance is sized at entry from realised volatility: `stopBps ≈ STOP_LOSS_VOL_K × σ × √STOP_LOSS_HORIZON_BARS`, clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]`. Same risk in σ-units across regimes. |
 | `STOP_LOSS_VOL_K` | `1.0` | Number of σ used in the vol-scaled stop formula. Larger = wider stops (more breathing room, fewer stop-outs, bigger losses when they fire). |
@@ -194,13 +195,14 @@ See `.github/workflows/ci.yml`.
 
 ## What the bot does NOT do (intentional)
 
-- **No trailing stop.** The stop is static (`STOP_LOSS_BPS` below entry), not adaptive.
+- **No realised loss by default.** With `STOP_LOSS_ENABLED=false` (the default), the bot never market-sells into the book. The staircase exit walks the GTC sell limit from the signal-derived TP down to break-even-after-fees and pins it there — so a fill always yields ≥ $0 net. Stuck positions are accepted in exchange for a hard $0 floor on realised P&L per trade.
+- **No trailing stop.** Even when `STOP_LOSS_ENABLED=true`, the stop is static at fill time (vol-scaled, but fixed once the position opens), not adaptive.
 - **No leverage.**
 - **No averaging down or pyramiding.**
 - **No cross-symbol correlation guard.** When `ENTRY_UNIVERSE_MODE=dynamic` and 30+ pairs are in scope, the engine can become long the same beta on multiple symbols simultaneously.
 - **No Kelly sizing, drawdown guard, kill-switch file watcher, or TWAP execution.** Older docs mention env vars for these — they are not implemented.
 
-The 4-hour break-even reset and static stop-loss are the two post-fill exit levers.
+The staircase exit (decay TP toward break-even over `BREAKEVEN_TIMEOUT_MS`) is the only post-fill exit lever in the default configuration. Stop-loss is opt-in.
 
 ### Known structural limitation of "small TP + long-hold tail"
 
