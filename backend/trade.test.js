@@ -52,10 +52,13 @@ const assert = require('assert/strict');
   assert.equal(trade.getPredictorWarmupSnapshot().inProgress, false);
 
   // Pin the EV-gate floor so a future "tighten this knob" regression doesn't
-  // silently re-starve daily entries. Default `MIN_NET_EDGE_BPS=5` means the
-  // gate requires fillProbability >= 5 / (TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS)
-  // = 5 / 15 = 0.333, which is subordinate to the slope-positive guard
-  // (fillProbability > 0.5). See README "Strategy economics" / `MIN_NET_EDGE_BPS`.
+  // silently re-starve daily entries. With the scalper-friendly defaults
+  // (`TARGET_NET_PROFIT_BPS=15`, `ENTRY_SLIPPAGE_BPS=3`), `MIN_NET_EDGE_BPS=2`
+  // means the gate requires `fillProbability >= 2 / 12 = ~0.17`, which is
+  // subordinate to the slope-positive guard (fillProbability > 0.5). Raising
+  // MIN above 2 without also raising TARGET will resurrect the small-target
+  // rejection problem and starve scalp entries. See README "Strategy
+  // economics" / `MIN_NET_EDGE_BPS`.
   const fs__pin = require('fs');
   const path__pin = require('path');
   const tradeSrc__pin = fs__pin.readFileSync(
@@ -64,8 +67,8 @@ const assert = require('assert/strict');
   );
   assert.match(
     tradeSrc__pin,
-    /const MIN_NET_EDGE_BPS = readNumber\('MIN_NET_EDGE_BPS', 5\);/,
-    'MIN_NET_EDGE_BPS default must stay at 5; raising it tightens entries below 10 wins/day target.',
+    /const MIN_NET_EDGE_BPS = readNumber\('MIN_NET_EDGE_BPS', 2\);/,
+    'MIN_NET_EDGE_BPS default must stay at 2; raising it without raising TARGET re-blocks small-target scalp entries.',
   );
 
   console.log('trade.test.js passed');

@@ -8,9 +8,11 @@
 //      GTC limit BUY at the current ask.
 //   4. When the buy fills, submit ONE GTC limit SELL at
 //      entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000)
-//      so the user's +0.25% target is AFTER Alpaca's round-trip fees.
+//      so the small NET target (default +0.15%, allowed range 0.10%..0.50%)
+//      is AFTER Alpaca's round-trip fees. This is a *scalper*: target is
+//      deliberately tiny so wins fill often and the strategy compounds.
 //   5. If the take-profit doesn't fill within BREAKEVEN_TIMEOUT_MS (default
-//      10 minutes from when the position was first observed), cancel the GTC
+//      4 hours from when the position was first observed), cancel the GTC
 //      sell and replace it with a sell at break-even-after-fees
 //      (entry * (1 + FEE_BPS_ROUND_TRIP/10000)). That guarantees zero net
 //      profit but recycles the slot so the engine keeps trading.
@@ -54,9 +56,11 @@ function readList(name, fallback = []) {
 
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
-// +25 bps (0.25%) target is AFTER fees, not before. Keep this in a
-// realistic live range so the spread+fee entry gate can pass for liquid pairs.
-const TARGET_NET_PROFIT_BPS = Math.min(40, Math.max(20, readNumber('TARGET_NET_PROFIT_BPS', 25)));
+// target is AFTER fees, not before. This is a *scalper*: target small,
+// take many bites. Allowed range 10..50 bps net (= 0.10%..0.50% net of fees);
+// raise this above 50 only with deliberate intent — wider targets fill less
+// often and break the small-win/small-stop symmetry.
+const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(10, readNumber('TARGET_NET_PROFIT_BPS', 15)));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
 // entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
 // above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
@@ -150,23 +154,20 @@ const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
 // slippage buffers) to clear this bar before we submit a buy. Entry-only —
 // sell behavior is unchanged.
 //
-// With realizedWinBps = TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS = 15 and a
-// fillProbability sourced from logistic_cdf(slopeTStat), MIN_NET_EDGE_BPS=10
-// required p ≥ 0.667 ⇒ slopeTStat ≥ ~0.69, which on a 20-bar 1m OLS over
-// tier-1 crypto fires only on rare clean uptrends and starved daily entries
-// (production instance was averaging well under the 10 wins/day target).
-// Lowering the floor to 5 makes the EV gate require p ≥ 0.333, which is
-// already subsumed by the slope_not_positive guard (p > 0.5 ⇔ t > 0). The
-// alpha_below_execution_cost guard (projected move ≥ spread + slippage)
-// continues to enforce a per-trade economic floor, and the static GTC
-// take-profit ensures realised wins are still entry × (1 + 60bps gross /
-// 10000) regardless of how marginal the predicted slope was. Combined with
-// the 10-min break-even reset, no positive-slope candidate that beats its
-// own execution costs is excluded from entry by EV math any more.
+// realizedWinBps = TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS, and the gate
+// requires realizedWinBps × fillProbability >= MIN_NET_EDGE_BPS. With the
+// scalper-friendly defaults below (target=15, slip=3, MIN=2), the gate is
+// `12 × p >= 2` ⇒ p >= ~0.17 — comfortably looser than the slope-positive
+// guard (p > 0.5 ⇔ t > 0) and the alpha_below_execution_cost guard, both of
+// which continue to enforce per-trade economic floors. The cost-floor gate
+// further requires GROSS_TARGET >= entrySlip + exitSlip + fees + MIN, i.e.
+// TARGET >= 3 + 3 + 2 = 8 bps, so the documented 10..50 bps target range
+// always clears the friction floor. Raising MIN, slippage, or fees without
+// also raising TARGET will resurrect the small-target rejection problem.
 const NET_EDGE_GATE_ENABLED = readBoolean('NET_EDGE_GATE_ENABLED', true);
-const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 5);
-const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 5));
-const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 5));
+const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 2);
+const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 3));
+const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 3));
 
 // --- corrected entry economics (see backend/modules/entryEconomics.js) ----
 //
