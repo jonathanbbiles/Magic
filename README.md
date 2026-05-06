@@ -10,7 +10,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 - Find tiny upward drifts in liquid crypto pairs.
 - Capture a small **net profit** per trade after fees (default **0.15%**, allowed range **0.10%..0.50%**).
-- Cap downside with a real stop-loss: if price falls 1.00% below entry, flatten with a market sell.
+- Cap downside with a vol-scaled stop-loss: each trade's stop distance is sized from entry-time volatility, clamped to a floor (20 bps) and a hard cap (`STOP_LOSS_BPS=100`).
 - Recycle stuck positions: if the take-profit doesn't fill within 4 hours, drop to a break-even-after-fees sell so capital comes back instead of sitting idle.
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
@@ -27,7 +27,7 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
    entry × (1 + (signalDerivedNetBps + FEE_BPS_ROUND_TRIP) / 10000)
    ```
    where `signalDerivedNetBps = clamp(projectedBps − FEE_BPS_ROUND_TRIP, TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS)`. The exit target is **per-trade**: a confident signal (high `projectedBps`) gets a bigger TP, a marginal signal falls back to the static `TARGET_NET_PROFIT_BPS` floor (default 15 bps net = `entry × 1.0055`). Set `SIGNAL_SIZED_EXIT_ENABLED=false` to revert to fixed `TARGET_NET_PROFIT_BPS` for every trade.
-5. **Stop-loss + break-even reset.** After fill, the engine monitors risk continuously. If live bid falls to `entry × (1 − STOP_LOSS_BPS/10000)` (default 1.00%), it cancels the resting sell and exits immediately with a market sell (`IOC`). If stop-loss never triggers and TP still has not filled within `BREAKEVEN_TIMEOUT_MS` (default 14 400 000 ms = 4 hours), the engine cancels TP and reposts break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP / 10000)`).
+5. **Stop-loss + break-even reset.** After fill, the engine monitors risk continuously. The stop distance is **per-trade**, sized at entry from realised volatility: `stopLossBpsResolved ≈ STOP_LOSS_VOL_K × volatilityBps × √STOP_LOSS_HORIZON_BARS`, clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]`. Quiet markets get tight stops (e.g. BTC σ=5 bps/min → ~40 bps stop), wild markets get loose ones (UNI σ=12 → ~95 bps). If live bid falls to `entry × (1 − stopLossBpsResolved/10000)`, the engine cancels the resting sell and exits immediately with a market sell (`IOC`). Set `VOL_SCALED_STOP_ENABLED=false` to revert to the static `STOP_LOSS_BPS` for every trade. If stop-loss never triggers and TP still has not filled within `BREAKEVEN_TIMEOUT_MS` (default 14 400 000 ms = 4 hours), the engine cancels TP and reposts break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP / 10000)`).
 
 There is no fixed concurrency cap. The engine opens as many positions as `PORTFOLIO_SIZING_PCT` of equity will fund (one per symbol). Once cash falls below `MIN_TRADE_NOTIONAL_USD`, new entries are skipped until a position closes.
 
@@ -129,7 +129,11 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
 | `BREAKEVEN_TIMEOUT_MS` | `14400000` | After this many ms unfilled, the TP is cancelled and replaced with a break-even-after-fees sell. Default is 4 hours to let small-drift setups actually reach target before fallback. Floor: 30 000. |
 | `STOP_LOSS_ENABLED` | `true` | Enables hard downside cap in exit manager. When on, bot monitors live bid and force-exits if stop is breached. |
-| `STOP_LOSS_BPS` | `100` | Stop-loss distance below entry (bps). At default 100 bps, exit triggers near -1.00% from average entry. |
+| `STOP_LOSS_BPS` | `100` | **Cap** on the stop-loss distance below entry (bps). When `VOL_SCALED_STOP_ENABLED=true` (default), the actual per-trade stop is sized from entry-time volatility and is usually tighter than this cap. When `VOL_SCALED_STOP_ENABLED=false`, this is the fixed stop for every trade. |
+| `VOL_SCALED_STOP_ENABLED` | `true` | When ON, each trade's stop distance is sized at entry from realised volatility: `stopBps ≈ STOP_LOSS_VOL_K × σ × √STOP_LOSS_HORIZON_BARS`, clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]`. Same risk in σ-units across regimes. |
+| `STOP_LOSS_VOL_K` | `1.0` | Number of σ used in the vol-scaled stop formula. Larger = wider stops (more breathing room, fewer stop-outs, bigger losses when they fire). |
+| `STOP_LOSS_HORIZON_BARS` | `60` | Horizon (in 1-min bars) over which σ is integrated. Default 60 = "1-σ move over the next hour." Larger = wider stops. |
+| `STOP_LOSS_BPS_FLOOR` | `20` | Floor for the vol-scaled stop. Protects against vol-calc collapse in dead markets where σ ≈ 0 would yield a near-zero stop and instant whipsaw. |
 | `ENTRY_SLIPPAGE_BPS` | `3` | Slippage budget on the entry side. Used in the cost-floor and net-edge gates; lowered from 5 so a 10–15 bps net target can clear the friction floor. |
 | `EXIT_SLIPPAGE_BPS` | `3` | Slippage budget on the exit side. Same rationale as ENTRY_SLIPPAGE_BPS. |
 | `CORRECTED_FILL_PROB_ENABLED` | `true` | Use the closed-form GBM barrier-hitting probability (`backend/modules/entryEconomics.js`) as `fillProbability` in the EV gate. When `false`, falls back to the legacy `logistic_cdf(slopeTStat)` proxy. Both values are still logged in `entry_submitted` for parity tracking. |
