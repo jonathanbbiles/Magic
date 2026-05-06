@@ -97,7 +97,14 @@ const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD
 // to ~0 on tier-1 crypto and starves entries via net_edge_below_min. Floor at
 // 30 s to stay above broker round-trip latency.
 const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 14400000));
-const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
+// Stop-loss is OFF by default. Per the original strategy intent (CLAUDE.md
+// hard rule #5: "Don't add stop-loss, max-hold, or force-exit logic without
+// explicit user instruction"), the bot does NOT market-sell into a loss.
+// The staircase exit (below) gradually walks the GTC sell limit toward
+// break-even-after-fees so realized P&L is bounded at $0 net regardless of
+// MTM drawdown. Set STOP_LOSS_ENABLED=true on Render to re-enable the hard
+// risk cap if you want force-exit-on-bid behaviour back.
+const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', false);
 const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
 // Volatility-scaled stop. When ON, each trade's stop distance is sized from
 // the entry-time realised volatility: stopBps ≈ k × σ × √HORIZON. Quiet
@@ -127,6 +134,41 @@ function deriveStopLossBps(volatilityBps, spreadBps) {
   const minimum = Math.max(STOP_LOSS_BPS_FLOOR, spreadFloor);
   return Math.max(minimum, Math.min(STOP_LOSS_BPS, scaled));
 }
+
+// --- staircase exit ---------------------------------------------------------
+//
+// "If I'm going to lose money on this, I need to let the crypto ride until
+// it gets to the breakeven point." — operator instruction.
+//
+// The GTC sell limit on every position is gradually walked DOWN over time
+// from the initial signal-derived TP toward break-even-after-fees. Floor:
+// entry × (1 + FEE_BPS_ROUND_TRIP / 10000), which is $0 net P&L. The bot
+// never reposts below that, so a fill always yields >= $0. Position can
+// stay stuck if price never reaches break-even — but no realised loss.
+//
+// Decay is linear over BREAKEVEN_TIMEOUT_MS (default 4 h) from the initial
+// gross target to the break-even gross target. Reposts only fire when the
+// desired price is at least STAIRCASE_REPOST_TOLERANCE_BPS below the
+// resting limit, so we don't churn cancel/repost on tiny age increments.
+//
+// This SUPERSEDES the legacy one-shot break-even-replace at T = 4 h. When
+// STAIRCASE_EXIT_ENABLED=false, the legacy path runs as a fallback.
+const STAIRCASE_EXIT_ENABLED = readBoolean('STAIRCASE_EXIT_ENABLED', true);
+const STAIRCASE_REPOST_TOLERANCE_BPS = Math.max(0.5, readNumber('STAIRCASE_REPOST_TOLERANCE_BPS', 3));
+
+function computeStaircaseExitGrossBps(initialGrossBps, ageMs) {
+  if (!STAIRCASE_EXIT_ENABLED) return initialGrossBps;
+  const breakeven = FEE_BPS_ROUND_TRIP;
+  const initial = Number(initialGrossBps);
+  if (!Number.isFinite(initial)) return breakeven;
+  if (initial <= breakeven) return breakeven;
+  if (!Number.isFinite(ageMs) || ageMs <= 0) return initial;
+  if (ageMs >= BREAKEVEN_TIMEOUT_MS) return breakeven;
+  const t = ageMs / BREAKEVEN_TIMEOUT_MS;
+  const decayed = initial + (breakeven - initial) * t;
+  return Math.max(breakeven, decayed);
+}
+
 // Scan interval (ms).
 const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS', runtimeConfig.entryScanIntervalMs || 12000));
 // Exit-manager reconcile interval (ms).
@@ -1905,11 +1947,90 @@ async function reconcileExits() {
       entryIntentState.set(pair, { state: 'managing', createdAt: entryIntentState.get(pair)?.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString(), rejectionReason: null });
       pendingBuys.delete(pair);
 
-      // Break-even reset: if the take-profit has been parked for at least
-      // BREAKEVEN_TIMEOUT_MS without filling, cancel it and replace with a
-      // sell at entry * (1 + FEE_BPS_ROUND_TRIP/10000). Net PnL = 0 after
-      // fees, slot recycles. Runs at most once per position.
-      if (!breakevenAttachedPrior && Number.isFinite(avg) && avg > 0 && existing?.id) {
+      // Staircase exit: walk the GTC sell limit DOWN linearly from the
+      // initial signal-derived TP to break-even-after-fees over
+      // BREAKEVEN_TIMEOUT_MS. Floor: entry × (1 + fees/10000) = $0 net.
+      // Reposts only when the desired price drops by ≥ tolerance below
+      // the resting limit, so we don't churn cancel/repost on tiny age
+      // increments. When STAIRCASE_EXIT_ENABLED=false, falls back to the
+      // legacy one-shot break-even-replace at T = BREAKEVEN_TIMEOUT_MS.
+      if (STAIRCASE_EXIT_ENABLED && Number.isFinite(avg) && avg > 0 && existing?.id) {
+        const firstSeen = positionFirstSeenAt.get(pair);
+        const ageMs = Number.isFinite(firstSeen) ? Date.now() - firstSeen : 0;
+        const initialGrossBps = resolveExitGrossBps(pair);
+        const desiredGrossBps = computeStaircaseExitGrossBps(initialGrossBps, ageMs);
+        const desiredPrice = avg * (1 + desiredGrossBps / 10000);
+        const currentLimit = Number(existing?.limit_price);
+        const currentGrossBps = Number.isFinite(currentLimit) && currentLimit > 0
+          ? ((currentLimit - avg) / avg) * 10000
+          : initialGrossBps;
+        const dropBps = currentGrossBps - desiredGrossBps;
+        const isBreakeven = desiredGrossBps <= FEE_BPS_ROUND_TRIP + 0.01;
+        // Repost only if desired is meaningfully below current AND we
+        // haven't already pinned at break-even (no need to repost the
+        // same price every cycle).
+        if (dropBps >= STAIRCASE_REPOST_TOLERANCE_BPS && !(breakevenAttachedPrior && isBreakeven)) {
+          try {
+            await cancelOrder(existing.id);
+            const tickInfo = await getAssetTickInfo(pair);
+            const limitStr = formatTickPrice(desiredPrice, tickInfo.priceIncrement);
+            if (limitStr) {
+              const sellResult = await submitOrder({
+                symbol: pair,
+                side: 'sell',
+                type: 'limit',
+                time_in_force: 'gtc',
+                qty: String(qty),
+                limit_price: limitStr,
+              });
+              const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
+              const submittedAt = sellOrder?.submitted_at || new Date().toISOString();
+              const expectedNetBps = Math.max(0, desiredGrossBps - FEE_BPS_ROUND_TRIP);
+              exitState.set(pair, {
+                ...exitState.get(pair),
+                sellOrderId: sellOrder?.id || null,
+                sellOrderLimit: desiredPrice,
+                targetPrice: desiredPrice,
+                sellOrderSubmittedAt: submittedAt,
+                reconciliationState: isBreakeven ? 'breakeven_attached' : 'staircase_step',
+                lastReconciliationAction: isBreakeven ? 'breakeven_replace' : 'staircase_repost',
+                targetPriceSource: isBreakeven ? 'breakeven_replace' : 'staircase_step',
+                expectedNetProfitBps: expectedNetBps,
+                minNetProfitBps: expectedNetBps,
+                desiredNetExitBps: desiredGrossBps,
+                requiredExitBpsGross: desiredGrossBps,
+                requiredExitBps: desiredGrossBps,
+                breakevenAttached: isBreakeven,
+                breakevenAttachedAt: isBreakeven ? submittedAt : null,
+                lastSeenOpenSellAt: submittedAt,
+              });
+              lastSuccessfulAction = {
+                at: new Date().toISOString(),
+                symbol: pair,
+                action: isBreakeven ? 'breakeven_replace' : 'staircase_repost',
+                orderId: sellOrder?.id || null,
+              };
+              console.log('exit_staircase_step', {
+                symbol: pair,
+                ageSeconds: Math.round(ageMs / 1000),
+                initialGrossBps: Number(initialGrossBps.toFixed(2)),
+                previousGrossBps: Number(currentGrossBps.toFixed(2)),
+                desiredGrossBps: Number(desiredGrossBps.toFixed(2)),
+                desiredNetBps: Number((desiredGrossBps - FEE_BPS_ROUND_TRIP).toFixed(2)),
+                newLimitPrice: desiredPrice,
+                isBreakeven,
+                cancelledOrderId: existing.id,
+                newOrderId: sellOrder?.id || null,
+              });
+            }
+          } catch (err) {
+            lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'staircase_repost_failed', message: err?.errorMessage || err?.message || String(err) };
+            console.warn('exit_staircase_failed', { symbol: pair, error: err?.errorMessage || err?.message });
+          }
+        }
+      } else if (!breakevenAttachedPrior && Number.isFinite(avg) && avg > 0 && existing?.id) {
+        // Legacy one-shot break-even reset (when staircase is disabled).
+        // Kept verbatim for env-flag rollback safety.
         const firstSeen = positionFirstSeenAt.get(pair);
         const ageMs = Number.isFinite(firstSeen) ? Date.now() - firstSeen : 0;
         if (ageMs >= BREAKEVEN_TIMEOUT_MS) {
