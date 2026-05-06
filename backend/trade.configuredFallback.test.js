@@ -87,8 +87,12 @@ function installFailingAssetsFetchMock() {
     } else if (u.pathname === '/v1beta3/crypto/us/bars') {
       const symbols = (u.searchParams.get('symbols') || '').split(',').filter(Boolean);
       const limit = Number(u.searchParams.get('limit')) || 0;
+      const sort = u.searchParams.get('sort') || 'asc';
       const bars = {};
-      for (const s of symbols) bars[s] = makeBars(limit, { start: 100, step: 0.05 });
+      for (const s of symbols) {
+        const arr = makeBars(limit, { start: 100, step: 0.05 });
+        bars[s] = sort === 'desc' ? arr.slice().reverse() : arr;
+      }
       body = { bars };
     } else if (u.pathname === '/v2/orders') {
       // POST /v2/orders → submitted buy.

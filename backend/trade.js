@@ -600,14 +600,31 @@ async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe 
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { bars: {} };
   const cacheKey = `${location}:${timeframe}:${limit}:${list.join(',')}`;
+  // Without an explicit `start`, /v1beta3/crypto/{loc}/bars has been observed
+  // in production to return 200 OK with empty `bars:{}` for every requested
+  // symbol — which the predictor surfaces as `insufficient_bars` for every
+  // scan, blocking all entries. We pass a 24 h lookback `start` (more than
+  // enough for our 1m and 5m timeframes) and `sort=desc` so the endpoint
+  // returns the most recent `limit` bars regardless of how many bars exist
+  // in the lookback window. We then reverse to chronological order so
+  // existing callers continue to see oldest-first arrays and the
+  // `bars.slice(0, -1)` "drop the in-progress newest bar" semantics keep
+  // working unchanged.
+  const startIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   for (let attempt = 0; attempt <= BARS_FETCH_RETRIES; attempt += 1) {
     try {
       const payload = await alpacaRequest({
         base: 'data',
         path: `/v1beta3/crypto/${encodeURIComponent(location)}/bars`,
-        query: { symbols: list.join(','), timeframe, limit },
+        query: { symbols: list.join(','), timeframe, limit, start: startIso, sort: 'desc' },
         label: 'crypto_bars',
       }) || { bars: {} };
+      if (payload && payload.bars && typeof payload.bars === 'object') {
+        for (const key of Object.keys(payload.bars)) {
+          const arr = payload.bars[key];
+          if (Array.isArray(arr)) payload.bars[key] = arr.slice().reverse();
+        }
+      }
       barsCache.set(cacheKey, { at: Date.now(), payload });
       return payload;
     } catch (err) {
