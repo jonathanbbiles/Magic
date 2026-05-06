@@ -57,10 +57,13 @@ function readList(name, fallback = []) {
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
 // target is AFTER fees, not before. This is a *scalper*: target small,
-// take many bites. Allowed range 10..50 bps net (= 0.10%..0.50% net of fees);
+// take many bites. Allowed range 5..50 bps net (= 0.05%..0.50% net of fees);
 // raise this above 50 only with deliberate intent — wider targets fill less
-// often and break the small-win/small-stop symmetry.
-const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(10, readNumber('TARGET_NET_PROFIT_BPS', 15)));
+// often and break the small-win/small-stop symmetry. Default lowered from
+// 15 to 8 bps net so the SIGNAL_TARGET_FRACTION multiplier (default 0.5,
+// see deriveSignalTargetNetBps below) actually has room to bite for typical
+// projections; with the old 15-bps floor the fractional formula was a no-op.
+const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(5, readNumber('TARGET_NET_PROFIT_BPS', 8)));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
 // entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
 // above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
@@ -305,11 +308,18 @@ const BARRIER_HORIZON_BARS = Math.max(1, readNumber(
 // When ON, each entry's TP is sized from that entry's own `projectedBps`
 // (the OLS slope-based forward move estimate), floored at TARGET_NET_PROFIT_BPS
 // and capped at SIGNAL_TARGET_MAX_NET_BPS. Confident signals get bigger TPs;
-// weak signals fall back to the floor (= today's static behavior). Wins are
-// no longer all the same size: the model's own confidence sets each trade's
-// ambition. Off by default in env override paths so it can be flipped without
-// a redeploy if it backfires; default ON because it's the documented intent.
+// weak signals fall back to the floor. Wins are no longer all the same size.
+//
+// SIGNAL_TARGET_FRACTION (default 0.5) is the operator-tunable knob: target
+// is `fraction × projectedBps − fees`. Setting it to 0.5 means we aim to fill
+// at half the predicted move. Under unbiased predictions (~50/50 over/under)
+// targeting 100% of the projection only fills when the move reaches its FULL
+// predicted magnitude — roughly a 30–50% fill rate. Targeting half-distance
+// trades smaller-per-trade profit for materially higher fill probability;
+// the resulting expected $ per trade is usually higher because fill-rate gain
+// outpaces TP shrinkage. Set fraction=1.0 to revert to the old behaviour.
 const SIGNAL_SIZED_EXIT_ENABLED = readBoolean('SIGNAL_SIZED_EXIT_ENABLED', true);
+const SIGNAL_TARGET_FRACTION = Math.min(2, Math.max(0.1, readNumber('SIGNAL_TARGET_FRACTION', 0.5)));
 const SIGNAL_TARGET_MAX_NET_BPS = Math.min(
   50,
   Math.max(TARGET_NET_PROFIT_BPS, readNumber('SIGNAL_TARGET_MAX_NET_BPS', 50)),
@@ -319,10 +329,11 @@ function deriveSignalTargetNetBps(projectedBps) {
   if (!SIGNAL_SIZED_EXIT_ENABLED) return TARGET_NET_PROFIT_BPS;
   const projected = Number(projectedBps);
   if (!Number.isFinite(projected)) return TARGET_NET_PROFIT_BPS;
-  // projectedBps is the predicted forward move from current mid. To net X bps
-  // after fees, set the TP at X + fees gross. So netSignal = projected - fees.
+  // Aim to fill at SIGNAL_TARGET_FRACTION of the projected forward move.
+  // To net X bps after fees, set TP at X + fees gross, so:
+  //   signalNet = fraction × projected − fees.
   // Then floor at the static scalp target and cap at the configured max.
-  const signalNet = projected - FEE_BPS_ROUND_TRIP;
+  const signalNet = SIGNAL_TARGET_FRACTION * projected - FEE_BPS_ROUND_TRIP;
   return Math.max(TARGET_NET_PROFIT_BPS, Math.min(SIGNAL_TARGET_MAX_NET_BPS, signalNet));
 }
 
