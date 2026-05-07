@@ -188,6 +188,45 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
   assert.ok(trades.length > 0, 'should produce trades when both ALT and BTC are uptrending');
 }
 
+// REGRESSION: BTC lead-lag gate must fire even when bars don't carry an
+// `S` field — Alpaca's per-symbol bars endpoint doesn't echo it, and an
+// earlier version of replaySymbol used `bars[0]?.S` in its useBtcGate
+// short-circuit, evaluating `undefined !== undefined` to false and
+// disabling the gate everywhere in production. This test mirrors the real
+// pipeline: bars without an S field, BTC plunging — the gate must engage.
+{
+  const opts = {
+    predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+    targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+    minVolumeRatio: 0, maxBtcLeadLagDropBps: -5,
+    btcLeadLagLookbackBars: 5,
+  };
+  const altBars = [];
+  let p = 100;
+  for (let i = 0; i < 60; i += 1) {
+    p *= 1 + 5 / 10000;
+    altBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: p, h: p * 1.001, l: p * 0.999, c: p, v: 1000,
+      // NO `S` field — production-realistic.
+    });
+  }
+  const btcBars = [];
+  let bp = 80000;
+  for (let i = 0; i < 60; i += 1) {
+    bp *= 1 - 10 / 10000;          // BTC plunging
+    btcBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: bp, h: bp * 1.0005, l: bp * 0.999, c: bp, v: 1000,
+      // NO `S` field.
+    });
+  }
+  const trades = replaySymbol(altBars, opts, btcBars);
+  assert.ok(trades.gateSkipped.btc_leading_drop > 0, 'BTC gate must fire even when bars have no S field');
+  assert.equal(trades.length, 0, 'no trades when BTC is in steady freefall — even with bars[].S undefined');
+}
+
 // runBacktest with a mocked global fetch (intercepts the Alpaca bars endpoint).
 {
   const origFetch = global.fetch;
