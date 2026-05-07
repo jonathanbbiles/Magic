@@ -93,6 +93,7 @@ const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
+const { runBacktest } = require('./scripts/backtest_strategy');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -581,6 +582,77 @@ app.get('/health', (req, res) => {
   });
 });
 
+// --- backtest auto-run + on-demand endpoint ---------------------------------
+//
+// Runs the historical backtester (scripts/backtest_strategy.js) in-process so
+// users without Render shell access can see real-history fill / expectancy
+// stats by polling /dashboard.meta.backtest. Auto-fires once ~60 seconds
+// after server start so the engine has time to settle. Can also be triggered
+// on demand at /debug/backtest?days=...&fraction=...
+const BACKTEST_AUTORUN_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_ENABLED || 'true').toLowerCase());
+const BACKTEST_AUTORUN_DELAY_MS = Math.max(5_000, Number(process.env.BACKTEST_AUTORUN_DELAY_MS) || 60_000);
+const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DAYS) || 30);
+let lastBacktestResult = null;
+let lastBacktestError = null;
+let backtestRunning = false;
+
+async function runBacktestAndStore(overrides = {}) {
+  if (backtestRunning) return { error: 'backtest_already_running' };
+  backtestRunning = true;
+  const ranAt = new Date().toISOString();
+  console.log('backtest_started', { ranAt, params: overrides });
+  try {
+    const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY || runtimeConfig?.entrySymbolsPrimary?.join(',') || 'BTC/USD,ETH/USD';
+    const days = Math.max(1, Number(overrides.days) || BACKTEST_AUTORUN_DAYS);
+    const result = await runBacktest({
+      symbols: overrides.symbols || symbolsCsv,
+      windowDays: days,
+      ...(overrides.predictBars ? { predictBars: Number(overrides.predictBars) } : {}),
+      ...(overrides.minProjectedBps != null ? { minProjectedBps: Number(overrides.minProjectedBps) } : {}),
+      ...(overrides.signalTargetFraction != null ? { signalTargetFraction: Number(overrides.signalTargetFraction) } : {}),
+      ...(overrides.targetNetBps != null ? { targetNetBps: Number(overrides.targetNetBps) } : {}),
+    });
+    lastBacktestResult = { ...result, windowDays: days };
+    lastBacktestError = null;
+    console.log('backtest_completed', { ranAt: result.ranAt, ...result.overall });
+    return lastBacktestResult;
+  } catch (err) {
+    lastBacktestError = { at: new Date().toISOString(), message: err?.message || String(err) };
+    console.warn('backtest_failed', lastBacktestError);
+    return { error: lastBacktestError.message };
+  } finally {
+    backtestRunning = false;
+  }
+}
+
+app.get('/debug/backtest', async (req, res) => {
+  // If a result already exists and ?refresh isn't set, return cached.
+  const wantRefresh = String(req.query.refresh || '').toLowerCase() === 'true';
+  if (lastBacktestResult && !wantRefresh && Object.keys(req.query).length === 0) {
+    return res.json({ ok: true, cached: true, result: lastBacktestResult });
+  }
+  if (backtestRunning) {
+    return res.status(202).json({ ok: false, status: 'running', cached: lastBacktestResult });
+  }
+  // Kick off in background; respond immediately if synchronous wait isn't asked for.
+  const wait = String(req.query.wait || 'true').toLowerCase() === 'true';
+  const overrides = {
+    days: req.query.days,
+    minProjectedBps: req.query.minProjectedBps,
+    signalTargetFraction: req.query.signalTargetFraction || req.query.fraction,
+    targetNetBps: req.query.targetNetBps,
+    predictBars: req.query.predictBars,
+    symbols: req.query.symbols,
+  };
+  if (!wait) {
+    runBacktestAndStore(overrides).catch(() => {});
+    return res.status(202).json({ ok: false, status: 'started', cached: lastBacktestResult });
+  }
+  const result = await runBacktestAndStore(overrides);
+  if (result?.error) return res.status(500).json({ ok: false, error: result.error });
+  res.json({ ok: true, cached: false, result });
+});
+
 app.get('/debug/auth', (req, res) => {
   const authStatus = getAlpacaAuthStatus();
   const baseStatus = getAlpacaBaseStatus();
@@ -956,6 +1028,13 @@ app.get('/dashboard', async (req, res) => {
         pollAgeMs: lastQuote?.ageMs ?? null,
         botMood: governorSummary?.coolDownActive ? 'defensive' : 'normal',
         guardSummary: managerStatus?.sessionGovernor || null,
+        backtest: lastBacktestResult ? {
+          ranAt: lastBacktestResult.ranAt,
+          windowDays: lastBacktestResult.windowDays,
+          params: lastBacktestResult.params,
+          overall: lastBacktestResult.overall,
+          perSymbol: lastBacktestResult.perSymbol,
+        } : (backtestRunning ? { status: 'running', startedAt: new Date().toISOString() } : (lastBacktestError ? { error: lastBacktestError } : null)),
         connectionState: {
           hasLastHttpError: Boolean(lastError),
           alpaca: getAlpacaAuthStatus(),
@@ -1760,6 +1839,22 @@ writeRunSnapshot();
 const server = app.listen(port, () => {
   console.log('server_start', { env: process.env.NODE_ENV || 'development', port });
 });
+
+// Kick off the auto-backtest a short while after the server starts. Skipped
+// during tests, when the env flag is off, or when Alpaca creds aren't set.
+const backtestSkipReason = (() => {
+  if (!BACKTEST_AUTORUN_ENABLED) return 'autorun_disabled';
+  if (process.env.NODE_ENV === 'test') return 'test_env';
+  if (!(process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY)) return 'no_alpaca_creds';
+  return null;
+})();
+if (backtestSkipReason) {
+  console.log('backtest_autorun_skipped', { reason: backtestSkipReason });
+} else {
+  setTimeout(() => {
+    runBacktestAndStore({}).catch(() => {});
+  }, BACKTEST_AUTORUN_DELAY_MS);
+}
 
 recordEquitySnapshot();
 setInterval(() => {
