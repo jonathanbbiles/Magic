@@ -77,7 +77,11 @@ GET /debug/backtest?days=60&signalTargetFraction=1.0         → re-run with ove
 GET /debug/backtest?wait=false&minProjectedBps=25            → kick off in background, return immediately
 ```
 
-Disable with `BACKTEST_AUTORUN_ENABLED=false` (e.g. while debugging unrelated startup issues that you don't want competing with ~10 minutes of Alpaca data calls).
+Symbol universe is the live `ENTRY_SYMBOLS_PRIMARY` list (env var if set, otherwise `runtimeConfig.configuredPrimarySymbols` derived from `LIVE_CRITICAL_DEFAULTS`). Override per-call with `?symbols=BTC/USD,ETH/USD,...`.
+
+After the primary 30-day run completes, an **A/B run** fires automatically with `signalTargetFraction=BACKTEST_AUTORUN_AB_FRACTION` (default `1.0`) so each restart gives you a side-by-side comparison vs the live setting (`signalTargetFraction=0.5`). The result lands at `meta.backtestAlt` — same shape as `meta.backtest`. Compare `overall.avgNetBpsPerEntry` between the two to see whether the half-projection multiplier is helping or hurting on real history. Disable the A/B with `BACKTEST_AUTORUN_AB_ENABLED=false`.
+
+Disable everything with `BACKTEST_AUTORUN_ENABLED=false` (e.g. while debugging unrelated startup issues that you don't want competing with extra Alpaca data calls).
 
 ## The math, briefly
 

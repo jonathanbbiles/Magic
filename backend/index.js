@@ -592,17 +592,27 @@ app.get('/health', (req, res) => {
 const BACKTEST_AUTORUN_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_ENABLED || 'true').toLowerCase());
 const BACKTEST_AUTORUN_DELAY_MS = Math.max(5_000, Number(process.env.BACKTEST_AUTORUN_DELAY_MS) || 60_000);
 const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DAYS) || 30);
+// A/B: run a SECOND backtest with the alternate signalTargetFraction so we
+// always have a side-by-side comparison vs the live setting. Default OFF
+// would defeat the user's "no shell access" workflow, so this is ON.
+const BACKTEST_AUTORUN_AB_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_AB_ENABLED || 'true').toLowerCase());
+const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || 1.0;
 let lastBacktestResult = null;
+let lastBacktestAlt = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
-async function runBacktestAndStore(overrides = {}) {
+async function runBacktestAndStore(overrides = {}, slot = 'primary') {
   if (backtestRunning) return { error: 'backtest_already_running' };
   backtestRunning = true;
   const ranAt = new Date().toISOString();
-  console.log('backtest_started', { ranAt, params: overrides });
+  console.log('backtest_started', { ranAt, slot, params: overrides });
   try {
-    const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY || runtimeConfig?.entrySymbolsPrimary?.join(',') || 'BTC/USD,ETH/USD';
+    const liveSymbols = Array.isArray(runtimeConfig?.configuredPrimarySymbols) && runtimeConfig.configuredPrimarySymbols.length
+      ? runtimeConfig.configuredPrimarySymbols
+      : null;
+    const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY
+      || (liveSymbols ? liveSymbols.join(',') : 'BTC/USD,ETH/USD');
     const days = Math.max(1, Number(overrides.days) || BACKTEST_AUTORUN_DAYS);
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
@@ -612,10 +622,12 @@ async function runBacktestAndStore(overrides = {}) {
       ...(overrides.signalTargetFraction != null ? { signalTargetFraction: Number(overrides.signalTargetFraction) } : {}),
       ...(overrides.targetNetBps != null ? { targetNetBps: Number(overrides.targetNetBps) } : {}),
     });
-    lastBacktestResult = { ...result, windowDays: days };
+    const stored = { ...result, windowDays: days };
+    if (slot === 'alt') lastBacktestAlt = stored;
+    else lastBacktestResult = stored;
     lastBacktestError = null;
-    console.log('backtest_completed', { ranAt: result.ranAt, ...result.overall });
-    return lastBacktestResult;
+    console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
+    return stored;
   } catch (err) {
     lastBacktestError = { at: new Date().toISOString(), message: err?.message || String(err) };
     console.warn('backtest_failed', lastBacktestError);
@@ -1035,6 +1047,14 @@ app.get('/dashboard', async (req, res) => {
           overall: lastBacktestResult.overall,
           perSymbol: lastBacktestResult.perSymbol,
         } : (backtestRunning ? { status: 'running', startedAt: new Date().toISOString() } : (lastBacktestError ? { error: lastBacktestError } : null)),
+        backtestAlt: lastBacktestAlt ? {
+          ranAt: lastBacktestAlt.ranAt,
+          windowDays: lastBacktestAlt.windowDays,
+          params: lastBacktestAlt.params,
+          overall: lastBacktestAlt.overall,
+          perSymbol: lastBacktestAlt.perSymbol,
+          note: `A/B vs primary — only signalTargetFraction differs (alt=${lastBacktestAlt.params?.signalTargetFraction}, primary=${lastBacktestResult?.params?.signalTargetFraction ?? 'n/a'})`,
+        } : null,
         connectionState: {
           hasLastHttpError: Boolean(lastError),
           alpaca: getAlpacaAuthStatus(),
@@ -1851,8 +1871,14 @@ const backtestSkipReason = (() => {
 if (backtestSkipReason) {
   console.log('backtest_autorun_skipped', { reason: backtestSkipReason });
 } else {
-  setTimeout(() => {
-    runBacktestAndStore({}).catch(() => {});
+  setTimeout(async () => {
+    await runBacktestAndStore({}, 'primary').catch(() => {});
+    if (BACKTEST_AUTORUN_AB_ENABLED) {
+      // Chain the A/B run after the primary so we don't trip the
+      // backtestRunning guard. Only signalTargetFraction differs; everything
+      // else mirrors live so the comparison is apples-to-apples.
+      await runBacktestAndStore({ signalTargetFraction: BACKTEST_AUTORUN_AB_FRACTION }, 'alt').catch(() => {});
+    }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
 
