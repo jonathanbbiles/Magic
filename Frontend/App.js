@@ -596,6 +596,33 @@ function CastCard({ position, activeRef }) {
 }
 
 // ----------------------------------------------------------------------------
+// sortPositionsByHealth — green (winning %) at top, red (losing %) at bottom.
+// Sort key: unrealized_plpc descending. Ties break on unrealized_pl. Positions
+// with non-numeric P&L sink to the bottom so live winners/losers stay grouped.
+// ----------------------------------------------------------------------------
+function sortPositionsByHealth(positions) {
+  if (!Array.isArray(positions)) return [];
+  const score = (p) => {
+    const pct = num(p?.unrealized_plpc);
+    const usd = num(p?.unrealized_pl);
+    return { pct, usd };
+  };
+  return [...positions].sort((a, b) => {
+    const A = score(a);
+    const B = score(b);
+    const aValid = A.pct != null;
+    const bValid = B.pct != null;
+    if (!aValid && !bValid) return 0;
+    if (!aValid) return 1;
+    if (!bValid) return -1;
+    if (A.pct !== B.pct) return B.pct - A.pct;
+    const au = A.usd == null ? -Infinity : A.usd;
+    const bu = B.usd == null ? -Infinity : B.usd;
+    return bu - au;
+  });
+}
+
+// ----------------------------------------------------------------------------
 // Stage — overview tab. The "tonight at a glance" view.
 // ----------------------------------------------------------------------------
 function Stage({ data, activeRef, onJumpToCast }) {
@@ -604,7 +631,7 @@ function Stage({ data, activeRef, onJumpToCast }) {
   const truth = meta?.truth || {};
   const runtime = meta?.runtime || {};
   const portfolio = data?.portfolio || {};
-  const positions = Array.isArray(data?.positions) ? data.positions : [];
+  const positions = sortPositionsByHealth(data?.positions);
   const scorecard = meta?.scorecard || {};
   const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? null;
   const engineOk = String(engineState || '').toLowerCase() === 'ready' || String(engineState || '').toLowerCase() === 'scanning';
@@ -663,20 +690,6 @@ function Stage({ data, activeRef, onJumpToCast }) {
         deltaSinceLast={delta}
       />
       <StatTriple items={stats} />
-
-      {/* Tonight's Cast preview */}
-      <Pressable onPress={onJumpToCast} style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🎭 TONIGHT&apos;S CAST</Text>
-        <Text style={s.sectionHeaderSub}>{positions.length} live · tap for details</Text>
-      </Pressable>
-      {positions.length === 0 ? (
-        <View style={s.emptyTile}>
-          <Text style={s.emptyTitle}>No positions on stage</Text>
-          <Text style={s.emptyBody}>The engine is looking for the next entry.</Text>
-        </View>
-      ) : (
-        positions.slice(0, 6).map((p, i) => <CastCardCompact key={p?.symbol || i} position={p} activeRef={activeRef} />)
-      )}
 
       {/* Engine pulse */}
       <View style={s.sectionHeader}>
@@ -737,6 +750,20 @@ function Stage({ data, activeRef, onJumpToCast }) {
           </View>
         </>
       )}
+
+      {/* Tonight's Cast (last section, all positions, sorted green→red). */}
+      <Pressable onPress={onJumpToCast} style={s.sectionHeader}>
+        <Text style={s.sectionHeaderTitle}>🎭 TONIGHT&apos;S CAST</Text>
+        <Text style={s.sectionHeaderSub}>{positions.length} live · tap for details</Text>
+      </Pressable>
+      {positions.length === 0 ? (
+        <View style={s.emptyTile}>
+          <Text style={s.emptyTitle}>No positions on stage</Text>
+          <Text style={s.emptyBody}>The engine is looking for the next entry.</Text>
+        </View>
+      ) : (
+        positions.map((p, i) => <CastCardCompact key={p?.symbol || i} position={p} activeRef={activeRef} />)
+      )}
     </View>
   );
 }
@@ -773,7 +800,7 @@ function CastCardCompact({ position, activeRef }) {
 // Cast — full-detail positions tab.
 // ----------------------------------------------------------------------------
 function Cast({ data, activeRef }) {
-  const positions = Array.isArray(data?.positions) ? data.positions : [];
+  const positions = sortPositionsByHealth(data?.positions);
   if (positions.length === 0) {
     return (
       <View style={s.tabBody}>
@@ -1180,7 +1207,6 @@ function AppInner() {
       />
 
       {error ? <Banner tone="error">{error}</Banner> : null}
-      {BACKEND.warning && !error ? <Banner tone="info">{/* configBanner */}{BACKEND.warning}</Banner> : null}
 
       <ScrollView
         style={{ flex: 1 }}
