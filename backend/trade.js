@@ -263,6 +263,24 @@ const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 2);
 // slippage and ~half a fee round-trip, so sub-floor signals never even
 // reach the EV math.
 const MIN_PROJECTED_BPS_TO_ENTER = Math.max(0, readNumber('MIN_PROJECTED_BPS_TO_ENTER', 15));
+// Top-detection candidate gates. Both default OFF (0 / -Infinity) so they
+// don't change live behaviour — flip them on once a backtest measures
+// whether they improve expectancy. See README "Forensics-only candidate
+// features" for the math.
+//
+// MIN_VOLUME_RATIO_TO_ENTER: refuse entries when recent-window volume
+// dropped below `ratio × all-window volume`. >1 means rising volume
+// (confirmation), <1 means fading. Tops typically print on declining
+// volume. Set to e.g. 0.8 to refuse momentum on dying volume; 0 = gate off.
+const MIN_VOLUME_RATIO_TO_ENTER = Math.max(0, readNumber('MIN_VOLUME_RATIO_TO_ENTER', 0));
+// MAX_BTC_LEAD_LAG_DROP_BPS: refuse non-BTC entries when BTC's last-5-bar
+// return is more negative than this threshold. Alts lag BTC by 30–90s in
+// crypto, so a recent BTC drop is a leading indicator that alt momentum
+// is about to reverse. Negative number; 0 or positive = gate off (would
+// require BTC to be UP to enter, which is too restrictive). Set to e.g.
+// -5 to refuse alt entries when BTC just dropped ≥5 bps. Skipped when
+// BTC lead-lag snapshot is missing or stale (>5 min old).
+const MAX_BTC_LEAD_LAG_DROP_BPS = readNumber('MAX_BTC_LEAD_LAG_DROP_BPS', 0);
 // Orderbook-imbalance feature. Default OFF — enabling adds an extra
 // /latest/orderbooks fetch per scan (≈ same cost as the existing /latest/quotes
 // hit), against Alpaca's 200/min crypto data cap. When ON, every entry's
@@ -1748,6 +1766,41 @@ async function scanAndEnter() {
           minProjectedBps: MIN_PROJECTED_BPS_TO_ENTER,
         });
         continue;
+      }
+
+      // Volume confirmation gate (top-detection candidate). Tops typically
+      // print on declining volume — `volumeRatio < 1` means recent-window
+      // volume is fading vs the OLS lookback. When this gate is enabled,
+      // refuse entries that pass slope/projection but lack volume backing.
+      // Default OFF (threshold = 0). See README for math.
+      if (MIN_VOLUME_RATIO_TO_ENTER > 0) {
+        const ratio = Number(sig.volumeRatio);
+        if (Number.isFinite(ratio) && ratio < MIN_VOLUME_RATIO_TO_ENTER) {
+          rejectTrade(pair, 'volume_below_min', {
+            volumeRatio: ratio,
+            minVolumeRatio: MIN_VOLUME_RATIO_TO_ENTER,
+          });
+          continue;
+        }
+      }
+
+      // BTC lead-lag gate (top-detection candidate). Alts lag BTC by 30–90s
+      // in crypto, so a fresh BTC drop is a leading indicator that alt
+      // momentum is about to reverse. When this gate is enabled, refuse
+      // non-BTC entries if BTC's last-5-bar return is more negative than
+      // the threshold. Default OFF (threshold = 0 means any positive value
+      // disables the gate; only negative thresholds enable it).
+      if (MAX_BTC_LEAD_LAG_DROP_BPS < 0 && pair !== BTC_LEAD_LAG_SYMBOL) {
+        const snap = getBtcLeadLagSnapshot();
+        const recent = Number(snap?.recentReturnBps);
+        if (Number.isFinite(recent) && recent < MAX_BTC_LEAD_LAG_DROP_BPS) {
+          rejectTrade(pair, 'btc_leading_drop', {
+            btcRecentReturnBps: recent,
+            btcLeadLagAgeMs: snap?.ageMs ?? null,
+            maxBtcLeadLagDropBps: MAX_BTC_LEAD_LAG_DROP_BPS,
+          });
+          continue;
+        }
       }
 
       if (NET_EDGE_GATE_ENABLED) {
