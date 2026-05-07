@@ -52,6 +52,19 @@ Everything else in the codebase is plumbing, telemetry, and safety rails around 
 
 ---
 
+## Forensics-only candidate features
+
+Three features are computed every scan and dropped into the `entry_submitted` log + dashboard `forensics` payload, but **do not currently gate any entry decision**. They exist so the backtester (below) can A/B them against historical bars and quantify whether they're worth wiring into the live gate as a follow-up.
+
+| Field | Meaning |
+| --- | --- |
+| `volumeRatio` | mean(last-25%-window 1m volume) / mean(all PREDICT_BARS 1m volume). >1 = volume rising in the recent window (momentum confirmation), <1 = fading. Free — bars are already fetched. |
+| `volumeWeightedSlopeBps` | Same OLS slope as `slopeBpsPerBar` but each bar weighted by its volume. When this agrees with `slopeBpsPerBar`, the trend is volume-confirmed; when they disagree, the trend is being pushed by low-volume noise. Free. |
+| `btcLeadLag.{recentReturnBps, slopeBpsPerBar, ageMs}` | BTC's recent move (last 5 closed 1m bars) attached to every non-BTC entry's forensics. Alts typically lag BTC by 30–90 s in crypto, so this is a leading indicator. Cached from the BTC scan that runs first each cycle; surfaced as `null` if older than 5 min. Free — BTC is already in the universe. |
+| `bookImbalance` | Top-N orderbook notional imbalance, range [-1, +1]. Only populated when `ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true`; otherwise `null`. Costs an extra `/latest/orderbooks` fetch per symbol. |
+
+Run `npm run backtest` with new gate ideas (`--min-projected-bps=20`, `--signal-target-fraction=1.0`, etc.) before wiring any of these into the live gate.
+
 ## The math, briefly
 
 - **Entry signal** (`backend/modules/entryProbability.js`): OLS slope on recent 1m closes → t-statistic → logistic CDF for `pUp` ∈ [0, 1].
@@ -74,6 +87,10 @@ npm run reconcile                                    # compare predicted vs real
 node scripts/simulate_strategy.js                    # closed-form Monte Carlo across drift/vol regimes
 node scripts/simulate_strategy.js --regime=adverse   # single-regime detail
 node scripts/simulate_strategy.js --json             # machine-readable for charts
+npm run backtest                                     # replay strategy on real Alpaca historical bars
+npm run backtest -- --start=2026-04-01 --end=2026-05-01 --symbols=BTC/USD,ETH/USD
+npm run backtest -- --json                           # machine-readable for diff-tools
+npm run backtest -- --signal-target-fraction=1.0 --min-projected-bps=20  # A/B parameter sweeps
 ```
 
 The simulator's headline finding under live defaults (target 20 bps net, 40 bps fees, 10-min break-even timeout, 12 bps/min realised vol): expectancy is **strongly negative under flat or adverse drift** because the no-stop-loss design parks capital in stuck positions whose MTM keeps decaying. Only sustained positive drift produces a small positive expectancy (~+1 bps per trade at +0.5 bps/min drift). This is the math justification for the corrected fill-probability model and the cost-floor gate above.
@@ -126,6 +143,8 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `PROFIT_BUFFER_BPS` | `5` | Cushion used in entry edge gate. The gate requires `spread ≤ TARGET_NET_PROFIT_BPS − PROFIT_BUFFER_BPS`, so with the default 20 bps target the effective entry spread headroom is 15 bps (well inside `SPREAD_MAX_BPS`). Raising it tightens entries toward BTC-only; setting it to 0 lets `SPREAD_MAX_BPS` become the only spread filter. |
 | `MIN_NET_EDGE_BPS` | `2` | Minimum expected net edge (bps) to clear before buying. Computed as `(TARGET_NET_PROFIT_BPS − ENTRY_SLIPPAGE_BPS) × fillProbability`. With current defaults (`TARGET=8`, `slip=3`), the EV check is `5 × p ≥ 2` ⇒ p ≥ 0.4. Realised wins per fill are still `+TARGET_NET_PROFIT_BPS` after fees because the GTC take-profit price is fixed; this knob only widens which candidates are eligible to attempt that win. |
 | `MIN_PROJECTED_BPS_TO_ENTER` | `15` | Hard floor on the OLS-projected forward move (bps) required to enter. After lowering `TARGET_NET_PROFIT_BPS` to 8, the EV gate started letting through near-noise projections (live: BCH at `projectedBps=2.6`, `honestEvBps=-54`). Default 15 ≈ 3× modelled slippage and ~half a fee round-trip — sub-floor signals never reach the EV math. Skip reason: `projected_below_min`. |
+| `ORDERBOOK_IMBALANCE_FEATURE_ENABLED` | `false` | Optional observational feature. When `true`, the entry scan fetches `/v1beta3/crypto/{loc}/latest/orderbooks` per symbol and adds `bookImbalance` ∈ [-1, +1] to the entry forensics payload (positive = more bid notional, negative = more ask). Pure observation — does NOT gate entries. Default OFF because enabling adds ~60 extra requests/min against Alpaca's 200/min cap. Flip on once a backtest confirms the signal has edge worth the API budget. |
+| `ORDERBOOK_IMBALANCE_LEVELS` | `5` | Number of best-N orderbook levels per side included in the imbalance sum. Only consulted when `ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true`. |
 | `PORTFOLIO_SIZING_PCT` | `0.10` | Fraction of equity per trade. |
 | `MIN_TRADE_NOTIONAL_USD` | `1` | Dust floor below which buys are skipped. |
 | `BREAKEVEN_TIMEOUT_MS` | `14400000` | Time over which the staircase exit decays the GTC sell limit from the signal-derived TP to break-even-after-fees. Default 4 hours. Floor: 30 000. Also used as the fallback one-shot break-even-replace deadline when `STAIRCASE_EXIT_ENABLED=false`. |
@@ -185,6 +204,7 @@ npm run smoke             # local smoke test
 npm run preflight         # runtime-env check + smoke
 npm run check:complexity  # enforces line budget on trade.js
 npm run reconcile         # offline analysis: predicted vs realized hit rate
+npm run backtest          # replay strategy on real Alpaca historical bars
 ```
 
 CI runs on every push/PR to `main`:
