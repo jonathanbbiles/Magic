@@ -263,6 +263,15 @@ const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 2);
 // slippage and ~half a fee round-trip, so sub-floor signals never even
 // reach the EV math.
 const MIN_PROJECTED_BPS_TO_ENTER = Math.max(0, readNumber('MIN_PROJECTED_BPS_TO_ENTER', 15));
+// Orderbook-imbalance feature. Default OFF — enabling adds an extra
+// /latest/orderbooks fetch per scan (≈ same cost as the existing /latest/quotes
+// hit), against Alpaca's 200/min crypto data cap. When ON, every entry's
+// `bookImbalance` field reflects (bid − ask) notional over the top
+// ORDERBOOK_IMBALANCE_LEVELS levels, range [-1, +1]. Pure observation —
+// not a gate. Flip on once you've confirmed via backtest that the signal
+// has edge worth the API budget.
+const ORDERBOOK_IMBALANCE_FEATURE_ENABLED = readBoolean('ORDERBOOK_IMBALANCE_FEATURE_ENABLED', false);
+const ORDERBOOK_IMBALANCE_LEVELS = Math.max(1, readNumber('ORDERBOOK_IMBALANCE_LEVELS', 5));
 const ENTRY_SLIPPAGE_BPS = Math.max(0, readNumber('ENTRY_SLIPPAGE_BPS', 3));
 const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 3));
 
@@ -728,6 +737,45 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
   }) || { trades: {} };
 }
 
+// Latest L2 snapshot from Alpaca crypto. Only invoked when
+// ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true so the default deployment adds
+// no incremental rate-limit pressure. Each entry is { symbol -> { a: [...], b: [...] } }
+// where a/b are arrays of { p, s } (price, size) sorted best-first.
+async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
+  const list = normalizeSymbolsParam(symbols);
+  if (!list.length) return { orderbooks: {} };
+  return alpacaRequest({
+    base: 'data',
+    path: `/v1beta3/crypto/${encodeURIComponent(location)}/latest/orderbooks`,
+    query: { symbols: list.join(',') },
+    label: 'crypto_orderbooks_latest',
+  }) || { orderbooks: {} };
+}
+
+// Top-N orderbook imbalance: (bidNotional − askNotional) / (bidNotional + askNotional)
+// summed over the best `levels` levels per side. Range [-1, +1]; positive
+// means more buy-side depth, negative means more sell-side. Returns null if
+// the book is malformed or one side is empty.
+function computeOrderbookImbalance(book, levels = 5) {
+  const asks = Array.isArray(book?.a) ? book.a : [];
+  const bids = Array.isArray(book?.b) ? book.b : [];
+  if (!asks.length || !bids.length) return null;
+  const sumNotional = (side) => {
+    let total = 0;
+    for (let i = 0; i < Math.min(levels, side.length); i += 1) {
+      const p = Number(side[i]?.p);
+      const s = Number(side[i]?.s);
+      if (Number.isFinite(p) && Number.isFinite(s) && p > 0 && s > 0) total += p * s;
+    }
+    return total;
+  };
+  const askNotional = sumNotional(asks);
+  const bidNotional = sumNotional(bids);
+  const denom = askNotional + bidNotional;
+  if (denom <= 0) return null;
+  return (bidNotional - askNotional) / denom;
+}
+
 async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { bars: {} };
@@ -930,6 +978,7 @@ async function getPredictionSignal(pair) {
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
     const closedBars = bars.slice(0, -1);
     const closes = closedBars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
+    const volumes = closedBars.map((b) => Number(b?.v)).filter((v) => Number.isFinite(v) && v >= 0);
     if (closes.length < PREDICT_BARS) {
       return { ok: false, reason: 'insufficient_bars' };
     }
@@ -975,6 +1024,43 @@ async function getPredictionSignal(pair) {
       }
     }
 
+    // Volume features. volumeRatio = mean(recent N) / mean(all). >1 means
+    // volume is rising in the recent window (momentum confirmation), <1 means
+    // it's fading. volumeWeightedSlopeBps reweights the OLS by per-bar volume:
+    // when it agrees with slopeBpsPerBar, the move is volume-confirmed; when
+    // it disagrees, the trend is being pushed by low-volume noise.
+    let volumeRatio = null;
+    let volumeWeightedSlopeBps = null;
+    let recentVolumeMean = null;
+    if (volumes.length === closes.length && volumes.length >= PREDICT_BARS) {
+      const totalVolMean = volumes.reduce((s, v) => s + v, 0) / volumes.length;
+      const recentWindow = Math.max(3, Math.floor(volumes.length / 4));
+      const recentSlice = volumes.slice(-recentWindow);
+      recentVolumeMean = recentSlice.reduce((s, v) => s + v, 0) / recentSlice.length;
+      if (totalVolMean > 0) volumeRatio = recentVolumeMean / totalVolMean;
+
+      const totalVol = volumes.reduce((s, v) => s + v, 0);
+      if (totalVol > 0) {
+        let wMeanX = 0;
+        let wMeanY = 0;
+        for (let i = 0; i < n; i += 1) {
+          wMeanX += i * volumes[i];
+          wMeanY += closes[i] * volumes[i];
+        }
+        wMeanX /= totalVol;
+        wMeanY /= totalVol;
+        let wNum = 0;
+        let wDenX = 0;
+        for (let i = 0; i < n; i += 1) {
+          const dx = i - wMeanX;
+          wNum += volumes[i] * dx * (closes[i] - wMeanY);
+          wDenX += volumes[i] * dx * dx;
+        }
+        const wSlope = wDenX > 0 ? wNum / wDenX : 0;
+        volumeWeightedSlopeBps = wMeanY > 0 ? (wSlope / wMeanY) * 10000 : 0;
+      }
+    }
+
     const reason = shortTermOk ? null : 'short_term_dip';
 
     return {
@@ -985,6 +1071,9 @@ async function getPredictionSignal(pair) {
       slopeTStat,
       projectedBps: slopeBpsPerBar * PREDICT_BARS,
       volatilityBps,
+      volumeRatio,
+      volumeWeightedSlopeBps,
+      recentVolumeMean,
       closes,
     };
   } catch (err) {
@@ -1046,6 +1135,40 @@ const skipReasonCounts = new Map();
 const rollingSkipReasons = new Map();
 const rollingSkipByReasonAndSymbol = [];
 const lastQuoteUpdateBySymbol = new Map();
+
+// BTC lead-lag cache. Updated whenever getPredictionSignal('BTC/USD')
+// succeeds. Alts read this on every entry evaluation so the predictor sees
+// what BTC has done in the last few minutes (alts typically lag BTC by
+// 30–90s in crypto). Capped at BTC_LEAD_LAG_MAX_AGE_MS so stale data is
+// dropped instead of silently scoring entries against the prior session.
+const BTC_LEAD_LAG_SYMBOL = 'BTC/USD';
+const BTC_LEAD_LAG_MAX_AGE_MS = 5 * 60 * 1000;
+let btcLeadLagSnapshot = null;
+function recordBtcLeadLagSnapshot(sig) {
+  if (!sig || !sig.ok) return;
+  const closes = Array.isArray(sig.closes) ? sig.closes : [];
+  let recentReturnBps = null;
+  if (closes.length >= 5) {
+    const a = closes[closes.length - 5];
+    const b = closes[closes.length - 1];
+    if (Number.isFinite(a) && a > 0 && Number.isFinite(b)) {
+      recentReturnBps = ((b - a) / a) * 10000;
+    }
+  }
+  btcLeadLagSnapshot = {
+    slopeBpsPerBar: Number.isFinite(sig.slopeBpsPerBar) ? sig.slopeBpsPerBar : null,
+    projectedBps: Number.isFinite(sig.projectedBps) ? sig.projectedBps : null,
+    recentReturnBps,
+    volumeRatio: Number.isFinite(sig.volumeRatio) ? sig.volumeRatio : null,
+    capturedAt: Date.now(),
+  };
+}
+function getBtcLeadLagSnapshot() {
+  if (!btcLeadLagSnapshot) return null;
+  const ageMs = Date.now() - btcLeadLagSnapshot.capturedAt;
+  if (ageMs > BTC_LEAD_LAG_MAX_AGE_MS) return null;
+  return { ...btcLeadLagSnapshot, ageMs };
+}
 
 let entryManagerRunning = false;
 let exitManagerRunning = false;
@@ -1493,9 +1616,26 @@ async function scanAndEnter() {
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
       const sig = await getPredictionSignal(pair);
+      if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
       if (!sig.ok) {
         rejectTrade(pair, sig.reason || 'prediction_rejected');
         continue;
+      }
+
+      // Optional orderbook imbalance fetch. Only fires when the env flag is
+      // on so the default deployment makes zero extra API calls. Stored as
+      // a separate variable rather than mutating `sig` so the predictor
+      // stays a pure function.
+      let bookImbalance = null;
+      if (ORDERBOOK_IMBALANCE_FEATURE_ENABLED) {
+        try {
+          const obPayload = await fetchCryptoOrderbooks({ symbols: [pair] });
+          const book = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+          bookImbalance = computeOrderbookImbalance(book, ORDERBOOK_IMBALANCE_LEVELS);
+        } catch (err) {
+          // Non-fatal — feature is observational. Log but don't reject.
+          console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
+        }
       }
       const needed = requiredEdgeBps(spreadBps, sig.volatilityBps);
 
@@ -1700,6 +1840,12 @@ async function scanAndEnter() {
           stopLossHorizonBars: STOP_LOSS_HORIZON_BARS,
           stopOverSpreadBps: STOP_OVER_SPREAD_BPS,
           htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
+          volumeRatio: Number.isFinite(sig.volumeRatio) ? sig.volumeRatio : null,
+          volumeWeightedSlopeBps: Number.isFinite(sig.volumeWeightedSlopeBps) ? sig.volumeWeightedSlopeBps : null,
+          recentVolumeMean: Number.isFinite(sig.recentVolumeMean) ? sig.recentVolumeMean : null,
+          btcLeadLag: pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot(),
+          bookImbalance,
+          bookImbalanceFeatureEnabled: ORDERBOOK_IMBALANCE_FEATURE_ENABLED,
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
         tradePredictions.set(pair, {
@@ -1751,6 +1897,11 @@ async function scanAndEnter() {
           volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
           volatilityBps: prediction.volatilityBps,
           htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
+          volumeRatio: prediction.volumeRatio,
+          volumeWeightedSlopeBps: prediction.volumeWeightedSlopeBps,
+          btcRecentReturnBps: prediction.btcLeadLag?.recentReturnBps ?? null,
+          btcLeadLagAgeMs: prediction.btcLeadLag?.ageMs ?? null,
+          bookImbalance: prediction.bookImbalance,
         });
         summary.entered += 1;
         summary.acceptedSymbols.push(pair);
@@ -2397,6 +2548,10 @@ module.exports = {
   normalizeSymbolsParam,
   fetchCryptoQuotes,
   fetchCryptoTrades,
+  fetchCryptoOrderbooks,
+  computeOrderbookImbalance,
+  recordBtcLeadLagSnapshot,
+  getBtcLeadLagSnapshot,
   fetchCryptoBars,
   fetchStockQuotes,
   fetchStockTrades,
