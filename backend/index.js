@@ -1874,8 +1874,15 @@ const backtestSkipReason = (() => {
 if (backtestSkipReason) {
   console.log('backtest_autorun_skipped', { reason: backtestSkipReason });
 } else {
+  // Read the LIVE fraction the same way trade.js does (env override, else
+  // default 1.0) and pass it explicitly to the primary backtest so the
+  // backtester always mirrors what the engine is actually doing — even if
+  // someone sets SIGNAL_TARGET_FRACTION via env without changing code.
+  const liveSignalTargetFraction = Number.isFinite(Number(process.env.SIGNAL_TARGET_FRACTION))
+    ? Number(process.env.SIGNAL_TARGET_FRACTION)
+    : 1.0;
   setTimeout(async () => {
-    await runBacktestAndStore({}, 'primary').catch(() => {});
+    await runBacktestAndStore({ signalTargetFraction: liveSignalTargetFraction }, 'primary').catch(() => {});
     if (BACKTEST_AUTORUN_AB_ENABLED) {
       // Chain the A/B run after the primary so we don't trip the
       // backtestRunning guard. Only signalTargetFraction differs; everything
