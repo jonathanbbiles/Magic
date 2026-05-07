@@ -45,6 +45,12 @@ const DEFAULTS = {
   feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
   breakevenTimeoutMin: 240,              // BREAKEVEN_TIMEOUT_MS / 60_000
   cooldownAfterEntryBars: 5,             // refuse re-entry on same symbol for N bars after each entry
+  // Top-detection candidate gates (matches trade.js env knobs). Default 0
+  // = off, matching the live default. Override to A/B against gate-on.
+  minVolumeRatio: 0,                     // matches MIN_VOLUME_RATIO_TO_ENTER
+  maxBtcLeadLagDropBps: 0,               // matches MAX_BTC_LEAD_LAG_DROP_BPS
+  // Lookback used for BTC lead-lag return (matches recordBtcLeadLagSnapshot)
+  btcLeadLagLookbackBars: 5,
   json: false,
 };
 
@@ -129,14 +135,49 @@ async function fetchAllBars({ symbol, start, end, dataBase, headers }) {
 }
 
 // Replay one symbol bar-by-bar. Returns an array of trade outcomes.
-function replaySymbol(bars, opts) {
+// Build a timestamp→close-index map for BTC bars so per-entry lookups are O(1).
+function buildBtcIndex(btcBars) {
+  if (!Array.isArray(btcBars) || !btcBars.length) return null;
+  const closes = btcBars.map((b) => Number(b?.c));
+  const tsMs = btcBars.map((b) => Date.parse(b?.t));
+  // Map from minute-floor timestamp to bar index (handles micro-timing drift)
+  const byTs = new Map();
+  for (let i = 0; i < btcBars.length; i += 1) {
+    if (Number.isFinite(tsMs[i])) byTs.set(Math.floor(tsMs[i] / 60_000), i);
+  }
+  return { closes, tsMs, byTs };
+}
+
+function btcRecentReturnAt(idx, btcIdx, lookbackBars) {
+  if (!btcIdx) return null;
+  if (idx < lookbackBars) return null;
+  const past = btcIdx.closes[idx - lookbackBars];
+  const now = btcIdx.closes[idx];
+  if (!Number.isFinite(past) || !Number.isFinite(now) || past <= 0) return null;
+  return ((now - past) / past) * 10000;
+}
+
+function replaySymbol(bars, opts, btcBars = null) {
   const trades = [];
   if (!Array.isArray(bars) || bars.length < opts.predictBars + 2) return trades;
   let cooldownUntilIdx = -1;
   const closes = bars.map((b) => Number(b?.c));
   const highs = bars.map((b) => Number(b?.h));
   const lows = bars.map((b) => Number(b?.l));
+  const volumes = bars.map((b) => Number(b?.v));
   const tsMs = bars.map((b) => Date.parse(b?.t));
+
+  // For BTC lead-lag we need to align this symbol's timestamps to BTC's bars.
+  // Build the index once; resolve per-bar at gate-eval time.
+  const useBtcGate = opts.maxBtcLeadLagDropBps < 0
+    && btcBars
+    && bars[0]?.S !== 'BTC/USD'
+    && opts.btcSymbol !== bars[0]?.S;
+  const btcIdx = useBtcGate ? buildBtcIndex(btcBars) : null;
+
+  // Per-symbol stats (skip-reason counts) so callers can see why entries were
+  // refused under different gate configs.
+  const stats = { skipped: { volume_below_min: 0, btc_leading_drop: 0 } };
 
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
@@ -146,6 +187,40 @@ function replaySymbol(bars, opts) {
     if (!sig) continue;
     if (!(sig.tStat > 0)) continue;
     if (sig.projectedBps < opts.minProjectedBps) continue;
+
+    // Volume confirmation gate (matches trade.js MIN_VOLUME_RATIO_TO_ENTER).
+    // Skip when recent-window volume is faded vs the OLS-window average.
+    if (opts.minVolumeRatio > 0) {
+      const winVols = volumes.slice(i - opts.predictBars, i).filter((v) => Number.isFinite(v) && v >= 0);
+      if (winVols.length >= 4) {
+        const totalVolMean = winVols.reduce((s, v) => s + v, 0) / winVols.length;
+        const recentN = Math.max(3, Math.floor(winVols.length / 4));
+        const recentSlice = winVols.slice(-recentN);
+        const recentMean = recentSlice.reduce((s, v) => s + v, 0) / recentSlice.length;
+        if (totalVolMean > 0) {
+          const ratio = recentMean / totalVolMean;
+          if (ratio < opts.minVolumeRatio) {
+            stats.skipped.volume_below_min += 1;
+            continue;
+          }
+        }
+      }
+    }
+
+    // BTC lead-lag gate (matches trade.js MAX_BTC_LEAD_LAG_DROP_BPS). Look up
+    // BTC's last-N-bar return as of this symbol's bar timestamp; refuse if
+    // BTC dropped harder than the threshold.
+    if (btcIdx && opts.maxBtcLeadLagDropBps < 0) {
+      const minute = Math.floor(tsMs[i] / 60_000);
+      const btcBarIdx = btcIdx.byTs.get(minute);
+      if (Number.isFinite(btcBarIdx)) {
+        const btcReturn = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+        if (Number.isFinite(btcReturn) && btcReturn < opts.maxBtcLeadLagDropBps) {
+          stats.skipped.btc_leading_drop += 1;
+          continue;
+        }
+      }
+    }
 
     const entryPrice = Number(bars[i].c);
     if (!Number.isFinite(entryPrice) || entryPrice <= 0) continue;
@@ -196,6 +271,10 @@ function replaySymbol(bars, opts) {
     cooldownUntilIdx = entryIdx + opts.cooldownAfterEntryBars;
   }
 
+  // Stats are attached as a non-enumerable so existing array-based assertions
+  // (length, .filter, etc.) still work, but callers that want skip-reason
+  // counts can read them off `trades.gateSkipped`.
+  Object.defineProperty(trades, 'gateSkipped', { value: stats.skipped, enumerable: false });
   return trades;
 }
 
@@ -311,18 +390,43 @@ async function runBacktest(overrides = {}) {
   }
   if (!opts.end) opts.end = new Date().toISOString();
 
+  // Fetch BTC bars first so non-BTC symbols can use them for the lead-lag
+  // gate. If BTC is in the test universe we'll reuse the same bars; if not,
+  // we still pre-fetch when the gate is enabled.
+  const btcSymbol = 'BTC/USD';
+  const btcLeadLagActive = opts.maxBtcLeadLagDropBps < 0;
+  const barsBySymbol = {};
+  if (btcLeadLagActive && !symbols.includes(btcSymbol)) {
+    try {
+      barsBySymbol[btcSymbol] = await fetchAllBars({ symbol: btcSymbol, start: opts.start, end: opts.end, dataBase, headers });
+    } catch (err) {
+      // Non-fatal — gate just becomes a no-op for this run.
+      barsBySymbol[btcSymbol] = [];
+    }
+  }
+
   const perSymbol = {};
   let allTrades = [];
+  let totalGateSkips = { volume_below_min: 0, btc_leading_drop: 0 };
   for (const symbol of symbols) {
     let bars = [];
     try {
-      bars = await fetchAllBars({ symbol, start: opts.start, end: opts.end, dataBase, headers });
+      bars = barsBySymbol[symbol] || await fetchAllBars({ symbol, start: opts.start, end: opts.end, dataBase, headers });
+      barsBySymbol[symbol] = bars;
     } catch (err) {
       perSymbol[symbol] = { error: err?.message || String(err) };
       continue;
     }
-    const trades = replaySymbol(bars, opts).map((t) => ({ ...t, symbol }));
-    perSymbol[symbol] = { ...summarise(trades), barsFetched: bars.length };
+    const btcBars = symbol === btcSymbol ? null : barsBySymbol[btcSymbol] || null;
+    const tradesArr = replaySymbol(bars, opts, btcBars);
+    const trades = tradesArr.map((t) => ({ ...t, symbol }));
+    perSymbol[symbol] = {
+      ...summarise(trades),
+      barsFetched: bars.length,
+      gateSkipped: tradesArr.gateSkipped || { volume_below_min: 0, btc_leading_drop: 0 },
+    };
+    totalGateSkips.volume_below_min += perSymbol[symbol].gateSkipped.volume_below_min;
+    totalGateSkips.btc_leading_drop += perSymbol[symbol].gateSkipped.btc_leading_drop;
     allTrades = allTrades.concat(trades);
   }
   const overall = summarise(allTrades);
@@ -339,9 +443,13 @@ async function runBacktest(overrides = {}) {
       signalTargetMaxNetBps: opts.signalTargetMaxNetBps,
       feeBpsRoundTrip: opts.feeBpsRoundTrip,
       breakevenTimeoutMin: opts.breakevenTimeoutMin,
+      minVolumeRatio: opts.minVolumeRatio,
+      maxBtcLeadLagDropBps: opts.maxBtcLeadLagDropBps,
+      btcLeadLagLookbackBars: opts.btcLeadLagLookbackBars,
     },
     perSymbol,
     overall,
+    gateSkipped: totalGateSkips,
   };
 }
 
