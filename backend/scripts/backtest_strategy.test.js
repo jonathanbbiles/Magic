@@ -89,6 +89,105 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
   assert.equal(s.winRateAmongFills, 2 / 3);   // tp + staircase have positive net
 }
 
+// Volume gate: declining volume in the recent window blocks entries.
+{
+  const opts = {
+    predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+    targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+    minVolumeRatio: 0.8, maxBtcLeadLagDropBps: 0,
+  };
+  // Steady uptrend with HEAVY decay in volume in the last 25% of bars.
+  // Last quarter has volume 50, rest has 1000 → recent ratio ≈ 0.13 < 0.8.
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 60; i += 1) {
+    p *= 1 + 5 / 10000;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: p, h: p * 1.001, l: p * 0.999, c: p,
+      v: i >= 45 ? 50 : 1000,
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  // Some entries can fire BEFORE bar 45 (window=10 means OLS is on bars
+  // i-10..i-1). What matters: entries near the volume cliff are blocked.
+  assert.ok(trades.gateSkipped.volume_below_min > 0, 'volume gate should fire on volume cliff');
+}
+
+// BTC lead-lag gate: alt entries blocked when BTC has dropped sharply.
+{
+  const opts = {
+    predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+    targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+    minVolumeRatio: 0, maxBtcLeadLagDropBps: -5,
+    btcLeadLagLookbackBars: 5,
+  };
+  // Symbol is going up (would normally enter every bar)
+  const altBars = [];
+  let p = 100;
+  for (let i = 0; i < 60; i += 1) {
+    p *= 1 + 5 / 10000;
+    altBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: p, h: p * 1.001, l: p * 0.999, c: p, v: 1000,
+      S: 'ALT/USD',
+    });
+  }
+  // BTC is dropping by 10 bps/bar over the same window — recent return
+  // looking back 5 bars is well below -5 bps everywhere.
+  const btcBars = [];
+  let bp = 80000;
+  for (let i = 0; i < 60; i += 1) {
+    bp *= 1 - 10 / 10000;
+    btcBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: bp, h: bp * 1.0005, l: bp * 0.999, c: bp, v: 1000,
+      S: 'BTC/USD',
+    });
+  }
+  const trades = replaySymbol(altBars, opts, btcBars);
+  assert.ok(trades.gateSkipped.btc_leading_drop > 0, 'BTC lead-lag gate should block alt entries when BTC is plunging');
+  // With BTC plunging on every candidate bar, EVERY potential entry should
+  // be blocked → zero trades fire.
+  assert.equal(trades.length, 0, 'no trades when BTC is in steady freefall');
+}
+
+// BTC lead-lag gate: alt entries proceed when BTC is rising.
+{
+  const opts = {
+    predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+    targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+    minVolumeRatio: 0, maxBtcLeadLagDropBps: -5,
+    btcLeadLagLookbackBars: 5,
+  };
+  const altBars = [];
+  let p = 100;
+  for (let i = 0; i < 60; i += 1) {
+    p *= 1 + 5 / 10000;
+    altBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: p, h: p * 1.001, l: p * 0.999, c: p, v: 1000,
+      S: 'ALT/USD',
+    });
+  }
+  const btcBars = [];
+  let bp = 80000;
+  for (let i = 0; i < 60; i += 1) {
+    bp *= 1 + 5 / 10000;          // BTC rising
+    btcBars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+      o: bp, h: bp * 1.001, l: bp * 0.999, c: bp, v: 1000,
+      S: 'BTC/USD',
+    });
+  }
+  const trades = replaySymbol(altBars, opts, btcBars);
+  assert.equal(trades.gateSkipped.btc_leading_drop, 0, 'BTC gate should NOT fire when BTC is rising');
+  assert.ok(trades.length > 0, 'should produce trades when both ALT and BTC are uptrending');
+}
+
 // runBacktest with a mocked global fetch (intercepts the Alpaca bars endpoint).
 {
   const origFetch = global.fetch;

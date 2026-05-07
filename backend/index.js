@@ -596,10 +596,18 @@ const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DA
 // always have a side-by-side comparison vs the live setting. Default OFF
 // would defeat the user's "no shell access" workflow, so this is ON.
 const BACKTEST_AUTORUN_AB_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_AB_ENABLED || 'true').toLowerCase());
-// Default alt = 0.5 (the previous live setting) so the A/B keeps producing
-// a useful side-by-side after we flipped live to 1.0. Override via env if
-// you want to re-test something else.
-const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || 0.5;
+// Auto-run alt slot used to compare top-detection gates against the
+// gate-off baseline. Primary always runs gate-off (live config); alt runs
+// the same fraction with the suggested gate thresholds enabled. Override
+// via env if you want to test different thresholds.
+const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || null;
+const BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO = Number(process.env.BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO) || 0.8;
+const BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS = (() => {
+  const raw = process.env.BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS;
+  if (raw == null || raw === '') return -5;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : -5;
+})();
 let lastBacktestResult = null;
 let lastBacktestAlt = null;
 let lastBacktestError = null;
@@ -624,6 +632,8 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.minProjectedBps != null ? { minProjectedBps: Number(overrides.minProjectedBps) } : {}),
       ...(overrides.signalTargetFraction != null ? { signalTargetFraction: Number(overrides.signalTargetFraction) } : {}),
       ...(overrides.targetNetBps != null ? { targetNetBps: Number(overrides.targetNetBps) } : {}),
+      ...(overrides.minVolumeRatio != null ? { minVolumeRatio: Number(overrides.minVolumeRatio) } : {}),
+      ...(overrides.maxBtcLeadLagDropBps != null ? { maxBtcLeadLagDropBps: Number(overrides.maxBtcLeadLagDropBps) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -658,6 +668,8 @@ app.get('/debug/backtest', async (req, res) => {
     targetNetBps: req.query.targetNetBps,
     predictBars: req.query.predictBars,
     symbols: req.query.symbols,
+    minVolumeRatio: req.query.minVolumeRatio,
+    maxBtcLeadLagDropBps: req.query.maxBtcLeadLagDropBps,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});
@@ -1056,7 +1068,16 @@ app.get('/dashboard', async (req, res) => {
           params: lastBacktestAlt.params,
           overall: lastBacktestAlt.overall,
           perSymbol: lastBacktestAlt.perSymbol,
-          note: `A/B vs primary — only signalTargetFraction differs (alt=${lastBacktestAlt.params?.signalTargetFraction}, primary=${lastBacktestResult?.params?.signalTargetFraction ?? 'n/a'})`,
+          note: (() => {
+            const altP = lastBacktestAlt.params || {};
+            const priP = lastBacktestResult?.params || {};
+            const diffs = [];
+            if (altP.signalTargetFraction !== priP.signalTargetFraction) diffs.push(`fraction: alt=${altP.signalTargetFraction}, primary=${priP.signalTargetFraction ?? 'n/a'}`);
+            if (altP.minVolumeRatio !== priP.minVolumeRatio) diffs.push(`minVolumeRatio: alt=${altP.minVolumeRatio}, primary=${priP.minVolumeRatio ?? 0}`);
+            if (altP.maxBtcLeadLagDropBps !== priP.maxBtcLeadLagDropBps) diffs.push(`maxBtcLeadLagDropBps: alt=${altP.maxBtcLeadLagDropBps}, primary=${priP.maxBtcLeadLagDropBps ?? 0}`);
+            return diffs.length ? `A/B vs primary — ${diffs.join('; ')}` : 'A/B vs primary — params identical (gate thresholds match)';
+          })(),
+          gateSkipped: lastBacktestAlt.gateSkipped || null,
         } : null,
         connectionState: {
           hasLastHttpError: Boolean(lastError),
@@ -1874,20 +1895,37 @@ const backtestSkipReason = (() => {
 if (backtestSkipReason) {
   console.log('backtest_autorun_skipped', { reason: backtestSkipReason });
 } else {
-  // Read the LIVE fraction the same way trade.js does (env override, else
-  // default 1.0) and pass it explicitly to the primary backtest so the
-  // backtester always mirrors what the engine is actually doing — even if
-  // someone sets SIGNAL_TARGET_FRACTION via env without changing code.
+  // Read the LIVE config the same way trade.js does so the backtester
+  // mirrors what the engine is actually doing — even when someone sets env
+  // vars without changing code.
   const liveSignalTargetFraction = Number.isFinite(Number(process.env.SIGNAL_TARGET_FRACTION))
     ? Number(process.env.SIGNAL_TARGET_FRACTION)
     : 1.0;
+  const liveMinVolumeRatio = Number.isFinite(Number(process.env.MIN_VOLUME_RATIO_TO_ENTER))
+    ? Number(process.env.MIN_VOLUME_RATIO_TO_ENTER)
+    : 0;
+  const liveMaxBtcDropBps = Number.isFinite(Number(process.env.MAX_BTC_LEAD_LAG_DROP_BPS))
+    ? Number(process.env.MAX_BTC_LEAD_LAG_DROP_BPS)
+    : 0;
   setTimeout(async () => {
-    await runBacktestAndStore({ signalTargetFraction: liveSignalTargetFraction }, 'primary').catch(() => {});
+    await runBacktestAndStore({
+      signalTargetFraction: liveSignalTargetFraction,
+      minVolumeRatio: liveMinVolumeRatio,
+      maxBtcLeadLagDropBps: liveMaxBtcDropBps,
+    }, 'primary').catch(() => {});
     if (BACKTEST_AUTORUN_AB_ENABLED) {
-      // Chain the A/B run after the primary so we don't trip the
-      // backtestRunning guard. Only signalTargetFraction differs; everything
-      // else mirrors live so the comparison is apples-to-apples.
-      await runBacktestAndStore({ signalTargetFraction: BACKTEST_AUTORUN_AB_FRACTION }, 'alt').catch(() => {});
+      // Alt run = same fraction as live + suggested gate thresholds turned
+      // ON. Lets the dashboard show gate-on vs gate-off side by side. If a
+      // BACKTEST_AUTORUN_AB_FRACTION override is also set, that wins so
+      // existing fraction-A/B users aren't surprised.
+      const altFraction = BACKTEST_AUTORUN_AB_FRACTION != null
+        ? BACKTEST_AUTORUN_AB_FRACTION
+        : liveSignalTargetFraction;
+      await runBacktestAndStore({
+        signalTargetFraction: altFraction,
+        minVolumeRatio: BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO,
+        maxBtcLeadLagDropBps: BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS,
+      }, 'alt').catch(() => {});
     }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
