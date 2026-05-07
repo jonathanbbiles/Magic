@@ -60,8 +60,8 @@ function readList(name, fallback = []) {
 // take many bites. Allowed range 5..50 bps net (= 0.05%..0.50% net of fees);
 // raise this above 50 only with deliberate intent — wider targets fill less
 // often and break the small-win/small-stop symmetry. Default lowered from
-// 15 to 8 bps net so the SIGNAL_TARGET_FRACTION multiplier (default 0.5,
-// see deriveSignalTargetNetBps below) actually has room to bite for typical
+// 15 to 8 bps net so the SIGNAL_TARGET_FRACTION multiplier (see
+// deriveSignalTargetNetBps below) actually has room to bite for typical
 // projections; with the old 15-bps floor the fractional formula was a no-op.
 const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(5, readNumber('TARGET_NET_PROFIT_BPS', 8)));
 // Round-trip Alpaca crypto fees, in basis points. Default reflects taker
@@ -326,16 +326,19 @@ const BARRIER_HORIZON_BARS = Math.max(1, readNumber(
 // and capped at SIGNAL_TARGET_MAX_NET_BPS. Confident signals get bigger TPs;
 // weak signals fall back to the floor. Wins are no longer all the same size.
 //
-// SIGNAL_TARGET_FRACTION (default 0.5) is the operator-tunable knob: target
-// is `fraction × projectedBps − fees`. Setting it to 0.5 means we aim to fill
-// at half the predicted move. Under unbiased predictions (~50/50 over/under)
-// targeting 100% of the projection only fills when the move reaches its FULL
-// predicted magnitude — roughly a 30–50% fill rate. Targeting half-distance
-// trades smaller-per-trade profit for materially higher fill probability;
-// the resulting expected $ per trade is usually higher because fill-rate gain
-// outpaces TP shrinkage. Set fraction=1.0 to revert to the old behaviour.
+// SIGNAL_TARGET_FRACTION (default 1.0) is the operator-tunable knob: target
+// is `fraction × projectedBps − fees`. Setting it to 1.0 means we aim to
+// fill at the full predicted move; the staircase exit catches the misses
+// at break-even or above (97% fill rate observed) so the lower-than-it-
+// looks TP fill rate doesn't hurt expectancy. The original ship default
+// was 0.5 (target half the move for higher fill rate), but a 30-day
+// 12-symbol Alpaca-bar backtest measured fraction=1.0 at +5.73 bps/entry
+// vs +3.97 bps/entry for fraction=0.5 — a 44% boost with virtually
+// identical risk profile (stuck rate moved by 0.1pp). Reverted to 1.0
+// based on that data; flip back to 0.5 here or via env if you want to
+// re-test.
 const SIGNAL_SIZED_EXIT_ENABLED = readBoolean('SIGNAL_SIZED_EXIT_ENABLED', true);
-const SIGNAL_TARGET_FRACTION = Math.min(2, Math.max(0.1, readNumber('SIGNAL_TARGET_FRACTION', 0.5)));
+const SIGNAL_TARGET_FRACTION = Math.min(2, Math.max(0.1, readNumber('SIGNAL_TARGET_FRACTION', 1.0)));
 const SIGNAL_TARGET_MAX_NET_BPS = Math.min(
   50,
   Math.max(TARGET_NET_PROFIT_BPS, readNumber('SIGNAL_TARGET_MAX_NET_BPS', 50)),
