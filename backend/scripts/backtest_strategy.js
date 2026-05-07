@@ -39,7 +39,7 @@ const DEFAULTS = {
   end: null,                             // ISO date — defaults to today
   predictBars: 20,                       // matches live PREDICT_BARS
   minProjectedBps: 15,                   // matches live MIN_PROJECTED_BPS_TO_ENTER
-  signalTargetFraction: 0.5,             // matches live SIGNAL_TARGET_FRACTION
+  signalTargetFraction: 1.0,             // matches live SIGNAL_TARGET_FRACTION
   targetNetBps: 8,                       // matches live TARGET_NET_PROFIT_BPS
   signalTargetMaxNetBps: 50,             // matches live cap
   feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
