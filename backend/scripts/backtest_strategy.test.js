@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { olsSlope, deriveTargetNetBps, replaySymbol, summarise } = require('./backtest_strategy');
+const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = require('./backtest_strategy');
 
 // olsSlope sanity: a clean uptrend should give positive slope and t-stat,
 // flat noise should give near-zero slope.
@@ -89,4 +89,72 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise } = require('./bac
   assert.equal(s.winRateAmongFills, 2 / 3);   // tp + staircase have positive net
 }
 
-console.log('backtest_strategy tests passed');
+// runBacktest with a mocked global fetch (intercepts the Alpaca bars endpoint).
+{
+  const origFetch = global.fetch;
+  const origKey = process.env.APCA_API_KEY_ID;
+  const origSecret = process.env.APCA_API_SECRET_KEY;
+  process.env.APCA_API_KEY_ID = 'test_key';
+  process.env.APCA_API_SECRET_KEY = 'test_secret';
+
+  // Build a tiny synthetic uptrend per symbol.
+  function makeBars(n, p0 = 100) {
+    const bars = [];
+    let p = p0;
+    for (let i = 0; i < n; i += 1) {
+      p *= 1 + 5 / 10000;
+      bars.push({
+        t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+        o: p, h: p * 1.001, l: p * 0.999, c: p, v: 1000,
+      });
+    }
+    return bars;
+  }
+
+  const symbolBars = {
+    'BTC/USD': makeBars(60, 100000),
+    'ETH/USD': makeBars(60, 3000),
+  };
+
+  global.fetch = async (url) => {
+    const u = new URL(url);
+    const symbols = u.searchParams.get('symbols');
+    const bars = symbolBars[symbols] || [];
+    return {
+      ok: true,
+      status: 200,
+      async json() { return { bars: { [symbols]: bars }, next_page_token: null }; },
+    };
+  };
+
+  (async () => {
+    const result = await runBacktest({
+      symbols: ['BTC/USD', 'ETH/USD'],
+      start: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      windowDays: 1,
+      predictBars: 10,
+      minProjectedBps: 5,
+      signalTargetFraction: 0.5,
+      targetNetBps: 8,
+      signalTargetMaxNetBps: 50,
+      feeBpsRoundTrip: 40,
+      breakevenTimeoutMin: 240,
+      cooldownAfterEntryBars: 20,
+    });
+    assert.ok(result.ranAt, 'should set ranAt');
+    assert.ok(result.params, 'should echo params');
+    assert.ok(result.perSymbol['BTC/USD'], 'BTC should have stats');
+    assert.ok(result.perSymbol['ETH/USD'], 'ETH should have stats');
+    assert.ok(result.overall.entries > 0, 'should produce entries on uptrend');
+
+    global.fetch = origFetch;
+    if (origKey === undefined) delete process.env.APCA_API_KEY_ID; else process.env.APCA_API_KEY_ID = origKey;
+    if (origSecret === undefined) delete process.env.APCA_API_SECRET_KEY; else process.env.APCA_API_SECRET_KEY = origSecret;
+    console.log('backtest_strategy tests passed');
+  })().catch((err) => {
+    global.fetch = origFetch;
+    console.error(err);
+    process.exit(1);
+  });
+}

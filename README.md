@@ -65,6 +65,20 @@ Three features are computed every scan and dropped into the `entry_submitted` lo
 
 Run `npm run backtest` with new gate ideas (`--min-projected-bps=20`, `--signal-target-fraction=1.0`, etc.) before wiring any of these into the live gate.
 
+### Backtest auto-run (no shell access required)
+
+The bot also runs the backtester automatically ~60 seconds after every server start, against the last `BACKTEST_AUTORUN_DAYS=30` of bars for the configured universe. The result is parked in memory and surfaced under `meta.backtest` on `/dashboard`, so anyone polling the dashboard can read fresh historical-replay stats every time Render redeploys without ever opening a shell.
+
+On-demand parameter sweeps via the same path:
+```
+GET /debug/backtest                                          → cached result if any
+GET /debug/backtest?refresh=true                             → re-run with default params
+GET /debug/backtest?days=60&signalTargetFraction=1.0         → re-run with overrides (waits for completion)
+GET /debug/backtest?wait=false&minProjectedBps=25            → kick off in background, return immediately
+```
+
+Disable with `BACKTEST_AUTORUN_ENABLED=false` (e.g. while debugging unrelated startup issues that you don't want competing with ~10 minutes of Alpaca data calls).
+
 ## The math, briefly
 
 - **Entry signal** (`backend/modules/entryProbability.js`): OLS slope on recent 1m closes → t-statistic → logistic CDF for `pUp` ∈ [0, 1].

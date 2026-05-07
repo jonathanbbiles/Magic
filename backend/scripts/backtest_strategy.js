@@ -289,8 +289,64 @@ async function main() {
   process.stdout.write(`winRateAmongFills=${overall.winRateAmongFills == null ? '—' : (overall.winRateAmongFills*100).toFixed(0)}% medianHoldMin=${overall.medianHoldMin}\n`);
 }
 
+// Programmatic entry point. Same fetch + replay pipeline as the CLI but
+// callable in-process from index.js so the bot can auto-run a backtest on
+// startup and surface the result on /dashboard. Pass overrides for the
+// tunable params; everything not specified falls back to DEFAULTS or the
+// values the live engine uses.
+async function runBacktest(overrides = {}) {
+  const opts = { ...DEFAULTS, ...overrides };
+  const symbols = Array.isArray(opts.symbols)
+    ? opts.symbols
+    : String(opts.symbols).split(',').map((s) => s.trim()).filter(Boolean);
+  const dataBase = (opts.dataBase || process.env.DATA_BASE || 'https://data.alpaca.markets').replace(/\/+$/, '');
+  const keyId = opts.apiKey || process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY;
+  const secret = opts.apiSecret || process.env.APCA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY || process.env.ALPACA_API_SECRET_KEY;
+  if (!keyId || !secret) throw new Error('missing_alpaca_credentials');
+  const headers = { 'APCA-API-KEY-ID': keyId, 'APCA-API-SECRET-KEY': secret };
+
+  if (!opts.start) {
+    const days = Number.isFinite(opts.windowDays) ? opts.windowDays : 30;
+    opts.start = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  }
+  if (!opts.end) opts.end = new Date().toISOString();
+
+  const perSymbol = {};
+  let allTrades = [];
+  for (const symbol of symbols) {
+    let bars = [];
+    try {
+      bars = await fetchAllBars({ symbol, start: opts.start, end: opts.end, dataBase, headers });
+    } catch (err) {
+      perSymbol[symbol] = { error: err?.message || String(err) };
+      continue;
+    }
+    const trades = replaySymbol(bars, opts).map((t) => ({ ...t, symbol }));
+    perSymbol[symbol] = { ...summarise(trades), barsFetched: bars.length };
+    allTrades = allTrades.concat(trades);
+  }
+  const overall = summarise(allTrades);
+  return {
+    ranAt: new Date().toISOString(),
+    params: {
+      symbols,
+      start: opts.start,
+      end: opts.end,
+      predictBars: opts.predictBars,
+      minProjectedBps: opts.minProjectedBps,
+      signalTargetFraction: opts.signalTargetFraction,
+      targetNetBps: opts.targetNetBps,
+      signalTargetMaxNetBps: opts.signalTargetMaxNetBps,
+      feeBpsRoundTrip: opts.feeBpsRoundTrip,
+      breakevenTimeoutMin: opts.breakevenTimeoutMin,
+    },
+    perSymbol,
+    overall,
+  };
+}
+
 if (require.main === module) {
   main().catch((err) => { console.error(err); process.exit(1); });
 }
 
-module.exports = { olsSlope, deriveTargetNetBps, replaySymbol, summarise };
+module.exports = { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest, fetchAllBars };
