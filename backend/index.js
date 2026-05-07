@@ -596,7 +596,10 @@ const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DA
 // always have a side-by-side comparison vs the live setting. Default OFF
 // would defeat the user's "no shell access" workflow, so this is ON.
 const BACKTEST_AUTORUN_AB_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_AB_ENABLED || 'true').toLowerCase());
-const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || 1.0;
+// Default alt = 0.5 (the previous live setting) so the A/B keeps producing
+// a useful side-by-side after we flipped live to 1.0. Override via env if
+// you want to re-test something else.
+const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || 0.5;
 let lastBacktestResult = null;
 let lastBacktestAlt = null;
 let lastBacktestError = null;
