@@ -168,11 +168,15 @@ function replaySymbol(bars, opts, btcBars = null) {
   const tsMs = bars.map((b) => Date.parse(b?.t));
 
   // For BTC lead-lag we need to align this symbol's timestamps to BTC's bars.
-  // Build the index once; resolve per-bar at gate-eval time.
-  const useBtcGate = opts.maxBtcLeadLagDropBps < 0
-    && btcBars
-    && bars[0]?.S !== 'BTC/USD'
-    && opts.btcSymbol !== bars[0]?.S;
+  // Build the index once; resolve per-bar at gate-eval time. The caller
+  // (runBacktest) is responsible for passing btcBars=null when the symbol
+  // being replayed IS BTC; we just check that we have bars and the gate
+  // is enabled. (Earlier versions of this check also gated on bars[0]?.S
+  // and opts.btcSymbol — but neither is reliably populated by the
+  // pipeline, and `undefined !== undefined === false` short-circuited the
+  // whole gate to OFF on every symbol. Bug observed live: 30 days, 11
+  // symbols, 0 BTC-gate firings.)
+  const useBtcGate = Number(opts.maxBtcLeadLagDropBps) < 0 && Array.isArray(btcBars) && btcBars.length > 0;
   const btcIdx = useBtcGate ? buildBtcIndex(btcBars) : null;
 
   // Per-symbol stats (skip-reason counts) so callers can see why entries were
