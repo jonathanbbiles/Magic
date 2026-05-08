@@ -592,24 +592,47 @@ app.get('/health', (req, res) => {
 const BACKTEST_AUTORUN_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_ENABLED || 'true').toLowerCase());
 const BACKTEST_AUTORUN_DELAY_MS = Math.max(5_000, Number(process.env.BACKTEST_AUTORUN_DELAY_MS) || 60_000);
 const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DAYS) || 30);
-// A/B: run a SECOND backtest with the alternate signalTargetFraction so we
-// always have a side-by-side comparison vs the live setting. Default OFF
-// would defeat the user's "no shell access" workflow, so this is ON.
+// A/B: master switch for the two alt backtest runs (alt + alt2). When ON,
+// after the primary completes we run two more backtests with one gate
+// isolated each, so the dashboard always has a side-by-side comparison vs
+// the live setting. Default OFF would defeat the user's "no shell access"
+// workflow, so this is ON.
 const BACKTEST_AUTORUN_AB_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_AB_ENABLED || 'true').toLowerCase());
-// Auto-run alt slot used to compare top-detection gates against the
-// gate-off baseline. Primary always runs gate-off (live config); alt runs
-// the same fraction with the suggested gate thresholds enabled. Override
-// via env if you want to test different thresholds.
+// Auto-run alt slots used to compare top-detection gates against the
+// gate-off baseline. Primary always runs gate-off (live config). Alt slots
+// each isolate ONE gate so we can attribute the impact:
+//   - alt  : looser BTC lead-lag (default -15 bps), volume gate off
+//   - alt2 : tighter volume ratio (default 1.2), BTC gate off
+// Override via env if you want to test different thresholds.
 const BACKTEST_AUTORUN_AB_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB_FRACTION) || null;
-const BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO = Number(process.env.BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO) || 0.8;
+const BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO;
+  if (raw == null || raw === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+})();
 const BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS = (() => {
   const raw = process.env.BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS;
-  if (raw == null || raw === '') return -5;
+  if (raw == null || raw === '') return -15;
   const n = Number(raw);
-  return Number.isFinite(n) ? n : -5;
+  return Number.isFinite(n) ? n : -15;
+})();
+const BACKTEST_AUTORUN_AB2_FRACTION = Number(process.env.BACKTEST_AUTORUN_AB2_FRACTION) || null;
+const BACKTEST_AUTORUN_AB2_MIN_VOLUME_RATIO = (() => {
+  const raw = process.env.BACKTEST_AUTORUN_AB2_MIN_VOLUME_RATIO;
+  if (raw == null || raw === '') return 1.2;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 1.2;
+})();
+const BACKTEST_AUTORUN_AB2_MAX_BTC_DROP_BPS = (() => {
+  const raw = process.env.BACKTEST_AUTORUN_AB2_MAX_BTC_DROP_BPS;
+  if (raw == null || raw === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
 })();
 let lastBacktestResult = null;
 let lastBacktestAlt = null;
+let lastBacktestAlt2 = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -637,6 +660,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
+    else if (slot === 'alt2') lastBacktestAlt2 = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
@@ -1078,6 +1102,23 @@ app.get('/dashboard', async (req, res) => {
             return diffs.length ? `A/B vs primary — ${diffs.join('; ')}` : 'A/B vs primary — params identical (gate thresholds match)';
           })(),
           gateSkipped: lastBacktestAlt.gateSkipped || null,
+        } : null,
+        backtestAlt2: lastBacktestAlt2 ? {
+          ranAt: lastBacktestAlt2.ranAt,
+          windowDays: lastBacktestAlt2.windowDays,
+          params: lastBacktestAlt2.params,
+          overall: lastBacktestAlt2.overall,
+          perSymbol: lastBacktestAlt2.perSymbol,
+          note: (() => {
+            const altP = lastBacktestAlt2.params || {};
+            const priP = lastBacktestResult?.params || {};
+            const diffs = [];
+            if (altP.signalTargetFraction !== priP.signalTargetFraction) diffs.push(`fraction: alt2=${altP.signalTargetFraction}, primary=${priP.signalTargetFraction ?? 'n/a'}`);
+            if (altP.minVolumeRatio !== priP.minVolumeRatio) diffs.push(`minVolumeRatio: alt2=${altP.minVolumeRatio}, primary=${priP.minVolumeRatio ?? 0}`);
+            if (altP.maxBtcLeadLagDropBps !== priP.maxBtcLeadLagDropBps) diffs.push(`maxBtcLeadLagDropBps: alt2=${altP.maxBtcLeadLagDropBps}, primary=${priP.maxBtcLeadLagDropBps ?? 0}`);
+            return diffs.length ? `A/B vs primary — ${diffs.join('; ')}` : 'A/B vs primary — params identical (gate thresholds match)';
+          })(),
+          gateSkipped: lastBacktestAlt2.gateSkipped || null,
         } : null,
         connectionState: {
           hasLastHttpError: Boolean(lastError),
@@ -1914,10 +1955,12 @@ if (backtestSkipReason) {
       maxBtcLeadLagDropBps: liveMaxBtcDropBps,
     }, 'primary').catch(() => {});
     if (BACKTEST_AUTORUN_AB_ENABLED) {
-      // Alt run = same fraction as live + suggested gate thresholds turned
-      // ON. Lets the dashboard show gate-on vs gate-off side by side. If a
-      // BACKTEST_AUTORUN_AB_FRACTION override is also set, that wins so
-      // existing fraction-A/B users aren't surprised.
+      // Two alt runs, each isolating ONE top-detection gate so we can
+      // attribute expectancy impact:
+      //   alt  = looser BTC lead-lag (default -15 bps), volume gate off
+      //   alt2 = tighter volume ratio (default 1.2), BTC gate off
+      // BACKTEST_AUTORUN_AB_FRACTION / BACKTEST_AUTORUN_AB2_FRACTION override
+      // the fraction per slot if set; otherwise both mirror the live fraction.
       const altFraction = BACKTEST_AUTORUN_AB_FRACTION != null
         ? BACKTEST_AUTORUN_AB_FRACTION
         : liveSignalTargetFraction;
@@ -1926,6 +1969,14 @@ if (backtestSkipReason) {
         minVolumeRatio: BACKTEST_AUTORUN_AB_MIN_VOLUME_RATIO,
         maxBtcLeadLagDropBps: BACKTEST_AUTORUN_AB_MAX_BTC_DROP_BPS,
       }, 'alt').catch(() => {});
+      const alt2Fraction = BACKTEST_AUTORUN_AB2_FRACTION != null
+        ? BACKTEST_AUTORUN_AB2_FRACTION
+        : liveSignalTargetFraction;
+      await runBacktestAndStore({
+        signalTargetFraction: alt2Fraction,
+        minVolumeRatio: BACKTEST_AUTORUN_AB2_MIN_VOLUME_RATIO,
+        maxBtcLeadLagDropBps: BACKTEST_AUTORUN_AB2_MAX_BTC_DROP_BPS,
+      }, 'alt2').catch(() => {});
     }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
