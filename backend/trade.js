@@ -88,6 +88,18 @@ const PORTFOLIO_SIZING_PCT = Math.max(0, readNumber('PORTFOLIO_SIZING_PCT', 0.10
 // is typically $1; keep a small default so the last slot can still fill even
 // when cash has drifted just under 10% of equity.
 const MIN_TRADE_NOTIONAL_USD = Math.max(0.01, readNumber('MIN_TRADE_NOTIONAL_USD', 1));
+// Sizing-floor gate. When > 0, refuse entries whose cash-clamped notional is
+// below this fraction of the equity-derived target. Live diagnostics observed
+// fragmented-cash entries firing at ~$1.78 (19% of a ~$9.23 target) and
+// turning into the worst-percent loss in the book; the bot should wait for
+// cash to free up properly rather than deploy a quarter-sized position.
+// Set to 0 to revert to the legacy "fill any size above MIN_TRADE_NOTIONAL_USD"
+// behavior. Capped at 1 because exceeding the target is impossible (the cash
+// clamp only ever shrinks notional, never grows it).
+const MIN_SIZING_FRACTION_OF_TARGET = Math.min(
+  1,
+  Math.max(0, readNumber('MIN_SIZING_FRACTION_OF_TARGET', 0.6)),
+);
 // Concurrency is now bounded by available cash, not a fixed slot count: the
 // engine opens as many positions as PORTFOLIO_SIZING_PCT of equity will fund,
 // one per symbol. There is intentionally no MAX_CONCURRENT_POSITIONS cap.
@@ -318,16 +330,20 @@ const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 3));
 //      This is a pure cost equation — no probabilistic assumption — and
 //      is the floor the user explicitly asked us to enforce.
 //
-// HONEST_EV_GATE_ENABLED is opt-in (default OFF) because it requires an
-// estimate of the average MTM loss on stuck positions, which is regime-
-// dependent. When ON, it computes:
+// HONEST_EV_GATE_ENABLED prices the no-fill branch as a non-zero MTM loss so
+// the asymmetric "no stop-loss + GTC TP only" structure is gated honestly:
 //     E[net] = hitProb × TARGET_NET_PROFIT_BPS - (1 - hitProb) × STUCK_LOSS_ASSUMED_BPS
 // and skips trades whose honest expectancy is below MIN_NET_EDGE_BPS.
-// Defaults are deliberately conservative: 100 bps stuck-loss assumption is
-// the median 1-week MTM hit on a flat-drift simulated stuck position.
+// Default ON: live diagnostics observed entries (e.g. BCH at projectedBps=2.6
+// with honestEvBps=-54, DOGE at honestEvBps=-3.7) clearing the cheaper net-edge
+// gate while having negative honest expectancy — exactly the trades the
+// no-stop design has no way to recover from. Operator can set
+// HONEST_EV_GATE_ENABLED=false to revert to the legacy permissive behavior.
+// 100 bps stuck-loss assumption is the median 1-week MTM hit on a flat-drift
+// simulated stuck position.
 const CORRECTED_FILL_PROB_ENABLED = readBoolean('CORRECTED_FILL_PROB_ENABLED', true);
 const ENFORCE_GROSS_TARGET_FLOOR = readBoolean('ENFORCE_GROSS_TARGET_FLOOR', true);
-const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', false);
+const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', true);
 const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 100));
 // Horizon (in 1-minute bars) over which we expect the take-profit to fill.
 // Defaults to BREAKEVEN_TIMEOUT_MS in minutes — i.e., the same window after
@@ -1594,6 +1610,22 @@ async function scanAndEnter() {
   );
   if (tradeNotional < MIN_TRADE_NOTIONAL_USD) {
     bumpSkipReason('insufficient_cash');
+    summary.topSkipReasons = mapToObject(skipReasonCounts);
+    lastEntryScanSummary = summary;
+    lastEntryScanAt = new Date().toISOString();
+    currentScanState = 'idle';
+    return;
+  }
+  // Sizing-floor gate: if the cash clamp shrunk us below MIN_SIZING_FRACTION_OF_TARGET
+  // of intended size, abort the scan rather than deploy a fragmented entry.
+  // Live data showed an AVAX entry at $1.78 (19% of a $9.23 target) producing the
+  // book's worst per-position drawdown; better to wait for cash to free up
+  // properly than to take an undersized signal that just locks the slot.
+  if (
+    MIN_SIZING_FRACTION_OF_TARGET > 0 &&
+    tradeNotional < targetNotional * MIN_SIZING_FRACTION_OF_TARGET
+  ) {
+    bumpSkipReason('sizing_below_floor');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
     lastEntryScanSummary = summary;
     lastEntryScanAt = new Date().toISOString();
