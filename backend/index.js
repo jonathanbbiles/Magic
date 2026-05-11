@@ -1944,10 +1944,10 @@ if (backtestSkipReason) {
     : 1.0;
   const liveMinVolumeRatio = Number.isFinite(Number(process.env.MIN_VOLUME_RATIO_TO_ENTER))
     ? Number(process.env.MIN_VOLUME_RATIO_TO_ENTER)
-    : 0;
+    : 1.0;
   const liveMaxBtcDropBps = Number.isFinite(Number(process.env.MAX_BTC_LEAD_LAG_DROP_BPS))
     ? Number(process.env.MAX_BTC_LEAD_LAG_DROP_BPS)
-    : 0;
+    : -10;
   setTimeout(async () => {
     await runBacktestAndStore({
       signalTargetFraction: liveSignalTargetFraction,

@@ -45,10 +45,10 @@ const DEFAULTS = {
   feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
   breakevenTimeoutMin: 240,              // BREAKEVEN_TIMEOUT_MS / 60_000
   cooldownAfterEntryBars: 5,             // refuse re-entry on same symbol for N bars after each entry
-  // Top-detection candidate gates (matches trade.js env knobs). Default 0
-  // = off, matching the live default. Override to A/B against gate-on.
-  minVolumeRatio: 0,                     // matches MIN_VOLUME_RATIO_TO_ENTER
-  maxBtcLeadLagDropBps: 0,               // matches MAX_BTC_LEAD_LAG_DROP_BPS
+  // Top-detection gates (matches trade.js env knobs). Defaults track live
+  // config — both gates default ON. Set to 0 to A/B against gate-off.
+  minVolumeRatio: 1.0,                   // matches MIN_VOLUME_RATIO_TO_ENTER
+  maxBtcLeadLagDropBps: -10,             // matches MAX_BTC_LEAD_LAG_DROP_BPS
   // Lookback used for BTC lead-lag return (matches recordBtcLeadLagSnapshot)
   btcLeadLagLookbackBars: 5,
   json: false,

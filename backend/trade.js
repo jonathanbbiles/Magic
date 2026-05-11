@@ -245,12 +245,15 @@ const PREDICT_BARS = Math.max(5, readNumber('PREDICT_BARS', 20));
 // A high value before entry is strongly associated with post-entry reversal.
 const VOLATILITY_MAX_BPS = Math.max(10, readNumber('VOLATILITY_MAX_BPS', 100));
 
-// Higher-timeframe confirmation. Require recent 5m bars not to be in a
-// clearly established downtrend before accepting a 1m entry signal.
+// Higher-timeframe confirmation. Require recent 5m bars to show positive
+// drift before accepting a 1m entry signal. Default raised from 0 → 1
+// bps/bar after live diagnostics showed ADA (htf=1.03) and ETH (htf=2.37)
+// entering at the top of a broader market sell-off — slopes statistically
+// indistinguishable from zero were passing the "not in a downtrend" gate.
 const HTF_FILTER_ENABLED = readBoolean('HTF_FILTER_ENABLED', true);
 const HTF_TIMEFRAME = String(process.env.HTF_TIMEFRAME || '5Min');
 const HTF_BARS = Math.max(5, readNumber('HTF_BARS', 12));
-const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 0);
+const HTF_MIN_SLOPE_BPS_PER_BAR = readNumber('HTF_MIN_SLOPE_BPS_PER_BAR', 1);
 
 // Expected-value gate. Require probability-weighted net edge (after fees and
 // slippage buffers) to clear this bar before we submit a buy. Entry-only —
@@ -275,24 +278,42 @@ const MIN_NET_EDGE_BPS = readNumber('MIN_NET_EDGE_BPS', 2);
 // slippage and ~half a fee round-trip, so sub-floor signals never even
 // reach the EV math.
 const MIN_PROJECTED_BPS_TO_ENTER = Math.max(0, readNumber('MIN_PROJECTED_BPS_TO_ENTER', 15));
-// Top-detection candidate gates. Both default OFF (0 / -Infinity) so they
-// don't change live behaviour — flip them on once a backtest measures
-// whether they improve expectancy. See README "Forensics-only candidate
-// features" for the math.
+// Top-detection gates. Defaults flipped ON after the dashboard's auto-run
+// backtest A/B confirmed both prune ~10–45% of entries with near-zero
+// expectancy cost (primary 5.46 → alt 5.41 / alt2 5.42 bps net per entry)
+// while live diagnostics showed an 11-position cluster firing into a broad
+// crypto roll-over because both gates were silently OFF (every entry's
+// forensics had `btcLeadLag: null`, including a DOT entry with
+// `volumeRatio: 0`). Set to 0 to disable.
 //
 // MIN_VOLUME_RATIO_TO_ENTER: refuse entries when recent-window volume
 // dropped below `ratio × all-window volume`. >1 means rising volume
 // (confirmation), <1 means fading. Tops typically print on declining
-// volume. Set to e.g. 0.8 to refuse momentum on dying volume; 0 = gate off.
-const MIN_VOLUME_RATIO_TO_ENTER = Math.max(0, readNumber('MIN_VOLUME_RATIO_TO_ENTER', 0));
+// volume. Default 1.0 = recent volume must at least equal the lookback
+// mean. Set to 0 to disable.
+const MIN_VOLUME_RATIO_TO_ENTER = Math.max(0, readNumber('MIN_VOLUME_RATIO_TO_ENTER', 1.0));
 // MAX_BTC_LEAD_LAG_DROP_BPS: refuse non-BTC entries when BTC's last-5-bar
 // return is more negative than this threshold. Alts lag BTC by 30–90s in
 // crypto, so a recent BTC drop is a leading indicator that alt momentum
-// is about to reverse. Negative number; 0 or positive = gate off (would
-// require BTC to be UP to enter, which is too restrictive). Set to e.g.
-// -5 to refuse alt entries when BTC just dropped ≥5 bps. Skipped when
-// BTC lead-lag snapshot is missing or stale (>5 min old).
-const MAX_BTC_LEAD_LAG_DROP_BPS = readNumber('MAX_BTC_LEAD_LAG_DROP_BPS', 0);
+// is about to reverse. Negative number; 0 or positive = gate off. Default
+// -10 bps after the alt-backtest at -15 bps showed negligible expectancy
+// cost; -10 is slightly tighter to bias toward fewer-but-cleaner entries.
+// Skipped when BTC lead-lag snapshot is missing or stale (>5 min old).
+const MAX_BTC_LEAD_LAG_DROP_BPS = readNumber('MAX_BTC_LEAD_LAG_DROP_BPS', -10);
+// MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: portfolio-level drawdown gate.
+// When the live book's aggregate unrealized P&L (sum / equity, in percent)
+// is below this threshold, refuse all new entries until the situation
+// improves. The per-symbol gates can each individually pass during a
+// broad market top because they have no portfolio context — live
+// diagnostics observed 11 simultaneous losers entered over a 10-hour
+// window into a crypto-wide sell-off, with UNI already -100+ bps when
+// XRP fired 3 hours later. This is the missing macro filter. Default
+// -2.0 (= -2% book drawdown). Set to 0 to disable. Negative threshold
+// only.
+const MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER = readNumber(
+  'MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER',
+  -2.0,
+);
 // Orderbook-imbalance feature. Default OFF — enabling adds an extra
 // /latest/orderbooks fetch per scan (≈ same cost as the existing /latest/quotes
 // hit), against Alpaca's 200/min crypto data cap. When ON, every entry's
@@ -339,12 +360,14 @@ const EXIT_SLIPPAGE_BPS = Math.max(0, readNumber('EXIT_SLIPPAGE_BPS', 3));
 // gate while having negative honest expectancy — exactly the trades the
 // no-stop design has no way to recover from. Operator can set
 // HONEST_EV_GATE_ENABLED=false to revert to the legacy permissive behavior.
-// 100 bps stuck-loss assumption is the median 1-week MTM hit on a flat-drift
-// simulated stuck position.
+// STUCK_LOSS_ASSUMED_BPS default raised from 100 → 250 after live diagnostics
+// measured the actual unrealized drawdown on a 11-position stuck cluster at
+// ~270 bps per position — the previous 100 bps assumption was systematically
+// rating marginal entries +EV when reality was -EV.
 const CORRECTED_FILL_PROB_ENABLED = readBoolean('CORRECTED_FILL_PROB_ENABLED', true);
 const ENFORCE_GROSS_TARGET_FLOOR = readBoolean('ENFORCE_GROSS_TARGET_FLOOR', true);
 const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', true);
-const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 100));
+const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 250));
 // Horizon (in 1-minute bars) over which we expect the take-profit to fill.
 // Defaults to BREAKEVEN_TIMEOUT_MS in minutes — i.e., the same window after
 // which the engine would otherwise replace the TP with a break-even sell.
@@ -1500,10 +1523,19 @@ async function buildHeldAndOpenSellsIndex() {
   const positions = await fetchPositions();
   const held = new Set();
   const byPair = new Map();
+  let totalUnrealizedPl = 0;
+  let totalCostBasis = 0;
   for (const p of positions) {
     const pair = normalizePair(p?.symbol);
     if (pair) { held.add(pair); byPair.set(pair, p); }
+    const upl = Number(p?.unrealized_pl);
+    const cost = Number(p?.cost_basis);
+    if (Number.isFinite(upl)) totalUnrealizedPl += upl;
+    if (Number.isFinite(cost) && cost > 0) totalCostBasis += cost;
   }
+  const aggregateUnrealizedPct = totalCostBasis > 0
+    ? (totalUnrealizedPl / totalCostBasis) * 100
+    : null;
   const openOrders = await fetchOrders({ status: 'open', nested: true, limit: 500 });
   const openBuyPairs = new Set();
   const openSellByPair = new Map();
@@ -1515,7 +1547,7 @@ async function buildHeldAndOpenSellsIndex() {
     if (side === 'buy') openBuyPairs.add(pair);
     if (side === 'sell') openSellByPair.set(pair, o);
   });
-  return { held, byPair, openBuyPairs, openSellByPair };
+  return { held, byPair, openBuyPairs, openSellByPair, aggregateUnrealizedPct };
 }
 
 async function scanAndEnter() {
@@ -1553,11 +1585,12 @@ async function scanAndEnter() {
   }
   currentScanUniverseSize = universe.length;
 
-  let held, openBuyPairs;
+  let held, openBuyPairs, aggregateUnrealizedPct;
   try {
     const idx = await buildHeldAndOpenSellsIndex();
     held = idx.held;
     openBuyPairs = idx.openBuyPairs;
+    aggregateUnrealizedPct = idx.aggregateUnrealizedPct;
   } catch (err) {
     lastExecutionFailure = { at: new Date().toISOString(), reason: 'positions_or_orders_fetch_failed', message: err?.errorMessage || err?.message || String(err) };
     currentScanState = 'idle';
@@ -1577,6 +1610,25 @@ async function scanAndEnter() {
     topSkipReasons: {},
     acceptedSymbols: [],
   };
+
+  // Portfolio-drawdown entry gate. The per-symbol gates have no portfolio
+  // context — they can each individually pass during a broad market top.
+  // When the live book's aggregate unrealized P&L % is below threshold,
+  // pause new entries until existing positions recover. Negative threshold
+  // only; 0 disables. Defensive: when there are no held positions, the
+  // aggregate is null and the gate is skipped.
+  if (
+    MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER < 0 &&
+    Number.isFinite(aggregateUnrealizedPct) &&
+    aggregateUnrealizedPct < MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER
+  ) {
+    bumpSkipReason('portfolio_drawdown_below_min');
+    summary.topSkipReasons = mapToObject(skipReasonCounts);
+    lastEntryScanSummary = summary;
+    lastEntryScanAt = new Date().toISOString();
+    currentScanState = 'idle';
+    return;
+  }
 
   // Size this scan's trades as PORTFOLIO_SIZING_PCT of current equity, then
   // clamp to available cash so the last slot can still fill when cash has
