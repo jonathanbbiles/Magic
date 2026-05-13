@@ -71,6 +71,31 @@ const assert = require('assert/strict');
     'MIN_NET_EDGE_BPS default must stay at 2; raising it without raising TARGET re-blocks small-target scalp entries.',
   );
 
+  // Pin STOP_LOSS_ENABLED default to true so the code matches
+  // LIVE_CRITICAL_DEFAULTS.STOP_LOSS_ENABLED. Previously the source defaulted
+  // to false while liveDefaults claimed true — production with the env var
+  // unset would silently run with no stop, despite the drift-warning system
+  // saying everything was fine. Lock both layers here so they cannot diverge.
+  assert.match(
+    tradeSrc__pin,
+    /const STOP_LOSS_ENABLED = readBoolean\('STOP_LOSS_ENABLED', true\);/,
+    'STOP_LOSS_ENABLED default must stay at true; reverting starves the vol-scaled stop in production whenever the env var is unset.',
+  );
+  assert.equal(typeof trade.getStopLossConfig, 'function', 'missing export getStopLossConfig');
+  const stopCfg = trade.getStopLossConfig();
+  assert.equal(typeof stopCfg.enabled, 'boolean');
+  assert.equal(typeof stopCfg.staticBps, 'number');
+  assert.ok(stopCfg.staticBps > 0);
+  assert.equal(typeof stopCfg.volScaledEnabled, 'boolean');
+  assert.equal(typeof stopCfg.floorBps, 'number');
+  if (process.env.STOP_LOSS_ENABLED == null) {
+    assert.equal(
+      stopCfg.enabled,
+      true,
+      'With STOP_LOSS_ENABLED unset, the stop-loss must be ON to match LIVE_CRITICAL_DEFAULTS.',
+    );
+  }
+
   console.log('trade.test.js passed');
   process.exit(0);
 })();
