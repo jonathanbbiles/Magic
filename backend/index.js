@@ -1085,6 +1085,7 @@ app.get('/dashboard', async (req, res) => {
           params: lastBacktestResult.params,
           overall: lastBacktestResult.overall,
           perSymbol: lastBacktestResult.perSymbol,
+          gateSkipped: lastBacktestResult.gateSkipped || null,
         } : (backtestRunning ? { status: 'running', startedAt: new Date().toISOString() } : (lastBacktestError ? { error: lastBacktestError } : null)),
         backtestAlt: lastBacktestAlt ? {
           ranAt: lastBacktestAlt.ranAt,
