@@ -71,6 +71,14 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ORDERBOOK_SPARSE_ALLOW_TIER1: 'true',
   ORDERBOOK_SPARSE_ALLOW_TIER2: 'true',
   ORDERBOOK_SPARSE_ALLOW_TIER3: 'false',
+  // Tier-aware entry spread caps. The flat SPREAD_MAX_BPS stays as a global
+  // ceiling; each per-tier cap is clamped to min(tierCap, SPREAD_MAX_BPS) at
+  // resolution time so a misconfiguration can't blow past the global guardrail.
+  // Tier1 (BTC/ETH) stays tight; tier3 (long-tail alts on Alpaca) gets the
+  // room thinner books need so the dynamic universe actually produces fills.
+  SPREAD_MAX_BPS_TIER1: '30',
+  SPREAD_MAX_BPS_TIER2: '45',
+  SPREAD_MAX_BPS_TIER3: '90',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));
