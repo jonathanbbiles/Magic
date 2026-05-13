@@ -112,14 +112,16 @@ const MIN_SIZING_FRACTION_OF_TARGET = Math.min(
 // to ~0 on tier-1 crypto and starves entries via net_edge_below_min. Floor at
 // 30 s to stay above broker round-trip latency.
 const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 14400000));
-// Stop-loss is OFF by default. Per the original strategy intent (CLAUDE.md
-// hard rule #5: "Don't add stop-loss, max-hold, or force-exit logic without
-// explicit user instruction"), the bot does NOT market-sell into a loss.
-// The staircase exit (below) gradually walks the GTC sell limit toward
-// break-even-after-fees so realized P&L is bounded at $0 net regardless of
-// MTM drawdown. Set STOP_LOSS_ENABLED=true on Render to re-enable the hard
-// risk cap if you want force-exit-on-bid behaviour back.
-const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', false);
+// Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
+// strategy intent (CLAUDE.md hard rule #5) walked the GTC sell limit toward
+// break-even-after-fees so realized P&L was bounded at $0 net; in practice the
+// strategy's own simulate_strategy.js shows that asymmetry produces strongly
+// negative expectancy in flat/adverse drift because stuck positions accumulate
+// unbounded unrealized MTM. The vol-scaled stop below caps that tail: tight
+// stops in quiet markets, wider stops in vol — same risk in σ-units regardless
+// of regime, never wider than STOP_LOSS_BPS. Set STOP_LOSS_ENABLED=false on
+// Render to revert to the no-realised-loss design.
+const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
 const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
 // Volatility-scaled stop. When ON, each trade's stop distance is sized from
 // the entry-time realised volatility: stopBps ≈ k × σ × √HORIZON. Quiet
@@ -2130,6 +2132,18 @@ function resolveStopLossBps(pair) {
   return STOP_LOSS_BPS;
 }
 
+function getStopLossConfig() {
+  return {
+    enabled: STOP_LOSS_ENABLED,
+    staticBps: STOP_LOSS_BPS,
+    volScaledEnabled: VOL_SCALED_STOP_ENABLED,
+    volK: STOP_LOSS_VOL_K,
+    horizonBars: STOP_LOSS_HORIZON_BARS,
+    floorBps: STOP_LOSS_BPS_FLOOR,
+    overSpreadBps: STOP_OVER_SPREAD_BPS,
+  };
+}
+
 async function reconcileExits() {
   const { byPair, openSellByPair } = await buildHeldAndOpenSellsIndex();
   for (const [pair, pos] of byPair.entries()) {
@@ -2722,4 +2736,5 @@ module.exports = {
   getPredictionSignal,
   getHigherTimeframeSignal,
   scanAndEnter,
+  getStopLossConfig,
 };

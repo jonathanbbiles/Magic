@@ -6,6 +6,12 @@ const summary = getRuntimeConfigSummary(process.env);
 assert.equal(summary.entryScanIntervalMs, Number(LIVE_CRITICAL_DEFAULTS.ENTRY_SCAN_INTERVAL_MS));
 assert.equal(summary.entryPrefetchChunkSize, Number(LIVE_CRITICAL_DEFAULTS.ENTRY_PREFETCH_CHUNK_SIZE));
 
+// Stop-loss must be ON in the live defaults so production caps the loss-side
+// tail. If this drifts back to 'false', the staircase exit becomes the only
+// post-fill risk lever and stuck positions accumulate unbounded MTM in
+// adverse drift (see simulate_strategy.js expectancy table).
+assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_ENABLED, 'true');
+
 assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
