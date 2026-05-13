@@ -218,6 +218,28 @@ const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS'
 // valid candidates in normal-but-noisy live books; the tighter economics and
 // microstructure gates still run afterwards (entry-max, EV, alpha, etc.).
 const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 60));
+// Tier-aware spread caps: BTC/ETH stay tight, mid-caps a bit looser, long-tail
+// alts get the room their thinner books need. Each is clamped to the global
+// SPREAD_MAX_BPS at resolution so the flat cap remains an authoritative ceiling.
+const SPREAD_MAX_BPS_TIER1 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER1', 30));
+const SPREAD_MAX_BPS_TIER2 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER2', 45));
+const SPREAD_MAX_BPS_TIER3 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER3', 90));
+const TIER1_SYMBOL_SET = new Set(runtimeConfig.executionTier1Symbols || []);
+const TIER2_SYMBOL_SET = new Set(runtimeConfig.executionTier2Symbols || []);
+function resolveSymbolTier(pair) {
+  if (TIER1_SYMBOL_SET.has(pair)) return 'tier1';
+  if (TIER2_SYMBOL_SET.has(pair)) return 'tier2';
+  return runtimeConfig.executionTier3Default ? 'tier3' : 'unclassified';
+}
+function resolveSpreadCapBps(pair) {
+  const tier = resolveSymbolTier(pair);
+  let tierCap;
+  if (tier === 'tier1') tierCap = SPREAD_MAX_BPS_TIER1;
+  else if (tier === 'tier2') tierCap = SPREAD_MAX_BPS_TIER2;
+  else if (tier === 'tier3') tierCap = SPREAD_MAX_BPS_TIER3;
+  else tierCap = SPREAD_MAX_BPS_TIER1; // unclassified: most conservative
+  return Math.min(tierCap, SPREAD_MAX_BPS);
+}
 // Keep the microstructure spread gate aligned with the primary spread cap by
 // default; the economics gates below (execution-cost floor, alpha, EV) are the
 // intended profitability filters. A lower hidden default here can starve entry
@@ -1712,7 +1734,7 @@ async function scanAndEnter() {
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
-      const spreadCapBps = SPREAD_MAX_BPS + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
+      const spreadCapBps = resolveSpreadCapBps(pair) + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
       const spreadToleranceBps = SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS;
       if (spreadBps > (spreadCapBps + spreadToleranceBps)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }
 
