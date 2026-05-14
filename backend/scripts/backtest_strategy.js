@@ -67,6 +67,11 @@ const DEFAULTS = {
   // position closes at the stop price (proxy for live market IOC fill). 0
   // disables, matching the legacy backtest behaviour.
   stopLossBps: 40,
+  // HTF downtrend gate. When > 0, requires the higher-timeframe slope
+  // (htfBars × 5 m closes) to be ≥ this floor (bps/bar). Matches live
+  // HTF_MIN_SLOPE_BPS_PER_BAR. Set to 0 to disable.
+  htfMinSlopeBpsPerBar: 0,
+  htfBars: 12,
   json: false,
 };
 
@@ -221,6 +226,27 @@ function replaySymbol(bars, opts, btcBars = null) {
       if (sig.projectedBps < requiredGrossBps) {
         stats.skipped.projected_below_gross_target += 1;
         continue;
+      }
+    }
+
+    // HTF downtrend gate (matches trade.js HTF_MIN_SLOPE_BPS_PER_BAR). Sample
+    // 5-minute closes from the 1-minute bars by taking every 5th close from a
+    // window of size htfBars × 5, then OLS-fit slope in bps/bar. Refuse when
+    // slope is below the floor.
+    if (opts.htfMinSlopeBpsPerBar > 0) {
+      const htfBarsNeeded = Math.max(3, Math.floor(opts.htfBars || 12));
+      const htfWindowMins = htfBarsNeeded * 5;
+      if (i >= htfWindowMins) {
+        const htfWindow = [];
+        for (let k = i - htfWindowMins + 5; k <= i; k += 5) htfWindow.push(closes[k]);
+        if (htfWindow.length >= 3 && htfWindow.every((c) => Number.isFinite(c) && c > 0)) {
+          const htfSig = olsSlope(htfWindow);
+          if (htfSig && htfSig.slopeBpsPerBar < opts.htfMinSlopeBpsPerBar) {
+            if (!stats.skipped.htf_downtrend) stats.skipped.htf_downtrend = 0;
+            stats.skipped.htf_downtrend += 1;
+            continue;
+          }
+        }
       }
     }
 

@@ -75,7 +75,10 @@ GET /debug/backtest                                          → cached result i
 GET /debug/backtest?refresh=true                             → re-run with default params
 GET /debug/backtest?days=60&signalTargetFraction=1.0         → re-run with overrides (waits for completion)
 GET /debug/backtest?wait=false&minProjectedBps=25            → kick off in background, return immediately
+GET /debug/backtest?refresh=true&htfMinSlopeBpsPerBar=2&stopLossBps=25  → sweep tightened-gate combos
 ```
+
+Accepted overrides: `days`, `predictBars`, `minProjectedBps`, `signalTargetFraction`, `targetNetBps`, `symbols`, `minVolumeRatio`, `maxBtcLeadLagDropBps`, `stopLossBps`, `htfMinSlopeBpsPerBar`, `htfBars`.
 
 Symbol universe is the live `ENTRY_SYMBOLS_PRIMARY` list (env var if set, otherwise `runtimeConfig.configuredPrimarySymbols` derived from `LIVE_CRITICAL_DEFAULTS`). Override per-call with `?symbols=BTC/USD,ETH/USD,...`.
 
