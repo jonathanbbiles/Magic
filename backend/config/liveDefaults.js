@@ -54,6 +54,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_QUOTE_MAX_AGE_MS: '15000',
   ENTRY_QUOTE_STALE_GRACE_MS: '15000',
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS: '120000',
+  // Per-symbol stale-quote pruner. After STALE_QUOTE_PRUNE_LOOKBACK observed
+  // fetches whose fresh-fraction drops below STALE_QUOTE_PRUNE_MIN_FRESH_RATIO,
+  // the symbol is dropped from the rest of the entry gate (and counted as
+  // `pruned_stale_quotes`). Re-admits after STALE_QUOTE_PRUNE_PROBATION_FRESH
+  // consecutive fresh observations. Default-ON because production logs show
+  // ~30% of the dynamic universe is chronically quote-stale on Alpaca.
+  STALE_QUOTE_PRUNE_ENABLED: 'true',
+  STALE_QUOTE_PRUNE_LOOKBACK: '8',
+  STALE_QUOTE_PRUNE_MIN_FRESH_RATIO: '0.4',
+  STALE_QUOTE_PRUNE_PROBATION_FRESH: '2',
   BREAKEVEN_TIMEOUT_MS: '7200000',
   MAX_HOLD_MS: '21600000',
   ENTRY_LIMIT_PRICE_MODE: 'mid',
