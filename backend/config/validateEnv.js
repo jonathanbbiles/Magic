@@ -298,6 +298,10 @@ const validateEnv = () => {
     const orderbookSparseStaleQuoteToleranceMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', 15000);
     const entryQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_QUOTE_MAX_AGE_MS', 120000);
     const entryRegimeStaleQuoteMaxAgeMs = parseFiniteNumberEnv('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', entryQuoteMaxAgeMs);
+    const staleQuotePruneEnabled = parseBooleanEnv('STALE_QUOTE_PRUNE_ENABLED', true);
+    const staleQuotePruneLookback = parseFiniteNumberEnv('STALE_QUOTE_PRUNE_LOOKBACK', 8);
+    const staleQuotePruneMinFreshRatio = parseFiniteNumberEnv('STALE_QUOTE_PRUNE_MIN_FRESH_RATIO', 0.4);
+    const staleQuotePruneProbationFresh = parseFiniteNumberEnv('STALE_QUOTE_PRUNE_PROBATION_FRESH', 2);
     const orderbookSparseConfirmRetry = parseBooleanEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY', true);
     const orderbookSparseConfirmRetryMs = parseFiniteNumberEnv('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', 150);
     const sparseFallbackSymbols = parseSymbolListEnv('ORDERBOOK_SPARSE_FALLBACK_SYMBOLS', 'BTC/USD,ETH/USD');
@@ -354,6 +358,9 @@ const validateEnv = () => {
     assertInRange('ORDERBOOK_SPARSE_STALE_QUOTE_TOLERANCE_MS', orderbookSparseStaleQuoteToleranceMs, 0, 3600000);
     assertInRange('ENTRY_QUOTE_MAX_AGE_MS', entryQuoteMaxAgeMs, 0, 3600000);
     assertInRange('ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS', entryRegimeStaleQuoteMaxAgeMs, 0, 3600000);
+    assertInRange('STALE_QUOTE_PRUNE_LOOKBACK', staleQuotePruneLookback, 2, 50);
+    assertInRange('STALE_QUOTE_PRUNE_MIN_FRESH_RATIO', staleQuotePruneMinFreshRatio, 0, 1);
+    assertInRange('STALE_QUOTE_PRUNE_PROBATION_FRESH', staleQuotePruneProbationFresh, 1, 20);
     assertInRange('ORDERBOOK_SPARSE_CONFIRM_RETRY_MS', orderbookSparseConfirmRetryMs, 0, 10000);
     assertInRange('MARKETDATA_QUOTE_TTL_MS', marketdataQuoteTtlMs, 1, 600000);
     assertInRange('MARKETDATA_ORDERBOOK_TTL_MS', marketdataOrderbookTtlMs, 1, 600000);
@@ -524,6 +531,12 @@ const validateEnv = () => {
         confirmRetry: orderbookSparseConfirmRetry,
         confirmRetryMs: orderbookSparseConfirmRetryMs,
         symbols: sparseFallbackSymbols,
+      },
+      staleQuotePruner: {
+        enabled: staleQuotePruneEnabled,
+        lookback: staleQuotePruneLookback,
+        minFreshRatio: staleQuotePruneMinFreshRatio,
+        probationFreshObservations: staleQuotePruneProbationFresh,
       },
       executionTiering: {
         tier1Symbols: dedupeSymbols(executionTier1Symbols),

@@ -657,6 +657,9 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.targetNetBps != null ? { targetNetBps: Number(overrides.targetNetBps) } : {}),
       ...(overrides.minVolumeRatio != null ? { minVolumeRatio: Number(overrides.minVolumeRatio) } : {}),
       ...(overrides.maxBtcLeadLagDropBps != null ? { maxBtcLeadLagDropBps: Number(overrides.maxBtcLeadLagDropBps) } : {}),
+      ...(overrides.stopLossBps != null ? { stopLossBps: Number(overrides.stopLossBps) } : {}),
+      ...(overrides.htfMinSlopeBpsPerBar != null ? { htfMinSlopeBpsPerBar: Number(overrides.htfMinSlopeBpsPerBar) } : {}),
+      ...(overrides.htfBars != null ? { htfBars: Number(overrides.htfBars) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -694,6 +697,9 @@ app.get('/debug/backtest', async (req, res) => {
     symbols: req.query.symbols,
     minVolumeRatio: req.query.minVolumeRatio,
     maxBtcLeadLagDropBps: req.query.maxBtcLeadLagDropBps,
+    stopLossBps: req.query.stopLossBps,
+    htfMinSlopeBpsPerBar: req.query.htfMinSlopeBpsPerBar,
+    htfBars: req.query.htfBars,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});

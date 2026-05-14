@@ -30,6 +30,7 @@ const {
 } = require('./modules/entryEconomics');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
+const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
 const runtimeConfig = getRuntimeConfig(process.env);
 
@@ -254,6 +255,22 @@ const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
 // lag doesn't blanket-reject entries.
 const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000));
 const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS', 15000));
+// Per-symbol stale-quote pruner. Skips chronically-stale pairs (those whose
+// recent quotes are reliably older than the QUOTE_MAX_AGE_MS+grace ceiling)
+// after we've observed them stale for STALE_QUOTE_PRUNE_LOOKBACK samples,
+// without paying for the downstream bars-fetch and predictor each scan.
+// Symbols re-enter after STALE_QUOTE_PRUNE_PROBATION_FRESH consecutive
+// fresh observations.
+const STALE_QUOTE_PRUNE_ENABLED = readBoolean('STALE_QUOTE_PRUNE_ENABLED', true);
+const STALE_QUOTE_PRUNE_LOOKBACK = Math.max(2, readNumber('STALE_QUOTE_PRUNE_LOOKBACK', 8));
+const STALE_QUOTE_PRUNE_MIN_FRESH_RATIO = Math.min(1, Math.max(0, readNumber('STALE_QUOTE_PRUNE_MIN_FRESH_RATIO', 0.4)));
+const STALE_QUOTE_PRUNE_PROBATION_FRESH = Math.max(1, readNumber('STALE_QUOTE_PRUNE_PROBATION_FRESH', 2));
+const quoteFreshness = createQuoteFreshnessTracker({
+  lookback: STALE_QUOTE_PRUNE_LOOKBACK,
+  minFreshRatio: STALE_QUOTE_PRUNE_MIN_FRESH_RATIO,
+  freshThresholdMs: QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS,
+  probationFreshObservations: STALE_QUOTE_PRUNE_PROBATION_FRESH,
+});
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 // Default raised to 60 bps so the hard guardrail no longer blocks otherwise
 // valid candidates in normal-but-noisy live books; the tighter economics and
@@ -1425,7 +1442,13 @@ function getEntryDiagnosticsSnapshot() {
     topSkipReasonsRolling: mapToObject(rollingSkipReasons),
     entryManager: getTradingManagerStatus().entryManagerHeartbeat,
     gating: {},
-    quoteFreshness: { maxAgeMs: QUOTE_MAX_AGE_MS, staleEntryQuoteSkips: skipReasonCounts.get('stale_quote') || 0 },
+    quoteFreshness: {
+      maxAgeMs: QUOTE_MAX_AGE_MS,
+      staleEntryQuoteSkips: skipReasonCounts.get('stale_quote') || 0,
+      prunedStaleQuoteSkips: skipReasonCounts.get('pruned_stale_quotes') || 0,
+      prunerEnabled: STALE_QUOTE_PRUNE_ENABLED,
+      ...quoteFreshness.snapshot(),
+    },
     rejectionWindow: getRejectionWindowStats(),
     quoteAgesBySymbolMs: Object.fromEntries(Array.from(lastQuoteUpdateBySymbol.entries()).map(([sym, ts]) => [sym, Date.now() - ts])),
     ratePressureState: null,
@@ -1763,6 +1786,7 @@ async function scanAndEnter() {
       if (quoteTsMs > 0) lastQuoteUpdateBySymbol.set(pair, quoteTsMs);
       const nowMs = Date.now();
       const ageMs = nowMs - quoteTsMs;
+      quoteFreshness.record(pair, ageMs);
       const quoteFingerprint = `${Number(quote.bp)}:${Number(quote.ap)}:${quoteTsMs}`;
       const previousFingerprint = lastQuoteFingerprintBySymbol.get(pair) || null;
       const quoteLooksNew = previousFingerprint !== quoteFingerprint;
@@ -1772,6 +1796,7 @@ async function scanAndEnter() {
         // updating bid/ask. If the quote moved since the previous scan, avoid
         // classifying it as stale solely due to provider timestamp lag.
       } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
+      if (STALE_QUOTE_PRUNE_ENABLED && quoteFreshness.isPruned(pair)) { rejectTrade(pair, 'pruned_stale_quotes', { ageMs }); continue; }
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
