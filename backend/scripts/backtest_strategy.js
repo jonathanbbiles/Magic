@@ -11,16 +11,22 @@
  * What this models:
  *   - OLS slope on the prior PREDICT_BARS 1-minute closes (same math as live)
  *   - projected_below_min gate (entries must clear MIN_PROJECTED_BPS)
+ *   - projected_below_gross_target gate (Fix 2)
  *   - slope_not_positive gate
  *   - GTC sell at entry × (1 + GROSS_TARGET_BPS / 10000)
  *   - Staircase exit: linearly walk the limit toward break-even-after-fees
  *     over BREAKEVEN_TIMEOUT_MS
+ *   - Stop-loss at entry × (1 - STOP_LOSS_BPS / 10000) (Fix 4)
+ *   - Hard max-hold market exit at MAX_HOLD_MS (Fix 3)
  *
  * What this does NOT model (yet):
  *   - Live spread/quote freshness gates (bars don't carry quote-level data)
  *   - HTF downtrend filter (cheap to add — see TODO)
  *   - micro_signal_missing (depends on quote-level state)
  *   - Per-trade fees; we report gross AND net assuming FEE_BPS_ROUND_TRIP=40
+ *   - Entry-price mode (Fix 1) — backtest uses bar closes as entry price,
+ *     same as before. Live `mid` mode saves ~half-spread on entry that the
+ *     backtest doesn't currently penalise.
  *
  * Net effect: the backtester is *more permissive* than live. Treat its
  * fill-rate / expectancy numbers as upper bounds for the underlying signal.
@@ -43,7 +49,7 @@ const DEFAULTS = {
   targetNetBps: 8,                       // matches live TARGET_NET_PROFIT_BPS
   signalTargetMaxNetBps: 50,             // matches live cap
   feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
-  breakevenTimeoutMin: 240,              // BREAKEVEN_TIMEOUT_MS / 60_000
+  breakevenTimeoutMin: 120,              // BREAKEVEN_TIMEOUT_MS / 60_000 (Fix 4 default 2 h)
   cooldownAfterEntryBars: 5,             // refuse re-entry on same symbol for N bars after each entry
   // Top-detection gates (matches trade.js env knobs). Defaults track live
   // config — both gates default ON. Set to 0 to A/B against gate-off.
@@ -51,6 +57,16 @@ const DEFAULTS = {
   maxBtcLeadLagDropBps: -10,             // matches MAX_BTC_LEAD_LAG_DROP_BPS
   // Lookback used for BTC lead-lag return (matches recordBtcLeadLagSnapshot)
   btcLeadLagLookbackBars: 5,
+  // Fix 2: refuse trades whose projected move can't cover the gross target.
+  enforceProjectedCoversGross: true,
+  entrySlippageBps: 3,                   // matches live ENTRY_SLIPPAGE_BPS
+  exitSlippageBps: 3,                    // matches live EXIT_SLIPPAGE_BPS
+  // Fix 3: hard max-hold market exit. Set to 0 to disable. Live default 6 h.
+  maxHoldMin: 360,
+  // Fix 4: stop-loss bps below entry. If the bar low pierces the stop, the
+  // position closes at the stop price (proxy for live market IOC fill). 0
+  // disables, matching the legacy backtest behaviour.
+  stopLossBps: 40,
   json: false,
 };
 
@@ -181,7 +197,10 @@ function replaySymbol(bars, opts, btcBars = null) {
 
   // Per-symbol stats (skip-reason counts) so callers can see why entries were
   // refused under different gate configs.
-  const stats = { skipped: { volume_below_min: 0, btc_leading_drop: 0 } };
+  const stats = { skipped: { volume_below_min: 0, btc_leading_drop: 0, projected_below_gross_target: 0 } };
+
+  // Per-symbol gate counts for new gates that Fix 2 / Fix 4 added live.
+  if (!stats.skipped.projected_below_gross_target) stats.skipped.projected_below_gross_target = 0;
 
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
@@ -191,6 +210,19 @@ function replaySymbol(bars, opts, btcBars = null) {
     if (!sig) continue;
     if (!(sig.tStat > 0)) continue;
     if (sig.projectedBps < opts.minProjectedBps) continue;
+
+    // Fix 2: projected_below_gross_target — refuse trades whose projection
+    // can't cover the gross move (target + slippage) needed to fill the TP.
+    if (opts.enforceProjectedCoversGross) {
+      const grossTargetBps = opts.targetNetBps + opts.feeBpsRoundTrip;
+      const entrySlip = Number(opts.entrySlippageBps) || 0;
+      const exitSlip = Number(opts.exitSlippageBps) || 0;
+      const requiredGrossBps = grossTargetBps + entrySlip + exitSlip;
+      if (sig.projectedBps < requiredGrossBps) {
+        stats.skipped.projected_below_gross_target += 1;
+        continue;
+      }
+    }
 
     // Volume confirmation gate (matches trade.js MIN_VOLUME_RATIO_TO_ENTER).
     // Skip when recent-window volume is faded vs the OLS-window average.
@@ -239,8 +271,26 @@ function replaySymbol(bars, opts, btcBars = null) {
     let fillIdx = null;
     let fillGrossBps = null;
     let fillPrice = null;
+    // Fix 4: stop-loss price. If the bar low pierces this, the position
+    // closes at the stop price (proxy for live market IOC fill from the bid).
+    const stopLossBpsAbs = Math.max(0, Number(opts.stopLossBps) || 0);
+    const stopPrice = stopLossBpsAbs > 0 ? entryPrice * (1 - stopLossBpsAbs / 10000) : null;
+    // Fix 3: hard max-hold market exit. After maxHoldMs the position closes
+    // at the next bar's close (proxy for market IOC fill).
+    const maxHoldMs = Math.max(0, (Number(opts.maxHoldMin) || 0) * 60_000);
     for (let j = entryIdx + 1; j < bars.length; j += 1) {
       const ageMs = tsMs[j] - entryTs;
+      const low = lows[j];
+      // Stop-loss precedence: if both the stop AND the TP wick happen in the
+      // same bar, treat the bar as stop-out (conservative; live exit manager
+      // checks stop FIRST in reconcileExits).
+      if (stopPrice != null && Number.isFinite(low) && low <= stopPrice) {
+        outcome = 'stop_loss';
+        fillIdx = j;
+        fillPrice = stopPrice;
+        fillGrossBps = -stopLossBpsAbs;
+        break;
+      }
       const t = Math.min(1, Math.max(0, ageMs / (opts.breakevenTimeoutMin * 60_000)));
       const desiredGrossBps = initialGrossBps + (breakevenGrossBps - initialGrossBps) * t;
       const limitPrice = entryPrice * (1 + desiredGrossBps / 10000);
@@ -250,6 +300,17 @@ function replaySymbol(bars, opts, btcBars = null) {
         fillIdx = j;
         fillPrice = limitPrice;
         fillGrossBps = desiredGrossBps;
+        break;
+      }
+      // Fix 3: hard time-based market exit.
+      if (maxHoldMs > 0 && ageMs >= maxHoldMs) {
+        const exitPrice = Number(closes[j]);
+        if (Number.isFinite(exitPrice) && exitPrice > 0) {
+          outcome = 'max_hold';
+          fillIdx = j;
+          fillPrice = exitPrice;
+          fillGrossBps = ((exitPrice - entryPrice) / entryPrice) * 10000;
+        }
         break;
       }
     }
@@ -289,6 +350,8 @@ function summarise(trades) {
   const tp = trades.filter((t) => t.outcome === 'tp');
   const step = trades.filter((t) => t.outcome === 'staircase_step');
   const be = trades.filter((t) => t.outcome === 'breakeven');
+  const stopLoss = trades.filter((t) => t.outcome === 'stop_loss');
+  const maxHold = trades.filter((t) => t.outcome === 'max_hold');
   const sumNet = filled.reduce((s, t) => s + (t.fillNetBps || 0), 0);
   const sumGross = filled.reduce((s, t) => s + (t.fillGrossBps || 0), 0);
   const wins = filled.filter((t) => (t.fillNetBps || 0) > 0);
@@ -301,6 +364,8 @@ function summarise(trades) {
     tpFills: tp.length,
     staircaseFills: step.length,
     breakevenFills: be.length,
+    stopLossFills: stopLoss.length,
+    maxHoldFills: maxHold.length,
     stuck: stuck.length,
     stuckRate: total > 0 ? stuck.length / total : null,
     avgNetBpsPerFill: filled.length > 0 ? sumNet / filled.length : null,
@@ -411,7 +476,7 @@ async function runBacktest(overrides = {}) {
 
   const perSymbol = {};
   let allTrades = [];
-  let totalGateSkips = { volume_below_min: 0, btc_leading_drop: 0 };
+  let totalGateSkips = { volume_below_min: 0, btc_leading_drop: 0, projected_below_gross_target: 0 };
   for (const symbol of symbols) {
     let bars = [];
     try {
@@ -424,13 +489,15 @@ async function runBacktest(overrides = {}) {
     const btcBars = symbol === btcSymbol ? null : barsBySymbol[btcSymbol] || null;
     const tradesArr = replaySymbol(bars, opts, btcBars);
     const trades = tradesArr.map((t) => ({ ...t, symbol }));
+    const symbolGateSkipped = tradesArr.gateSkipped || { volume_below_min: 0, btc_leading_drop: 0, projected_below_gross_target: 0 };
     perSymbol[symbol] = {
       ...summarise(trades),
       barsFetched: bars.length,
-      gateSkipped: tradesArr.gateSkipped || { volume_below_min: 0, btc_leading_drop: 0 },
+      gateSkipped: symbolGateSkipped,
     };
-    totalGateSkips.volume_below_min += perSymbol[symbol].gateSkipped.volume_below_min;
-    totalGateSkips.btc_leading_drop += perSymbol[symbol].gateSkipped.btc_leading_drop;
+    totalGateSkips.volume_below_min += symbolGateSkipped.volume_below_min || 0;
+    totalGateSkips.btc_leading_drop += symbolGateSkipped.btc_leading_drop || 0;
+    totalGateSkips.projected_below_gross_target += symbolGateSkipped.projected_below_gross_target || 0;
     allTrades = allTrades.concat(trades);
   }
   const overall = summarise(allTrades);
@@ -450,6 +517,11 @@ async function runBacktest(overrides = {}) {
       minVolumeRatio: opts.minVolumeRatio,
       maxBtcLeadLagDropBps: opts.maxBtcLeadLagDropBps,
       btcLeadLagLookbackBars: opts.btcLeadLagLookbackBars,
+      enforceProjectedCoversGross: opts.enforceProjectedCoversGross,
+      entrySlippageBps: opts.entrySlippageBps,
+      exitSlippageBps: opts.exitSlippageBps,
+      maxHoldMin: opts.maxHoldMin,
+      stopLossBps: opts.stopLossBps,
     },
     perSymbol,
     overall,
