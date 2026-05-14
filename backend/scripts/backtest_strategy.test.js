@@ -279,6 +279,14 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
       feeBpsRoundTrip: 40,
       breakevenTimeoutMin: 240,
       cooldownAfterEntryBars: 20,
+      // This test validates runBacktest plumbing on a low-magnitude synthetic
+      // uptrend (5 bps/bar × 10 bars = 50 projected bps). The Fix 2 default
+      // gate (projection ≥ grossTarget + slippage = 54 bps) would block these
+      // entries; disable it here so the plumbing test stays meaningful.
+      enforceProjectedCoversGross: false,
+      // Disable Fix 3 / Fix 4 too — synthetic bars don't model stop / max-hold.
+      maxHoldMin: 0,
+      stopLossBps: 0,
     });
     assert.ok(result.ranAt, 'should set ranAt');
     assert.ok(result.params, 'should echo params');

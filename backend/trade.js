@@ -54,6 +54,31 @@ function readList(name, fallback = []) {
   return raw.split(',').map((v) => normalizePair(v.trim()) || v.trim()).filter(Boolean);
 }
 
+function readEnum(name, allowed, fallback) {
+  const raw = String(process.env[name] ?? '').trim().toLowerCase();
+  if (!raw) return fallback;
+  return allowed.includes(raw) ? raw : fallback;
+}
+
+// Entry price mode (Fix 1). Live scorecard showed an avg entry spread of ~29
+// bps and the buy lifting the ask — half the spread is paid as cost on every
+// trade. 'mid' rests the buy at (bid+ask)/2; 'bid_plus_tick' rests one tick
+// above bid (most passive). 'ask' restores the original cross-the-spread
+// behaviour. Reposting a passive buy that doesn't fill is handled by
+// ENTRY_FILL_TIMEOUT_MS below.
+const ENTRY_LIMIT_PRICE_MODE = readEnum('ENTRY_LIMIT_PRICE_MODE', ['ask', 'mid', 'bid_plus_tick'], 'mid');
+// Cancel-the-buy-if-not-filled timeout (Fix 1). The mid/bid_plus_tick modes
+// require active management — if the market runs away, we don't want a stale
+// passive buy filling minutes later at a no-longer-edge price. Default 30 s.
+// Set to 0 to disable (passive buy rests until the staircase exit logic
+// detects it on a held position — not recommended outside backtest parity).
+const ENTRY_FILL_TIMEOUT_MS = Math.max(0, readNumber('ENTRY_FILL_TIMEOUT_MS', 30000));
+// Fix 2: refuse entries whose own projection doesn't cover the gross target
+// we'd need to hit TP. Live forensics: projected 38 bps move into a 48 bps
+// gross target — we were asking the market for more than the model itself
+// predicted. Default ON; set to false to revert.
+const ENFORCE_PROJECTED_COVERS_GROSS = readBoolean('ENFORCE_PROJECTED_COVERS_GROSS', true);
+
 // Target NET profit per trade, in basis points. Sell limit is placed at
 // entry * (1 + (TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP) / 10000) so the
 // target is AFTER fees, not before. This is a *scalper*: target small,
@@ -105,13 +130,21 @@ const MIN_SIZING_FRACTION_OF_TARGET = Math.min(
 // one per symbol. There is intentionally no MAX_CONCURRENT_POSITIONS cap.
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
-// being first observed, cancel the TP and replace it at break-even-after-fees
-// so the slot recycles. Default 14_400_000 ms (4 h), matching the README and
-// liveDefaults: this is also the horizon used by BARRIER_HORIZON_BARS for the
-// closed-form fill-probability gate, so a small value collapses fillProbability
-// to ~0 on tier-1 crypto and starves entries via net_edge_below_min. Floor at
-// 30 s to stay above broker round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 14400000));
+// being first observed, the staircase walks the sell limit down to
+// break-even-after-fees so the slot recycles. Default lowered from 4 h → 2 h
+// after live scorecard showed a 25% TP-fill rate and 0% win rate over four
+// closed trades: faster decay means more positions either close at break-even
+// or trip the stop sooner, instead of sitting underwater for a full 4 hours.
+// Also used as BARRIER_HORIZON_BARS for the closed-form fill-probability gate
+// (smaller value → tighter probability → fewer entries — that is the intended
+// effect). Floor at 30 s to stay above broker round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 7200000));
+// Hard time-based market exit (Fix 3). After MAX_HOLD_MS the exit manager
+// cancels any resting GTC sell and submits a market IOC sell — actually
+// closes positions that never tripped the stop and never hit the TP, instead
+// of letting them sit at a break-even-pinned staircase forever. Default 6 h
+// (2 h past the staircase's break-even pin). Set to 0 to disable.
+const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 21600000));
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
 // strategy intent (CLAUDE.md hard rule #5) walked the GTC sell limit toward
 // break-even-after-fees so realized P&L was bounded at $0 net; in practice the
@@ -122,7 +155,10 @@ const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 
 // of regime, never wider than STOP_LOSS_BPS. Set STOP_LOSS_ENABLED=false on
 // Render to revert to the no-realised-loss design.
 const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
-const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
+// Default lowered from 100 → 40 bps (Fix 4). At +8 bps net TP / −100 bps stop
+// the strategy needs ~93% win rate to break even; live observed 25%. Tightening
+// the stop reshapes the payoff so it can survive a realistic 60–70% win rate.
+const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 40));
 // Volatility-scaled stop. When ON, each trade's stop distance is sized from
 // the entry-time realised volatility: stopBps ≈ k × σ × √HORIZON. Quiet
 // markets get tight stops, wild markets get loose ones — same risk in
@@ -131,7 +167,8 @@ const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 100));
 const VOL_SCALED_STOP_ENABLED = readBoolean('VOL_SCALED_STOP_ENABLED', true);
 const STOP_LOSS_VOL_K = Math.max(0.1, readNumber('STOP_LOSS_VOL_K', 1.0));
 const STOP_LOSS_HORIZON_BARS = Math.max(1, readNumber('STOP_LOSS_HORIZON_BARS', 60));
-const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 20));
+// Lowered from 20 → 15 bps to match the tighter STOP_LOSS_BPS cap (Fix 4).
+const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 15));
 // Buffer below the bid-side spread that the stop must always preserve.
 // The stop check fires when bid <= avg_entry × (1 - stopBps/10000), but
 // avg_entry is the ASK we paid — so the bid sits one spread below ask
@@ -209,10 +246,14 @@ const ENTRY_SCAN_INTERVAL_MS = Math.max(3000, readNumber('ENTRY_SCAN_INTERVAL_MS
 const EXIT_SCAN_INTERVAL_MS = Math.max(5000, readNumber('EXIT_SCAN_INTERVAL_MS', 15000));
 // Trading master switch.
 const TRADING_ENABLED = readBoolean('TRADING_ENABLED', true);
-// Quote staleness cutoff (ms). Default 180s plus a 30s grace window to
-// tolerate provider timestamp lag while still rejecting clearly stale quotes.
-const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 180000));
-const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS', 30000));
+// Quote staleness cutoff (ms). Default lowered from 180s → 15s (Fix 5) after
+// live scorecard showed an average entry quote age of 49.5 s and a 0% win rate
+// on closed trades — crypto can move 20–30 bps in 30 s, which is most of the
+// strategy's signal-derived TP. The "quote looks new" grace path below still
+// admits a fresh-but-late quote within (MAX_AGE + GRACE), so provider-timestamp
+// lag doesn't blanket-reject entries.
+const QUOTE_MAX_AGE_MS = Math.max(1000, readNumber('ENTRY_QUOTE_MAX_AGE_MS', 15000));
+const QUOTE_STALE_GRACE_MS = Math.max(0, readNumber('ENTRY_QUOTE_STALE_GRACE_MS', 15000));
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
 // Default raised to 60 bps so the hard guardrail no longer blocks otherwise
 // valid candidates in normal-but-noisy live books; the tighter economics and
@@ -1876,6 +1917,24 @@ async function scanAndEnter() {
         continue;
       }
 
+      // Fix 2: refuse trades whose own projection can't cover the gross move
+      // needed to fill the TP. Live forensics showed projectedBps≈38 with a
+      // GROSS_TARGET_BPS=48 + entry/exit slippage required: we were asking
+      // for ~54 bps of move when the model itself only predicted ~38.
+      if (ENFORCE_PROJECTED_COVERS_GROSS) {
+        const requiredGrossBps = GROSS_TARGET_BPS + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS;
+        if (projectedBps < requiredGrossBps) {
+          rejectTrade(pair, 'projected_below_gross_target', {
+            projectedBps,
+            requiredGrossBps,
+            grossTargetBps: GROSS_TARGET_BPS,
+            entrySlippageBps: ENTRY_SLIPPAGE_BPS,
+            exitSlippageBps: EXIT_SLIPPAGE_BPS,
+          });
+          continue;
+        }
+      }
+
       // Volume confirmation gate (top-detection candidate). Tops typically
       // print on declining volume — `volumeRatio < 1` means recent-window
       // volume is fading vs the OLS lookback. When this gate is enabled,
@@ -1940,9 +1999,23 @@ async function scanAndEnter() {
       const effectiveNotional = tradeNotional;
 
       // Round buy limit to the asset's price_increment so Alpaca accepts it.
+      // Fix 1: rest the buy below the ask. 'mid' = (ask+bid)/2 (saves ~half
+      // the spread on entry); 'bid_plus_tick' = bid + one tick (most passive,
+      // pays no spread but fills less often); 'ask' = lift the offer (legacy).
       const tickInfo = await getAssetTickInfo(pair);
-      const buyLimitStr = formatTickPrice(ask, tickInfo.priceIncrement);
+      let buyPriceRaw;
+      if (ENTRY_LIMIT_PRICE_MODE === 'ask') buyPriceRaw = ask;
+      else if (ENTRY_LIMIT_PRICE_MODE === 'bid_plus_tick') buyPriceRaw = bid + (Number(tickInfo.priceIncrement) || 0);
+      else buyPriceRaw = (ask + bid) / 2;
+      if (!Number.isFinite(buyPriceRaw) || buyPriceRaw <= 0) buyPriceRaw = ask;
+      const buyLimitStr = formatTickPrice(buyPriceRaw, tickInfo.priceIncrement);
       if (!buyLimitStr) { rejectTrade(pair, 'invalid_ask'); continue; }
+      const buyLimitNum = Number(buyLimitStr);
+      // Bps saved vs. lifting the ask. Logged on the prediction record so the
+      // expectancy diff can be measured per trade after the fact.
+      const buyLimitOffsetBpsFromAsk = Number.isFinite(buyLimitNum) && ask > 0
+        ? ((ask - buyLimitNum) / ask) * 10000
+        : 0;
 
       const buyRes = await submitOrder({
         symbol: pair,
@@ -1967,7 +2040,11 @@ async function scanAndEnter() {
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
+          buyLimitPriceMode: ENTRY_LIMIT_PRICE_MODE,
+          buyLimitOffsetBpsFromAsk,
+          entryFillTimeoutMs: ENTRY_FILL_TIMEOUT_MS,
           askAtSubmit: ask,
+          bidAtSubmit: bid,
           tradeNotional: effectiveNotional,
           spreadBps,
           quoteAgeMs: ageMs,
@@ -2168,6 +2245,48 @@ function getStopLossConfig() {
 
 async function reconcileExits() {
   const { byPair, openSellByPair } = await buildHeldAndOpenSellsIndex();
+
+  // Fix 1: cancel pending buys that haven't filled within ENTRY_FILL_TIMEOUT_MS.
+  // Passive (mid / bid_plus_tick) entries may rest under the market if the
+  // ask runs away; we don't want a stale buy to fill seconds-to-minutes later
+  // at a no-longer-edge price. A position that already appeared in byPair has
+  // partial/full fill and is handled below — only cancel pendings that are
+  // still purely unfilled.
+  if (ENTRY_FILL_TIMEOUT_MS > 0) {
+    const nowMs = Date.now();
+    for (const [pair, pending] of Array.from(pendingBuys.entries())) {
+      if (byPair.has(pair)) continue;
+      const submittedAt = Number(pending?.submittedAt);
+      if (!Number.isFinite(submittedAt)) continue;
+      const ageMs = nowMs - submittedAt;
+      if (ageMs <= ENTRY_FILL_TIMEOUT_MS) continue;
+      const orderId = pending?.orderId;
+      if (!orderId) { pendingBuys.delete(pair); continue; }
+      try {
+        await cancelOrder(orderId);
+        console.log('entry_fill_timeout_cancel', { symbol: pair, orderId, ageMs });
+        try {
+          tradeForensics.update(orderId, {
+            phase: 'entry_cancelled_timeout',
+            cancelledAt: new Date().toISOString(),
+            entryFillAgeMs: ageMs,
+          });
+        } catch (err) {
+          console.warn('forensics_entry_timeout_update_failed', { symbol: pair, error: err?.message });
+        }
+      } catch (err) {
+        console.warn('entry_fill_timeout_cancel_failed', {
+          symbol: pair,
+          orderId,
+          error: err?.errorMessage || err?.message,
+        });
+      }
+      pendingBuys.delete(pair);
+      tradePredictions.delete(pair);
+      entryIntentState.delete(pair);
+    }
+  }
+
   for (const [pair, pos] of byPair.entries()) {
     const qty = Number(pos?.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
@@ -2284,6 +2403,66 @@ async function reconcileExits() {
         } catch (err) {
           lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'stop_loss_failed', message: err?.errorMessage || err?.message || String(err) };
           console.warn('exit_stop_loss_failed', { symbol: pair, error: err?.errorMessage || err?.message });
+        }
+      }
+    }
+
+    // Fix 3: hard max-hold market exit. Staircase walks the sell down to
+    // break-even-after-fees and pins there; without this, a position that
+    // never trips the stop and never wicks to break-even sits indefinitely.
+    // After MAX_HOLD_MS the resting sell is cancelled and a market IOC sell
+    // closes the position at whatever the bid is — actually realises the
+    // outcome instead of parking capital.
+    if (MAX_HOLD_MS > 0 && Number.isFinite(avg) && avg > 0) {
+      const existing = openSellByPair.get(pair);
+      const ageMs = resolveStaircaseAgeMs(pair, existing);
+      if (ageMs >= MAX_HOLD_MS) {
+        try {
+          if (existing?.id) await cancelOrder(existing.id);
+          const sellResult = await submitOrder({
+            symbol: pair,
+            side: 'sell',
+            type: 'market',
+            time_in_force: 'ioc',
+            qty: String(qty),
+          });
+          const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
+          const triggeredAt = sellOrder?.submitted_at || new Date().toISOString();
+          const orderFillPrice = Number(sellOrder?.filled_avg_price);
+          const quote = await getLatestQuote(pair).catch(() => null);
+          const bidNow = Number(quote?.bp);
+          const exitPrice = Number.isFinite(orderFillPrice) && orderFillPrice > 0
+            ? orderFillPrice
+            : (Number.isFinite(bidNow) && bidNow > 0 ? bidNow : avg);
+          const realizedGrossBps = avg > 0 ? ((exitPrice - avg) / avg) * 10000 : 0;
+          exitState.set(pair, {
+            ...exitState.get(pair),
+            sellOrderId: sellOrder?.id || null,
+            targetPrice: exitPrice,
+            sellOrderSubmittedAt: triggeredAt,
+            reconciliationState: 'max_hold_market_exit',
+            lastReconciliationAction: 'max_hold_market_sell',
+            expectedNetProfitBps: realizedGrossBps - FEE_BPS_ROUND_TRIP,
+            minNetProfitBps: realizedGrossBps - FEE_BPS_ROUND_TRIP,
+            maxHoldExitTriggered: true,
+            maxHoldExitAt: triggeredAt,
+            maxHoldExitPrice: exitPrice,
+            maxHoldAgeMs: ageMs,
+          });
+          lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'max_hold_market_sell', orderId: sellOrder?.id || null };
+          console.log('exit_max_hold_triggered', {
+            symbol: pair,
+            ageMs,
+            maxHoldMs: MAX_HOLD_MS,
+            exitPrice,
+            realizedGrossBps: Number(realizedGrossBps.toFixed(2)),
+            cancelledOrderId: existing?.id || null,
+            newOrderId: sellOrder?.id || null,
+          });
+          continue;
+        } catch (err) {
+          lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'max_hold_exit_failed', message: err?.errorMessage || err?.message || String(err) };
+          console.warn('exit_max_hold_failed', { symbol: pair, error: err?.errorMessage || err?.message });
         }
       }
     }
@@ -2534,15 +2713,19 @@ async function reconcileExits() {
     if (byPair.has(pair)) continue;
     const pred = tradePredictions.get(pair);
     const entry = Number(state?.entryPriceUsed);
-    // For stop-loss exits, prefer the recorded actual exit price (live bid
-    // at trigger time, or filled_avg_price if Alpaca returned it on the IOC
-    // market sell). Falls back to targetPrice for TP and break-even closes
-    // where targetPrice IS the fill price by construction (GTC limit fills).
+    // For stop-loss / max-hold exits, prefer the recorded actual exit price
+    // (live bid at trigger time, or filled_avg_price if Alpaca returned it on
+    // the IOC market sell). Falls back to targetPrice for TP and break-even
+    // closes where targetPrice IS the fill price by construction (GTC limit
+    // fills).
     const stopLossClose = state?.stopLossTriggered === true;
+    const maxHoldClose = state?.maxHoldExitTriggered === true;
     const stopLossExitPrice = Number(state?.stopLossExitPrice);
-    const exit = stopLossClose && Number.isFinite(stopLossExitPrice) && stopLossExitPrice > 0
-      ? stopLossExitPrice
-      : Number(state?.targetPrice);
+    const maxHoldExitPrice = Number(state?.maxHoldExitPrice);
+    let exit;
+    if (stopLossClose && Number.isFinite(stopLossExitPrice) && stopLossExitPrice > 0) exit = stopLossExitPrice;
+    else if (maxHoldClose && Number.isFinite(maxHoldExitPrice) && maxHoldExitPrice > 0) exit = maxHoldExitPrice;
+    else exit = Number(state?.targetPrice);
     const closedAt = new Date().toISOString();
     if (pred && Number.isFinite(entry) && entry > 0 && Number.isFinite(exit) && exit > 0) {
       const grossBps = ((exit - entry) / entry) * 10000;
@@ -2551,13 +2734,14 @@ async function reconcileExits() {
       const grossPnlUsd = (grossBps * notional) / 10000;
       const netPnlUsd = (netBps * notional) / 10000;
       const holdSeconds = Math.max(0, (Date.now() - Number(pred.submittedAt || 0)) / 1000);
-      // Close-classification precedence: stop_loss → breakeven_limit → tp_limit.
-      // Prior bug: stop-loss exits were silently labeled 'tp_limit' because
-      // the close path only checked breakevenAttached, which inflated
+      // Close-classification precedence: stop_loss → max_hold → breakeven_limit
+      // → tp_limit. Prior bug: stop-loss exits were silently labeled 'tp_limit'
+      // because the close path only checked breakevenAttached, which inflated
       // tpFillRate and made the scorecard inconsistent (winRate=0,
       // tpFillRate=1 simultaneously when a single stop-out fired).
       let exitReason;
       if (stopLossClose) exitReason = 'stop_loss';
+      else if (maxHoldClose) exitReason = 'max_hold';
       else if (state?.breakevenAttached) exitReason = 'breakeven_limit';
       else exitReason = 'tp_limit';
       try {
