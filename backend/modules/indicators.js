@@ -137,12 +137,76 @@ function atrToBps(atr, price) {
   return (a / p) * 10000;
 }
 
+// Wilder RSI. Returns the latest RSI value over `period` closes (default 14),
+// or null if there are fewer than period+1 closes (RSI needs at least one
+// return per smoothing slot).
+function rsi(values, period = 14) {
+  const data = toFiniteArray(values);
+  const span = Math.max(1, Math.floor(Number(period) || 14));
+  if (data.length < span + 1) return null;
+  let gainSum = 0;
+  let lossSum = 0;
+  for (let i = 1; i <= span; i += 1) {
+    const diff = data[i] - data[i - 1];
+    if (diff >= 0) gainSum += diff;
+    else lossSum += -diff;
+  }
+  let avgGain = gainSum / span;
+  let avgLoss = lossSum / span;
+  for (let i = span + 1; i < data.length; i += 1) {
+    const diff = data[i] - data[i - 1];
+    const gain = diff >= 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = ((avgGain * (span - 1)) + gain) / span;
+    avgLoss = ((avgLoss * (span - 1)) + loss) / span;
+  }
+  if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+// RSI computed for each closing index from `period` onward; earlier slots are
+// null (not enough history to fit the window). Useful for "is RSI rising for 3
+// prints" checks downstream.
+function rsiSeries(values, period = 14) {
+  const data = toFiniteArray(values);
+  const span = Math.max(1, Math.floor(Number(period) || 14));
+  if (data.length < span + 1) return [];
+  const series = Array(data.length).fill(null);
+  let gainSum = 0;
+  let lossSum = 0;
+  for (let i = 1; i <= span; i += 1) {
+    const diff = data[i] - data[i - 1];
+    if (diff >= 0) gainSum += diff;
+    else lossSum += -diff;
+  }
+  let avgGain = gainSum / span;
+  let avgLoss = lossSum / span;
+  series[span] = avgLoss === 0
+    ? (avgGain === 0 ? 50 : 100)
+    : 100 - 100 / (1 + (avgGain / avgLoss));
+  for (let i = span + 1; i < data.length; i += 1) {
+    const diff = data[i] - data[i - 1];
+    const gain = diff >= 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = ((avgGain * (span - 1)) + gain) / span;
+    avgLoss = ((avgLoss * (span - 1)) + loss) / span;
+    series[i] = avgLoss === 0
+      ? (avgGain === 0 ? 50 : 100)
+      : 100 - 100 / (1 + (avgGain / avgLoss));
+  }
+  return series;
+}
+
 module.exports = {
   ema,
+  emaSeries,
   macd,
   slope,
   zscore,
   volumeTrend,
   computeATR,
   atrToBps,
+  rsi,
+  rsiSeries,
 };
