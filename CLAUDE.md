@@ -40,6 +40,17 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 
 `SIGNAL_VERSION` selects which entry signal the scan uses. **Default `ols`** (legacy 1m linear-regression predictor; current production behaviour). `multi_factor` switches to the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`. **Do not flip the live default to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Rollback: set `SIGNAL_VERSION=ols` in Render env and restart.
 
+## Recommended live env overrides (Render)
+
+The code defaults are conservative for development; the recommended live posture overrides them via Render env (no code change required). See the "Production deployment" section of the top-level `README.md` for the full rationale.
+
+- `ENTRY_UNIVERSE_MODE=configured` — scopes the scan to the 12 deep-liquidity primary pairs (`ENTRY_SYMBOLS_PRIMARY`). Alpaca's quote feed for long-tail alts is chronically stale; `dynamic` mode loses ~13/33 symbols to the stale-quote pruner at any moment.
+- `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests below the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000` (already on by default), which recycles unfilled passive rests on the next scan. Don't add mid→ask escalation: that just reverts to legacy spread-crossing economics.
+
+## Entry quote prefetch
+
+The entry-scan quote loop batches `/latest/quotes` calls via `prefetchQuotesForCandidates` in `backend/trade.js` (helper near `fetchCryptoQuotes`, invocation just before the per-symbol loop in `scanAndEnter`). Default `ENTRY_PREFETCH_QUOTES=true`, `ENTRY_PREFETCH_CHUNK_SIZE=8`. The per-symbol loop reads from the prefetched Map first and falls back to a single-symbol fetch only when a chunk failed. Rollback: `ENTRY_PREFETCH_QUOTES=false` in Render env (no code change).
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
