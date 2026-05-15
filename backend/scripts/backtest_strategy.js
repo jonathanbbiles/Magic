@@ -161,6 +161,10 @@ const DEFAULTS = {
   mrTargetNetBpsFloor: 5,
   mrSignalTargetMaxNetBps: 120,
   mrStopLossBps: 60,
+  // Tier-3 MR stop cap — mirrors live MR_STOP_LOSS_BPS_TIER3. Long-tail alts
+  // have wider spreads; the tier-aware cap lets the backtest model their
+  // actual realized stop distance instead of clipping to the tier-1/2 60.
+  mrStopLossBpsTier3: 100,
   mrMaxHoldMin: 45,
   mrBreakevenTimeoutMin: 30,
   // Override signal-config knobs (passed through to evaluateMeanReversionSignal
@@ -561,7 +565,18 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       const cap = Number(opts.mrSignalTargetMaxNetBps) || 120;
       const raw = mrSig.projectedBps - fees;
       signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
-      stopLossBpsAbsForTrade = Math.max(0, Number(opts.mrStopLossBps) || 0);
+      // Tier-aware MR stop. Tier-1/2 = mrStopLossBps (default 60); tier-3
+      // = mrStopLossBpsTier3 (default 100, wider headroom for alts). Mirrors
+      // the live deriveStopLossBps tier dispatch in backend/trade.js.
+      const tier1 = Array.isArray(opts.spreadCostTier1Symbols) ? opts.spreadCostTier1Symbols : [];
+      const tier2 = Array.isArray(opts.spreadCostTier2Symbols) ? opts.spreadCostTier2Symbols : [];
+      const symUp = String(resolvedSymbol || '').toUpperCase();
+      const isTier3 = !(tier1.map((s) => s.toUpperCase()).includes(symUp)
+        || tier2.map((s) => s.toUpperCase()).includes(symUp));
+      const mrCap = isTier3
+        ? Math.max(0, Number(opts.mrStopLossBpsTier3) || 0)
+        : Math.max(0, Number(opts.mrStopLossBps) || 0);
+      stopLossBpsAbsForTrade = mrCap;
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -975,6 +990,7 @@ async function runBacktest(overrides = {}) {
       mrTargetNetBpsFloor: opts.mrTargetNetBpsFloor,
       mrSignalTargetMaxNetBps: opts.mrSignalTargetMaxNetBps,
       mrStopLossBps: opts.mrStopLossBps,
+      mrStopLossBpsTier3: opts.mrStopLossBpsTier3,
       mrMaxHoldMin: opts.mrMaxHoldMin,
       mrBreakevenTimeoutMin: opts.mrBreakevenTimeoutMin,
       rejectNearHighEnabled: opts.rejectNearHighEnabled,

@@ -741,6 +741,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mrTargetNetBpsFloor != null ? { mrTargetNetBpsFloor: Number(overrides.mrTargetNetBpsFloor) } : {}),
       ...(overrides.mrSignalTargetMaxNetBps != null ? { mrSignalTargetMaxNetBps: Number(overrides.mrSignalTargetMaxNetBps) } : {}),
       ...(overrides.mrStopLossBps != null ? { mrStopLossBps: Number(overrides.mrStopLossBps) } : {}),
+      ...(overrides.mrStopLossBpsTier3 != null ? { mrStopLossBpsTier3: Number(overrides.mrStopLossBpsTier3) } : {}),
       ...(overrides.mrMaxHoldMin != null ? { mrMaxHoldMin: Number(overrides.mrMaxHoldMin) } : {}),
       ...(overrides.mrBreakevenTimeoutMin != null ? { mrBreakevenTimeoutMin: Number(overrides.mrBreakevenTimeoutMin) } : {}),
       ...(overrides.mrDropTriggerBps != null ? { mrDropTriggerBps: Number(overrides.mrDropTriggerBps) } : {}),
