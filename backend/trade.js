@@ -29,6 +29,7 @@ const {
   computeMinimumGrossTargetBps,
 } = require('./modules/entryEconomics');
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
+const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
@@ -133,20 +134,23 @@ const MIN_SIZING_FRACTION_OF_TARGET = Math.min(
 
 // If the take-profit hasn't filled within BREAKEVEN_TIMEOUT_MS of the position
 // being first observed, the staircase walks the sell limit down to
-// break-even-after-fees so the slot recycles. Default lowered from 4 h → 2 h
-// after live scorecard showed a 25% TP-fill rate and 0% win rate over four
-// closed trades: faster decay means more positions either close at break-even
-// or trip the stop sooner, instead of sitting underwater for a full 4 hours.
-// Also used as BARRIER_HORIZON_BARS for the closed-form fill-probability gate
-// (smaller value → tighter probability → fewer entries — that is the intended
-// effect). Floor at 30 s to stay above broker round-trip latency.
-const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 7200000));
+// break-even-after-fees so the slot recycles. Default tightened from 2 h →
+// 45 min: the operator target is +1%/day via tiny scalps, so any position
+// that hasn't resolved in 45 min has missed its intended micro-move and
+// should pin to break-even (and let the stop or max-hold close the trade)
+// rather than tie up capital. Also used as BARRIER_HORIZON_BARS for the
+// closed-form fill-probability gate (smaller value → tighter probability →
+// fewer entries — intended effect). Floor at 30 s to stay above broker
+// round-trip latency.
+const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 2700000));
 // Hard time-based market exit (Fix 3). After MAX_HOLD_MS the exit manager
 // cancels any resting GTC sell and submits a market IOC sell — actually
 // closes positions that never tripped the stop and never hit the TP, instead
-// of letting them sit at a break-even-pinned staircase forever. Default 6 h
-// (2 h past the staircase's break-even pin). Set to 0 to disable.
-const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 21600000));
+// of letting them sit at a break-even-pinned staircase forever. Default
+// tightened from 6 h → 90 min: scalps that haven't resolved in 90 min are
+// failing the strategy thesis — recycle the capital instead of paying the
+// MTM tail. Set to 0 to disable.
+const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 5400000));
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
 // strategy intent (CLAUDE.md hard rule #5) walked the GTC sell limit toward
 // break-even-after-fees so realized P&L was bounded at $0 net; in practice the
@@ -157,10 +161,12 @@ const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 21600000));
 // of regime, never wider than STOP_LOSS_BPS. Set STOP_LOSS_ENABLED=false on
 // Render to revert to the no-realised-loss design.
 const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
-// Default lowered from 100 → 40 bps (Fix 4). At +8 bps net TP / −100 bps stop
-// the strategy needs ~93% win rate to break even; live observed 25%. Tightening
-// the stop reshapes the payoff so it can survive a realistic 60–70% win rate.
-const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 40));
+// Default tightened to 35 bps (was 40 after Fix 4, originally 100). At
+// +8 bps net TP / −35 bps stop the strategy needs ~82% win rate to break
+// even on the realised-loss path; the staircase and break-even floor cap
+// the rest of the tail. Vol-scaled stop usually picks a value well below
+// this cap; this is only the ceiling.
+const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 35));
 // Multi-factor signal stop-loss cap. When SIGNAL_VERSION='multi_factor', the
 // per-trade vol-scaled stop is capped at this value instead of STOP_LOSS_BPS.
 // Default 100 bps matches the wider TP target the new signal uses (40-150 bps
@@ -398,12 +404,22 @@ const MAX_BTC_LEAD_LAG_DROP_BPS = readNumber('MAX_BTC_LEAD_LAG_DROP_BPS', -10);
 // diagnostics observed 11 simultaneous losers entered over a 10-hour
 // window into a crypto-wide sell-off, with UNI already -100+ bps when
 // XRP fired 3 hours later. This is the missing macro filter. Default
-// -2.0 (= -2% book drawdown). Set to 0 to disable. Negative threshold
-// only.
+// tightened from -2.0 → -0.5 (= -0.5% book drawdown): operator target is
+// +1%/day via tiny scalps, so a -0.5% portfolio drawdown is already half
+// a day's P&L — pause new entries before giving up the day. Set to 0 to
+// disable. Negative threshold only.
 const MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER = readNumber(
   'MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER',
-  -2.0,
+  -0.5,
 );
+// Recent-high proximity gate. Operator pain: "we do good but then get stuck
+// when we bought when the market was too high." Refuses entries where the
+// bid is within REJECT_NEAR_HIGH_BPS of the highest close in the last
+// REJECT_NEAR_HIGH_LOOKBACK_BARS 1-minute bars. Uses already-fetched closes;
+// no extra Alpaca call. Set REJECT_NEAR_HIGH_ENABLED=false to disable.
+const REJECT_NEAR_HIGH_ENABLED = readBoolean('REJECT_NEAR_HIGH_ENABLED', true);
+const REJECT_NEAR_HIGH_BPS = Math.max(0, readNumber('REJECT_NEAR_HIGH_BPS', 30));
+const REJECT_NEAR_HIGH_LOOKBACK_BARS = Math.max(1, readNumber('REJECT_NEAR_HIGH_LOOKBACK_BARS', 60));
 // Orderbook-imbalance feature. Default OFF — enabling adds an extra
 // /latest/orderbooks fetch per scan (≈ same cost as the existing /latest/quotes
 // hit), against Alpaca's 200/min crypto data cap. When ON, every entry's
@@ -1937,6 +1953,28 @@ async function scanAndEnter() {
         continue;
       }
 
+      // Recent-high proximity gate. Reject when the bid is within
+      // REJECT_NEAR_HIGH_BPS of the highest close in the last
+      // REJECT_NEAR_HIGH_LOOKBACK_BARS minutes. Buying at local tops is the
+      // dominant source of stuck positions; this gate uses already-fetched
+      // closes (no extra Alpaca call).
+      const recentHighGateResult = evaluateRecentHighGate({
+        closes: sig.closes,
+        bid,
+        lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
+        rejectBps: REJECT_NEAR_HIGH_BPS,
+        enabled: REJECT_NEAR_HIGH_ENABLED,
+      });
+      if (!recentHighGateResult.ok && recentHighGateResult.reason === 'near_recent_high') {
+        rejectTrade(pair, 'near_recent_high', {
+          recentHigh: recentHighGateResult.recentHigh,
+          recentHighBps: recentHighGateResult.recentHighBps,
+          lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
+          rejectBps: REJECT_NEAR_HIGH_BPS,
+        });
+        continue;
+      }
+
       // Optional orderbook imbalance fetch. Only fires when the env flag is
       // on so the default deployment makes zero extra API calls. Stored as
       // a separate variable rather than mutating `sig` so the predictor
@@ -2246,6 +2284,10 @@ async function scanAndEnter() {
           volumeWeightedSlopeBps: Number.isFinite(sig.volumeWeightedSlopeBps) ? sig.volumeWeightedSlopeBps : null,
           recentVolumeMean: Number.isFinite(sig.recentVolumeMean) ? sig.recentVolumeMean : null,
           btcLeadLag: pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot(),
+          recentHigh: recentHighGateResult.recentHigh,
+          recentHighBps: recentHighGateResult.recentHighBps,
+          recentHighLookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
+          recentHighRejectBps: REJECT_NEAR_HIGH_BPS,
           bookImbalance,
           bookImbalanceFeatureEnabled: ORDERBOOK_IMBALANCE_FEATURE_ENABLED,
           signalVersion: sig.signalVersion || SIGNAL_VERSION,

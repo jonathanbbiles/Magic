@@ -424,6 +424,12 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
       // Disable Fix 3 / Fix 4 too — synthetic bars don't model stop / max-hold.
       maxHoldMin: 0,
       stopLossBps: 0,
+      // Disable the recent-high gate (every bar in a monotonic uptrend IS the
+      // recent high) and the half-spread cost (synthetic bars don't model
+      // spread) so the plumbing assertion (entries > 0) still holds.
+      rejectNearHighEnabled: false,
+      entrySpreadCostBps: 0,
+      entryFillTimeoutMin: 0,
     });
     assert.ok(result.ranAt, 'should set ranAt');
     assert.ok(result.params, 'should echo params');

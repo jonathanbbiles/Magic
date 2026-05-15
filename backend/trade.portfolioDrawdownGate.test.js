@@ -31,6 +31,10 @@ process.env.MIN_TRADE_NOTIONAL_USD = '1';
 // pick a value tight enough that a -3% mocked book trips it but a 0% book
 // does not.
 process.env.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER = '-2.0';
+// Disable the recent-high gate: this test's mocked bars are a monotonic
+// uptrend, so every entry IS the recent high and the gate would block
+// everything before the portfolio-drawdown gate could even be observed.
+process.env.REJECT_NEAR_HIGH_ENABLED = 'false';
 
 const trade = require('./trade');
 

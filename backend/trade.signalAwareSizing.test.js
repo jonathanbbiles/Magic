@@ -88,19 +88,19 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
 
 // --- deriveStopLossBps ------------------------------------------------------
 
-// 9. OLS path with realistic vol — vol-scaled stop is below the OLS cap (40).
-// 1.0 × 4 × √60 ≈ 30.98, between the floor (15) and the cap (40).
+// 9. OLS path with realistic vol — vol-scaled stop is below the OLS cap (35).
+// 1.0 × 4 × √60 ≈ 30.98, between the floor (15) and the cap (35).
 {
   const v = deriveStopLossBps(4, 5, 'ols');
-  assert.ok(v > 15 && v < 40, `expected vol-scaled in (15, 40), got ${v}`);
+  assert.ok(v > 15 && v < 35, `expected vol-scaled in (15, 35), got ${v}`);
 }
 
-// 10. OLS path with high vol: clamped at the OLS cap (40). Same input on the
-// multi-factor path is uncapped because MF allows wider stops.
+// 10. OLS path with high vol: clamped at the OLS cap (35, tightened from 40).
+// Same input on the multi-factor path is uncapped because MF allows wider stops.
 {
   const ols = deriveStopLossBps(20, 5, 'ols');
   const mf = deriveStopLossBps(20, 5, 'multi_factor');
-  assert.equal(ols, 40);                 // OLS cap = 40
+  assert.equal(ols, 35);                 // OLS cap = 35
   assert.ok(mf > ols, `expected MF stop > OLS stop on high vol, got ols=${ols}, mf=${mf}`);
   assert.ok(mf <= 100, `MF stop should respect MF cap (100), got ${mf}`);
 }

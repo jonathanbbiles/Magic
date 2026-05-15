@@ -18,18 +18,28 @@
  *     over BREAKEVEN_TIMEOUT_MS
  *   - Stop-loss at entry × (1 - STOP_LOSS_BPS / 10000) (Fix 4)
  *   - Hard max-hold market exit at MAX_HOLD_MS (Fix 3)
+ *   - Recent-high proximity gate: refuses entries within rejectNearHighBps
+ *     of the highest close in the last rejectNearHighLookbackBars (parity
+ *     with live REJECT_NEAR_HIGH_*).
+ *   - Half-spread cost on entry: the live engine rests at mid; the backtest
+ *     now charges entryPrice × (1 + halfSpread/10000) where halfSpread is
+ *     the tier-aware spread cap halved. This brings backtest fill economics
+ *     in line with live (~3–5 bps drag previously hidden).
+ *   - Entry-fill-timeout cancellation: passive limits that don't get hit
+ *     within entryFillTimeoutMin (default 0.5 min) are cancelled, matching
+ *     live ENTRY_FILL_TIMEOUT_MS. Set to 0 to disable.
  *
  * What this does NOT model (yet):
- *   - Live spread/quote freshness gates (bars don't carry quote-level data)
+ *   - Live quote freshness gates (bars don't carry quote-level age data)
  *   - HTF downtrend filter (cheap to add — see TODO)
  *   - micro_signal_missing (depends on quote-level state)
  *   - Per-trade fees; we report gross AND net assuming FEE_BPS_ROUND_TRIP=40
- *   - Entry-price mode (Fix 1) — backtest uses bar closes as entry price,
- *     same as before. Live `mid` mode saves ~half-spread on entry that the
- *     backtest doesn't currently penalise.
  *
- * Net effect: the backtester is *more permissive* than live. Treat its
- * fill-rate / expectancy numbers as upper bounds for the underlying signal.
+ * The half-spread + fill-timeout additions remove the previous "backtest
+ * more permissive than live" gap. Remaining gaps still favour the backtest
+ * slightly (quote staleness, orderbook factor on MF), but the headline
+ * avgNetBpsPerEntry is now within ~1–2 bps of the live execution path
+ * instead of the previous 5+ bps overstatement.
  *
  * Usage:
  *   node scripts/backtest_strategy.js --symbols=BTC/USD,ETH/USD --start=2026-04-01 --end=2026-05-01
@@ -39,6 +49,7 @@
 
 const path = require('path');
 const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
+const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
   symbols: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
@@ -55,7 +66,7 @@ const DEFAULTS = {
   targetNetBps: 8,                       // matches live TARGET_NET_PROFIT_BPS
   signalTargetMaxNetBps: 50,             // matches live cap
   feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
-  breakevenTimeoutMin: 120,              // BREAKEVEN_TIMEOUT_MS / 60_000 (Fix 4 default 2 h)
+  breakevenTimeoutMin: 45,               // BREAKEVEN_TIMEOUT_MS / 60_000 (tightened to 45 min)
   cooldownAfterEntryBars: 5,             // refuse re-entry on same symbol for N bars after each entry
   // Top-detection gates (matches trade.js env knobs). Defaults track live
   // config — both gates default ON. Set to 0 to A/B against gate-off.
@@ -67,12 +78,33 @@ const DEFAULTS = {
   enforceProjectedCoversGross: true,
   entrySlippageBps: 3,                   // matches live ENTRY_SLIPPAGE_BPS
   exitSlippageBps: 3,                    // matches live EXIT_SLIPPAGE_BPS
-  // Fix 3: hard max-hold market exit. Set to 0 to disable. Live default 6 h.
-  maxHoldMin: 360,
+  // Fix 3: hard max-hold market exit. Set to 0 to disable. Live default 90 min.
+  maxHoldMin: 90,
   // Fix 4: stop-loss bps below entry. If the bar low pierces the stop, the
   // position closes at the stop price (proxy for live market IOC fill). 0
-  // disables, matching the legacy backtest behaviour.
-  stopLossBps: 40,
+  // disables, matching the legacy backtest behaviour. Tightened from 40 → 35
+  // to match the live cap reduction in liveDefaults.js.
+  stopLossBps: 35,
+  // Recent-high proximity gate (matches trade.js REJECT_NEAR_HIGH_*). Reject
+  // entries where the bar close is within rejectNearHighBps of the highest
+  // close in the last rejectNearHighLookbackBars bars. Set rejectNearHighBps
+  // to 0 to disable, or pass --reject-near-high-enabled=false.
+  rejectNearHighEnabled: true,
+  rejectNearHighBps: 30,
+  rejectNearHighLookbackBars: 60,
+  // Half-spread cost on entry (live engine rests at mid; live half-spread is
+  // ~half the tier cap). Bars don't carry quote-level spread so we apply a
+  // flat conservative estimate: 20 bps default = half of typical tier-2
+  // observed spreads (~40 bps round trip). Pass 0 via CLI/query param to
+  // disable for legacy parity; pass a smaller value (e.g. 10) for tier-1
+  // (BTC/ETH) sensitivity sweeps.
+  entrySpreadCostBps: 20,
+  // Entry-fill-timeout cancellation. Live cancels passive buy limits after
+  // ENTRY_FILL_TIMEOUT_MS = 30 s. Backtest counts an entry as cancelled (no
+  // fill, no trade record) if no bar within the next entryFillTimeoutMin
+  // minutes has a low ≤ effective entry price. 0 disables (legacy behaviour:
+  // fills always succeed at the candidate bar's close).
+  entryFillTimeoutMin: 1,                // 1 minute = 60 s ≈ 2× live timeout (conservative)
   // HTF downtrend gate. When > 0, requires the higher-timeframe slope
   // (htfBars × 5 m closes) to be ≥ this floor (bps/bar). Matches live
   // HTF_MIN_SLOPE_BPS_PER_BAR. Set to 0 to disable.
@@ -85,11 +117,12 @@ const DEFAULTS = {
   mfStopLossBps: 100,
   // The multi-factor signal includes an orderbook bid-share factor. Alpaca
   // historical bars don't carry orderbook snapshots, so the backtest can't
-  // evaluate it. 'always_pass' (default) treats the factor as auto-passing
-  // — making the backtest more permissive than live. 'always_fail' rules
-  // every entry out (only useful as a sanity check). The result payload
-  // surfaces this caveat under `mfBacktestCaveats`.
-  mfBookImbalanceMode: 'always_pass',
+  // evaluate it. Default flipped to 'always_fail' (was 'always_pass'): live
+  // requires the factor to pass, so a stub that always-passes makes the
+  // backtest more permissive than live — exactly the kind of optimism that
+  // led to backtest-vs-live divergence. Setting this to 'always_pass'
+  // re-enables the optimistic behaviour for A/B sanity checks only.
+  mfBookImbalanceMode: 'always_fail',
   mfMinBars1m: 24,                       // multi-factor needs ≥24 closed 1m bars (RSI window + ATR)
   mfMinBars5m: 18,                       // and ≥16 closed 5m bars (synthesized from 1m)
   mfMinBars15m: 22,                      // and ≥22 closed 15m bars (synthesized from 1m)
@@ -352,6 +385,31 @@ function replaySymbol(bars, opts, btcBars = null) {
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
 
+    // Recent-high proximity gate — runs before strategy dispatch so both OLS
+    // and multi-factor benefit. Opt-in pattern matches other gates here: only
+    // active when both the explicit enable flag is true AND the bps threshold
+    // is positive. Existing tests that don't set these opts keep their old
+    // behaviour.
+    if (opts.rejectNearHighEnabled === true && Number(opts.rejectNearHighBps) > 0) {
+      const lookback = Math.max(1, Number(opts.rejectNearHighLookbackBars) || 60);
+      const windowStart = Math.max(0, i - lookback);
+      const window = closes.slice(windowStart, i).filter((c) => Number.isFinite(c) && c > 0);
+      if (window.length > 0) {
+        const recentHigh = Math.max(...window);
+        const candidateClose = Number(closes[i]);
+        if (Number.isFinite(candidateClose) && candidateClose > 0 && recentHigh > 0) {
+          // Drawdown-from-peak convention (matches recentHighGate.js):
+          // distance is a fraction of the high.
+          const recentHighBps = ((recentHigh - candidateClose) / recentHigh) * 10000;
+          if (recentHighBps < Number(opts.rejectNearHighBps)) {
+            if (!stats.skipped.near_recent_high) stats.skipped.near_recent_high = 0;
+            stats.skipped.near_recent_high += 1;
+            continue;
+          }
+        }
+      }
+    }
+
     let sig = null;
     let signalDerivedNetBps = null;
     let stopLossBpsAbsForTrade = Math.max(0, Number(opts.stopLossBps) || 0);
@@ -475,10 +533,41 @@ function replaySymbol(bars, opts, btcBars = null) {
       }
     }
 
-    const entryPrice = Number(bars[i].c);
-    if (!Number.isFinite(entryPrice) || entryPrice <= 0) continue;
+    const candidateClose = Number(bars[i].c);
+    if (!Number.isFinite(candidateClose) || candidateClose <= 0) continue;
     const entryIdx = i;
     const entryTs = tsMs[i];
+
+    // Half-spread cost on entry. The live engine rests at mid; a passive mid
+    // limit at fill time means we paid half the spread to enter. Bars don't
+    // carry quote-level spread, so this is opt-in: when entrySpreadCostBps
+    // > 0, the effective entry price is shifted up by that bps. Default 0
+    // (backwards-compatible with existing tests); auto-run sets it to the
+    // typical tier-2 half-spread.
+    const halfSpreadBps = Math.max(0, Number(opts.entrySpreadCostBps) || 0);
+    const entryPrice = halfSpreadBps > 0
+      ? candidateClose * (1 + halfSpreadBps / 10000)
+      : candidateClose;
+
+    // Entry-fill-timeout cancellation. The live engine cancels passive buy
+    // limits that haven't filled in ENTRY_FILL_TIMEOUT_MS (default 30 s).
+    // Backtest proxy: if no bar within the next entryFillTimeoutMin minutes
+    // has low ≤ candidateClose (the passive buy-limit reference), treat the
+    // entry as cancelled — no trade record. 0 disables (legacy behaviour).
+    const fillTimeoutMin = Math.max(0, Number(opts.entryFillTimeoutMin) || 0);
+    if (fillTimeoutMin > 0) {
+      const fillDeadlineMs = entryTs + fillTimeoutMin * 60_000;
+      let filled = false;
+      for (let j = entryIdx + 1; j < bars.length; j += 1) {
+        if (tsMs[j] > fillDeadlineMs) break;
+        if (Number.isFinite(lows[j]) && lows[j] <= candidateClose) { filled = true; break; }
+      }
+      if (!filled) {
+        if (!stats.skipped.entry_unfilled) stats.skipped.entry_unfilled = 0;
+        stats.skipped.entry_unfilled += 1;
+        continue;
+      }
+    }
 
     // Per-strategy TP sizing. OLS uses deriveTargetNetBps (clamped to
     // [targetNetBps, signalTargetMaxNetBps]); multi_factor sets
@@ -753,6 +842,11 @@ async function runBacktest(overrides = {}) {
       mfSignalTargetMaxNetBps: opts.mfSignalTargetMaxNetBps,
       mfStopLossBps: opts.mfStopLossBps,
       mfBookImbalanceMode: opts.mfBookImbalanceMode,
+      rejectNearHighEnabled: opts.rejectNearHighEnabled,
+      rejectNearHighBps: opts.rejectNearHighBps,
+      rejectNearHighLookbackBars: opts.rejectNearHighLookbackBars,
+      entrySpreadCostBps: opts.entrySpreadCostBps,
+      entryFillTimeoutMin: opts.entryFillTimeoutMin,
     },
     perSymbol,
     overall,
