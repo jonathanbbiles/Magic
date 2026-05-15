@@ -558,7 +558,7 @@ const SIGNAL_SELECTOR_MIN_BPS = readNumber('SIGNAL_SELECTOR_MIN_BPS', 3);
 const SIGNAL_SELECTOR_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_VETO_ENABLED', true);
 // Minimum backtest sample size — below this, the result is statistically
 // meaningless and the selector falls back to veto for that signal.
-const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES', 30));
+const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES', 5));
 
 const signalSelector = require('./modules/signalSelector');
 // Bootstrap: when the operator has overridden the signal AND disabled the
