@@ -124,16 +124,60 @@ function mean(values) {
   return values.reduce((s, v) => s + v, 0) / values.length;
 }
 
+// Phase 1: aggregate 1m bars into a coarser timeframe (5m or 15m). Returns
+// synthetic OHLCV bars with the same shape Alpaca returns, so the rest of
+// the signal logic doesn't care whether it's running on real 5m bars or
+// synthesized ones. Anchors aggregation to wall-clock multiples (timestamp
+// rounded down to the nearest interval) so adjacent scans see the same
+// closed bars even if the per-scan offset shifts.
+function aggregateBars(bars1m, intervalMin) {
+  if (!Array.isArray(bars1m) || bars1m.length === 0 || intervalMin < 2) return [];
+  const intervalMs = intervalMin * 60 * 1000;
+  const buckets = new Map();
+  for (const bar of bars1m) {
+    const tsMs = Date.parse(bar?.t);
+    if (!Number.isFinite(tsMs)) continue;
+    const bucketStart = Math.floor(tsMs / intervalMs) * intervalMs;
+    let agg = buckets.get(bucketStart);
+    if (!agg) {
+      agg = { t: new Date(bucketStart).toISOString(), o: bar.o, h: bar.h, l: bar.l, c: bar.c, v: 0, n: 0, vw: bar.vw };
+      buckets.set(bucketStart, agg);
+    }
+    if (Number.isFinite(Number(bar.h)) && Number(bar.h) > Number(agg.h)) agg.h = bar.h;
+    if (Number.isFinite(Number(bar.l)) && Number(bar.l) < Number(agg.l)) agg.l = bar.l;
+    agg.c = bar.c;
+    agg.v = (Number(agg.v) || 0) + (Number(bar.v) || 0);
+    agg.n = (Number(agg.n) || 0) + (Number(bar.n) || 0);
+  }
+  return Array.from(buckets.values()).sort((a, b) => Date.parse(a.t) - Date.parse(b.t));
+}
+
 function evaluateMeanReversionSignal({
   pair,
   bars1m = [],
+  bars5m = null,
+  bars15m = null,
+  timeframe = '1m',
   btcLeadLag = null,
   config = {},
 } = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...(config || {}) };
   const isBtc = String(pair || '').toUpperCase() === 'BTC/USD';
 
-  const closedBars = dropInProgressBar(bars1m);
+  // Resolve the bar set for the requested timeframe. 1m uses bars1m directly;
+  // 5m / 15m prefer real bars from Alpaca when provided, falling back to
+  // aggregating 1m bars. Aggregation requires more 1m bars than the signal's
+  // requiredBars (because aggregateBars(36 1m, 5min) ≈ 7 5m bars).
+  let bars;
+  if (timeframe === '5m') {
+    bars = Array.isArray(bars5m) && bars5m.length > 0 ? bars5m : aggregateBars(bars1m, 5);
+  } else if (timeframe === '15m') {
+    bars = Array.isArray(bars15m) && bars15m.length > 0 ? bars15m : aggregateBars(bars1m, 15);
+  } else {
+    bars = bars1m;
+  }
+
+  const closedBars = dropInProgressBar(bars);
   if (closedBars.length < cfg.requiredBars) {
     return { ok: false, reason: 'mr_insufficient_history' };
   }
@@ -247,6 +291,7 @@ function evaluateMeanReversionSignal({
     ok: true,
     reason: null,
     signalVersion: 'mean_reversion',
+    timeframe,
     projectedBps,
     dropBps,
     dropMagnitudeBps,
@@ -280,5 +325,6 @@ function evaluateMeanReversionSignal({
 
 module.exports = {
   evaluateMeanReversionSignal,
+  aggregateBars,
   DEFAULT_CONFIG,
 };

@@ -64,9 +64,9 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
-  // Live default flipped to 'configured'; the dynamic universe is ~30% stale-
-  // pruned on Alpaca and starves entries.
-  assert.equal(guardrails.entryUniverse.modeEffective, 'configured');
+  // Live default flipped to 'dynamic' for Phase 1 — wider universe for more
+  // mean-reversion triggers; stale-quote pruner handles per-symbol staleness.
+  assert.equal(guardrails.entryUniverse.modeEffective, 'dynamic');
   assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, true);
   assert.equal(guardrails.engineV2.enabled, false);
   assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);

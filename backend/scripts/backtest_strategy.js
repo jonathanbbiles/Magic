@@ -50,6 +50,7 @@
 const path = require('path');
 const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal');
+const { evaluateRangeMeanReversionSignal } = require('../modules/rangeMeanReversionSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
@@ -167,6 +168,19 @@ const DEFAULTS = {
   mrStopLossBpsTier3: 100,
   mrMaxHoldMin: 45,
   mrBreakevenTimeoutMin: 30,
+  // Phase 1: timeframe selector for the MR signal in this backtest run.
+  // '1m' = legacy behavior. '5m' / '15m' aggregate the 1m bars internally.
+  mrTimeframe: '1m',
+  // Range mean-reversion params (only consulted when strategy='range_mean_reversion').
+  // Tighter than capitulation MR because the trade thesis is "fade range
+  // probes," not "fade capitulation drops" — smaller TP, smaller stop.
+  rangeMrDropTriggerBps: 50,
+  rangeMrMaxRangePct: 0.015,
+  rangeMrTargetNetBpsFloor: 5,
+  rangeMrSignalTargetMaxNetBps: 60,
+  rangeMrStopLossBps: 40,
+  rangeMrMaxHoldMin: 30,
+  rangeMrBreakevenTimeoutMin: 15,
   // Override signal-config knobs (passed through to evaluateMeanReversionSignal
   // via the cfg parameter). Leave null to use the module defaults.
   mrDropTriggerBps: null,
@@ -446,6 +460,12 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const strategy = String(opts.strategy || 'ols').toLowerCase();
   const isMultiFactor = strategy === 'multi_factor';
   const isMeanReversion = strategy === 'mean_reversion';
+  const isRangeMr = strategy === 'range_mean_reversion';
+  // Phase 1: timeframe selector for the mean-reversion signal. '1m' (default)
+  // runs the existing 1m-bar logic; '5m' / '15m' synthesize coarser bars from
+  // the same 1m series. The selector compares all three variants to pick the
+  // best per-trade expectancy on each symbol.
+  const mrTimeframe = isMeanReversion ? String(opts.mrTimeframe || '1m').toLowerCase() : '1m';
 
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
@@ -526,10 +546,12 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
         }
       }
       // Build a window for the signal. The signal needs at least
-      // requiredBars (32 by default) closed bars; pass it a 36-bar slice
-      // and an in-progress bar (the candidate bar itself) so its
-      // dropInProgressBar() can shave the last entry as live would.
-      const need = 36;
+      // requiredBars (32 by default) closed bars at the chosen timeframe.
+      // For coarser timeframes (5m / 15m), aggregation collapses the 1m
+      // window — multiply the 1m bar count to ensure enough aggregated
+      // bars: 5m → ×5, 15m → ×15. Plus headroom for in-progress.
+      const tfMultiplier = mrTimeframe === '15m' ? 15 : (mrTimeframe === '5m' ? 5 : 1);
+      const need = 36 * tfMultiplier;
       if (i + 1 < need) {
         if (!stats.skipped.mr_insufficient_history) stats.skipped.mr_insufficient_history = 0;
         stats.skipped.mr_insufficient_history += 1;
@@ -547,6 +569,13 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       const mrSig = evaluateMeanReversionSignal({
         pair: bars[i]?.S || null,
         bars1m: window,
+        // Phase 1: when mrTimeframe='5m'/'15m', the signal aggregates the 1m
+        // bars internally. We pass the same 1m window for all timeframes;
+        // the signal handles aggregation. This means 5m/15m variants need
+        // more 1m bars to produce enough aggregated bars — but the signal
+        // returns mr_insufficient_history if not enough, which is correctly
+        // counted as a skip (not a trade).
+        timeframe: mrTimeframe,
         btcLeadLag: Number.isFinite(btcReturnBps) ? { recentReturnBps: btcReturnBps, ageMs: 0 } : null,
         config: mrConfig,
       });
@@ -577,6 +606,38 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
         ? Math.max(0, Number(opts.mrStopLossBpsTier3) || 0)
         : Math.max(0, Number(opts.mrStopLossBps) || 0);
       stopLossBpsAbsForTrade = mrCap;
+    } else if (isRangeMr) {
+      // Phase 1: range mean-reversion entry. Smaller drops within an
+      // established range, much more frequent than capitulation MR.
+      const need = 64; // matches rangeMeanReversionSignal DEFAULT_CONFIG.requiredBars
+      if (i + 1 < need) {
+        if (!stats.skipped.range_mr_insufficient_history) stats.skipped.range_mr_insufficient_history = 0;
+        stats.skipped.range_mr_insufficient_history += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] });  // synthetic in-progress
+      const rangeCfg = {};
+      if (Number.isFinite(opts.rangeMrDropTriggerBps)) rangeCfg.dropTriggerBps = opts.rangeMrDropTriggerBps;
+      if (Number.isFinite(opts.rangeMrMaxRangePct)) rangeCfg.maxRangePct = opts.rangeMrMaxRangePct;
+      const rangeSig = evaluateRangeMeanReversionSignal({
+        pair: bars[i]?.S || null,
+        bars1m: window,
+        config: rangeCfg,
+      });
+      if (!rangeSig?.ok) {
+        const reason = rangeSig?.reason || 'range_mr_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: rangeSig.projectedBps };
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.rangeMrTargetNetBpsFloor) || 5;
+      const cap = Number(opts.rangeMrSignalTargetMaxNetBps) || 60;
+      const raw = rangeSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Math.max(0, Number(opts.rangeMrStopLossBps) || 0);
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -729,6 +790,9 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isMeanReversion) {
       activeMaxHoldMin = Number(opts.mrMaxHoldMin || opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.mrBreakevenTimeoutMin || opts.breakevenTimeoutMin || 45);
+    } else if (isRangeMr) {
+      activeMaxHoldMin = Number(opts.rangeMrMaxHoldMin || opts.maxHoldMin || 30);
+      activeBreakevenMin = Number(opts.rangeMrBreakevenTimeoutMin || opts.breakevenTimeoutMin || 15);
     } else {
       activeMaxHoldMin = Number(opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);

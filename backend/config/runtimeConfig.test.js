@@ -113,9 +113,10 @@ withEnv({}, () => {
   assert.equal(cfg.sparseStaleToleranceMs, 15000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 5000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 15000);
-  // Live default flipped from 'dynamic' → 'configured'. The 12 deep-liquidity
-  // primary pairs avoid the stale-quote tax that dominates the dynamic universe.
-  assert.equal(cfg.entryUniverseModeEffective, 'configured');
+  // Live default flipped to 'dynamic' for Phase 1: the wider universe catches
+  // mean-reversion triggers on alts the configured list misses. Stale-quote
+  // pruner still drops chronically-stale symbols at the per-symbol level.
+  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
   assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');

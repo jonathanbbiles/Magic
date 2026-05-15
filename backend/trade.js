@@ -30,6 +30,7 @@ const {
 } = require('./modules/entryEconomics');
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
+const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -185,12 +186,18 @@ const MR_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MR_BREAKEVEN_TIMEOUT
 // signal version (recorded in tradePredictions at entry time).
 function getMaxHoldMsForSignal(signalVersion) {
   if (signalVersion === 'multi_factor') return MF_MAX_HOLD_MS;
-  if (signalVersion === 'mean_reversion') return MR_MAX_HOLD_MS;
+  if (signalVersion === 'mean_reversion'
+      || signalVersion === 'mean_reversion_5m'
+      || signalVersion === 'mean_reversion_15m') return MR_MAX_HOLD_MS;
+  if (signalVersion === 'range_mean_reversion') return RANGE_MR_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
   if (signalVersion === 'multi_factor') return MF_BREAKEVEN_TIMEOUT_MS;
-  if (signalVersion === 'mean_reversion') return MR_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'mean_reversion'
+      || signalVersion === 'mean_reversion_5m'
+      || signalVersion === 'mean_reversion_15m') return MR_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'range_mean_reversion') return RANGE_MR_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -247,16 +254,47 @@ const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20))
 const MR_STOP_LOSS_BPS = Math.max(1, readNumber('MR_STOP_LOSS_BPS', 60));
 const MR_STOP_LOSS_BPS_TIER3 = Math.max(MR_STOP_LOSS_BPS, readNumber('MR_STOP_LOSS_BPS_TIER3', 100));
 
+// Phase 1: master kill switch + per-layer feature flags. PHASE1_ENABLED=false
+// reverts every Phase 1 layer to its legacy behavior in a single env flip.
+// Per-layer flags compose with the master flag (AND-gated), so an operator
+// can disable a single layer without touching the others.
+const PHASE1_ENABLED = readBoolean('PHASE1_ENABLED', true);
+const RANGE_MR_ENABLED = PHASE1_ENABLED && readBoolean('RANGE_MR_ENABLED', true);
+const ADAPTIVE_SIZING_ENABLED = PHASE1_ENABLED && readBoolean('ADAPTIVE_SIZING_ENABLED', true);
+const CONCURRENT_POSITIONS_SOFT_CAP_ENABLED = PHASE1_ENABLED && readBoolean('CONCURRENT_POSITIONS_SOFT_CAP_ENABLED', true);
+const MAX_CONCURRENT_POSITIONS_SOFT_CAP = Math.max(0, readNumber('MAX_CONCURRENT_POSITIONS_SOFT_CAP', 8));
+// Adaptive sizing: caps the upper bound of the per-trade sizing multiplier.
+// MAX_SIZING_FRACTION_OF_TARGET=1.5 means a high-confidence trigger can
+// deploy up to 1.5× the base PORTFOLIO_SIZING_PCT (e.g. 15% of equity at
+// the default 10% base). Bounded conservatively because backtest evidence
+// for the new signal classes is still thin.
+const MAX_SIZING_FRACTION_OF_TARGET = Math.max(1.0, readNumber('MAX_SIZING_FRACTION_OF_TARGET', 1.5));
+
+// Range mean-reversion env knobs.
+const RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('RANGE_MR_TARGET_NET_BPS_FLOOR', 5));
+const RANGE_MR_SIGNAL_TARGET_MAX_NET_BPS = Math.max(
+  RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR,
+  readNumber('RANGE_MR_SIGNAL_TARGET_MAX_NET_BPS', 60),
+);
+const RANGE_MR_STOP_LOSS_BPS = Math.max(1, readNumber('RANGE_MR_STOP_LOSS_BPS', 40));
+const RANGE_MR_MAX_HOLD_MS = Math.max(60_000, readNumber('RANGE_MR_MAX_HOLD_MS', 1_800_000));
+const RANGE_MR_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('RANGE_MR_BREAKEVEN_TIMEOUT_MS', 900_000));
+
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
-  else if (signalVersion === 'mean_reversion') {
+  else if (signalVersion === 'mean_reversion'
+      || signalVersion === 'mean_reversion_5m'
+      || signalVersion === 'mean_reversion_15m') {
     // Tier-aware MR cap: tier-3 alts need wider headroom because their
     // spreads alone consume most of the tier-1/2 cap. Falls back to the
     // tier-1/2 cap when pair is null (e.g. legacy callers in tests).
+    // All three MR timeframes share the same cap — the timeframe affects
+    // trigger frequency, not stop economics.
     const isTier3 = pair && typeof resolveSymbolTier === 'function' && resolveSymbolTier(pair) === 'tier3';
     cap = isTier3 ? MR_STOP_LOSS_BPS_TIER3 : MR_STOP_LOSS_BPS;
   }
+  else if (signalVersion === 'range_mean_reversion') cap = RANGE_MR_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -670,15 +708,31 @@ const MR_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
 );
 
 function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
-  // Mean-reversion: projectedBps is already a GROSS target (half the drop),
-  // not a forward-move prediction. Convert directly to net by subtracting
-  // fees, then clamp to MR's tighter range. Don't multiply by
-  // SIGNAL_TARGET_FRACTION (the half-drop math is the fraction).
-  if (signalVersion === 'mean_reversion') {
+  // Mean-reversion (1m / 5m / 15m all behave identically): projectedBps is
+  // already a GROSS target (half the drop), not a forward-move prediction.
+  // Convert directly to net by subtracting fees, then clamp to MR's tighter
+  // range. Don't multiply by SIGNAL_TARGET_FRACTION (the half-drop math is
+  // the fraction).
+  if (signalVersion === 'mean_reversion'
+      || signalVersion === 'mean_reversion_5m'
+      || signalVersion === 'mean_reversion_15m') {
     const projected = Number(projectedBps);
     if (!Number.isFinite(projected)) return MR_TARGET_NET_PROFIT_BPS_FLOOR;
     const signalNet = projected - FEE_BPS_ROUND_TRIP;
     return Math.max(MR_TARGET_NET_PROFIT_BPS_FLOOR, Math.min(MR_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  }
+  // Range mean-reversion: projectedBps is the half-distance to the range
+  // midpoint. Same conversion pattern as MR — gross to net by subtracting
+  // fees, clamped to the range-MR-specific floor and cap (smaller than MR
+  // because the per-trade move is smaller).
+  if (signalVersion === 'range_mean_reversion') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR;
+    const signalNet = projected - FEE_BPS_ROUND_TRIP;
+    return Math.max(
+      RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR,
+      Math.min(RANGE_MR_SIGNAL_TARGET_MAX_NET_BPS, signalNet),
+    );
   }
   let floor;
   let ceiling;
@@ -1541,14 +1595,30 @@ async function getMultiFactorSignalForPair(pair, quote) {
 // confirmation + BTC decorrelation + RSI oversold). Fetches enough bars
 // to satisfy meanReversionSignal.requiredBars + headroom for the drop +
 // in-progress bar.
-async function getMeanReversionSignalForPair(pair) {
+async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
   try {
-    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 36, timeframe: '1Min' });
+    // Fetch enough 1m bars to support 1m, 5m (×5), or 15m (×15) aggregation.
+    // 36 bars × 15 = 540 bars covers the 15m variant at requiredBars=32.
+    const limit = timeframe === '15m' ? 540 : (timeframe === '5m' ? 180 : 36);
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
-    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag });
+    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe });
   } catch (err) {
     return { ok: false, reason: 'mean_reversion_signal_failed', error: err?.message };
+  }
+}
+
+// Phase 1: range mean-reversion signal wrapper. Smaller drops within an
+// established range; only needs 1m bars (more of them than capitulation MR
+// because the range identification window is wider).
+async function getRangeMeanReversionSignalForPair(pair) {
+  try {
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 70, timeframe: '1Min' });
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    return evaluateRangeMeanReversionSignal({ pair, bars1m });
+  } catch (err) {
+    return { ok: false, reason: 'range_mean_reversion_signal_failed', error: err?.message };
   }
 }
 
@@ -1999,8 +2069,17 @@ async function scanAndEnter() {
     return;
   }
 
-  // One concurrent position per symbol; total concurrency is bounded only by
-  // available cash (clamped below by MIN_TRADE_NOTIONAL_USD).
+  // One concurrent position per symbol. Phase 1 adds a soft cap on total
+  // concurrent positions: prevents fragmenting cash across more positions
+  // than the sizing math can comfortably fund. When the cap is hit, the
+  // scan still runs (so dashboard stats stay accurate), but candidates
+  // beyond the remaining-slot budget are skipped with reason
+  // 'concurrent_position_cap'. Disabled when CONCURRENT_POSITIONS_SOFT_CAP_ENABLED=false
+  // or PHASE1_ENABLED=false; reverts to legacy "cash-only bounded" behavior.
+  const heldCount = held.size;
+  const remainingSlots = CONCURRENT_POSITIONS_SOFT_CAP_ENABLED
+    ? Math.max(0, MAX_CONCURRENT_POSITIONS_SOFT_CAP - heldCount)
+    : Infinity;
   const candidates = universe.filter((pair) => !held.has(pair) && !openBuyPairs.has(pair));
   const summary = {
     ts: new Date().toISOString(),
@@ -2102,6 +2181,15 @@ async function scanAndEnter() {
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
+    // Phase 1: concurrent-position soft cap. Once we've placed enough buys
+    // this scan to reach the soft cap, skip remaining candidates with a
+    // diagnostic skip reason so the dashboard can show the cap is biting.
+    // The held-position count is the cross-scan baseline; placed counts the
+    // in-progress entries from this scan.
+    if (CONCURRENT_POSITIONS_SOFT_CAP_ENABLED && (heldCount + placed) >= MAX_CONCURRENT_POSITIONS_SOFT_CAP) {
+      rejectTrade(pair, 'concurrent_position_cap', { heldCount, placed, cap: MAX_CONCURRENT_POSITIONS_SOFT_CAP });
+      continue;
+    }
     try {
       let payload;
       const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
@@ -2144,7 +2232,13 @@ async function scanAndEnter() {
       if (ACTIVE_SIGNAL_VERSION === 'multi_factor') {
         sig = await getMultiFactorSignalForPair(pair, quote);
       } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion') {
-        sig = await getMeanReversionSignalForPair(pair);
+        sig = await getMeanReversionSignalForPair(pair, '1m');
+      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_5m') {
+        sig = await getMeanReversionSignalForPair(pair, '5m');
+      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m') {
+        sig = await getMeanReversionSignalForPair(pair, '15m');
+      } else if (ACTIVE_SIGNAL_VERSION === 'range_mean_reversion') {
+        sig = await getRangeMeanReversionSignalForPair(pair);
       } else {
         sig = await getPredictionSignal(pair);
       }
@@ -2393,10 +2487,32 @@ async function scanAndEnter() {
       }
 
       // Notional sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available
-      // cash. The README documents this as the only sizing rule — no phantom
-      // stop-loss-based risk sizing, no correlation guard, no drawdown brake,
-      // no maintenance-margin guard. Concurrency is bounded by cash, period.
-      const effectiveNotional = tradeNotional;
+      // cash. Phase 1 adds adaptive sizing: a high-confidence trigger
+      // (sig.confidence > 1) scales notional UP toward MAX_SIZING_FRACTION_OF_TARGET
+      // × base; a low-confidence trigger scales DOWN toward
+      // MIN_SIZING_FRACTION_OF_TARGET × base. The base is still the
+      // cash-clamped tradeNotional. When ADAPTIVE_SIZING_ENABLED=false
+      // (or PHASE1_ENABLED=false), all trades use the static base.
+      let sizingMultiplier = 1.0;
+      if (ADAPTIVE_SIZING_ENABLED) {
+        const conf = Number(sig?.confidence);
+        if (Number.isFinite(conf) && conf > 0) {
+          // Confidence is reported by the signal as a multiplier hint
+          // around 1.0 (range mean reversion uses [0.5, 1.5], MR returns
+          // exactly 1, others may not return it). Clamp to the operator-
+          // configured bounds.
+          sizingMultiplier = Math.max(
+            MIN_SIZING_FRACTION_OF_TARGET,
+            Math.min(MAX_SIZING_FRACTION_OF_TARGET, conf),
+          );
+        }
+      }
+      // Don't let adaptive sizing exceed available cash; the cash clamp wins.
+      const adaptiveTarget = tradeNotional * sizingMultiplier;
+      const effectiveNotional = Math.min(
+        adaptiveTarget,
+        Number.isFinite(availableCash) ? availableCash : adaptiveTarget,
+      );
 
       // Round buy limit to the asset's price_increment so Alpaca accepts it.
       // Fix 1: rest the buy below the ask. 'mid' = (ask+bid)/2 (saves ~half
