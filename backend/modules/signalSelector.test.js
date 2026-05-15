@@ -65,10 +65,10 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(d.activeNetBps, 15);
 }
 
-// 7. Sample size below floor → not a candidate even if netBps is great.
+// 7. Sample size below floor (default 5) → not a candidate even if netBps is great.
 {
   const d = pickActiveSignal({
-    olsBacktest: bt({ avgNetBpsPerEntry: 50, entries: 5 }),
+    olsBacktest: bt({ avgNetBpsPerEntry: 50, entries: 3 }),
     mfBacktest: bt({ avgNetBpsPerEntry: 6, entries: 100 }),
   });
   assert.equal(d.signalVersion, 'multi_factor', 'OLS rejected for tiny sample even with great netBps');
@@ -163,13 +163,22 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(d.tradingVeto, false);
 }
 
-// 16. Mean-reversion sample size too small → not a candidate.
+// 16. Mean-reversion sample size below floor (default 5) → not a candidate.
 {
   const d = pickActiveSignal({
-    meanRevBacktest: bt({ avgNetBpsPerEntry: 50, entries: 5 }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 50, entries: 3 }),
   });
   assert.equal(d.signalVersion, null, 'tiny sample fails sample-size floor');
   assert.equal(d.tradingVeto, true);
+}
+
+// 16b. At-floor sample size (5) → IS a candidate with the new lowered floor.
+{
+  const d = pickActiveSignal({
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 20, entries: 5 }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion', '5 entries meets the new minimum floor');
+  assert.equal(d.activeNetBps, 20);
 }
 
 // 17. Operator override to mean_reversion → use it.

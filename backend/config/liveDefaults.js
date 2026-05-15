@@ -101,7 +101,7 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // threshold +3 bps net per entry, sample-size floor 30 entries.
   SIGNAL_SELECTOR_MIN_BPS: '3',
   SIGNAL_SELECTOR_VETO_ENABLED: 'true',
-  SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '30',
+  SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '5',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
   // TARGET_NET_PROFIT_BPS / SIGNAL_TARGET_MAX_NET_BPS / STOP_LOSS_BPS but

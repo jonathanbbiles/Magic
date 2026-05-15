@@ -51,7 +51,7 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '', 'live default empty so auto-selector runs');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '3');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 
 // Exit-side defaults tightened so scalps that don't resolve fast recycle
 // capital instead of paying the long MTM tail. Signal-aware: OLS keeps the
