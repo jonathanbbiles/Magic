@@ -81,6 +81,13 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_TARGET_NET_PROFIT_BPS_FLOOR: '5',
   MR_SIGNAL_TARGET_MAX_NET_BPS: '120',
   MR_STOP_LOSS_BPS: '60',
+  // Tier-3 (long-tail alt) MR stop cap. Their spreads (~70-90 bps) already
+  // push the spread-floor minimum well above the tier-1/2 60-bps cap, so
+  // a tier-aware cap is required for the vol-scaled stop to scale above
+  // the spread floor instead of being clipped flat. Operator-facing knob:
+  // raising MR_STOP_LOSS_BPS_TIER3 widens the cushion on alts; lowering it
+  // narrows the cushion (cannot go below MR_STOP_LOSS_BPS — clamped at read).
+  MR_STOP_LOSS_BPS_TIER3: '100',
   MR_MAX_HOLD_MS: '2700000',
   MR_BREAKEVEN_TIMEOUT_MS: '1800000',
   ENTRY_LIMIT_PRICE_MODE: 'mid',

@@ -236,14 +236,27 @@ const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20))
 // Mean-reversion stop-loss cap. Tight by design: mean reversion either
 // happens fast or fails fast. 60 bps cap = ~2× typical drop trigger × 0.3
 // = enough room for the trade to breathe without absorbing a full
-// continuation move. Wider would let trades hold through the directional
-// continuation that we DON'T want to fade.
+// continuation move on tier-1/2 deep-liquidity pairs.
+//
+// Tier-3 (long-tail alts) carry wider spreads (~70-90 bps) and noisier
+// post-drop microstructure. The spread floor in this function already
+// pushes their effective stop to ~spread+20 bps, but the cap also needs
+// to be wide enough to let vol-scaled stops scale above the spread floor
+// without being clipped to 60. MR_STOP_LOSS_BPS_TIER3 (default 100) is
+// the cap consulted when the symbol resolves to tier3.
 const MR_STOP_LOSS_BPS = Math.max(1, readNumber('MR_STOP_LOSS_BPS', 60));
+const MR_STOP_LOSS_BPS_TIER3 = Math.max(MR_STOP_LOSS_BPS, readNumber('MR_STOP_LOSS_BPS_TIER3', 100));
 
-function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols') {
+function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
-  else if (signalVersion === 'mean_reversion') cap = MR_STOP_LOSS_BPS;
+  else if (signalVersion === 'mean_reversion') {
+    // Tier-aware MR cap: tier-3 alts need wider headroom because their
+    // spreads alone consume most of the tier-1/2 cap. Falls back to the
+    // tier-1/2 cap when pair is null (e.g. legacy callers in tests).
+    const isTier3 = pair && typeof resolveSymbolTier === 'function' && resolveSymbolTier(pair) === 'tier3';
+    cap = isTier3 ? MR_STOP_LOSS_BPS_TIER3 : MR_STOP_LOSS_BPS;
+  }
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -2423,7 +2436,7 @@ async function scanAndEnter() {
         const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
-        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION);
+        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION, pair);
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),

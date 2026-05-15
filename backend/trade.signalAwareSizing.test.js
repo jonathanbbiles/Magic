@@ -128,4 +128,29 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
   assert.equal(v, vOls);
 }
 
+// 13. Tier-aware MR stop. High vol forces the cap to bind. Tier-1 (BTC/USD)
+// uses MR_STOP_LOSS_BPS=60; tier-3 (unclassified) uses
+// MR_STOP_LOSS_BPS_TIER3=100. Spread floor kept tight (5 bps + 20 = 25) so
+// the cap dominates, not the floor. Default tier set in liveDefaults:
+// BTC/ETH = tier1, primary alts = tier2, anything else = tier3 (per
+// EXECUTION_TIER3_DEFAULT=true).
+{
+  // High-vol input drives the vol-scaled value above both caps.
+  const tier1 = deriveStopLossBps(20, 5, 'mean_reversion', 'BTC/USD');
+  const tier3 = deriveStopLossBps(20, 5, 'mean_reversion', 'PEPE/USD');
+  assert.equal(tier1, 60, `tier-1 MR cap should bind at 60, got ${tier1}`);
+  assert.equal(tier3, 100, `tier-3 MR cap should bind at 100, got ${tier3}`);
+  // Sanity: tier3 stop must be wider than tier1 on identical vol so alts
+  // get the headroom their wider spreads require.
+  assert.ok(tier3 > tier1, `expected tier3 > tier1, got tier1=${tier1} tier3=${tier3}`);
+}
+
+// 14. Tier-aware MR stop falls back to the tier-1/2 cap when no pair is
+// passed. Preserves backward compatibility with callers that pre-date the
+// pair argument (existing tests, ad-hoc invocations).
+{
+  const noPair = deriveStopLossBps(20, 5, 'mean_reversion');
+  assert.equal(noPair, 60, `MR with no pair should use tier-1/2 cap (60), got ${noPair}`);
+}
+
 console.log('trade.signalAwareSizing.test.js passed');
