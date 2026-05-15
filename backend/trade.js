@@ -28,6 +28,7 @@ const {
   estimateExpectedNetBps,
   computeMinimumGrossTargetBps,
 } = require('./modules/entryEconomics');
+const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
@@ -450,6 +451,14 @@ const CORRECTED_FILL_PROB_ENABLED = readBoolean('CORRECTED_FILL_PROB_ENABLED', t
 const ENFORCE_GROSS_TARGET_FLOOR = readBoolean('ENFORCE_GROSS_TARGET_FLOOR', true);
 const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', true);
 const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 250));
+// Entry-signal dispatch. Default 'ols' keeps the legacy 1m-OLS slope
+// predictor live unchanged. Set to 'multi_factor' to switch to the new
+// pullback-in-uptrend signal (see backend/modules/multiFactorSignal.js).
+// When 'multi_factor' is active the OLS-specific gates (slope_not_positive,
+// net_edge_below_min, honest_ev_below_min) are skipped — the new signal's
+// own factor vote replaces them. Structural gates (drawdown, sizing,
+// freshness, spread, vol-cap, HTF) still apply to both.
+const SIGNAL_VERSION = readEnum('SIGNAL_VERSION', ['ols', 'multi_factor'], 'ols');
 // Horizon (in 1-minute bars) over which we expect the take-profit to fill.
 // Defaults to BREAKEVEN_TIMEOUT_MS in minutes — i.e., the same window after
 // which the engine would otherwise replace the TP with a break-even sell.
@@ -1265,6 +1274,40 @@ async function getHigherTimeframeSignal(pair) {
   }
 }
 
+// Multi-factor signal wrapper. Fetches the three timeframes the new signal
+// needs (1m / 5m / 15m bars) plus the orderbook in parallel, then evaluates
+// the factor vote. Returns the same shape as getPredictionSignal so the
+// rest of the entry path can consume it without further branching.
+async function getMultiFactorSignalForPair(pair, quote) {
+  try {
+    const [bars1mPayload, bars5mPayload, bars15mPayload, obPayload] = await Promise.all([
+      fetchCryptoBars({ symbols: [pair], limit: 32, timeframe: '1Min' }),
+      fetchCryptoBars({ symbols: [pair], limit: 24, timeframe: '5Min' }),
+      fetchCryptoBars({ symbols: [pair], limit: 24, timeframe: '15Min' }),
+      fetchCryptoOrderbooks({ symbols: [pair] }).catch((err) => {
+        console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
+        return { orderbooks: {} };
+      }),
+    ]);
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const bars5m = bars5mPayload?.bars?.[pair] || bars5mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const bars15m = bars15mPayload?.bars?.[pair] || bars15mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
+    return evaluateMultiFactorSignal({
+      pair,
+      bars1m,
+      bars5m,
+      bars15m,
+      orderbook,
+      quote: quote ? { bid: Number(quote.bp), ask: Number(quote.ap) } : null,
+      btcLeadLag,
+    });
+  } catch (err) {
+    return { ok: false, reason: 'multi_factor_signal_failed', error: err?.message };
+  }
+}
+
 // --- engine state -------------------------------------------------------
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
@@ -1810,7 +1853,9 @@ async function scanAndEnter() {
       if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
-      const sig = await getPredictionSignal(pair);
+      const sig = SIGNAL_VERSION === 'multi_factor'
+        ? await getMultiFactorSignalForPair(pair, quote)
+        : await getPredictionSignal(pair);
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
       if (!sig.ok) {
         rejectTrade(pair, sig.reason || 'prediction_rejected');
@@ -1922,8 +1967,11 @@ async function scanAndEnter() {
       // negative t-stat produced fillProbability ≈ 0.45 and the EV product
       // still cleared MIN_NET_EDGE_BPS — i.e. the gate would submit a long
       // even when the OLS fit predicted a downward move. Block long entries
-      // when the 1m model predicts down (or flat).
-      if (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0) {
+      // when the 1m model predicts down (or flat). Skipped for multi_factor
+      // signal: directional intent is already validated by the htfTrend +
+      // turnConfirm factors, and the multi_factor signal returns
+      // slopeTStat = 0 by design.
+      if (SIGNAL_VERSION === 'ols' && (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0)) {
         rejectTrade(pair, 'slope_not_positive');
         continue;
       }
@@ -1946,7 +1994,12 @@ async function scanAndEnter() {
       // needed to fill the TP. Live forensics showed projectedBps≈38 with a
       // GROSS_TARGET_BPS=48 + entry/exit slippage required: we were asking
       // for ~54 bps of move when the model itself only predicted ~38.
-      if (ENFORCE_PROJECTED_COVERS_GROSS) {
+      // Skipped for multi_factor: that signal's projectedBps is a per-trade
+      // ATR-derived TP target, not a forward-move prediction. Comparing it
+      // against the global GROSS_TARGET_BPS double-counts the cost floor.
+      // ENFORCE_GROSS_TARGET_FLOOR above already enforces the global cost
+      // floor as a deterministic accounting check that applies to both signals.
+      if (SIGNAL_VERSION === 'ols' && ENFORCE_PROJECTED_COVERS_GROSS) {
         const requiredGrossBps = GROSS_TARGET_BPS + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS;
         if (projectedBps < requiredGrossBps) {
           rejectTrade(pair, 'projected_below_gross_target', {
@@ -1995,7 +2048,11 @@ async function scanAndEnter() {
         }
       }
 
-      if (NET_EDGE_GATE_ENABLED) {
+      // Net-edge gate uses fillProbability × realizedWinBps, which is meaningful
+      // for the OLS signal (logistic CDF of a fitted slope) but not for the
+      // multi_factor signal (probability is replaced by a discrete factor vote).
+      // Skipped for multi_factor; the factor vote IS the net-edge proxy.
+      if (SIGNAL_VERSION === 'ols' && NET_EDGE_GATE_ENABLED) {
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
           rejectTrade(pair, 'net_edge_below_min', { netEdgeBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
           continue;
@@ -2012,7 +2069,11 @@ async function scanAndEnter() {
         targetNetBps: TARGET_NET_PROFIT_BPS,
         assumedStuckLossBps: STUCK_LOSS_ASSUMED_BPS,
       });
-      if (HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
+      // Same reasoning as the net-edge gate: hitProbability comes from the GBM
+      // barrier model parameterised by the OLS-fit drift, so it doesn't apply
+      // when the active signal is multi_factor. The factor vote already handled
+      // expectancy filtering.
+      if (SIGNAL_VERSION === 'ols' && HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
         rejectTrade(pair, 'honest_ev_below_min', { honestEvBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
         continue;
       }
@@ -2112,6 +2173,19 @@ async function scanAndEnter() {
           btcLeadLag: pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot(),
           bookImbalance,
           bookImbalanceFeatureEnabled: ORDERBOOK_IMBALANCE_FEATURE_ENABLED,
+          signalVersion: sig.signalVersion || SIGNAL_VERSION,
+          multiFactor: sig.factors
+            ? {
+                confidence: sig.confidence,
+                atrBps: sig.atrBps,
+                htfTrend: sig.factors.htfTrend?.ok,
+                pullback: sig.factors.pullback?.ok,
+                turnConfirm: sig.factors.turnConfirm?.ok,
+                bookImbalanceOk: sig.factors.bookImbalance?.ok,
+                volumeOk: sig.factors.volume?.ok,
+                btcLagOk: sig.factors.btcLag?.ok,
+              }
+            : null,
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
         tradePredictions.set(pair, {
@@ -2142,6 +2216,8 @@ async function scanAndEnter() {
         console.log('entry_submitted', {
           symbol: pair,
           tradeId: buyOrder.id,
+          signalVersion: prediction.signalVersion,
+          multiFactor: prediction.multiFactor,
           buyLimit: prediction.buyLimit,
           notional: effectiveNotional,
           spreadBps,

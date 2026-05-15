@@ -69,6 +69,11 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   ENFORCE_PROJECTED_COVERS_GROSS: 'true',
+  // Entry-signal dispatch. 'ols' is the legacy 1m-OLS predictor (current
+  // production behaviour). 'multi_factor' switches to the new pullback-in-
+  // uptrend signal — only flip after backtest + simulator validation per
+  // the rewrite plan. See README.md and backend/modules/multiFactorSignal.js.
+  SIGNAL_VERSION: 'ols',
   STOP_LOSS_ENABLED: 'true',
   STOP_LOSS_BPS: '40',
   STOP_LOSS_BPS_FLOOR: '15',
