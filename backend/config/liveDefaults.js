@@ -74,6 +74,14 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // uptrend signal — only flip after backtest + simulator validation per
   // the rewrite plan. See README.md and backend/modules/multiFactorSignal.js.
   SIGNAL_VERSION: 'ols',
+  // Multi-factor signal exit-sizing knobs. Only consulted when
+  // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
+  // TARGET_NET_PROFIT_BPS / SIGNAL_TARGET_MAX_NET_BPS / STOP_LOSS_BPS but
+  // sized for the multi-factor signal's wider payoff (40-150 bps net TP,
+  // proportionally wider stop). See README.md for the rationale.
+  MF_TARGET_NET_PROFIT_BPS_FLOOR: '40',
+  MF_SIGNAL_TARGET_MAX_NET_BPS: '150',
+  MF_STOP_LOSS_BPS: '100',
   STOP_LOSS_ENABLED: 'true',
   STOP_LOSS_BPS: '40',
   STOP_LOSS_BPS_FLOOR: '15',

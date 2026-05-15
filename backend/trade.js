@@ -161,6 +161,12 @@ const STOP_LOSS_ENABLED = readBoolean('STOP_LOSS_ENABLED', true);
 // the strategy needs ~93% win rate to break even; live observed 25%. Tightening
 // the stop reshapes the payoff so it can survive a realistic 60–70% win rate.
 const STOP_LOSS_BPS = Math.max(1, readNumber('STOP_LOSS_BPS', 40));
+// Multi-factor signal stop-loss cap. When SIGNAL_VERSION='multi_factor', the
+// per-trade vol-scaled stop is capped at this value instead of STOP_LOSS_BPS.
+// Default 100 bps matches the wider TP target the new signal uses (40-150 bps
+// net), preserving a reasonable R:R that the OLS-tuned 40 bps cap would
+// instantly invert. Read once at startup; no effect when SIGNAL_VERSION='ols'.
+const MF_STOP_LOSS_BPS = Math.max(1, readNumber('MF_STOP_LOSS_BPS', 100));
 // Volatility-scaled stop. When ON, each trade's stop distance is sized from
 // the entry-time realised volatility: stopBps ≈ k × σ × √HORIZON. Quiet
 // markets get tight stops, wild markets get loose ones — same risk in
@@ -180,15 +186,16 @@ const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 15));
 // is always at least N bps of room below the bid before the stop trips.
 const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20));
 
-function deriveStopLossBps(volatilityBps, spreadBps) {
-  if (!VOL_SCALED_STOP_ENABLED) return STOP_LOSS_BPS;
+function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols') {
+  const cap = signalVersion === 'multi_factor' ? MF_STOP_LOSS_BPS : STOP_LOSS_BPS;
+  if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
-  if (!Number.isFinite(sigma) || sigma <= 0) return STOP_LOSS_BPS;
+  if (!Number.isFinite(sigma) || sigma <= 0) return cap;
   const scaled = STOP_LOSS_VOL_K * sigma * Math.sqrt(STOP_LOSS_HORIZON_BARS);
   const spread = Number(spreadBps);
   const spreadFloor = Number.isFinite(spread) && spread > 0 ? spread + STOP_OVER_SPREAD_BPS : 0;
   const minimum = Math.max(STOP_LOSS_BPS_FLOOR, spreadFloor);
-  return Math.max(minimum, Math.min(STOP_LOSS_BPS, scaled));
+  return Math.max(minimum, Math.min(cap, scaled));
 }
 
 // --- staircase exit ---------------------------------------------------------
@@ -487,21 +494,44 @@ const BARRIER_HORIZON_BARS = Math.max(1, readNumber(
 // re-test.
 const SIGNAL_SIZED_EXIT_ENABLED = readBoolean('SIGNAL_SIZED_EXIT_ENABLED', true);
 const SIGNAL_TARGET_FRACTION = Math.min(2, Math.max(0.1, readNumber('SIGNAL_TARGET_FRACTION', 1.0)));
+// Absolute upper safety bound on any per-trade signal-sized TP, regardless
+// of which signal is active. Anything above 500 bps net is almost certainly
+// a configuration error rather than a real trade intent.
+const ABSOLUTE_TARGET_NET_BPS_CEILING = 500;
 const SIGNAL_TARGET_MAX_NET_BPS = Math.min(
-  50,
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
   Math.max(TARGET_NET_PROFIT_BPS, readNumber('SIGNAL_TARGET_MAX_NET_BPS', 50)),
 );
+// Multi-factor signal sizing overrides. Only consulted when
+// SIGNAL_VERSION='multi_factor'. The new signal's projectedBps is an
+// ATR-derived per-trade TP target sized in [40, 150] bps; the OLS-tuned
+// floor of 8 bps and cap of 50 bps would clamp every multi-factor trade
+// to a tiny TP that the wider stop can't pay for. These knobs are read
+// once at startup; OLS behavior is unaffected.
+const MF_TARGET_NET_PROFIT_BPS_FLOOR = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(1, readNumber('MF_TARGET_NET_PROFIT_BPS_FLOOR', 40)),
+);
+const MF_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(MF_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('MF_SIGNAL_TARGET_MAX_NET_BPS', 150)),
+);
 
-function deriveSignalTargetNetBps(projectedBps) {
-  if (!SIGNAL_SIZED_EXIT_ENABLED) return TARGET_NET_PROFIT_BPS;
+function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
+  const floor = signalVersion === 'multi_factor' ? MF_TARGET_NET_PROFIT_BPS_FLOOR : TARGET_NET_PROFIT_BPS;
+  const ceiling = signalVersion === 'multi_factor' ? MF_SIGNAL_TARGET_MAX_NET_BPS : SIGNAL_TARGET_MAX_NET_BPS;
+  if (!SIGNAL_SIZED_EXIT_ENABLED) return floor;
   const projected = Number(projectedBps);
-  if (!Number.isFinite(projected)) return TARGET_NET_PROFIT_BPS;
+  if (!Number.isFinite(projected)) return floor;
   // Aim to fill at SIGNAL_TARGET_FRACTION of the projected forward move.
   // To net X bps after fees, set TP at X + fees gross, so:
   //   signalNet = fraction × projected − fees.
-  // Then floor at the static scalp target and cap at the configured max.
+  // Then floor at the per-signal scalp target and cap at the per-signal max.
+  // For multi_factor, projectedBps is already a per-trade TP sized from ATR
+  // (1.5 × ATR_BPS clamped to [40, 150]); the per-signal floor preserves the
+  // wider payoff shape even when the projection itself sits at the ATR floor.
   const signalNet = SIGNAL_TARGET_FRACTION * projected - FEE_BPS_ROUND_TRIP;
-  return Math.max(TARGET_NET_PROFIT_BPS, Math.min(SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  return Math.max(floor, Math.min(ceiling, signalNet));
 }
 
 // --- Alpaca base URLs / auth ---------------------------------------------
@@ -2119,10 +2149,10 @@ async function scanAndEnter() {
         // GTC sell sits at entry × (1 + signalDerivedGrossBps/10000) instead
         // of the global GROSS_TARGET_BPS. Floor = static target (so weak
         // signals behave exactly like today), cap = SIGNAL_TARGET_MAX_NET_BPS.
-        const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps);
+        const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps, sig.signalVersion || SIGNAL_VERSION);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
-        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps);
+        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || SIGNAL_VERSION);
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
@@ -3044,4 +3074,8 @@ module.exports = {
   getHigherTimeframeSignal,
   scanAndEnter,
   getStopLossConfig,
+  // exposed so the sizing logic can be unit-tested in isolation against
+  // both signal-version branches (see trade.signalAwareSizing.test.js).
+  deriveSignalTargetNetBps,
+  deriveStopLossBps,
 };
