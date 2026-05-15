@@ -45,11 +45,23 @@
 
 const DEFAULTS = {
   trials: 5000,
+  // Strategy under simulation. 'ols' (default) is the legacy strategy:
+  // post a +TARGET_NET_BPS GTC, fall back to break-even after timeout, no
+  // stop-loss. 'multi_factor' simulates the new MF payoff: post the wider
+  // MF TP (default 40 bps net = 80 bps gross), with a hard stop at
+  // -mfStopLossBps. The simulator does NOT model entry gates — every trial
+  // is a "trade taken"; the output answers "given we entered, is the
+  // payoff structure sustainable in each regime?".
+  strategy: 'ols',
   spreadBps: 8,                  // typical BTC/ETH spread on Alpaca crypto
   feeInBps: 25,                  // taker
   feeOutBps: 15,                 // maker
   slipInBps: 3,                  // realistic entry slippage
-  targetNetBps: 20,              // matches live default
+  targetNetBps: 20,              // matches live default (OLS strategy)
+  // Multi-factor exit sizing (only used when strategy='multi_factor'). Mirror
+  // live MF_* env vars and the M4 backtest defaults.
+  mfTargetNetBps: 40,
+  mfStopLossBps: 100,
   feeRoundTripBps: 40,           // matches live default
   breakevenTimeoutMin: 10,
   stuckHorizonMin: 7 * 24 * 60,
@@ -61,6 +73,12 @@ const DEFAULTS = {
     adverse: { driftBpsPerMin: -0.5, volBpsPerMin: 12, label: 'adverse (slight down-drift)' },
     quiet:   { driftBpsPerMin:  0.0, volBpsPerMin:  6, label: 'quiet (low vol)' },
     wild:    { driftBpsPerMin:  0.0, volBpsPerMin: 25, label: 'wild (high vol)' },
+    // Trending chop: net-zero mean drift with elevated vol. Stress-tests
+    // pullback-in-uptrend strategies on the kind of market that breaks 1m-OLS
+    // but should still yield positive expectancy on a wider-payoff signal
+    // when the entry side picks the right pullbacks. Added in M6 of the
+    // strategy rewrite.
+    trending_chop: { driftBpsPerMin: 0.0, volBpsPerMin: 18, label: 'trending_chop (zero drift, elevated vol)' },
   },
 };
 
@@ -68,12 +86,15 @@ function parseArgs(argv) {
   const out = {
     regime: null,
     json: false,
+    strategy: DEFAULTS.strategy,
     trials: DEFAULTS.trials,
     spreadBps: DEFAULTS.spreadBps,
     feeInBps: DEFAULTS.feeInBps,
     feeOutBps: DEFAULTS.feeOutBps,
     slipInBps: DEFAULTS.slipInBps,
     targetNetBps: DEFAULTS.targetNetBps,
+    mfTargetNetBps: DEFAULTS.mfTargetNetBps,
+    mfStopLossBps: DEFAULTS.mfStopLossBps,
     feeRoundTripBps: DEFAULTS.feeRoundTripBps,
     breakevenTimeoutMin: DEFAULTS.breakevenTimeoutMin,
     stuckHorizonMin: DEFAULTS.stuckHorizonMin,
@@ -83,6 +104,7 @@ function parseArgs(argv) {
   for (const arg of argv.slice(2)) {
     if (arg === '--json') out.json = true;
     else if (arg === '-h' || arg === '--help') out.help = true;
+    else if (arg.startsWith('--strategy=')) out.strategy = arg.slice('--strategy='.length);
     else if (arg.startsWith('--regime=')) out.regime = arg.slice('--regime='.length);
     else if (arg.startsWith('--trials=')) out.trials = Number(arg.slice('--trials='.length));
     else if (arg.startsWith('--spread-bps=')) out.spreadBps = Number(arg.slice('--spread-bps='.length));
@@ -90,6 +112,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--fee-out-bps=')) out.feeOutBps = Number(arg.slice('--fee-out-bps='.length));
     else if (arg.startsWith('--slip-in-bps=')) out.slipInBps = Number(arg.slice('--slip-in-bps='.length));
     else if (arg.startsWith('--target-net-bps=')) out.targetNetBps = Number(arg.slice('--target-net-bps='.length));
+    else if (arg.startsWith('--mf-target-net-bps=')) out.mfTargetNetBps = Number(arg.slice('--mf-target-net-bps='.length));
+    else if (arg.startsWith('--mf-stop-loss-bps=')) out.mfStopLossBps = Number(arg.slice('--mf-stop-loss-bps='.length));
     else if (arg.startsWith('--fee-round-trip-bps=')) out.feeRoundTripBps = Number(arg.slice('--fee-round-trip-bps='.length));
     else if (arg.startsWith('--breakeven-min=')) out.breakevenTimeoutMin = Number(arg.slice('--breakeven-min='.length));
     else if (arg.startsWith('--stuck-min=')) out.stuckHorizonMin = Number(arg.slice('--stuck-min='.length));
@@ -152,29 +176,43 @@ function simulateOneTrade({
   feeRoundTripBps,
   breakevenTimeoutMin,
   stuckHorizonMin,
+  strategy = 'ols',
+  mfTargetNetBps = 40,
+  mfStopLossBps = 100,
   rand,
 }) {
   // We work in per-bps space. Mid starts at 0 bps; price-per-unit = e^(mid/10000).
   // Drift μ and vol σ are quoted as bps PER MINUTE. Each step is 1 minute so
   // we apply μ * Δt and σ * sqrt(Δt) directly. That's a discrete approximation
   // of dlog(p) = μ dt + σ dW.
-  const targetGrossBps = targetNetBps + feeRoundTripBps;     // 60 bps with defaults
-  const breakevenGrossBps = feeRoundTripBps;                  // 40 bps
+  const isMultiFactor = String(strategy).toLowerCase() === 'multi_factor';
+  // OLS uses the legacy +TARGET_NET TP, multi_factor uses the wider MF TP.
+  const effectiveTargetNetBps = isMultiFactor ? mfTargetNetBps : targetNetBps;
+  const targetGrossBps = effectiveTargetNetBps + feeRoundTripBps;
+  const breakevenGrossBps = feeRoundTripBps;
   // Entry effective cost (bps offset above mid_t0): half-spread + entry slippage.
   const entryOffsetBps = spreadBps / 2 + slipInBps;
 
-  // For the TP to fill the BID must reach (entry × 1.0060). Equivalently the
-  // mid must reach mid_t0 + entryOffsetBps + targetGrossBps + spread/2.
-  // For the break-even sell to fill, mid must reach mid_t0 + entryOffsetBps +
-  // breakevenGrossBps + spread/2.
+  // For the TP to fill the BID must reach (entry × 1 + targetGross/10000).
+  // Equivalently the mid must reach mid_t0 + entryOffsetBps + targetGrossBps
+  // + spread/2. Same logic for the break-even barrier.
   const tpMidBarrierBps = entryOffsetBps + targetGrossBps + spreadBps / 2;
   const beMidBarrierBps = entryOffsetBps + breakevenGrossBps + spreadBps / 2;
+  // Multi-factor stop barrier: in mid-bps space, the stop trips when the BID
+  // (= mid - spread/2) is below entry × (1 - stop/10000). Entry price ≈
+  // mid_t0 × (1 + entryOffset/10000), so stop trips when:
+  //   mid - spread/2 ≤ entryOffset - mfStopLossBps
+  //   ⇔ mid ≤ entryOffset + spread/2 - mfStopLossBps
+  const stopMidBarrierBps = isMultiFactor
+    ? entryOffsetBps + spreadBps / 2 - mfStopLossBps
+    : null;
 
   let mid = 0;
   let minMid = 0;
   let maxMid = 0;
 
-  // Phase 1: race TP vs breakevenTimeout (TP fill window).
+  // Phase 1: race TP vs breakevenTimeout (TP fill window). Multi-factor also
+  // races the hard stop in this window.
   let outcome = null;
   let holdMin = stuckHorizonMin;
 
@@ -182,15 +220,23 @@ function simulateOneTrade({
     mid += driftBpsPerMin + volBpsPerMin * gauss(rand);
     if (mid > maxMid) maxMid = mid;
     if (mid < minMid) minMid = mid;
+    if (stopMidBarrierBps != null && mid <= stopMidBarrierBps) {
+      outcome = 'stop_loss'; holdMin = t; break;
+    }
     if (mid >= tpMidBarrierBps) { outcome = 'tp'; holdMin = t; break; }
   }
 
   // Phase 2: break-even fill window (no time limit; we cap at stuck horizon).
+  // Multi-factor continues to race the hard stop here too — this is the more
+  // realistic kill path because most stuck OLS trades drift down further.
   if (outcome == null) {
     for (let t = breakevenTimeoutMin + 1; t <= stuckHorizonMin; t += 1) {
       mid += driftBpsPerMin + volBpsPerMin * gauss(rand);
       if (mid > maxMid) maxMid = mid;
       if (mid < minMid) minMid = mid;
+      if (stopMidBarrierBps != null && mid <= stopMidBarrierBps) {
+        outcome = 'stop_loss'; holdMin = t; break;
+      }
       if (mid >= beMidBarrierBps) { outcome = 'breakeven'; holdMin = t; break; }
     }
   }
@@ -206,6 +252,13 @@ function simulateOneTrade({
     netBps = (sellRatio - entryPaidRatio) * 10000;
   } else if (outcome === 'breakeven') {
     const sellRatio = (1 + breakevenGrossBps / 10000 + entryOffsetBps / 10000) * (1 - feeOutBps / 10000);
+    grossBps = (sellRatio - entryPaidRatio) * 10000 + (feeInBps + feeOutBps);
+    netBps = (sellRatio - entryPaidRatio) * 10000;
+  } else if (outcome === 'stop_loss') {
+    // Stop fills at the stop price (proxy for live market IOC sell from the
+    // bid). Net loss is approximately mfStopLossBps + fees.
+    const stopGrossBps = -mfStopLossBps;
+    const sellRatio = (1 + stopGrossBps / 10000 + entryOffsetBps / 10000) * (1 - feeOutBps / 10000);
     grossBps = (sellRatio - entryPaidRatio) * 10000 + (feeInBps + feeOutBps);
     netBps = (sellRatio - entryPaidRatio) * 10000;
   } else {
@@ -226,6 +279,7 @@ function summarize(trades) {
   const tp = trades.filter((t) => t.outcome === 'tp');
   const be = trades.filter((t) => t.outcome === 'breakeven');
   const stuck = trades.filter((t) => t.outcome === 'stuck');
+  const stopLoss = trades.filter((t) => t.outcome === 'stop_loss');
   const wins = trades.filter((t) => t.netBps > 0);
   const losses = trades.filter((t) => t.netBps < 0);
 
@@ -252,6 +306,7 @@ function summarize(trades) {
     tpRate: n ? tp.length / n : null,
     breakevenRate: n ? be.length / n : null,
     stuckRate: n ? stuck.length / n : null,
+    stopLossRate: n ? stopLoss.length / n : null,
     winRate,
     avgWinBps: avgWin,
     avgLossBps: avgLoss,
@@ -259,6 +314,7 @@ function summarize(trades) {
     profitFactor,
     medianHoldMin: median(trades, 'holdMin'),
     avgStuckLossBps: stuck.length ? mean(stuck, 'netBps') : null,
+    avgStopLossBps: stopLoss.length ? mean(stopLoss, 'netBps') : null,
     p10NetBps: percentile(trades.map((t) => t.netBps), 0.10),
     p50NetBps: percentile(trades.map((t) => t.netBps), 0.50),
     p90NetBps: percentile(trades.map((t) => t.netBps), 0.90),
@@ -290,6 +346,9 @@ function runRegime(name, params, args) {
       feeRoundTripBps: args.feeRoundTripBps,
       breakevenTimeoutMin: args.breakevenTimeoutMin,
       stuckHorizonMin: args.stuckHorizonMin,
+      strategy: args.strategy,
+      mfTargetNetBps: args.mfTargetNetBps,
+      mfStopLossBps: args.mfStopLossBps,
       rand,
     }));
   }
@@ -301,20 +360,23 @@ function fmtPct(v, d = 1) { return Number.isFinite(v) ? `${(v * 100).toFixed(d)}
 function fmtBps(v, d = 2) { return Number.isFinite(v) ? `${v.toFixed(d)} bps` : '   —   '; }
 
 function renderTable(rows, args) {
+  const isMultiFactor = String(args.strategy || 'ols').toLowerCase() === 'multi_factor';
+  const effectiveTargetNet = isMultiFactor ? args.mfTargetNetBps : args.targetNetBps;
   const lines = [];
   lines.push('=== Strategy Expectancy Simulation ===');
   lines.push('');
+  lines.push(`strategy: ${args.strategy}${isMultiFactor ? ` (mf_target_net=${args.mfTargetNetBps}, mf_stop=${args.mfStopLossBps} bps)` : ''}`);
   lines.push(`trials per regime: ${args.trials}`);
   lines.push(`spread: ${args.spreadBps} bps  |  fee_in (taker): ${args.feeInBps} bps  |  fee_out (maker): ${args.feeOutBps} bps`);
-  lines.push(`slip_in: ${args.slipInBps} bps  |  target_net: ${args.targetNetBps} bps  |  fee_rt: ${args.feeRoundTripBps} bps`);
-  lines.push(`gross_target: ${args.targetNetBps + args.feeRoundTripBps} bps  |  breakeven_timeout: ${args.breakevenTimeoutMin} min  |  stuck_horizon: ${args.stuckHorizonMin} min`);
+  lines.push(`slip_in: ${args.slipInBps} bps  |  target_net: ${effectiveTargetNet} bps  |  fee_rt: ${args.feeRoundTripBps} bps`);
+  lines.push(`gross_target: ${effectiveTargetNet + args.feeRoundTripBps} bps  |  breakeven_timeout: ${args.breakevenTimeoutMin} min  |  stuck_horizon: ${args.stuckHorizonMin} min`);
   lines.push('');
-  lines.push('regime         drift   vol   tp%    be%    stuck%   E[net]    avg_win   avg_loss  PF    med_hold');
+  lines.push('regime         drift   vol   tp%    be%    stop%   stuck%   E[net]    avg_win   avg_loss  PF    med_hold');
   for (const row of rows) {
     const s = row.summary;
     lines.push(
       `${row.regime.padEnd(12)} ${String(row.params.driftBpsPerMin).padStart(5)}  ${String(row.params.volBpsPerMin).padStart(4)}  ` +
-      `${fmtPct(s.tpRate, 1).padStart(6)} ${fmtPct(s.breakevenRate, 1).padStart(6)} ${fmtPct(s.stuckRate, 1).padStart(6)}   ` +
+      `${fmtPct(s.tpRate, 1).padStart(6)} ${fmtPct(s.breakevenRate, 1).padStart(6)} ${fmtPct(s.stopLossRate || 0, 1).padStart(6)} ${fmtPct(s.stuckRate, 1).padStart(6)}   ` +
       `${(s.expectancyBps != null ? s.expectancyBps.toFixed(2) : '   —   ').padStart(8)}  ` +
       `${(s.avgWinBps != null ? s.avgWinBps.toFixed(2) : '   —   ').padStart(8)}  ` +
       `${(s.avgLossBps != null ? s.avgLossBps.toFixed(2) : '   —   ').padStart(8)}  ` +
@@ -347,13 +409,19 @@ function main() {
     console.log(`Usage: node backend/scripts/simulate_strategy.js [options]
 
 Options:
-  --regime=NAME            run only one regime (benign, flat, adverse, quiet, wild)
+  --strategy=NAME          'ols' (default) or 'multi_factor'. multi_factor uses
+                           --mf-target-net-bps for the TP and --mf-stop-loss-bps
+                           for a hard stop on the way down.
+  --regime=NAME            run only one regime (benign, flat, adverse, quiet,
+                           wild, trending_chop)
   --trials=N               trials per regime (default ${DEFAULTS.trials})
   --spread-bps=N           spread (bps, default ${DEFAULTS.spreadBps})
   --fee-in-bps=N           taker fee on entry (bps, default ${DEFAULTS.feeInBps})
   --fee-out-bps=N          maker fee on exit (bps, default ${DEFAULTS.feeOutBps})
   --slip-in-bps=N          entry slippage budget (bps, default ${DEFAULTS.slipInBps})
-  --target-net-bps=N       net profit target after fees (bps, default ${DEFAULTS.targetNetBps})
+  --target-net-bps=N       OLS net profit target after fees (bps, default ${DEFAULTS.targetNetBps})
+  --mf-target-net-bps=N    multi_factor net profit target after fees (default ${DEFAULTS.mfTargetNetBps})
+  --mf-stop-loss-bps=N     multi_factor stop-loss distance below entry (default ${DEFAULTS.mfStopLossBps})
   --fee-round-trip-bps=N   round-trip fee assumption used by GTC pricing (bps, default ${DEFAULTS.feeRoundTripBps})
   --breakeven-min=N        BREAKEVEN_TIMEOUT_MS in minutes (default ${DEFAULTS.breakevenTimeoutMin})
   --stuck-min=N            mark-to-market horizon for stuck positions in minutes (default ${DEFAULTS.stuckHorizonMin})

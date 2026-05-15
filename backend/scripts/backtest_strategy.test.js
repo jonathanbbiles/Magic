@@ -227,6 +227,143 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
   assert.equal(trades.length, 0, 'no trades when BTC is in steady freefall — even with bars[].S undefined');
 }
 
+// --- Multi-factor strategy in backtest --------------------------------------
+
+// Multi-factor in backtest: rejects entries on a long synthetic downtrend.
+// The htfTrend factor (15m EMA20 must be rising) trivially fails when the
+// 15m closes are monotonically falling.
+{
+  const opts = {
+    strategy: 'multi_factor',
+    predictBars: 24,
+    minProjectedBps: 0,                 // multi_factor doesn't read this
+    signalTargetFraction: 1.0,
+    targetNetBps: 8,
+    signalTargetMaxNetBps: 50,
+    feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240,
+    cooldownAfterEntryBars: 5,
+    enforceProjectedCoversGross: false, // OLS-only gate — irrelevant here
+    minVolumeRatio: 0,                  // OLS-only — irrelevant
+    maxBtcLeadLagDropBps: 0,            // disable OLS BTC gate; MF has its own
+    htfMinSlopeBpsPerBar: 0,            // OLS-only — irrelevant
+    maxHoldMin: 0,
+    stopLossBps: 0,
+    mfTargetNetBpsFloor: 40,
+    mfSignalTargetMaxNetBps: 150,
+    mfStopLossBps: 100,
+    mfBookImbalanceMode: 'always_pass',
+  };
+  // ≥350 bars to satisfy the multi-factor min-history (≥330 closed 1m bars
+  // for the 15m EMA window). All declining at -2 bps/bar so the 15m HTF
+  // trend factor must reject.
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 360; i += 1) {
+    p *= 1 - 2 / 10000;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, 0, i * 60)).toISOString(),
+      o: p, h: p * 1.0001, l: p * 0.9995, c: p, v: 1000,
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  assert.equal(trades.length, 0, 'multi_factor must reject every bar in a sustained downtrend');
+}
+
+// Multi-factor in backtest: produces some entries on a long pullback-in-uptrend
+// shape (long uptrend with periodic shallow pullbacks). The exact count is
+// sensitive to the fixture geometry; we just assert it's positive and that
+// the per-trade TP target sits in the multi-factor floor/cap range.
+{
+  const opts = {
+    strategy: 'multi_factor',
+    predictBars: 24,
+    signalTargetFraction: 1.0,
+    targetNetBps: 8,
+    signalTargetMaxNetBps: 50,
+    feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240,
+    cooldownAfterEntryBars: 30,
+    enforceProjectedCoversGross: false,
+    minVolumeRatio: 0,
+    maxBtcLeadLagDropBps: 0,
+    htfMinSlopeBpsPerBar: 0,
+    maxHoldMin: 0,
+    stopLossBps: 0,
+    mfTargetNetBpsFloor: 40,
+    mfSignalTargetMaxNetBps: 150,
+    mfStopLossBps: 100,
+    mfBookImbalanceMode: 'always_pass',
+  };
+  // 600 bars: clean step pattern of 60 rising 1m bars (+3 bps/bar) then 20
+  // falling 1m bars (-3 bps/bar). After ≥330 bars of history (multi-factor
+  // 15m requirement), each pullback's last few bars should dip the 5m close
+  // below the 5m EMA(8) without pushing 5m RSI deeply oversold, satisfying
+  // the pullback factor in tandem with a rising 15m HTF trend.
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 600; i += 1) {
+    const cycleIdx = i % 80;
+    const drift = cycleIdx < 60 ? (3 / 10000) : (-3 / 10000);
+    p *= 1 + drift;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, 0, i * 60)).toISOString(),
+      o: p, h: p * 1.0008, l: p * 0.9992, c: p, v: 1500,
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  // We don't assert a specific count — it depends on factor alignment in the
+  // synthetic series — but we assert at least one trade fires AND that every
+  // trade's targetNetBps respects the multi-factor floor.
+  assert.ok(trades.length >= 1, `expected ≥1 multi_factor trade, got ${trades.length}; skipReasons=${JSON.stringify(trades.gateSkipped)}`);
+  for (const t of trades) {
+    assert.ok(t.targetNetBps >= opts.mfTargetNetBpsFloor,
+      `mf targetNetBps must be >= floor (${opts.mfTargetNetBpsFloor}), got ${t.targetNetBps} on ${t.outcome}`);
+    assert.ok(t.targetNetBps <= opts.mfSignalTargetMaxNetBps,
+      `mf targetNetBps must be <= cap (${opts.mfSignalTargetMaxNetBps}), got ${t.targetNetBps}`);
+  }
+}
+
+// Multi-factor with mfBookImbalanceMode='always_fail': the orderbook factor
+// rejects every candidate, so no trades fire even on a perfect pullback shape.
+{
+  const opts = {
+    strategy: 'multi_factor',
+    predictBars: 24,
+    signalTargetFraction: 1.0,
+    targetNetBps: 8,
+    signalTargetMaxNetBps: 50,
+    feeBpsRoundTrip: 40,
+    breakevenTimeoutMin: 240,
+    cooldownAfterEntryBars: 30,
+    enforceProjectedCoversGross: false,
+    minVolumeRatio: 0,
+    maxBtcLeadLagDropBps: 0,
+    htfMinSlopeBpsPerBar: 0,
+    maxHoldMin: 0,
+    stopLossBps: 0,
+    mfTargetNetBpsFloor: 40,
+    mfSignalTargetMaxNetBps: 150,
+    mfStopLossBps: 100,
+    mfBookImbalanceMode: 'always_fail',
+  };
+  // Same 600-bar fixture as the happy path test above so we know the only
+  // change is the orderbook mode rejecting every entry.
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 600; i += 1) {
+    const cycleIdx = i % 80;
+    const drift = cycleIdx < 60 ? (3 / 10000) : (-3 / 10000);
+    p *= 1 + drift;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, 0, i * 60)).toISOString(),
+      o: p, h: p * 1.0008, l: p * 0.9992, c: p, v: 1500,
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  assert.equal(trades.length, 0, 'always_fail orderbook proxy must block every multi_factor entry');
+}
+
 // runBacktest with a mocked global fetch (intercepts the Alpaca bars endpoint).
 {
   const origFetch = global.fetch;
