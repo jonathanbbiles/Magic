@@ -42,15 +42,18 @@ const { rsi: rsiCompute } = require('./indicators');
 
 const DEFAULT_CONFIG = Object.freeze({
   // 1. Drop trigger (cumulative bps over the last 3 closed 1m bars). Default
-  // raised to 100 bps so the math of "half-drop minus fees" always nets a
-  // positive target: half of 100 bps = 50 bps gross → 50 − 40 = 10 bps net.
-  // Below 100 bps the half-reversion doesn't pay for fees, defeating the
-  // "statistically guaranteed profit" thesis.
-  dropTriggerBps: 100,
-  // 2. Volatility-normalized: drop must be > volMultiplier × σ × √3 (the
-  // natural 3-bar σ scaling for a random walk). At 2σ the drop is in the
-  // tail of the normal distribution → tail-end statistical extreme.
-  volMultiplier: 2.0,
+  // lowered from 100 → 80 after the May 2026 backtest produced only 6 entries
+  // over 30 days at the strict 100-bp threshold. The half-drop target on an
+  // 80-bp drop = 40 bps gross → with the 5-bps net floor (MR_TARGET_NET_..._FLOOR)
+  // and 40 bps fees, the target nets at the floor or just above — still
+  // worth taking and unlocks more sample size for ongoing validation.
+  dropTriggerBps: 80,
+  // 2. Volatility-normalized: drop must be > volMultiplier × σ × √3. Default
+  // lowered from 2.0 → 1.5 after the May 2026 backtest. At 1.5σ the drop is
+  // still meaningful (probability ~13% under a Gaussian, ~7% on heavy-tailed
+  // crypto returns), and combined with the other 5 gates the false-positive
+  // rate stays low while sample size grows.
+  volMultiplier: 1.5,
   volLookback: 30,
   // 3. Volume confirmation: the last 3 bars must show ≥ 1.5× the average
   // volume — true capitulation, not low-volume drift.
