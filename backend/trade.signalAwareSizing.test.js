@@ -13,8 +13,9 @@
 //     MF_SIGNAL_TARGET_MAX_NET_BPS = 150
 //     MF_STOP_LOSS_BPS = 100
 //
-// FEE_BPS_ROUND_TRIP defaults to 40, which appears as the fee subtraction
-// in deriveSignalTargetNetBps' formula: signalNet = fraction × projected − fees.
+// FEE_BPS_ROUND_TRIP defaults to 30 (maker-maker on mid entry), which appears
+// as the fee subtraction in deriveSignalTargetNetBps' formula:
+// signalNet = fraction × projected − fees.
 
 const assert = require('assert/strict');
 
@@ -27,28 +28,28 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
 // --- deriveSignalTargetNetBps -----------------------------------------------
 
 // 1. OLS path with a tiny projection: floored at TARGET_NET_PROFIT_BPS (8).
-// signalNet = 1.0 × 20 − 40 = -20 → floor 8 wins.
+// signalNet = 1.0 × 20 − 30 = -10 → floor 8 wins.
 {
   const v = deriveSignalTargetNetBps(20, 'ols');
   assert.equal(v, 8);
 }
 
 // 2. OLS path with a strong projection: capped at SIGNAL_TARGET_MAX_NET_BPS (50).
-// signalNet = 1.0 × 200 − 40 = 160 → cap 50 wins.
+// signalNet = 1.0 × 200 − 30 = 170 → cap 50 wins.
 {
   const v = deriveSignalTargetNetBps(200, 'ols');
   assert.equal(v, 50);
 }
 
 // 3. OLS path with a moderate projection: lands between floor and cap.
-// signalNet = 1.0 × 80 − 40 = 40.
+// signalNet = 1.0 × 80 − 30 = 50 (the new cap, since 50 wins the min).
 {
   const v = deriveSignalTargetNetBps(80, 'ols');
-  assert.equal(v, 40);
+  assert.equal(v, 50);
 }
 
 // 4. Multi-factor path with the ATR floor projection (40). signalNet = 1.0 × 40
-// − 40 = 0 → MF floor 40 wins. This is the critical regression: under the OLS
+// − 30 = 10 → MF floor 40 wins. This is the critical regression: under the OLS
 // floor (8) the multi-factor signal would have shipped a tiny TP that the
 // wider stop can't pay for.
 {
@@ -57,14 +58,14 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
 }
 
 // 5. Multi-factor path with the ATR ceiling projection (150). signalNet =
-// 1.0 × 150 − 40 = 110 → between MF floor (40) and MF cap (150).
+// 1.0 × 150 − 30 = 120 → between MF floor (40) and MF cap (150).
 {
   const v = deriveSignalTargetNetBps(150, 'multi_factor');
-  assert.equal(v, 110);
+  assert.equal(v, 120);
 }
 
 // 6. Multi-factor path with an extreme projection: capped at MF cap (150).
-// signalNet = 1.0 × 400 − 40 = 360 → cap 150 wins. The OLS cap of 50 would
+// signalNet = 1.0 × 400 − 30 = 370 → cap 150 wins. The OLS cap of 50 would
 // have clamped this to 50, defeating the wider payoff.
 {
   const v = deriveSignalTargetNetBps(400, 'multi_factor');
@@ -77,6 +78,7 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
   const v = deriveSignalTargetNetBps(80);
   const vOls = deriveSignalTargetNetBps(80, 'ols');
   assert.equal(v, vOls);
+  assert.equal(v, 50);
 }
 
 // 8. Garbage projection input: returns the per-signal floor (defensive).

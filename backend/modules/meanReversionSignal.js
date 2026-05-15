@@ -41,19 +41,18 @@
 const { rsi: rsiCompute } = require('./indicators');
 
 const DEFAULT_CONFIG = Object.freeze({
-  // 1. Drop trigger (cumulative bps over the last 3 closed 1m bars). Default
-  // lowered from 100 → 80 after the May 2026 backtest produced only 6 entries
-  // over 30 days at the strict 100-bp threshold. The half-drop target on an
-  // 80-bp drop = 40 bps gross → with the 5-bps net floor (MR_TARGET_NET_..._FLOOR)
-  // and 40 bps fees, the target nets at the floor or just above — still
-  // worth taking and unlocks more sample size for ongoing validation.
-  dropTriggerBps: 80,
-  // 2. Volatility-normalized: drop must be > volMultiplier × σ × √3. Default
-  // lowered from 2.0 → 1.5 after the May 2026 backtest. At 1.5σ the drop is
-  // still meaningful (probability ~13% under a Gaussian, ~7% on heavy-tailed
-  // crypto returns), and combined with the other 5 gates the false-positive
-  // rate stays low while sample size grows.
-  volMultiplier: 1.5,
+  // 1. Drop trigger (cumulative bps over the last 3 closed 1m bars). Strict
+  // by design: rare large drops produce the highest-quality reversion setups.
+  // The May 2026 deploy briefly tested a loosened 80-bps trigger; result was
+  // 27 entries / 63% wins / -24 bps net (vs 6 entries / 100% wins / +14.91
+  // bps net at the strict 100-bps trigger). The loose trigger admits lower-
+  // quality setups whose smaller half-reversion targets can't pay for the
+  // same fixed stop. Reverted.
+  dropTriggerBps: 100,
+  // 2. Volatility-normalized: drop must be > volMultiplier × σ × √3 (the
+  // natural 3-bar σ scaling for a random walk). 2σ keeps us in the tail
+  // where mean reversion is most reliable; same revert as dropTriggerBps.
+  volMultiplier: 2.0,
   volLookback: 30,
   // 3. Volume confirmation: the last 3 bars must show ≥ 1.5× the average
   // volume — true capitulation, not low-volume drift.

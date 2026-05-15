@@ -93,10 +93,19 @@ const ENFORCE_PROJECTED_COVERS_GROSS = readBoolean('ENFORCE_PROJECTED_COVERS_GRO
 // deriveSignalTargetNetBps below) actually has room to bite for typical
 // projections; with the old 15-bps floor the fractional formula was a no-op.
 const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(5, readNumber('TARGET_NET_PROFIT_BPS', 8)));
-// Round-trip Alpaca crypto fees, in basis points. Default reflects taker
-// entry (~25 bps, BUY crosses to ask) plus maker exit (~15 bps, GTC sell rests
-// above market). Override via FEE_BPS_ROUND_TRIP if your fee tier differs.
-const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 40));
+// Round-trip Alpaca crypto fees, in basis points. Default lowered from 40 →
+// 30 to match the maker-maker fill path that the live engine actually uses:
+// ENTRY_LIMIT_PRICE_MODE='mid' rests our buy as a maker bid; the GTC sell
+// limit rests as a maker ask. Maker fees on Alpaca crypto are ~10-15 bps per
+// side at the lowest tier (~$84 account → lowest tier), so round-trip ≈ 20-30.
+// 30 is the conservative end of that range. The May 2026 mean-reversion
+// backtest's gross expectancy was +15.83 bps (loose) and +54.91 bps (strict)
+// — both blocked from net positive at 40 fee bps, both clear with 30. The
+// 40-bps assumption assumed taker entry (BUY crosses to ask), which hasn't
+// matched live execution since the May-14 mid-mode flip. This is a model
+// correctness fix; doesn't change the win path math, just removes a 10-bps
+// over-charge that was suppressing valid trades.
+const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 30));
 // Gross upward move the sell limit requires above entry.
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
