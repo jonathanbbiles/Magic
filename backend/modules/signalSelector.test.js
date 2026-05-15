@@ -139,7 +139,51 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(fetched.activeNetBps, 6);
 }
 
-// 14. bootstrapDecisionFromEnv: operator override + veto disabled → trade with override pre-backtest.
+// 14. Mean-reversion signal validated, beats MF and OLS → use mean_reversion.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: 4, entries: 500 }),
+    mfBacktest: bt({ avgNetBpsPerEntry: 6, entries: 200 }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 12, entries: 150 }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion', 'highest net bps wins');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.activeNetBps, 12);
+  assert.equal(d.meanRevNetBps, 12);
+}
+
+// 15. Only mean_reversion validates, others fail → pick mean_reversion.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: -50, entries: 500 }),
+    mfBacktest: bt({ avgNetBpsPerEntry: -45, entries: 200 }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 8, entries: 80 }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion');
+  assert.equal(d.tradingVeto, false);
+}
+
+// 16. Mean-reversion sample size too small → not a candidate.
+{
+  const d = pickActiveSignal({
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 50, entries: 5 }),
+  });
+  assert.equal(d.signalVersion, null, 'tiny sample fails sample-size floor');
+  assert.equal(d.tradingVeto, true);
+}
+
+// 17. Operator override to mean_reversion → use it.
+{
+  const d = pickActiveSignal({
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 7, entries: 80 }),
+    operatorOverride: 'mean_reversion',
+  });
+  assert.equal(d.signalVersion, 'mean_reversion');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.reason, 'operator_override_validated');
+}
+
+// 18. bootstrapDecisionFromEnv: operator override + veto disabled → trade with override pre-backtest.
 {
   // Reset state.
   setLatestDecision({

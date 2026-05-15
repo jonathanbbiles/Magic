@@ -55,10 +55,19 @@ function readBacktestEntries(backtest) {
 // Pure decision function. Inputs are backtest results (the same shape
 // surfaced under meta.backtest on /dashboard) plus operator config.
 // Returns a complete decision payload with reasoning for diagnostics.
+// Map of signal-version → the backtest that validates it. Used by the
+// selector to look up the right backtest record for each candidate signal.
+function getBacktestForSignal(version, backtests) {
+  if (version === 'multi_factor') return backtests.mfBacktest || null;
+  if (version === 'mean_reversion') return backtests.meanRevBacktest || null;
+  return backtests.olsBacktest || null;  // 'ols' or fallback
+}
+
 function pickActiveSignal({
   olsBacktest = null,
   mfBacktest = null,
-  operatorOverride = null,        // 'ols' | 'multi_factor' | null
+  meanRevBacktest = null,
+  operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion' | null
   config = {},
 } = {}) {
   const cfg = { ...DEFAULTS, ...(config || {}) };
@@ -68,6 +77,8 @@ function pickActiveSignal({
   const olsEntries = readBacktestEntries(olsBacktest);
   const mfNetBps = readBacktestNetBps(mfBacktest);
   const mfEntries = readBacktestEntries(mfBacktest);
+  const meanRevNetBps = readBacktestNetBps(meanRevBacktest);
+  const meanRevEntries = readBacktestEntries(meanRevBacktest);
 
   const candidates = [];
   if (olsNetBps != null && olsEntries >= cfg.minBacktestEntries && olsNetBps >= cfg.minBpsToActivate) {
@@ -76,14 +87,18 @@ function pickActiveSignal({
   if (mfNetBps != null && mfEntries >= cfg.minBacktestEntries && mfNetBps >= cfg.minBpsToActivate) {
     candidates.push({ version: 'multi_factor', netBps: mfNetBps, entries: mfEntries });
   }
+  if (meanRevNetBps != null && meanRevEntries >= cfg.minBacktestEntries && meanRevNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'mean_reversion', netBps: meanRevNetBps, entries: meanRevEntries });
+  }
   candidates.sort((a, b) => b.netBps - a.netBps);
 
   // Operator override wins on signal version. Veto still applies unless
   // disabled — the override picks WHICH signal, not whether to trade at all.
-  if (operatorOverride === 'ols' || operatorOverride === 'multi_factor') {
-    const overrideBacktest = operatorOverride === 'multi_factor' ? mfBacktest : olsBacktest;
-    const overrideNetBps = operatorOverride === 'multi_factor' ? mfNetBps : olsNetBps;
-    const overrideEntries = operatorOverride === 'multi_factor' ? mfEntries : olsEntries;
+  const allowedOverrides = ['ols', 'multi_factor', 'mean_reversion'];
+  if (allowedOverrides.includes(operatorOverride)) {
+    const overrideBacktest = getBacktestForSignal(operatorOverride, { olsBacktest, mfBacktest, meanRevBacktest });
+    const overrideNetBps = readBacktestNetBps(overrideBacktest);
+    const overrideEntries = readBacktestEntries(overrideBacktest);
     const overrideValidated = overrideNetBps != null
       && overrideEntries >= cfg.minBacktestEntries
       && overrideNetBps >= cfg.minBpsToActivate;
@@ -96,6 +111,7 @@ function pickActiveSignal({
       decisionAt,
       olsNetBps,
       mfNetBps,
+      meanRevNetBps,
       activeNetBps: overrideNetBps,
       candidates,
       operatorOverride,
@@ -113,6 +129,7 @@ function pickActiveSignal({
       decisionAt,
       olsNetBps,
       mfNetBps,
+      meanRevNetBps,
       activeNetBps: null,
       candidates,
       operatorOverride: null,
@@ -121,7 +138,7 @@ function pickActiveSignal({
     };
   }
   const best = candidates[0];
-  const bestBacktest = best.version === 'multi_factor' ? mfBacktest : olsBacktest;
+  const bestBacktest = getBacktestForSignal(best.version, { olsBacktest, mfBacktest, meanRevBacktest });
   return {
     signalVersion: best.version,
     tradingVeto: false,
@@ -131,6 +148,7 @@ function pickActiveSignal({
     decisionAt,
     olsNetBps,
     mfNetBps,
+    meanRevNetBps,
     activeNetBps: best.netBps,
     candidates,
     operatorOverride: null,
@@ -151,6 +169,7 @@ let latestDecision = {
   decisionAt: null,
   olsNetBps: null,
   mfNetBps: null,
+  meanRevNetBps: null,
   activeNetBps: null,
   candidates: [],
   operatorOverride: null,
@@ -171,7 +190,8 @@ function getCurrentDecision() {
 // Helper: when the operator has set SIGNAL_VERSION but vetoEnabled=false,
 // boot-time pre-backtest state should still respect the operator's choice.
 function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true } = {}) {
-  if (!vetoEnabled && (operatorOverride === 'ols' || operatorOverride === 'multi_factor')) {
+  const allowed = ['ols', 'multi_factor', 'mean_reversion'];
+  if (!vetoEnabled && allowed.includes(operatorOverride)) {
     latestDecision = {
       signalVersion: operatorOverride,
       tradingVeto: false,
@@ -179,6 +199,7 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
       decisionAt: new Date().toISOString(),
       olsNetBps: null,
       mfNetBps: null,
+      meanRevNetBps: null,
       activeNetBps: null,
       candidates: [],
       operatorOverride,

@@ -29,6 +29,7 @@ const {
   computeMinimumGrossTargetBps,
 } = require('./modules/entryEconomics');
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
+const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -162,15 +163,26 @@ const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 5400000));
 // 2026 auto-backtest observed 45.8% max_hold rate at 90 min, dragging MF
 // expectancy to -61 bps. Default 6 h matches the strategy's original design.
 const MF_MAX_HOLD_MS = Math.max(0, readNumber('MF_MAX_HOLD_MS', 21600000));
+// Mean-reversion exit timing: tight. The strategy thesis is "reversion
+// happens fast or it doesn't." 45-min max-hold + 30-min staircase decay
+// matches MR's expected fill window. If the bounce hasn't materialised
+// in 30 min, it isn't coming — pin at break-even and let the stop or
+// max-hold close out.
+const MR_MAX_HOLD_MS = Math.max(0, readNumber('MR_MAX_HOLD_MS', 2700000));     // 45 min
+const MR_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MR_BREAKEVEN_TIMEOUT_MS', 1800000));  // 30 min
 
 // Signal-aware exit timing helpers. The live exit manager and the
 // computeStaircaseExitGrossBps function consult these via the position's
 // signal version (recorded in tradePredictions at entry time).
 function getMaxHoldMsForSignal(signalVersion) {
-  return signalVersion === 'multi_factor' ? MF_MAX_HOLD_MS : MAX_HOLD_MS;
+  if (signalVersion === 'multi_factor') return MF_MAX_HOLD_MS;
+  if (signalVersion === 'mean_reversion') return MR_MAX_HOLD_MS;
+  return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
-  return signalVersion === 'multi_factor' ? MF_BREAKEVEN_TIMEOUT_MS : BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'multi_factor') return MF_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'mean_reversion') return MR_BREAKEVEN_TIMEOUT_MS;
+  return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
 // strategy intent (CLAUDE.md hard rule #5) walked the GTC sell limit toward
@@ -212,9 +224,18 @@ const STOP_LOSS_BPS_FLOOR = Math.max(1, readNumber('STOP_LOSS_BPS_FLOOR', 15));
 // floor enforces stopBps >= spreadBps + STOP_OVER_SPREAD_BPS so there
 // is always at least N bps of room below the bid before the stop trips.
 const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20));
+// Mean-reversion stop-loss cap. Tight by design: mean reversion either
+// happens fast or fails fast. 60 bps cap = ~2× typical drop trigger × 0.3
+// = enough room for the trade to breathe without absorbing a full
+// continuation move. Wider would let trades hold through the directional
+// continuation that we DON'T want to fade.
+const MR_STOP_LOSS_BPS = Math.max(1, readNumber('MR_STOP_LOSS_BPS', 60));
 
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols') {
-  const cap = signalVersion === 'multi_factor' ? MF_STOP_LOSS_BPS : STOP_LOSS_BPS;
+  let cap;
+  if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
+  else if (signalVersion === 'mean_reversion') cap = MR_STOP_LOSS_BPS;
+  else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
   if (!Number.isFinite(sigma) || sigma <= 0) return cap;
@@ -513,7 +534,7 @@ const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 
 // own factor vote replaces them. Structural gates (drawdown, sizing,
 // freshness, spread, vol-cap, HTF) still apply to both signals.
 const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-const SIGNAL_VERSION_OPERATOR_OVERRIDE = (SIGNAL_VERSION_RAW === 'ols' || SIGNAL_VERSION_RAW === 'multi_factor')
+const SIGNAL_VERSION_OPERATOR_OVERRIDE = ['ols', 'multi_factor', 'mean_reversion'].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW
   : null;
 const SIGNAL_VERSION_MODE = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'auto';
@@ -606,10 +627,46 @@ const MF_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
   ABSOLUTE_TARGET_NET_BPS_CEILING,
   Math.max(MF_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('MF_SIGNAL_TARGET_MAX_NET_BPS', 150)),
 );
+// Mean-reversion-at-extremes sizing knobs. The signal's projectedBps is
+// "half the cumulative drop" sized in bps; default floor 20 bps net /
+// cap 120 bps net is much tighter than MF's 40-150 because mean-reversion
+// targets are statistically near-guaranteed only when small relative to
+// the drop magnitude. Read once at startup.
+// Mean-reversion sizing. The signal returns projectedBps = "half the drop"
+// (gross). Convert: net target = gross_target - fees. With minimum 100 bps
+// drop trigger, projectedBps starts at 50, net at 50 - 40 = 10 bps. Tiny,
+// statistical, by design. Floor at 5 bps net so even with small drops we
+// don't size sub-fee targets; cap at MR_SIGNAL_TARGET_MAX_NET_BPS to bound
+// the per-trade target on extreme drops.
+const MR_TARGET_NET_PROFIT_BPS_FLOOR = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(1, readNumber('MR_TARGET_NET_PROFIT_BPS_FLOOR', 5)),
+);
+const MR_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(MR_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('MR_SIGNAL_TARGET_MAX_NET_BPS', 120)),
+);
 
 function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
-  const floor = signalVersion === 'multi_factor' ? MF_TARGET_NET_PROFIT_BPS_FLOOR : TARGET_NET_PROFIT_BPS;
-  const ceiling = signalVersion === 'multi_factor' ? MF_SIGNAL_TARGET_MAX_NET_BPS : SIGNAL_TARGET_MAX_NET_BPS;
+  // Mean-reversion: projectedBps is already a GROSS target (half the drop),
+  // not a forward-move prediction. Convert directly to net by subtracting
+  // fees, then clamp to MR's tighter range. Don't multiply by
+  // SIGNAL_TARGET_FRACTION (the half-drop math is the fraction).
+  if (signalVersion === 'mean_reversion') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return MR_TARGET_NET_PROFIT_BPS_FLOOR;
+    const signalNet = projected - FEE_BPS_ROUND_TRIP;
+    return Math.max(MR_TARGET_NET_PROFIT_BPS_FLOOR, Math.min(MR_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  }
+  let floor;
+  let ceiling;
+  if (signalVersion === 'multi_factor') {
+    floor = MF_TARGET_NET_PROFIT_BPS_FLOOR;
+    ceiling = MF_SIGNAL_TARGET_MAX_NET_BPS;
+  } else {
+    floor = TARGET_NET_PROFIT_BPS;
+    ceiling = SIGNAL_TARGET_MAX_NET_BPS;
+  }
   if (!SIGNAL_SIZED_EXIT_ENABLED) return floor;
   const projected = Number(projectedBps);
   if (!Number.isFinite(projected)) return floor;
@@ -1457,6 +1514,22 @@ async function getMultiFactorSignalForPair(pair, quote) {
   }
 }
 
+// Mean-reversion-at-extremes signal wrapper. Only needs 1m bars (the
+// signal's math: cumulative drop + vol-normalized significance + volume
+// confirmation + BTC decorrelation + RSI oversold). Fetches enough bars
+// to satisfy meanReversionSignal.requiredBars + headroom for the drop +
+// in-progress bar.
+async function getMeanReversionSignalForPair(pair) {
+  try {
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 36, timeframe: '1Min' });
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
+    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag });
+  } catch (err) {
+    return { ok: false, reason: 'mean_reversion_signal_failed', error: err?.message };
+  }
+}
+
 // --- engine state -------------------------------------------------------
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
@@ -2045,9 +2118,14 @@ async function scanAndEnter() {
       if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
-      const sig = ACTIVE_SIGNAL_VERSION === 'multi_factor'
-        ? await getMultiFactorSignalForPair(pair, quote)
-        : await getPredictionSignal(pair);
+      let sig;
+      if (ACTIVE_SIGNAL_VERSION === 'multi_factor') {
+        sig = await getMultiFactorSignalForPair(pair, quote);
+      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion') {
+        sig = await getMeanReversionSignalForPair(pair);
+      } else {
+        sig = await getPredictionSignal(pair);
+      }
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
       if (!sig.ok) {
         rejectTrade(pair, sig.reason || 'prediction_rejected');

@@ -73,6 +73,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // wider TP room to fill before being walked to break-even.
   MF_BREAKEVEN_TIMEOUT_MS: '10800000',
   MF_MAX_HOLD_MS: '21600000',
+  // Mean-reversion-at-extremes strategy defaults. The signal triggers on
+  // a >=100 bps volume-confirmed drop (2σ-significant, RSI-confirmed,
+  // BTC-decorrelated), targets half the drop, runs a tight 60 bps stop,
+  // 45-min max-hold and 30-min staircase decay. Net target floor 5 bps
+  // (tiny wins, statistically high probability) and cap 120 bps net.
+  MR_TARGET_NET_PROFIT_BPS_FLOOR: '5',
+  MR_SIGNAL_TARGET_MAX_NET_BPS: '120',
+  MR_STOP_LOSS_BPS: '60',
+  MR_MAX_HOLD_MS: '2700000',
+  MR_BREAKEVEN_TIMEOUT_MS: '1800000',
   ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   ENFORCE_PROJECTED_COVERS_GROSS: 'true',
