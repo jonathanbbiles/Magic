@@ -66,6 +66,13 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   STALE_QUOTE_PRUNE_PROBATION_FRESH: '2',
   BREAKEVEN_TIMEOUT_MS: '2700000',
   MAX_HOLD_MS: '5400000',
+  // Signal-aware exit timing for multi-factor: its wider TP target (40-150 bps
+  // net) needs longer σ-time than the OLS-tuned tight defaults. The May 2026
+  // auto-backtest at maxHold=90 min observed 45.8% max_hold rate dragging MF
+  // expectancy to -61 bps; 6 h max-hold + 3 h breakeven-timeout gives the
+  // wider TP room to fill before being walked to break-even.
+  MF_BREAKEVEN_TIMEOUT_MS: '10800000',
+  MF_MAX_HOLD_MS: '21600000',
   ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   ENFORCE_PROJECTED_COVERS_GROSS: 'true',

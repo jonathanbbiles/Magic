@@ -78,8 +78,17 @@ const DEFAULTS = {
   enforceProjectedCoversGross: true,
   entrySlippageBps: 3,                   // matches live ENTRY_SLIPPAGE_BPS
   exitSlippageBps: 3,                    // matches live EXIT_SLIPPAGE_BPS
-  // Fix 3: hard max-hold market exit. Set to 0 to disable. Live default 90 min.
+  // Fix 3: hard max-hold market exit. Set to 0 to disable. Live default 90 min
+  // for OLS (tight-scalp profile). Multi-factor uses its own longer hold
+  // (mfMaxHoldMin below) so its wider TP target has σ-time to develop.
   maxHoldMin: 90,
+  // Multi-factor-specific hold times. Live mirrors via MF_MAX_HOLD_MS /
+  // MF_BREAKEVEN_TIMEOUT_MS. The May 2026 auto-backtest at maxHoldMin=90
+  // showed MF hitting max_hold on 45.8% of trades at avgNetBps=-61 bps;
+  // extending to 360 min (6 h) gives the 40-150 bps TP target the σ-time
+  // it needs (≈ 17 σ-bps × √360min ≈ 320 bps reach at 1σ).
+  mfMaxHoldMin: 360,
+  mfBreakevenTimeoutMin: 180,
   // Fix 4: stop-loss bps below entry. If the bar low pierces the stop, the
   // position closes at the stop price (proxy for live market IOC fill). 0
   // disables, matching the legacy backtest behaviour. Tightened from 40 → 35
@@ -92,15 +101,14 @@ const DEFAULTS = {
   rejectNearHighEnabled: true,
   rejectNearHighBps: 30,
   rejectNearHighLookbackBars: 60,
-  // Half-spread cost on entry (live engine rests at mid; live half-spread
-  // depends heavily on the symbol's tier on Alpaca crypto). Bars don't carry
-  // quote-level spread so we apply a tier-aware estimate. Tier-1 (BTC/ETH)
-  // typically trades 10–20 bps spreads → half-spread ≈ 8 bps; tier-2 alts
-  // 30–50 bps → half-spread ≈ 18 bps; tier-3 longtail 70–120 bps →
-  // half-spread ≈ 35 bps. The flat `entrySpreadCostBps` (default null) is
-  // an override — when set, it OVERRIDES tier-aware values for every symbol.
-  // Pass 0 to disable spread charging entirely (legacy parity).
-  entrySpreadCostBps: null,
+  // Half-spread cost on entry. The live engine rests at mid and fills as a
+  // MAKER — no half-spread is paid on a real fill. The pessimistic tier-aware
+  // defaults (8/18/35 bps) are kept as operator-callable stress tests but
+  // DEFAULT to 0 because the previous default systematically over-charged
+  // every backtest by 8–35 bps/trade vs. the actual live `mid` execution
+  // economics. Set `entrySpreadCostBps=<number>` (or the tier knobs) on
+  // /debug/backtest to model a taker-style execution as a sensitivity check.
+  entrySpreadCostBps: 0,
   entrySpreadCostBpsTier1: 8,
   entrySpreadCostBpsTier2: 18,
   entrySpreadCostBpsTier3: 35,
@@ -623,9 +631,18 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     // uses mfStopLossBps (default 100) — see stopLossBpsAbsForTrade above.
     const stopLossBpsAbs = stopLossBpsAbsForTrade;
     const stopPrice = stopLossBpsAbs > 0 ? entryPrice * (1 - stopLossBpsAbs / 10000) : null;
-    // Fix 3: hard max-hold market exit. After maxHoldMs the position closes
-    // at the next bar's close (proxy for market IOC fill).
-    const maxHoldMs = Math.max(0, (Number(opts.maxHoldMin) || 0) * 60_000);
+    // Signal-aware hold times: MF uses mfMaxHoldMin / mfBreakevenTimeoutMin
+    // because its wider TP target (40–150 bps net) needs more σ-time than
+    // the OLS-tuned tight defaults. The May 2026 backtest at 90-min max-hold
+    // showed MF hitting max_hold on 45.8% of trades; the longer MF holds
+    // give the wider TP room to fill.
+    const activeMaxHoldMin = isMultiFactor
+      ? Number(opts.mfMaxHoldMin || opts.maxHoldMin || 0)
+      : Number(opts.maxHoldMin || 0);
+    const activeBreakevenMin = isMultiFactor
+      ? Number(opts.mfBreakevenTimeoutMin || opts.breakevenTimeoutMin || 45)
+      : Number(opts.breakevenTimeoutMin || 45);
+    const maxHoldMs = Math.max(0, activeMaxHoldMin * 60_000);
     for (let j = entryIdx + 1; j < bars.length; j += 1) {
       const ageMs = tsMs[j] - entryTs;
       const low = lows[j];
@@ -639,7 +656,7 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
         fillGrossBps = -stopLossBpsAbs;
         break;
       }
-      const t = Math.min(1, Math.max(0, ageMs / (opts.breakevenTimeoutMin * 60_000)));
+      const t = Math.min(1, Math.max(0, ageMs / (activeBreakevenMin * 60_000)));
       const desiredGrossBps = initialGrossBps + (breakevenGrossBps - initialGrossBps) * t;
       const limitPrice = entryPrice * (1 + desiredGrossBps / 10000);
       const high = highs[j];
@@ -877,6 +894,8 @@ async function runBacktest(overrides = {}) {
       mfSignalTargetMaxNetBps: opts.mfSignalTargetMaxNetBps,
       mfStopLossBps: opts.mfStopLossBps,
       mfBookImbalanceMode: opts.mfBookImbalanceMode,
+      mfMaxHoldMin: opts.mfMaxHoldMin,
+      mfBreakevenTimeoutMin: opts.mfBreakevenTimeoutMin,
       rejectNearHighEnabled: opts.rejectNearHighEnabled,
       rejectNearHighBps: opts.rejectNearHighBps,
       rejectNearHighLookbackBars: opts.rejectNearHighLookbackBars,
