@@ -66,7 +66,7 @@ const DEFAULTS = {
   signalTargetFraction: 1.0,             // matches live SIGNAL_TARGET_FRACTION
   targetNetBps: 8,                       // matches live TARGET_NET_PROFIT_BPS
   signalTargetMaxNetBps: 50,             // matches live cap
-  feeBpsRoundTrip: 40,                   // matches live FEE_BPS_ROUND_TRIP
+  feeBpsRoundTrip: 30,                   // matches live FEE_BPS_ROUND_TRIP (maker-maker on mid entry)
   breakevenTimeoutMin: 45,               // BREAKEVEN_TIMEOUT_MS / 60_000 (tightened to 45 min)
   cooldownAfterEntryBars: 5,             // refuse re-entry on same symbol for N bars after each entry
   // Top-detection gates (matches trade.js env knobs). Defaults track live
