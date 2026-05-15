@@ -76,6 +76,8 @@ GET /debug/backtest?refresh=true                             → re-run with def
 GET /debug/backtest?days=60&signalTargetFraction=1.0         → re-run with overrides (waits for completion)
 GET /debug/backtest?wait=false&minProjectedBps=25            → kick off in background, return immediately
 GET /debug/backtest?refresh=true&htfMinSlopeBpsPerBar=2&stopLossBps=25  → sweep tightened-gate combos
+GET /debug/backtest?refresh=true&strategy=multi_factor                  → score the new multi-factor signal
+GET /debug/backtest?refresh=true&strategy=multi_factor&mfTargetNetBpsFloor=60&mfSignalTargetMaxNetBps=200  → sweep multi-factor sizing
 ```
 
 Accepted overrides: `days`, `predictBars`, `minProjectedBps`, `signalTargetFraction`, `targetNetBps`, `symbols`, `minVolumeRatio`, `maxBtcLeadLagDropBps`, `stopLossBps`, `htfMinSlopeBpsPerBar`, `htfBars`.

@@ -38,11 +38,17 @@
  */
 
 const path = require('path');
+const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
 
 const DEFAULTS = {
   symbols: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
   start: null,                           // ISO date — defaults to 30 days ago
   end: null,                             // ISO date — defaults to today
+  // Strategy dispatch — 'ols' is the legacy 1m-OLS predictor (default; the
+  // existing replaySymbol gate chain). 'multi_factor' runs the new
+  // pullback-in-uptrend signal with synthesized 5m + 15m bars and a
+  // backtest-shaped orderbook proxy. See M5 of the rewrite plan.
+  strategy: 'ols',
   predictBars: 20,                       // matches live PREDICT_BARS
   minProjectedBps: 15,                   // matches live MIN_PROJECTED_BPS_TO_ENTER
   signalTargetFraction: 1.0,             // matches live SIGNAL_TARGET_FRACTION
@@ -72,6 +78,27 @@ const DEFAULTS = {
   // HTF_MIN_SLOPE_BPS_PER_BAR. Set to 0 to disable.
   htfMinSlopeBpsPerBar: 0,
   htfBars: 12,
+  // Multi-factor strategy params (only consulted when strategy='multi_factor').
+  // Mirror live MF_* env knobs.
+  mfTargetNetBpsFloor: 40,
+  mfSignalTargetMaxNetBps: 150,
+  mfStopLossBps: 100,
+  // The multi-factor signal includes an orderbook bid-share factor. Alpaca
+  // historical bars don't carry orderbook snapshots, so the backtest can't
+  // evaluate it. 'always_pass' (default) treats the factor as auto-passing
+  // — making the backtest more permissive than live. 'always_fail' rules
+  // every entry out (only useful as a sanity check). The result payload
+  // surfaces this caveat under `mfBacktestCaveats`.
+  mfBookImbalanceMode: 'always_pass',
+  mfMinBars1m: 24,                       // multi-factor needs ≥24 closed 1m bars (RSI window + ATR)
+  mfMinBars5m: 18,                       // and ≥16 closed 5m bars (synthesized from 1m)
+  mfMinBars15m: 22,                      // and ≥22 closed 15m bars (synthesized from 1m)
+  // Overlay required-flags. Default false in backtest because (a) BTC bars
+  // aren't always provided to replaySymbol, and (b) the volume overlay can
+  // veto trades on synthetic data even when the underlying signal is clean.
+  // Live runs with their own configured defaults via the MF_* env vars.
+  mfBtcLagRequired: false,
+  mfVolumeRequired: false,
   json: false,
 };
 
@@ -178,6 +205,118 @@ function btcRecentReturnAt(idx, btcIdx, lookbackBars) {
   return ((now - past) / past) * 10000;
 }
 
+// Aggregate the most recent N consecutive 1-minute bars ending at `endIdx`
+// (inclusive) into a single bar. Used by the multi-factor backtest path to
+// synthesise 5m/15m bars from the 1m series we fetch from Alpaca, since the
+// /v1beta3/crypto bars endpoint we hit for backtests is 1Min only.
+function aggregate1mBars(bars, endIdx, n) {
+  const startIdx = endIdx - n + 1;
+  if (startIdx < 0 || endIdx >= bars.length) return null;
+  let high = -Infinity;
+  let low = Infinity;
+  let vol = 0;
+  for (let i = startIdx; i <= endIdx; i += 1) {
+    const h = Number(bars[i]?.h);
+    const l = Number(bars[i]?.l);
+    const v = Number(bars[i]?.v);
+    if (Number.isFinite(h) && h > high) high = h;
+    if (Number.isFinite(l) && l < low) low = l;
+    if (Number.isFinite(v)) vol += v;
+  }
+  const open = Number(bars[startIdx]?.o);
+  const close = Number(bars[endIdx]?.c);
+  const ts = bars[endIdx]?.t;
+  if (!Number.isFinite(open) || !Number.isFinite(close)) return null;
+  return { o: open, h: high, l: low, c: close, v: vol, t: ts };
+}
+
+// Build the most recent K aggregated bars of size n (in 1m steps) ending at
+// `endIdx`. Returns an array in time order. `endIdx` is the index of the last
+// closed 1m bar to include — the resulting series excludes any in-progress
+// aggregation period (the multi-factor signal drops the in-progress bar
+// itself, so we hand it complete periods and let it slice).
+function buildAggregatedSeries(bars, endIdx, n, k) {
+  const out = [];
+  for (let pos = endIdx - (k - 1) * n; pos <= endIdx; pos += n) {
+    const bar = aggregate1mBars(bars, pos, n);
+    if (!bar) return [];
+    out.push(bar);
+  }
+  // Append a synthetic in-progress bar so multiFactorSignal's drop-the-last
+  // semantics line up with the closed bars we just built.
+  if (out.length > 0) out.push({ ...out[out.length - 1] });
+  return out;
+}
+
+// Build the bid-heavy / ask-heavy / neutral orderbook proxy the multi-factor
+// signal expects. Backtest doesn't have historical book data; the proxy is a
+// fixed shape determined by `mfBookImbalanceMode`. See DEFAULTS comment.
+function buildOrderbookProxy(price, mode) {
+  if (mode === 'always_fail') {
+    return {
+      bids: [{ p: price - 0.01, s: 1 }],
+      asks: Array.from({ length: 5 }, (_, i) => ({ p: price + 0.01 * (i + 1), s: 100 })),
+    };
+  }
+  // 'always_pass' default: bid-heavy book where bidShare ≈ 0.73.
+  return {
+    bids: Array.from({ length: 5 }, (_, i) => ({ p: price - 0.01 * (i + 1), s: 80 })),
+    asks: Array.from({ length: 5 }, (_, i) => ({ p: price + 0.01 * (i + 1), s: 30 })),
+  };
+}
+
+// Evaluate the multi-factor entry signal at index i of a 1m bar series.
+// Returns { ok, reason, projectedBps, atrBps, confidence, factors } or
+// { ok: false, reason: 'mf_insufficient_history' } when there aren't enough
+// 1m bars to synthesise the higher-timeframe windows the signal needs.
+function evaluateMultiFactorEntryAt({ idx, bars, opts, btcReturnBps, symbol }) {
+  // To synthesize the necessary 5m and 15m bar history, we need:
+  //   1m: at least mfMinBars1m closed bars before/at idx
+  //   5m: at least mfMinBars5m × 5 = 80 closed 1m bars
+  //   15m: at least mfMinBars15m × 15 = 330 closed 1m bars
+  // We'll feed the multi-factor signal the in-progress-bar convention by
+  // appending a synthetic last bar — see buildAggregatedSeries.
+  const minBars1m = opts.mfMinBars1m || 24;
+  const minBars5m = opts.mfMinBars5m || 18;
+  const minBars15m = opts.mfMinBars15m || 22;
+  const min1mForFiveM = (minBars5m + 1) * 5;     // +1 cushion for the in-progress aggregator
+  const min1mForFifteenM = (minBars15m + 1) * 15;
+  const need = Math.max(minBars1m, min1mForFiveM, min1mForFifteenM);
+  if (idx + 1 < need) {
+    return { ok: false, reason: 'mf_insufficient_history' };
+  }
+  // bars1m: the last (minBars1m + 1) closed 1m bars (last one is in-progress
+  // for the signal's semantic — the real bar at idx is that "in-progress").
+  const bars1mWindow = bars.slice(idx - minBars1m + 1, idx + 1);
+  // Append the bar at idx as the in-progress one (it'll be dropped by the
+  // signal; we need it so the signal sees minBars1m closed bars before it).
+  bars1mWindow.push({ ...bars[idx] });
+  const bars5m = buildAggregatedSeries(bars, idx, 5, minBars5m);
+  const bars15m = buildAggregatedSeries(bars, idx, 15, minBars15m);
+
+  const lastClose = Number(bars[idx]?.c);
+  const orderbook = buildOrderbookProxy(lastClose, opts.mfBookImbalanceMode);
+  const quote = { bid: lastClose * 0.9999, ask: lastClose * 1.0001 };
+
+  const btcLeadLag = (Number.isFinite(btcReturnBps))
+    ? { recentReturnBps: btcReturnBps, ageMs: 0 }
+    : null;
+
+  return evaluateMultiFactorSignal({
+    pair: symbol || null,
+    bars1m: bars1mWindow,
+    bars5m,
+    bars15m,
+    orderbook,
+    quote,
+    btcLeadLag,
+    config: {
+      btcLagRequired: Boolean(opts.mfBtcLagRequired),
+      volumeRequired: Boolean(opts.mfVolumeRequired),
+    },
+  });
+}
+
 function replaySymbol(bars, opts, btcBars = null) {
   const trades = [];
   if (!Array.isArray(bars) || bars.length < opts.predictBars + 2) return trades;
@@ -207,79 +346,131 @@ function replaySymbol(bars, opts, btcBars = null) {
   // Per-symbol gate counts for new gates that Fix 2 / Fix 4 added live.
   if (!stats.skipped.projected_below_gross_target) stats.skipped.projected_below_gross_target = 0;
 
+  const strategy = String(opts.strategy || 'ols').toLowerCase();
+  const isMultiFactor = strategy === 'multi_factor';
+
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
-    const window = closes.slice(i - opts.predictBars, i);
-    if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
-    const sig = olsSlope(window);
-    if (!sig) continue;
-    if (!(sig.tStat > 0)) continue;
-    if (sig.projectedBps < opts.minProjectedBps) continue;
 
-    // Fix 2: projected_below_gross_target — refuse trades whose projection
-    // can't cover the gross move (target + slippage) needed to fill the TP.
-    if (opts.enforceProjectedCoversGross) {
-      const grossTargetBps = opts.targetNetBps + opts.feeBpsRoundTrip;
-      const entrySlip = Number(opts.entrySlippageBps) || 0;
-      const exitSlip = Number(opts.exitSlippageBps) || 0;
-      const requiredGrossBps = grossTargetBps + entrySlip + exitSlip;
-      if (sig.projectedBps < requiredGrossBps) {
-        stats.skipped.projected_below_gross_target += 1;
+    let sig = null;
+    let signalDerivedNetBps = null;
+    let stopLossBpsAbsForTrade = Math.max(0, Number(opts.stopLossBps) || 0);
+
+    if (isMultiFactor) {
+      // Multi-factor entry decision. Fetch BTC's recent return at this bar
+      // index (alts only) so the multi-factor btcLag overlay can fire.
+      let btcReturnBps = null;
+      if (btcIdx) {
+        const minute = Math.floor(tsMs[i] / 60_000);
+        const btcBarIdx = btcIdx.byTs.get(minute);
+        if (Number.isFinite(btcBarIdx)) {
+          btcReturnBps = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+        }
+      }
+      const mfSig = evaluateMultiFactorEntryAt({
+        idx: i,
+        bars,
+        opts,
+        btcReturnBps,
+        symbol: bars[i]?.S || null,
+      });
+      if (!mfSig?.ok) {
+        const reason = mfSig?.reason || 'mf_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
         continue;
       }
-    }
+      sig = { tStat: 1, projectedBps: mfSig.projectedBps };
+      // Multi-factor sizing: clamp projectedBps with the MF floor/cap (live
+      // deriveSignalTargetNetBps uses MF_TARGET_NET_PROFIT_BPS_FLOOR /
+      // MF_SIGNAL_TARGET_MAX_NET_BPS when SIGNAL_VERSION='multi_factor').
+      const fraction = Number(opts.signalTargetFraction) || 1.0;
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.mfTargetNetBpsFloor) || 40;
+      const cap = Number(opts.mfSignalTargetMaxNetBps) || 150;
+      const raw = fraction * mfSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Math.max(0, Number(opts.mfStopLossBps) || 0);
+    } else {
+      const window = closes.slice(i - opts.predictBars, i);
+      if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
+      sig = olsSlope(window);
+      if (!sig) continue;
+      if (!(sig.tStat > 0)) continue;
+      if (sig.projectedBps < opts.minProjectedBps) continue;
 
-    // HTF downtrend gate (matches trade.js HTF_MIN_SLOPE_BPS_PER_BAR). Sample
-    // 5-minute closes from the 1-minute bars by taking every 5th close from a
-    // window of size htfBars × 5, then OLS-fit slope in bps/bar. Refuse when
-    // slope is below the floor.
-    if (opts.htfMinSlopeBpsPerBar > 0) {
-      const htfBarsNeeded = Math.max(3, Math.floor(opts.htfBars || 12));
-      const htfWindowMins = htfBarsNeeded * 5;
-      if (i >= htfWindowMins) {
-        const htfWindow = [];
-        for (let k = i - htfWindowMins + 5; k <= i; k += 5) htfWindow.push(closes[k]);
-        if (htfWindow.length >= 3 && htfWindow.every((c) => Number.isFinite(c) && c > 0)) {
-          const htfSig = olsSlope(htfWindow);
-          if (htfSig && htfSig.slopeBpsPerBar < opts.htfMinSlopeBpsPerBar) {
-            if (!stats.skipped.htf_downtrend) stats.skipped.htf_downtrend = 0;
-            stats.skipped.htf_downtrend += 1;
-            continue;
-          }
-        }
-      }
-    }
-
-    // Volume confirmation gate (matches trade.js MIN_VOLUME_RATIO_TO_ENTER).
-    // Skip when recent-window volume is faded vs the OLS-window average.
-    if (opts.minVolumeRatio > 0) {
-      const winVols = volumes.slice(i - opts.predictBars, i).filter((v) => Number.isFinite(v) && v >= 0);
-      if (winVols.length >= 4) {
-        const totalVolMean = winVols.reduce((s, v) => s + v, 0) / winVols.length;
-        const recentN = Math.max(3, Math.floor(winVols.length / 4));
-        const recentSlice = winVols.slice(-recentN);
-        const recentMean = recentSlice.reduce((s, v) => s + v, 0) / recentSlice.length;
-        if (totalVolMean > 0) {
-          const ratio = recentMean / totalVolMean;
-          if (ratio < opts.minVolumeRatio) {
-            stats.skipped.volume_below_min += 1;
-            continue;
-          }
-        }
-      }
-    }
-
-    // BTC lead-lag gate (matches trade.js MAX_BTC_LEAD_LAG_DROP_BPS). Look up
-    // BTC's last-N-bar return as of this symbol's bar timestamp; refuse if
-    // BTC dropped harder than the threshold.
-    if (btcIdx && opts.maxBtcLeadLagDropBps < 0) {
-      const minute = Math.floor(tsMs[i] / 60_000);
-      const btcBarIdx = btcIdx.byTs.get(minute);
-      if (Number.isFinite(btcBarIdx)) {
-        const btcReturn = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
-        if (Number.isFinite(btcReturn) && btcReturn < opts.maxBtcLeadLagDropBps) {
-          stats.skipped.btc_leading_drop += 1;
+      // Fix 2: projected_below_gross_target — refuse trades whose projection
+      // can't cover the gross move (target + slippage) needed to fill the TP.
+      // OLS-only — multi_factor's projectedBps is a sized TP target, not a
+      // forward-move prediction, so this check would double-count the cost
+      // floor.
+      if (opts.enforceProjectedCoversGross) {
+        const grossTargetBps = opts.targetNetBps + opts.feeBpsRoundTrip;
+        const entrySlip = Number(opts.entrySlippageBps) || 0;
+        const exitSlip = Number(opts.exitSlippageBps) || 0;
+        const requiredGrossBps = grossTargetBps + entrySlip + exitSlip;
+        if (sig.projectedBps < requiredGrossBps) {
+          stats.skipped.projected_below_gross_target += 1;
           continue;
+        }
+      }
+
+      // HTF downtrend gate (matches trade.js HTF_MIN_SLOPE_BPS_PER_BAR). Sample
+      // 5-minute closes from the 1-minute bars by taking every 5th close from a
+      // window of size htfBars × 5, then OLS-fit slope in bps/bar. Refuse when
+      // slope is below the floor. OLS-only because the multi_factor signal's
+      // own htfTrend factor enforces the same intent on a different formula.
+      if (opts.htfMinSlopeBpsPerBar > 0) {
+        const htfBarsNeeded = Math.max(3, Math.floor(opts.htfBars || 12));
+        const htfWindowMins = htfBarsNeeded * 5;
+        if (i >= htfWindowMins) {
+          const htfWindow = [];
+          for (let k = i - htfWindowMins + 5; k <= i; k += 5) htfWindow.push(closes[k]);
+          if (htfWindow.length >= 3 && htfWindow.every((c) => Number.isFinite(c) && c > 0)) {
+            const htfSig = olsSlope(htfWindow);
+            if (htfSig && htfSig.slopeBpsPerBar < opts.htfMinSlopeBpsPerBar) {
+              if (!stats.skipped.htf_downtrend) stats.skipped.htf_downtrend = 0;
+              stats.skipped.htf_downtrend += 1;
+              continue;
+            }
+          }
+        }
+      }
+
+      // Volume confirmation gate (matches trade.js MIN_VOLUME_RATIO_TO_ENTER).
+      // Skip when recent-window volume is faded vs the OLS-window average.
+      // OLS-only — multi_factor has its own volume overlay with a tighter
+      // default threshold.
+      if (opts.minVolumeRatio > 0) {
+        const winVols = volumes.slice(i - opts.predictBars, i).filter((v) => Number.isFinite(v) && v >= 0);
+        if (winVols.length >= 4) {
+          const totalVolMean = winVols.reduce((s, v) => s + v, 0) / winVols.length;
+          const recentN = Math.max(3, Math.floor(winVols.length / 4));
+          const recentSlice = winVols.slice(-recentN);
+          const recentMean = recentSlice.reduce((s, v) => s + v, 0) / recentSlice.length;
+          if (totalVolMean > 0) {
+            const ratio = recentMean / totalVolMean;
+            if (ratio < opts.minVolumeRatio) {
+              stats.skipped.volume_below_min += 1;
+              continue;
+            }
+          }
+        }
+      }
+
+      // BTC lead-lag gate (matches trade.js MAX_BTC_LEAD_LAG_DROP_BPS). Look up
+      // BTC's last-N-bar return as of this symbol's bar timestamp; refuse if
+      // BTC dropped harder than the threshold. OLS-only — multi_factor's
+      // btcLag overlay does the same thing on a stricter default threshold.
+      if (btcIdx && opts.maxBtcLeadLagDropBps < 0) {
+        const minute = Math.floor(tsMs[i] / 60_000);
+        const btcBarIdx = btcIdx.byTs.get(minute);
+        if (Number.isFinite(btcBarIdx)) {
+          const btcReturn = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+          if (Number.isFinite(btcReturn) && btcReturn < opts.maxBtcLeadLagDropBps) {
+            stats.skipped.btc_leading_drop += 1;
+            continue;
+          }
         }
       }
     }
@@ -289,7 +480,12 @@ function replaySymbol(bars, opts, btcBars = null) {
     const entryIdx = i;
     const entryTs = tsMs[i];
 
-    const targetNetBps = deriveTargetNetBps(sig.projectedBps, opts);
+    // Per-strategy TP sizing. OLS uses deriveTargetNetBps (clamped to
+    // [targetNetBps, signalTargetMaxNetBps]); multi_factor sets
+    // signalDerivedNetBps inline above using the MF floor/cap.
+    const targetNetBps = signalDerivedNetBps != null
+      ? signalDerivedNetBps
+      : deriveTargetNetBps(sig.projectedBps, opts);
     const initialGrossBps = targetNetBps + opts.feeBpsRoundTrip;
     const breakevenGrossBps = opts.feeBpsRoundTrip;
 
@@ -299,7 +495,9 @@ function replaySymbol(bars, opts, btcBars = null) {
     let fillPrice = null;
     // Fix 4: stop-loss price. If the bar low pierces this, the position
     // closes at the stop price (proxy for live market IOC fill from the bid).
-    const stopLossBpsAbs = Math.max(0, Number(opts.stopLossBps) || 0);
+    // Stop is per-strategy: OLS uses stopLossBps (default 40), multi_factor
+    // uses mfStopLossBps (default 100) — see stopLossBpsAbsForTrade above.
+    const stopLossBpsAbs = stopLossBpsAbsForTrade;
     const stopPrice = stopLossBpsAbs > 0 ? entryPrice * (1 - stopLossBpsAbs / 10000) : null;
     // Fix 3: hard max-hold market exit. After maxHoldMs the position closes
     // at the next bar's close (proxy for market IOC fill).
@@ -527,9 +725,12 @@ async function runBacktest(overrides = {}) {
     allTrades = allTrades.concat(trades);
   }
   const overall = summarise(allTrades);
+  const strategyName = String(opts.strategy || 'ols').toLowerCase();
+  const isMultiFactor = strategyName === 'multi_factor';
   return {
     ranAt: new Date().toISOString(),
     params: {
+      strategy: strategyName,
       symbols,
       start: opts.start,
       end: opts.end,
@@ -548,10 +749,23 @@ async function runBacktest(overrides = {}) {
       exitSlippageBps: opts.exitSlippageBps,
       maxHoldMin: opts.maxHoldMin,
       stopLossBps: opts.stopLossBps,
+      mfTargetNetBpsFloor: opts.mfTargetNetBpsFloor,
+      mfSignalTargetMaxNetBps: opts.mfSignalTargetMaxNetBps,
+      mfStopLossBps: opts.mfStopLossBps,
+      mfBookImbalanceMode: opts.mfBookImbalanceMode,
     },
     perSymbol,
     overall,
     gateSkipped: totalGateSkips,
+    // Caveats specific to the multi_factor strategy in backtest. Surfaced so
+    // dashboards / consumers don't silently treat the result as live-equivalent.
+    mfBacktestCaveats: isMultiFactor
+      ? [
+          'no_historical_orderbook_in_backtest',
+          `book_imbalance_mode=${opts.mfBookImbalanceMode}`,
+          'live_signal_uses_real_15m_bars_backtest_synthesizes_from_1m',
+        ]
+      : [],
   };
 }
 

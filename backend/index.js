@@ -660,6 +660,13 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.stopLossBps != null ? { stopLossBps: Number(overrides.stopLossBps) } : {}),
       ...(overrides.htfMinSlopeBpsPerBar != null ? { htfMinSlopeBpsPerBar: Number(overrides.htfMinSlopeBpsPerBar) } : {}),
       ...(overrides.htfBars != null ? { htfBars: Number(overrides.htfBars) } : {}),
+      ...(overrides.strategy ? { strategy: String(overrides.strategy) } : {}),
+      ...(overrides.mfTargetNetBpsFloor != null ? { mfTargetNetBpsFloor: Number(overrides.mfTargetNetBpsFloor) } : {}),
+      ...(overrides.mfSignalTargetMaxNetBps != null ? { mfSignalTargetMaxNetBps: Number(overrides.mfSignalTargetMaxNetBps) } : {}),
+      ...(overrides.mfStopLossBps != null ? { mfStopLossBps: Number(overrides.mfStopLossBps) } : {}),
+      ...(overrides.mfBookImbalanceMode ? { mfBookImbalanceMode: String(overrides.mfBookImbalanceMode) } : {}),
+      ...(overrides.mfBtcLagRequired != null ? { mfBtcLagRequired: String(overrides.mfBtcLagRequired) === 'true' } : {}),
+      ...(overrides.mfVolumeRequired != null ? { mfVolumeRequired: String(overrides.mfVolumeRequired) === 'true' } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -700,6 +707,13 @@ app.get('/debug/backtest', async (req, res) => {
     stopLossBps: req.query.stopLossBps,
     htfMinSlopeBpsPerBar: req.query.htfMinSlopeBpsPerBar,
     htfBars: req.query.htfBars,
+    strategy: req.query.strategy,
+    mfTargetNetBpsFloor: req.query.mfTargetNetBpsFloor,
+    mfSignalTargetMaxNetBps: req.query.mfSignalTargetMaxNetBps,
+    mfStopLossBps: req.query.mfStopLossBps,
+    mfBookImbalanceMode: req.query.mfBookImbalanceMode,
+    mfBtcLagRequired: req.query.mfBtcLagRequired,
+    mfVolumeRequired: req.query.mfVolumeRequired,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});
