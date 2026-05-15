@@ -663,7 +663,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     : 3;
   const vetoEnabled = !['0', 'false', 'no', 'off']
     .includes(String(process.env.SIGNAL_SELECTOR_VETO_ENABLED || 'true').toLowerCase());
-  const minBacktestEntries = Math.max(1, Number(process.env.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES) || 30);
+  const minBacktestEntries = Math.max(1, Number(process.env.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES) || 5);
 
   // The primary slot's strategy tells us which signal it validates. If the
   // operator overrode the primary slot to run multi_factor or mean_reversion,
