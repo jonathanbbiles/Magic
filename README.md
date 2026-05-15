@@ -202,7 +202,32 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `HONEST_EV_GATE_ENABLED` | `true` | When `true`, the EV calculation charges the non-fill branch a `STUCK_LOSS_ASSUMED_BPS` penalty so the asymmetric "no stop-loss" structure is priced honestly (`E[net] = p·targetNet − (1−p)·stuckLoss`). Default flipped from `false` after live diagnostics observed entries (BCH at `projectedBps=2.6, honestEvBps=-54`; DOGE at `honestEvBps=-3.7`) clearing the cheaper net-edge gate while having negative honest expectancy — exactly the trades the no-stop design has no way to recover from. Set to `false` to revert to the legacy permissive behaviour. Skip reason: `honest_ev_below_min`. |
 | `STUCK_LOSS_ASSUMED_BPS` | `250` | Bps of MTM loss assumed for positions that don't recover above break-even. Only consulted when `HONEST_EV_GATE_ENABLED=true`. Default raised from `100` → `250` after live diagnostics measured the actual unrealized drawdown on an 11-position stuck cluster at ~270 bps per position — the previous 100 bps assumption was systematically rating marginal entries +EV when reality was -EV. Calibrate by running `node scripts/simulate_strategy.js` and reading `avg_loss` for your target regime. |
 | `BARRIER_HORIZON_BARS` | `BREAKEVEN_TIMEOUT_MS / 60000` | Number of 1-minute bars used as the horizon in the barrier-hitting probability. Defaults to the break-even timeout in minutes — answers "how likely is the TP to fill before we'd otherwise replace it with a break-even sell?". |
-| `SIGNAL_VERSION` | `ols` | Selects which entry signal the scan loop uses. `ols` (default, current production) runs the legacy 1m linear-regression predictor described in step 2 of "The whole strategy in 5 lines". `multi_factor` runs the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`: four required factors (15m close > rising 15m EMA(20); 5m close ≤ 5m EMA(8) but 5m RSI(14) ≥ 35; 1m RSI(14) ≥ 50 OR last 3 1m RSI prints strictly improving; top-5 orderbook bid notional ≥ 55% of total) plus two configurable overlays (1m volume ratio and BTC lead-lag for alts). When `multi_factor` is selected the OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped — the new signal's factor vote replaces them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF) still apply to both. **The `multi_factor` signal is not yet validated for live use** — the rewrite milestones land it incrementally; flip this to `multi_factor` in production only after the backtest + simulator gates documented in the rewrite plan have been cleared. |
+| `SIGNAL_VERSION` | `ols` | Selects which entry signal the scan loop uses. `ols` (default, current production) runs the legacy 1m linear-regression predictor described in step 2 of "The whole strategy in 5 lines". `multi_factor` runs the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`: four required factors (15m close > rising 15m EMA(20); 5m close ≤ 5m EMA(8) but 5m RSI(14) ≥ 35; 1m RSI(14) ≥ 50 OR last 3 1m RSI prints strictly improving; top-5 orderbook bid notional ≥ 55% of total) plus two configurable overlays (1m volume ratio and BTC lead-lag for alts). When `multi_factor` is selected the OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped — the new signal's factor vote replaces them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF) still apply to both. **The `multi_factor` signal is not yet validated for live use** — the validation gate is documented immediately below. Rollback to `ols` is one Render restart away. |
+
+#### Multi-factor validation gate (must clear before flipping `SIGNAL_VERSION` to `multi_factor` in production)
+
+The `multi_factor` code path ships ready-to-test, **not validated**. Before enabling it on the live account, run the following on a host with the standard Alpaca credential env vars set (the same vars listed in "Required for live trading" above) and confirm each result:
+
+```sh
+# 30-day primary backtest (uses the live universe / current MF defaults).
+node backend/scripts/backtest_strategy.js --strategy=multi_factor --json | jq '.overall'
+# Pass criterion: avgNetBpsPerEntry >= +5 bps over 30 days.
+
+# Two A/B alts: tighter and looser MF sizing.
+node backend/scripts/backtest_strategy.js --strategy=multi_factor --mf-target-net-bps-floor=60 --mf-stop-loss-bps=120 --json | jq '.overall'
+node backend/scripts/backtest_strategy.js --strategy=multi_factor --mf-target-net-bps-floor=30 --mf-stop-loss-bps=80 --json | jq '.overall'
+# Pass criterion: each alt's avgNetBpsPerEntry >= +3 bps.
+
+# Cross-regime simulator (evaluates the payoff structure GIVEN entry; the
+# entry side comes from the backtest above).
+node backend/scripts/simulate_strategy.js --strategy=multi_factor
+# Pass criterion: positive expectancy in benign AND flat AND trending_chop
+# regimes. (adverse and wild are stress regimes; failing those is acceptable
+# and matches the OLS baseline's behaviour.)
+```
+
+If all three gates pass, set `SIGNAL_VERSION=multi_factor` in Render env and restart. If any gate fails, leave `SIGNAL_VERSION=ols` and treat the failure as signal research, not parameter tuning — the rewrite plan calls for a postmortem before further iteration. The dashboard's `meta.scorecard` exposes live scorecard divergence from `meta.backtest.overall`; any divergence > 2σ over the first 4 hours of live multi_factor trading should trigger an immediate rollback (`SIGNAL_VERSION=ols`).
+
 | `MF_TARGET_NET_PROFIT_BPS_FLOOR` | `40` | Per-trade TP floor (bps net) used only when `SIGNAL_VERSION='multi_factor'`. The multi-factor signal's `projectedBps` is an ATR-derived per-trade TP target sized in [40, 150] bps; the OLS-tuned 8 bps floor would clamp every multi-factor trade to a tiny TP that the wider stop can't pay for. Has no effect when `SIGNAL_VERSION='ols'`. Read once at startup. |
 | `MF_SIGNAL_TARGET_MAX_NET_BPS` | `150` | Per-trade TP cap (bps net) used only when `SIGNAL_VERSION='multi_factor'`. Mirrors `SIGNAL_TARGET_MAX_NET_BPS` but sized for the multi-factor signal's wider payoff. Has no effect when `SIGNAL_VERSION='ols'`. Code clamps to `[MF_TARGET_NET_PROFIT_BPS_FLOOR, 500]`. |
 | `MF_STOP_LOSS_BPS` | `100` | Stop-loss cap (bps) used only when `SIGNAL_VERSION='multi_factor'`. Mirrors `STOP_LOSS_BPS` but sized for the multi-factor signal's wider TP target — at 40 bps net TP / 100 bps stop the new payoff has a coherent risk:reward, while the OLS-tuned 40 bps cap would invert it. The vol-scaled stop formula and spread floor still apply on both signals; this is just the upper bound on the vol-scaled term. |

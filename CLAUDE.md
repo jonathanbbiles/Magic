@@ -27,17 +27,23 @@ Live Alpaca crypto trading bot. The full strategy is documented in `README.md` (
 
 ```sh
 cd backend
-npm test                  # full grouped test suite
-npm run smoke             # local smoke test
-npm run preflight         # runtime-env check + smoke
-npm run check:complexity  # line budget for trade.js
-npm run reconcile         # offline predicted vs realized analysis
+npm test                                          # full grouped test suite
+npm run smoke                                     # local smoke test
+npm run preflight                                 # runtime-env check + smoke
+npm run check:complexity                          # line budget for trade.js
+npm run reconcile                                 # offline predicted vs realized analysis
+node scripts/backtest_strategy.js --strategy=multi_factor   # multi-factor on real Alpaca bars
+node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor across regimes
 ```
+
+## Entry signal flag
+
+`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `ols`** (legacy 1m linear-regression predictor; current production behaviour). `multi_factor` switches to the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`. **Do not flip the live default to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Rollback: set `SIGNAL_VERSION=ols` in Render env and restart.
 
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
-- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
+- Math: `backend/modules/entryProbability.js`, `multiFactorSignal.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`
