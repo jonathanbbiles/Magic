@@ -907,6 +907,35 @@ async function fetchCryptoQuotes({ symbols, location = 'us' }) {
   return payload || { quotes: {} };
 }
 
+// Batched warm-up for the entry-scan quote loop. Splits the candidate list
+// into chunks of `chunkSize` (capped at 20 by Alpaca's URL-length limits) and
+// issues one multi-symbol /latest/quotes call per chunk instead of one call
+// per symbol from the entry loop. A single chunk that fails just leaves its
+// symbols absent from the returned Map — the per-symbol entry loop falls back
+// to a single-symbol fetch for any missing pair.
+async function prefetchQuotesForCandidates(candidates, chunkSize) {
+  const map = new Map();
+  if (!Array.isArray(candidates) || candidates.length === 0) return map;
+  const size = Math.max(1, Math.min(20, Math.floor(Number(chunkSize) || 8)));
+  for (let i = 0; i < candidates.length; i += size) {
+    const chunk = candidates.slice(i, i + size);
+    try {
+      const payload = await fetchCryptoQuotes({ symbols: chunk });
+      const quotes = payload?.quotes || {};
+      for (const pair of chunk) {
+        const q = quotes[pair] || quotes[toAlpacaSymbol(pair)];
+        if (q) map.set(pair, q);
+      }
+    } catch (err) {
+      console.warn('entry_quote_prefetch_chunk_failed', {
+        symbols: chunk,
+        error: err?.errorMessage || err?.message,
+      });
+    }
+  }
+  return map;
+}
+
 async function fetchCryptoTrades({ symbols, location = 'us' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { trades: {} };
@@ -1846,13 +1875,29 @@ async function scanAndEnter() {
     return;
   }
 
+  // Batched quote warm-up. Replaces 33 serial single-symbol /latest/quotes
+  // calls with one multi-symbol call per chunk of ENTRY_PREFETCH_CHUNK_SIZE
+  // (default 8). The per-symbol loop below reads from this Map first and
+  // only falls back to a single-symbol fetch when the prefetch is disabled
+  // or the chunk that owned this pair failed. Set ENTRY_PREFETCH_QUOTES=false
+  // to revert to legacy per-symbol fetches.
+  const prefetchedQuotes = runtimeConfig.entryPrefetchQuotes
+    ? await prefetchQuotesForCandidates(candidates, runtimeConfig.entryPrefetchChunkSize)
+    : null;
+
   let placed = 0;
   for (const pair of candidates) {
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
     try {
-      const payload = await fetchCryptoQuotes({ symbols: [pair] });
+      let payload;
+      const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
+      if (prefetched) {
+        payload = { quotes: { [pair]: prefetched } };
+      } else {
+        payload = await fetchCryptoQuotes({ symbols: [pair] });
+      }
       const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
       const quoteTsMs = quoteTimestampMs(quote) || 0;
