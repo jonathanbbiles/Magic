@@ -14,11 +14,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_ENABLED, 'true');
 
 assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
-// Universe default flipped from 'dynamic' → 'configured' so the live engine
-// trades the 12 deep-liquidity primary pairs by default. The dynamic universe
-// (~33 symbols) is dominated by stale-quote pruning and starves entries; live
-// diagnostics confirmed ~30% of dynamic symbols are chronically stale on Alpaca.
-assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
+// Universe default flipped to 'dynamic' (Phase 1) so the live engine scans
+// every active Alpaca crypto pair (~33 symbols), not just the 12 primary
+// configured pairs. Stale-quote pruning still applies per-symbol; the wider
+// universe catches mean-reversion triggers on alts the configured list misses.
+// Set ENTRY_UNIVERSE_MODE=configured in Render env to revert.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');

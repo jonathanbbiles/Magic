@@ -646,6 +646,17 @@ let lastBacktestMf = null;
 // auto-runs on every Render restart, surfaces as `meta.backtestMeanRev`
 // on /dashboard, feeds the signal selector.
 let lastBacktestMeanRev = null;
+// Phase 1: multi-timeframe MR backtest slots. The same MR signal evaluated
+// at the 5m and 15m timeframes (synthesized from 1m bars). Drops are larger
+// but rarer at coarser timeframes — gives the selector multiple candidate
+// MR variants to choose between based on which timeframe has the best
+// per-trade expectancy on each symbol.
+let lastBacktestMeanRev5m = null;
+let lastBacktestMeanRev15m = null;
+// Phase 1: range mean-reversion backtest slot. Smaller drops (-50 bps)
+// inside an established range; much more frequent triggers than the
+// capitulation MR signal.
+let lastBacktestRangeMr = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -655,7 +666,7 @@ let backtestRunning = false;
 // in backend/modules/signalSelector.js; this is just the integration glue.
 function refreshSignalSelectorDecision(reason = 'manual') {
   const operatorOverrideRaw = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion'].includes(operatorOverrideRaw)
+  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion'].includes(operatorOverrideRaw)
     ? operatorOverrideRaw
     : null;
   const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
@@ -679,6 +690,9 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     olsBacktest,
     mfBacktest,
     meanRevBacktest,
+    meanRev5mBacktest: lastBacktestMeanRev5m,
+    meanRev15mBacktest: lastBacktestMeanRev15m,
+    rangeMrBacktest: lastBacktestRangeMr,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -691,6 +705,9 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     olsNetBps: decision.olsNetBps,
     mfNetBps: decision.mfNetBps,
     meanRevNetBps: decision.meanRevNetBps,
+    meanRev5mNetBps: decision.meanRev5mNetBps,
+    meanRev15mNetBps: decision.meanRev15mNetBps,
+    rangeMrNetBps: decision.rangeMrNetBps,
     activeNetBps: decision.activeNetBps,
     operatorOverride,
     backtestRanAt: decision.backtestRanAt,
@@ -750,20 +767,30 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mrMaxBtcDropBps != null ? { mrMaxBtcDropBps: Number(overrides.mrMaxBtcDropBps) } : {}),
       ...(overrides.mrRsiOversold != null ? { mrRsiOversold: Number(overrides.mrRsiOversold) } : {}),
       ...(overrides.mrDeepDropGuardBps != null ? { mrDeepDropGuardBps: Number(overrides.mrDeepDropGuardBps) } : {}),
+      ...(overrides.mrTimeframe ? { mrTimeframe: String(overrides.mrTimeframe) } : {}),
+      ...(overrides.rangeMrDropTriggerBps != null ? { rangeMrDropTriggerBps: Number(overrides.rangeMrDropTriggerBps) } : {}),
+      ...(overrides.rangeMrMaxRangePct != null ? { rangeMrMaxRangePct: Number(overrides.rangeMrMaxRangePct) } : {}),
+      ...(overrides.rangeMrTargetNetBpsFloor != null ? { rangeMrTargetNetBpsFloor: Number(overrides.rangeMrTargetNetBpsFloor) } : {}),
+      ...(overrides.rangeMrSignalTargetMaxNetBps != null ? { rangeMrSignalTargetMaxNetBps: Number(overrides.rangeMrSignalTargetMaxNetBps) } : {}),
+      ...(overrides.rangeMrStopLossBps != null ? { rangeMrStopLossBps: Number(overrides.rangeMrStopLossBps) } : {}),
+      ...(overrides.rangeMrMaxHoldMin != null ? { rangeMrMaxHoldMin: Number(overrides.rangeMrMaxHoldMin) } : {}),
+      ...(overrides.rangeMrBreakevenTimeoutMin != null ? { rangeMrBreakevenTimeoutMin: Number(overrides.rangeMrBreakevenTimeoutMin) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
     else if (slot === 'alt2') lastBacktestAlt2 = stored;
     else if (slot === 'mf') lastBacktestMf = stored;
     else if (slot === 'mean_rev') lastBacktestMeanRev = stored;
+    else if (slot === 'mean_rev_5m') lastBacktestMeanRev5m = stored;
+    else if (slot === 'mean_rev_15m') lastBacktestMeanRev15m = stored;
+    else if (slot === 'range_mr') lastBacktestRangeMr = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
     // Refresh the signal selector decision now that fresh evidence is in for
-    // this slot. The selector consumes the primary / mf / mean_rev slots —
-    // the alt / alt2 slots are OLS-gate sensitivity studies and don't drive
-    // signal selection.
-    if (slot === 'primary' || slot === 'mf' || slot === 'mean_rev') {
+    // this slot. The selector consumes the primary / mf / mean_rev / mean_rev_5m
+    // / mean_rev_15m / range_mr slots; alt / alt2 are sensitivity studies.
+    if (['primary', 'mf', 'mean_rev', 'mean_rev_5m', 'mean_rev_15m', 'range_mr'].includes(slot)) {
       refreshSignalSelectorDecision(`after_backtest_${slot}`);
     }
     return stored;
@@ -1258,6 +1285,33 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestMeanRev.perSymbol,
           gateSkipped: lastBacktestMeanRev.gateSkipped || null,
           note: 'Mean-reversion-at-extremes signal candidate. Tiny-win strategy: enters on 1%+ capitulation drops, targets half-reversion.',
+        } : null,
+        backtestMeanRev5m: lastBacktestMeanRev5m ? {
+          ranAt: lastBacktestMeanRev5m.ranAt,
+          windowDays: lastBacktestMeanRev5m.windowDays,
+          params: lastBacktestMeanRev5m.params,
+          overall: lastBacktestMeanRev5m.overall,
+          perSymbol: lastBacktestMeanRev5m.perSymbol,
+          gateSkipped: lastBacktestMeanRev5m.gateSkipped || null,
+          note: 'Phase 1: mean-reversion signal evaluated on 5m bars (synthesized from 1m). Drops are larger but rarer than the 1m variant.',
+        } : null,
+        backtestMeanRev15m: lastBacktestMeanRev15m ? {
+          ranAt: lastBacktestMeanRev15m.ranAt,
+          windowDays: lastBacktestMeanRev15m.windowDays,
+          params: lastBacktestMeanRev15m.params,
+          overall: lastBacktestMeanRev15m.overall,
+          perSymbol: lastBacktestMeanRev15m.perSymbol,
+          gateSkipped: lastBacktestMeanRev15m.gateSkipped || null,
+          note: 'Phase 1: mean-reversion signal evaluated on 15m bars (synthesized from 1m). Coarsest timeframe; rarest but largest drops.',
+        } : null,
+        backtestRangeMr: lastBacktestRangeMr ? {
+          ranAt: lastBacktestRangeMr.ranAt,
+          windowDays: lastBacktestRangeMr.windowDays,
+          params: lastBacktestRangeMr.params,
+          overall: lastBacktestRangeMr.overall,
+          perSymbol: lastBacktestRangeMr.perSymbol,
+          gateSkipped: lastBacktestRangeMr.gateSkipped || null,
+          note: 'Phase 1: range mean-reversion signal candidate. Smaller drops within established price ranges; high-frequency tiny wins.',
         } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
@@ -2157,6 +2211,30 @@ if (backtestSkipReason) {
     await runBacktestAndStore({
       strategy: 'mean_reversion',
     }, 'mean_rev').catch(() => {});
+    // Phase 1: multi-timeframe MR variants. Each runs the same MR signal at
+    // a coarser timeframe (5m / 15m). Drops are larger but rarer; the selector
+    // picks whichever timeframe clears the threshold with the best expectancy.
+    // Gated by env: MR_TIMEFRAME_5M_ENABLED / MR_TIMEFRAME_15M_ENABLED.
+    const phase1Enabled = String(process.env.PHASE1_ENABLED || 'true').toLowerCase() !== 'false';
+    if (phase1Enabled && String(process.env.MR_TIMEFRAME_5M_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'mean_reversion',
+        mrTimeframe: '5m',
+      }, 'mean_rev_5m').catch(() => {});
+    }
+    if (phase1Enabled && String(process.env.MR_TIMEFRAME_15M_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'mean_reversion',
+        mrTimeframe: '15m',
+      }, 'mean_rev_15m').catch(() => {});
+    }
+    // Phase 1: range mean-reversion auto-run. Smaller drops within established
+    // ranges; designed for high-frequency tiny wins.
+    if (phase1Enabled && String(process.env.RANGE_MR_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'range_mean_reversion',
+      }, 'range_mr').catch(() => {});
+    }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
 

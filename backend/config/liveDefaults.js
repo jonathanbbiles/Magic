@@ -1,7 +1,7 @@
 const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
-  ENTRY_UNIVERSE_MODE: 'configured',
+  ENTRY_UNIVERSE_MODE: 'dynamic',
   ENTRY_SYMBOLS_PRIMARY: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
   ENTRY_SYMBOLS_SECONDARY: '',
   ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'false',
@@ -152,6 +152,46 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   SPREAD_MAX_BPS_TIER1: '30',
   SPREAD_MAX_BPS_TIER2: '45',
   SPREAD_MAX_BPS_TIER3: '90',
+  // Phase 1 master kill switch. When 'false', all Phase 1 layers (multi-
+  // timeframe MR, range mean reversion, adaptive sizing, concurrent-position
+  // soft cap) revert to legacy behavior in a single env flip. Per-layer
+  // flags below let an operator disable a single layer instead of the whole
+  // bundle if a specific layer is misbehaving.
+  PHASE1_ENABLED: 'true',
+  // Multi-timeframe mean reversion. Live MR signal currently runs on 1m bars
+  // only. With these flags enabled, the auto-backtester also evaluates the
+  // 5m and 15m variants so the signal selector can pick the timeframe with
+  // the best per-trade expectancy. Disable to remove a timeframe from the
+  // candidate set.
+  MR_TIMEFRAME_5M_ENABLED: 'true',
+  MR_TIMEFRAME_15M_ENABLED: 'true',
+  // Concurrent-position soft cap. The hard cap is "as many as cash funds";
+  // this soft cap prevents fragmenting cash across more positions than the
+  // sizing math comfortably supports. At a $84 account × 10% sizing, 8
+  // positions fully deploy ~80% of cash; above that the MIN_SIZING_FRACTION_OF_TARGET
+  // gate would start aborting scans. Set to 0 to disable.
+  CONCURRENT_POSITIONS_SOFT_CAP_ENABLED: 'true',
+  MAX_CONCURRENT_POSITIONS_SOFT_CAP: '8',
+  // Range mean-reversion signal. Fires on smaller drops (-50 to -100 bps)
+  // within an established price range — much more frequent triggers than
+  // the capitulation-grade MR signal. Tighter stops (40 bps) to match the
+  // smaller TP target.
+  RANGE_MR_ENABLED: 'true',
+  RANGE_MR_DROP_TRIGGER_BPS: '50',
+  RANGE_MR_RANGE_LOOKBACK_BARS: '60',
+  RANGE_MR_MAX_RANGE_PCT: '0.015',
+  RANGE_MR_TARGET_NET_BPS_FLOOR: '5',
+  RANGE_MR_SIGNAL_TARGET_MAX_NET_BPS: '60',
+  RANGE_MR_STOP_LOSS_BPS: '40',
+  RANGE_MR_MAX_HOLD_MS: '1800000',
+  RANGE_MR_BREAKEVEN_TIMEOUT_MS: '900000',
+  // Adaptive sizing: signal-confidence-based multiplier on the base
+  // PORTFOLIO_SIZING_PCT. Strong triggers (drop > 2σ above threshold) get
+  // up to MAX_SIZING_FRACTION_OF_TARGET × base; weak triggers get
+  // MIN_SIZING_FRACTION_OF_TARGET × base. Disable to keep all trades at
+  // the static 10% sizing.
+  ADAPTIVE_SIZING_ENABLED: 'true',
+  MAX_SIZING_FRACTION_OF_TARGET: '1.5',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));
