@@ -143,6 +143,12 @@ const MIN_SIZING_FRACTION_OF_TARGET = Math.min(
 // fewer entries — intended effect). Floor at 30 s to stay above broker
 // round-trip latency.
 const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 2700000));
+// Multi-factor signal's staircase-decay timeout. MF's wider TP (40-150 bps
+// net) needs more time for the pullback-in-uptrend signal to develop. The
+// OLS-tuned 45 min would force MF positions to pin at break-even before
+// price has the σ-time to reach a 80+ bps gross target. Default 3 h matches
+// the original wider-payoff intent documented in the rewrite plan.
+const MF_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MF_BREAKEVEN_TIMEOUT_MS', 10800000));
 // Hard time-based market exit (Fix 3). After MAX_HOLD_MS the exit manager
 // cancels any resting GTC sell and submits a market IOC sell — actually
 // closes positions that never tripped the stop and never hit the TP, instead
@@ -151,6 +157,21 @@ const BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BREAKEVEN_TIMEOUT_MS', 
 // failing the strategy thesis — recycle the capital instead of paying the
 // MTM tail. Set to 0 to disable.
 const MAX_HOLD_MS = Math.max(0, readNumber('MAX_HOLD_MS', 5400000));
+// Multi-factor signal's hard max-hold. MF's wider TP target means a 90-min
+// max-hold cuts most trades off before they have time to resolve. The May
+// 2026 auto-backtest observed 45.8% max_hold rate at 90 min, dragging MF
+// expectancy to -61 bps. Default 6 h matches the strategy's original design.
+const MF_MAX_HOLD_MS = Math.max(0, readNumber('MF_MAX_HOLD_MS', 21600000));
+
+// Signal-aware exit timing helpers. The live exit manager and the
+// computeStaircaseExitGrossBps function consult these via the position's
+// signal version (recorded in tradePredictions at entry time).
+function getMaxHoldMsForSignal(signalVersion) {
+  return signalVersion === 'multi_factor' ? MF_MAX_HOLD_MS : MAX_HOLD_MS;
+}
+function getBreakevenTimeoutMsForSignal(signalVersion) {
+  return signalVersion === 'multi_factor' ? MF_BREAKEVEN_TIMEOUT_MS : BREAKEVEN_TIMEOUT_MS;
+}
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
 // strategy intent (CLAUDE.md hard rule #5) walked the GTC sell limit toward
 // break-even-after-fees so realized P&L was bounded at $0 net; in practice the
@@ -225,15 +246,18 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols') {
 const STAIRCASE_EXIT_ENABLED = readBoolean('STAIRCASE_EXIT_ENABLED', true);
 const STAIRCASE_REPOST_TOLERANCE_BPS = Math.max(0.5, readNumber('STAIRCASE_REPOST_TOLERANCE_BPS', 3));
 
-function computeStaircaseExitGrossBps(initialGrossBps, ageMs) {
+function computeStaircaseExitGrossBps(initialGrossBps, ageMs, timeoutMsOverride = null) {
   if (!STAIRCASE_EXIT_ENABLED) return initialGrossBps;
   const breakeven = FEE_BPS_ROUND_TRIP;
   const initial = Number(initialGrossBps);
   if (!Number.isFinite(initial)) return breakeven;
   if (initial <= breakeven) return breakeven;
   if (!Number.isFinite(ageMs) || ageMs <= 0) return initial;
-  if (ageMs >= BREAKEVEN_TIMEOUT_MS) return breakeven;
-  const t = ageMs / BREAKEVEN_TIMEOUT_MS;
+  const timeoutMs = Number.isFinite(timeoutMsOverride) && timeoutMsOverride > 0
+    ? timeoutMsOverride
+    : BREAKEVEN_TIMEOUT_MS;
+  if (ageMs >= timeoutMs) return breakeven;
+  const t = ageMs / timeoutMs;
   const decayed = initial + (breakeven - initial) * t;
   return Math.max(breakeven, decayed);
 }
@@ -2708,10 +2732,14 @@ async function reconcileExits() {
     // After MAX_HOLD_MS the resting sell is cancelled and a market IOC sell
     // closes the position at whatever the bid is — actually realises the
     // outcome instead of parking capital.
-    if (MAX_HOLD_MS > 0 && Number.isFinite(avg) && avg > 0) {
+    // Signal-aware max-hold: MF uses MF_MAX_HOLD_MS (default 6 h) so its
+    // wider TP target has the σ-time it needs to develop.
+    const positionSignalVersion = tradePredictions.get(pair)?.prediction?.signalVersion || 'ols';
+    const positionMaxHoldMs = getMaxHoldMsForSignal(positionSignalVersion);
+    if (positionMaxHoldMs > 0 && Number.isFinite(avg) && avg > 0) {
       const existing = openSellByPair.get(pair);
       const ageMs = resolveStaircaseAgeMs(pair, existing);
-      if (ageMs >= MAX_HOLD_MS) {
+      if (ageMs >= positionMaxHoldMs) {
         try {
           if (existing?.id) await cancelOrder(existing.id);
           const sellResult = await submitOrder({
@@ -2748,7 +2776,8 @@ async function reconcileExits() {
           console.log('exit_max_hold_triggered', {
             symbol: pair,
             ageMs,
-            maxHoldMs: MAX_HOLD_MS,
+            maxHoldMs: positionMaxHoldMs,
+            signalVersion: positionSignalVersion,
             exitPrice,
             realizedGrossBps: Number(realizedGrossBps.toFixed(2)),
             cancelledOrderId: existing?.id || null,
@@ -2807,7 +2836,10 @@ async function reconcileExits() {
       if (STAIRCASE_EXIT_ENABLED && Number.isFinite(avg) && avg > 0 && existing?.id) {
         const ageMs = resolveStaircaseAgeMs(pair, existing);
         const initialGrossBps = resolveExitGrossBps(pair);
-        const desiredGrossBps = computeStaircaseExitGrossBps(initialGrossBps, ageMs);
+        // Signal-aware decay timeout: MF positions need the wider TP more time
+        // to fill before being walked toward break-even.
+        const positionBreakevenTimeoutMs = getBreakevenTimeoutMsForSignal(positionSignalVersion);
+        const desiredGrossBps = computeStaircaseExitGrossBps(initialGrossBps, ageMs, positionBreakevenTimeoutMs);
         const desiredPrice = avg * (1 + desiredGrossBps / 10000);
         const currentLimit = Number(existing?.limit_price);
         const currentGrossBps = Number.isFinite(currentLimit) && currentLimit > 0
@@ -2882,7 +2914,7 @@ async function reconcileExits() {
         // Kept verbatim for env-flag rollback safety. Uses the same
         // restart-resilient age anchor as the staircase path.
         const ageMs = resolveStaircaseAgeMs(pair, existing);
-        if (ageMs >= BREAKEVEN_TIMEOUT_MS) {
+        if (ageMs >= getBreakevenTimeoutMsForSignal(positionSignalVersion)) {
           try {
             await cancelOrder(existing.id);
             const breakevenPrice = avg * (1 + FEE_BPS_ROUND_TRIP / 10000);

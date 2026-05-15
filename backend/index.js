@@ -727,6 +727,8 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.rejectNearHighLookbackBars != null ? { rejectNearHighLookbackBars: Number(overrides.rejectNearHighLookbackBars) } : {}),
       ...(overrides.entrySpreadCostBps != null ? { entrySpreadCostBps: Number(overrides.entrySpreadCostBps) } : {}),
       ...(overrides.entryFillTimeoutMin != null ? { entryFillTimeoutMin: Number(overrides.entryFillTimeoutMin) } : {}),
+      ...(overrides.mfMaxHoldMin != null ? { mfMaxHoldMin: Number(overrides.mfMaxHoldMin) } : {}),
+      ...(overrides.mfBreakevenTimeoutMin != null ? { mfBreakevenTimeoutMin: Number(overrides.mfBreakevenTimeoutMin) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -786,6 +788,8 @@ app.get('/debug/backtest', async (req, res) => {
     rejectNearHighLookbackBars: req.query.rejectNearHighLookbackBars,
     entrySpreadCostBps: req.query.entrySpreadCostBps,
     entryFillTimeoutMin: req.query.entryFillTimeoutMin,
+    mfMaxHoldMin: req.query.mfMaxHoldMin,
+    mfBreakevenTimeoutMin: req.query.mfBreakevenTimeoutMin,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});

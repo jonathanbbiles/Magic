@@ -54,9 +54,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '30');
 
 // Exit-side defaults tightened so scalps that don't resolve fast recycle
-// capital instead of paying the long MTM tail.
+// capital instead of paying the long MTM tail. Signal-aware: OLS keeps the
+// tight 90/45 min; multi-factor uses 6 h / 3 h to give its wider TP room.
 assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '2700000');  // 45 min
 assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '5400000');           // 90 min
+assert.equal(LIVE_CRITICAL_DEFAULTS.MF_BREAKEVEN_TIMEOUT_MS, '10800000');  // 3 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MF_MAX_HOLD_MS, '21600000');           // 6 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '35');              // tightened from 40
 
 console.log('live defaults tests passed');
