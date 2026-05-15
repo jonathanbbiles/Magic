@@ -26,7 +26,7 @@
     "check:complexity": "node scripts/check_complexity_budget.js",
     "reconcile": "node scripts/reconcile_predictions.js",
     "backtest": "node scripts/backtest_strategy.js",
-    "test:scripts": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js scripts/reconcile_predictions.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js scripts/backtest_strategy.test.js"
+    "test:scripts": "TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js scripts/reconcile_predictions.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js scripts/backtest_strategy.test.js && TEST_LOG_LEVEL=quiet node -r ./test/quietConsole.js scripts/simulate_strategy.test.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
