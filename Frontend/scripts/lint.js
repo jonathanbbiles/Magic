@@ -8,7 +8,7 @@ if (!source.includes('DEFAULT_BACKEND_URL')) {
 if (!source.includes('EXPO_PUBLIC_BACKEND_URL')) {
   throw new Error('missing_backend_env_reference');
 }
-if (!source.includes('configBanner')) {
+if (!source.includes('Backend URL not configured')) {
   throw new Error('missing_backend_config_warning_banner');
 }
 
