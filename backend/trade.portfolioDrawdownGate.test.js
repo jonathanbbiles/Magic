@@ -35,6 +35,10 @@ process.env.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER = '-2.0';
 // uptrend, so every entry IS the recent high and the gate would block
 // everything before the portfolio-drawdown gate could even be observed.
 process.env.REJECT_NEAR_HIGH_ENABLED = 'false';
+// Signal selector vetos by default until first backtest completes; the
+// test drives scanAndEnter directly, so opt out via the operator override.
+process.env.SIGNAL_VERSION = 'ols';
+process.env.SIGNAL_SELECTOR_VETO_ENABLED = 'false';
 
 const trade = require('./trade');
 

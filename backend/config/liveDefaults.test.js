@@ -14,7 +14,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_ENABLED, 'true');
 
 assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
-assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
+// Universe default flipped from 'dynamic' → 'configured' so the live engine
+// trades the 12 deep-liquidity primary pairs by default. The dynamic universe
+// (~33 symbols) is dominated by stale-quote pruning and starves entries; live
+// diagnostics confirmed ~30% of dynamic symbols are chronically stale on Alpaca.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
@@ -39,6 +43,15 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-0.5
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_BPS, '30');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
+
+// Signal selector + backtest veto. The auto-selector picks the signal with
+// highest backtest expectancy; the veto refuses entries when no signal has
+// edge. Default-ON: stops the bot from bleeding when the math shows it can't
+// be profitable.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '', 'live default empty so auto-selector runs');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '3');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '30');
 
 // Exit-side defaults tightened so scalps that don't resolve fast recycle
 // capital instead of paying the long MTM tail.

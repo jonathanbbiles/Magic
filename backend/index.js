@@ -154,7 +154,11 @@ const {
   getPredictorWarmupSnapshot,
   getEngineStateSnapshot,
   getEntryRegimeStaleThresholdMs,
+  getActiveSignalVersion,
+  getSignalSelectorDecision,
 } = require('./trade');
+
+const signalSelector = require('./modules/signalSelector');
 
 const VERSION =
   process.env.VERSION ||
@@ -633,8 +637,59 @@ const BACKTEST_AUTORUN_AB2_MAX_BTC_DROP_BPS = (() => {
 let lastBacktestResult = null;
 let lastBacktestAlt = null;
 let lastBacktestAlt2 = null;
+// Multi-factor signal backtest slot. Auto-runs alongside the OLS primary on
+// every Render restart so the signal selector has fresh evidence on whether
+// the multi-factor strategy has live edge. Surfaced as `meta.backtestMf` on
+// /dashboard. NOT an A/B against primary — a parallel candidate signal.
+let lastBacktestMf = null;
 let lastBacktestError = null;
 let backtestRunning = false;
+
+// Recompute the signal selector decision based on the most recent backtest
+// results for OLS and multi-factor. Called after every backtest auto-run +
+// after every on-demand backtest completes. The pure-function selector lives
+// in backend/modules/signalSelector.js; this is just the integration glue.
+function refreshSignalSelectorDecision(reason = 'manual') {
+  const operatorOverrideRaw = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
+  const operatorOverride = (operatorOverrideRaw === 'ols' || operatorOverrideRaw === 'multi_factor')
+    ? operatorOverrideRaw
+    : null;
+  const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
+    ? Number(process.env.SIGNAL_SELECTOR_MIN_BPS)
+    : 3;
+  const vetoEnabled = !['0', 'false', 'no', 'off']
+    .includes(String(process.env.SIGNAL_SELECTOR_VETO_ENABLED || 'true').toLowerCase());
+  const minBacktestEntries = Math.max(1, Number(process.env.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES) || 30);
+
+  // The OLS primary slot reads as "olsBacktest" only if its strategy is OLS.
+  // (Operators can override the primary slot's strategy via env, in which
+  // case we treat that slot as the corresponding signal's evidence.)
+  const primaryStrategy = String(lastBacktestResult?.params?.strategy || 'ols').toLowerCase();
+  const olsBacktest = primaryStrategy === 'ols' ? lastBacktestResult : null;
+  const mfBacktest = primaryStrategy === 'multi_factor' ? lastBacktestResult : lastBacktestMf;
+
+  const decision = signalSelector.pickActiveSignal({
+    olsBacktest,
+    mfBacktest,
+    operatorOverride,
+    config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
+  });
+  signalSelector.setLatestDecision(decision);
+  console.log('signal_selector_decision', {
+    reason,
+    signalVersion: decision.signalVersion,
+    tradingVeto: decision.tradingVeto,
+    decisionReason: decision.reason,
+    olsNetBps: decision.olsNetBps,
+    mfNetBps: decision.mfNetBps,
+    activeNetBps: decision.activeNetBps,
+    operatorOverride,
+    backtestRanAt: decision.backtestRanAt,
+    minBpsToActivate,
+    vetoEnabled,
+  });
+  return decision;
+}
 
 async function runBacktestAndStore(overrides = {}, slot = 'primary') {
   if (backtestRunning) return { error: 'backtest_already_running' };
@@ -676,9 +731,16 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
     else if (slot === 'alt2') lastBacktestAlt2 = stored;
+    else if (slot === 'mf') lastBacktestMf = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
+    // Refresh the signal selector decision now that fresh evidence is in for
+    // this slot. The selector consumes the primary (OLS) and MF slots — the
+    // alt / alt2 slots are gate sensitivity studies and don't drive selection.
+    if (slot === 'primary' || slot === 'mf') {
+      refreshSignalSelectorDecision(`after_backtest_${slot}`);
+    }
     return stored;
   } catch (err) {
     lastBacktestError = { at: new Date().toISOString(), message: err?.message || String(err) };
@@ -1151,6 +1213,32 @@ app.get('/dashboard', async (req, res) => {
           })(),
           gateSkipped: lastBacktestAlt2.gateSkipped || null,
         } : null,
+        backtestMf: lastBacktestMf ? {
+          ranAt: lastBacktestMf.ranAt,
+          windowDays: lastBacktestMf.windowDays,
+          params: lastBacktestMf.params,
+          overall: lastBacktestMf.overall,
+          perSymbol: lastBacktestMf.perSymbol,
+          mfBacktestCaveats: lastBacktestMf.mfBacktestCaveats || null,
+          gateSkipped: lastBacktestMf.gateSkipped || null,
+          note: 'Multi-factor signal candidate. Compared to primary by signal selector to decide which signal the live engine uses.',
+        } : null,
+        signalSelector: (() => {
+          const decision = getSignalSelectorDecision();
+          return {
+            signalVersion: decision.signalVersion,
+            tradingVeto: decision.tradingVeto,
+            reason: decision.reason,
+            decisionAt: decision.decisionAt,
+            olsNetBps: decision.olsNetBps,
+            mfNetBps: decision.mfNetBps,
+            activeNetBps: decision.activeNetBps,
+            operatorOverride: decision.operatorOverride,
+            backtestRanAt: decision.backtestRanAt,
+            minBpsToActivate: decision.config?.minBpsToActivate,
+            vetoEnabled: decision.config?.vetoEnabled,
+          };
+        })(),
         connectionState: {
           hasLastHttpError: Boolean(lastError),
           alpaca: getAlpacaAuthStatus(),
@@ -2009,6 +2097,20 @@ if (backtestSkipReason) {
         maxBtcLeadLagDropBps: BACKTEST_AUTORUN_AB2_MAX_BTC_DROP_BPS,
       }, 'alt2').catch(() => {});
     }
+    // Multi-factor signal auto-run. Provides evidence for the signal selector
+    // alongside the OLS primary slot. Uses mfBookImbalanceMode='always_pass'
+    // because Alpaca historical bars don't carry orderbook depth — this is an
+    // upper-bound estimate of MF expectancy, with the live orderbook gate
+    // making real performance equal-or-tighter. The selector compares this to
+    // the primary OLS slot and picks the higher-expectancy validated signal.
+    await runBacktestAndStore({
+      strategy: 'multi_factor',
+      mfBookImbalanceMode: 'always_pass',
+      // MF backtest doesn't need MIN_PROJECTED_BPS (its projectedBps is an
+      // ATR-derived per-trade target, not a forward prediction), but the
+      // OLS-tuned defaults are harmless here — they're only consulted on
+      // the OLS code path inside replaySymbol.
+    }, 'mf').catch(() => {});
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
 

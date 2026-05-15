@@ -16,10 +16,26 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## What's different right now (self-correcting overhaul, May 2026)
+
+After live diagnostics confirmed the OLS strategy was bleeding capital (−65 bps/entry honest backtest) and parameter-tuning wasn't fixing it, the engine was rewired to be self-protective and self-correcting:
+
+- **Auto signal selector**. Both OLS and multi-factor backtests run on every Render restart; the selector picks whichever clears `SIGNAL_SELECTOR_MIN_BPS` (default +3 bps net per entry over 30 days). Decision lands at `meta.signalSelector` on `/dashboard`.
+- **Backtest veto**. When NO signal clears the threshold, the engine refuses all entries (`backtest_veto_active`). This stops the bot from bleeding when the math doesn't support trading. Override with `SIGNAL_SELECTOR_VETO_ENABLED=false` (legacy "trade anyway" mode).
+- **Multi-factor signal is live-eligible**. The pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js` no longer requires manual flipping. If its 30-day backtest clears the threshold and beats OLS's, the engine uses it automatically.
+- **Tier-aware spread cost in backtester**. BTC/ETH no longer mis-attributed a 20 bps half-spread (they trade ~10 bps total). Tier-1 = 8 bps half-spread, tier-2 = 18 bps, tier-3 = 35 bps.
+- **Configured universe by default**. Trades the 12 deep-liquidity primary pairs out of the box; the dynamic-universe mode is opt-in for operators who want to scan long-tail alts.
+- **Recent-high entry gate**. Refuses entries within 30 bps of the last-60-bar high. Surgical fix for the "we bought when the market was too high and got stuck" failure mode.
+
+Rollback any single piece via Render env: `SIGNAL_SELECTOR_VETO_ENABLED=false`, `REJECT_NEAR_HIGH_ENABLED=false`, `ENTRY_UNIVERSE_MODE=dynamic`, `SIGNAL_VERSION=ols`.
+
+---
+
 ## The whole strategy in 5 lines
 
-1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the entry universe. By default `ENTRY_UNIVERSE_MODE=dynamic`, which scans **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols — and lets the per-symbol gates downstream do the actual filtering. Setting `ENTRY_UNIVERSE_MODE=configured` instead restricts the scan to `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI, DOT, ADA, XRP, DOGE, LTC, BCH by default). The spread gate is tier-aware: `SPREAD_MAX_BPS_TIER1=30` (BTC/ETH), `_TIER2=45` (mid-caps in `EXECUTION_TIER2_SYMBOLS`), `_TIER3=90` (everything else). Each tier cap is clamped by the global `SPREAD_MAX_BPS=60` ceiling. Quote-freshness (`ENTRY_QUOTE_MAX_AGE_MS=60000`) is still flat. Raise the relevant tier cap (or the global `SPREAD_MAX_BPS`) to widen reach further.
-2. For each symbol, fit a linear regression on the last `PREDICT_BARS` (default 20) one-minute closes. Convert the slope's t-statistic to an upward probability via the logistic CDF.
+0. **Before any scan runs, the signal selector decides which signal is live.** The auto-backtester runs OLS and multi-factor on the last 30 days of bars on every Render restart; the selector picks whichever clears `SIGNAL_SELECTOR_MIN_BPS` (default `+3 bps avgNetBpsPerEntry`). If neither clears, the engine vetoes ALL entries (`backtest_veto_active`) — no more bleeding when the strategy demonstrably has no edge. The decision lands at `meta.signalSelector` on `/dashboard`. Operators can pin a signal via `SIGNAL_VERSION=ols|multi_factor` (the veto still applies unless `SIGNAL_SELECTOR_VETO_ENABLED=false`).
+1. Every `ENTRY_SCAN_INTERVAL_MS` (default 12 s), scan the entry universe. By default `ENTRY_UNIVERSE_MODE=configured`, which trades only the 12 deep-liquidity primary pairs in `ENTRY_SYMBOLS_PRIMARY` (BTC, ETH, SOL, AVAX, LINK, UNI, DOT, ADA, XRP, DOGE, LTC, BCH). Setting `ENTRY_UNIVERSE_MODE=dynamic` opens the scan to **every active Alpaca crypto pair** (USD-quoted, ex-stablecoins) — typically 30+ symbols — but expect ~30% of that long-tail universe to be chronically quote-stale and pruned before any gate evaluates. The spread gate is tier-aware: `SPREAD_MAX_BPS_TIER1=30` (BTC/ETH), `_TIER2=45` (mid-caps in `EXECUTION_TIER2_SYMBOLS`), `_TIER3=90` (everything else). Each tier cap is clamped by the global `SPREAD_MAX_BPS=60` ceiling.
+2. For each symbol, run the active signal (OLS regression on the last `PREDICT_BARS` 1m closes, OR the multi-factor pullback-in-uptrend voter — selector decides). The active signal produces a `projectedBps` (forward move estimate or per-trade ATR-derived TP target depending on signal).
 3. If the symbol clears the spread gate, the higher-timeframe slope filter, the net-edge gate, AND `projectedBps ≥ GROSS_TARGET_BPS + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS` (the projected-covers-gross gate; refuses entries whose own model says the move won't be big enough to fill the TP), place a **GTC limit BUY at the price selected by `ENTRY_LIMIT_PRICE_MODE`** (default `mid` = `(ask + bid) / 2`, recovering roughly half the spread cost vs. lifting the ask). The pending buy is cancelled if it hasn't filled within `ENTRY_FILL_TIMEOUT_MS` (default 30 s).
 4. When the buy fills, immediately place **one GTC limit SELL** at:
    ```
@@ -206,11 +222,34 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `HONEST_EV_GATE_ENABLED` | `true` | When `true`, the EV calculation charges the non-fill branch a `STUCK_LOSS_ASSUMED_BPS` penalty so the asymmetric "no stop-loss" structure is priced honestly (`E[net] = p·targetNet − (1−p)·stuckLoss`). Default flipped from `false` after live diagnostics observed entries (BCH at `projectedBps=2.6, honestEvBps=-54`; DOGE at `honestEvBps=-3.7`) clearing the cheaper net-edge gate while having negative honest expectancy — exactly the trades the no-stop design has no way to recover from. Set to `false` to revert to the legacy permissive behaviour. Skip reason: `honest_ev_below_min`. |
 | `STUCK_LOSS_ASSUMED_BPS` | `250` | Bps of MTM loss assumed for positions that don't recover above break-even. Only consulted when `HONEST_EV_GATE_ENABLED=true`. Default raised from `100` → `250` after live diagnostics measured the actual unrealized drawdown on an 11-position stuck cluster at ~270 bps per position — the previous 100 bps assumption was systematically rating marginal entries +EV when reality was -EV. Calibrate by running `node scripts/simulate_strategy.js` and reading `avg_loss` for your target regime. |
 | `BARRIER_HORIZON_BARS` | `BREAKEVEN_TIMEOUT_MS / 60000` | Number of 1-minute bars used as the horizon in the barrier-hitting probability. Defaults to the break-even timeout in minutes — answers "how likely is the TP to fill before we'd otherwise replace it with a break-even sell?". |
-| `SIGNAL_VERSION` | `ols` | Selects which entry signal the scan loop uses. `ols` (default, current production) runs the legacy 1m linear-regression predictor described in step 2 of "The whole strategy in 5 lines". `multi_factor` runs the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`: four required factors (15m close > rising 15m EMA(20); 5m close ≤ 5m EMA(8) but 5m RSI(14) ≥ 35; 1m RSI(14) ≥ 50 OR last 3 1m RSI prints strictly improving; top-5 orderbook bid notional ≥ 55% of total) plus two configurable overlays (1m volume ratio and BTC lead-lag for alts). When `multi_factor` is selected the OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped — the new signal's factor vote replaces them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF) still apply to both. **The `multi_factor` signal is not yet validated for live use** — the validation gate is documented immediately below. Rollback to `ols` is one Render restart away. |
+| `SIGNAL_VERSION` | *(unset → auto)* | Selects which entry signal the scan loop uses. **Default `auto`**: the runtime signal selector (`backend/modules/signalSelector.js`) picks `ols` or `multi_factor` based on the most recent backtest evidence. If neither signal has cleared `SIGNAL_SELECTOR_MIN_BPS` (default `+3 bps avgNetBpsPerEntry` over the last 30 days), all entries are vetoed (skip reason: `backtest_veto_active`). Set to `ols` or `multi_factor` to operator-override and pin the signal — the veto still applies to a pinned signal unless `SIGNAL_SELECTOR_VETO_ENABLED=false`. **Backtest evidence drives signal selection automatically**: the auto-backtester runs both OLS (primary slot, `meta.backtest`) and multi-factor (`meta.backtestMf`) on every Render restart, and the selector's decision lands at `meta.signalSelector` on `/dashboard`. The multi-factor signal in `backend/modules/multiFactorSignal.js` runs four required factors (15m close > rising 15m EMA(20); 5m close ≤ 5m EMA(8) but 5m RSI(14) ≥ 35; 1m RSI(14) ≥ 50 OR last 3 1m RSI prints strictly improving; top-5 orderbook bid notional ≥ 55% of total) plus two configurable overlays (1m volume ratio and BTC lead-lag for alts). When the active signal is `multi_factor` the OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped — the new signal's factor vote replaces them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF, recent-high) still apply to both. |
+| `SIGNAL_SELECTOR_MIN_BPS` | `3` | Threshold the backtest `avgNetBpsPerEntry` must clear for a signal to be considered "validated" by the auto-selector. Default +3 bps gives a small margin above zero to absorb backtest realism noise (the backtester's spread-cost / fill-timeout estimates are conservative but not perfect). Lower (e.g. `0` or `-2`) to relax. Set very high (e.g. `100`) to effectively force the veto on. |
+| `SIGNAL_SELECTOR_VETO_ENABLED` | `true` | When ON (default), the engine refuses ALL entries when no signal has cleared the activation threshold. This is the safety net that stops capital bleed when no strategy has demonstrable edge — the lesson from the live-observed −65 bps OLS backtest. Set `false` to revert to legacy behaviour (trade whatever `SIGNAL_VERSION` says, even if backtests show losses). |
+| `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES` | `30` | Minimum number of trade attempts in a 30-day backtest before the result counts as statistically meaningful. Below this, the signal is treated as unvalidated regardless of `avgNetBpsPerEntry`. |
 
-#### Multi-factor validation gate (must clear before flipping `SIGNAL_VERSION` to `multi_factor` in production)
+#### Multi-factor validation gate (the auto-selector now enforces this)
 
-The `multi_factor` code path ships ready-to-test, **not validated**. Before enabling it on the live account, run the following on a host with the standard Alpaca credential env vars set (the same vars listed in "Required for live trading" above) and confirm each result:
+The auto-selector enforces this validation continuously: on every Render restart, the auto-backtester runs both OLS and multi-factor against the last 30 days of bars, and the selector picks whichever clears `SIGNAL_SELECTOR_MIN_BPS` (default +3 bps). The operator can still run on-demand manual sweeps to debug parameters, but no manual signal-flip is required.
+
+```sh
+# Inspect the live decision (token-protected on production):
+curl -s $RENDER_URL/dashboard | jq '.meta.signalSelector'
+
+# Compare the OLS primary slot to the multi-factor slot:
+curl -s $RENDER_URL/dashboard | jq '{
+  ols: .meta.backtest.overall.avgNetBpsPerEntry,
+  mf:  .meta.backtestMf.overall.avgNetBpsPerEntry,
+  decision: .meta.signalSelector
+}'
+
+# Force a re-run of the multi-factor backtest with a sizing tweak:
+curl -s "$RENDER_URL/debug/backtest?refresh=true&strategy=multi_factor&mfTargetNetBpsFloor=60&wait=true" \
+  -H "x-api-token: $API_TOKEN" | jq '.result.overall'
+```
+
+The selector's decision auto-refreshes after every backtest completes. **Rollback at any point**: set `SIGNAL_VERSION=ols` (or `multi_factor`) on Render and restart — the operator override pins the signal regardless of the auto-selection.
+
+For manual local validation runs (when you want to confirm the auto-selector's logic against what you'd see on Render):
 
 ```sh
 # 30-day primary backtest (uses the live universe / current MF defaults).
@@ -263,8 +302,8 @@ If all three gates pass, set `SIGNAL_VERSION=multi_factor` in Render env and res
 ### Universe
 | Var | What it does |
 | --- | --- |
-| `ENTRY_UNIVERSE_MODE` | Default `dynamic` — scanner walks **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets`, typically 30+ symbols. The spread gate is tier-aware (`SPREAD_MAX_BPS_TIER1/2/3`), so long-tail alts pass at a looser ~90 bps cap while BTC/ETH stay at ~30 bps. Tier-aware volume / slippage / take-profit gates (`tradeGuards.js`) provide per-tier liquidity protection on top of that. Set to `configured` to restrict the scan to `ENTRY_SYMBOLS_PRIMARY` instead — useful when you want explicit control over which symbols are even considered. **Operational note:** Alpaca's crypto quote feed is chronically stale (~30 s+ ages) for low-volume pairs (e.g. PAXG, TRUMP, POL, SKY, WIF, BAT, PEPE, SUSHI). In `dynamic` mode the per-symbol stale-quote pruner (`STALE_QUOTE_PRUNE_*`) typically marks ~13 of 33 symbols stale at any moment and the per-scan `stale_quote` skip count dominates. Setting `ENTRY_UNIVERSE_MODE=configured` in Render scopes the scan to the 12 deep-liquidity primary pairs and drops most of the stale-quote tax. |
-| `ENTRY_SYMBOLS_PRIMARY` | The configured-mode universe. Default `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD` (12 deep-liquidity USD-quoted crypto pairs on Alpaca). Ignored when `ENTRY_UNIVERSE_MODE=dynamic` (the default). |
+| `ENTRY_UNIVERSE_MODE` | Default `configured` — scanner trades only `ENTRY_SYMBOLS_PRIMARY` (12 deep-liquidity USD-quoted crypto pairs). Default flipped from `dynamic` after live diagnostics confirmed ~30% of the dynamic universe (33 symbols) is chronically quote-stale on Alpaca — the pruner typically marks ~13 of 33 stale at any moment, and per-scan `stale_quote` rejections dominate, starving entries. The 12 configured pairs (BTC, ETH, SOL, AVAX, LINK, UNI, DOT, ADA, XRP, DOGE, LTC, BCH) maintain consistent quote freshness on Alpaca. Set to `dynamic` to scan **every** active Alpaca crypto pair (USD-quoted, ex-stablecoins) returned by `/v2/assets` — useful for opportunistic alt scans, but expect the stale-quote pruner to dominate the skip-reason mix. The spread gate stays tier-aware (`SPREAD_MAX_BPS_TIER1/2/3`) under both modes. |
+| `ENTRY_SYMBOLS_PRIMARY` | The configured-mode universe. Default `BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD` (12 deep-liquidity USD-quoted crypto pairs on Alpaca). Ignored when `ENTRY_UNIVERSE_MODE=dynamic`. |
 | `ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION` | Default `true` so production can opt into dynamic without an extra flag. The runtime validator only blocks production startup if mode is `dynamic` AND this flag is `false`. |
 
 ### Toggles

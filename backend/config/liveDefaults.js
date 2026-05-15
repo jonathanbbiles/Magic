@@ -1,7 +1,7 @@
 const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
-  ENTRY_UNIVERSE_MODE: 'dynamic',
+  ENTRY_UNIVERSE_MODE: 'configured',
   ENTRY_SYMBOLS_PRIMARY: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
   ENTRY_SYMBOLS_SECONDARY: '',
   ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'false',
@@ -69,11 +69,22 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   ENFORCE_PROJECTED_COVERS_GROSS: 'true',
-  // Entry-signal dispatch. 'ols' is the legacy 1m-OLS predictor (current
-  // production behaviour). 'multi_factor' switches to the new pullback-in-
-  // uptrend signal — only flip after backtest + simulator validation per
-  // the rewrite plan. See README.md and backend/modules/multiFactorSignal.js.
-  SIGNAL_VERSION: 'ols',
+  // Entry-signal dispatch. Empty string = 'auto' (the runtime signal selector
+  // picks 'ols' or 'multi_factor' based on the most recent backtest evidence).
+  // Set to 'ols' or 'multi_factor' to operator-pin a signal (the veto still
+  // applies unless SIGNAL_SELECTOR_VETO_ENABLED=false). The selector lives
+  // in backend/modules/signalSelector.js. Default left empty so the live
+  // engine is self-correcting out of the box; pin to 'ols' as an emergency
+  // rollback if the auto-selector misbehaves.
+  SIGNAL_VERSION: '',
+  // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
+  // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
+  // 30-day auto-backtest — exactly the safety net that stops the bot from
+  // bleeding when the strategy doesn't have demonstrable edge. Default
+  // threshold +3 bps net per entry, sample-size floor 30 entries.
+  SIGNAL_SELECTOR_MIN_BPS: '3',
+  SIGNAL_SELECTOR_VETO_ENABLED: 'true',
+  SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '30',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
   // TARGET_NET_PROFIT_BPS / SIGNAL_TARGET_MAX_NET_BPS / STOP_LOSS_BPS but

@@ -113,7 +113,9 @@ withEnv({}, () => {
   assert.equal(cfg.sparseStaleToleranceMs, 15000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 5000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 15000);
-  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
+  // Live default flipped from 'dynamic' → 'configured'. The 12 deep-liquidity
+  // primary pairs avoid the stale-quote tax that dominates the dynamic universe.
+  assert.equal(cfg.entryUniverseModeEffective, 'configured');
   assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
