@@ -642,6 +642,10 @@ let lastBacktestAlt2 = null;
 // the multi-factor strategy has live edge. Surfaced as `meta.backtestMf` on
 // /dashboard. NOT an A/B against primary — a parallel candidate signal.
 let lastBacktestMf = null;
+// Mean-reversion signal backtest slot. Same pattern as `lastBacktestMf`:
+// auto-runs on every Render restart, surfaces as `meta.backtestMeanRev`
+// on /dashboard, feeds the signal selector.
+let lastBacktestMeanRev = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -651,7 +655,7 @@ let backtestRunning = false;
 // in backend/modules/signalSelector.js; this is just the integration glue.
 function refreshSignalSelectorDecision(reason = 'manual') {
   const operatorOverrideRaw = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-  const operatorOverride = (operatorOverrideRaw === 'ols' || operatorOverrideRaw === 'multi_factor')
+  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion'].includes(operatorOverrideRaw)
     ? operatorOverrideRaw
     : null;
   const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
@@ -661,16 +665,20 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     .includes(String(process.env.SIGNAL_SELECTOR_VETO_ENABLED || 'true').toLowerCase());
   const minBacktestEntries = Math.max(1, Number(process.env.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES) || 30);
 
-  // The OLS primary slot reads as "olsBacktest" only if its strategy is OLS.
-  // (Operators can override the primary slot's strategy via env, in which
-  // case we treat that slot as the corresponding signal's evidence.)
+  // The primary slot's strategy tells us which signal it validates. If the
+  // operator overrode the primary slot to run multi_factor or mean_reversion,
+  // we treat that slot as evidence for the corresponding signal instead of
+  // OLS. The dedicated mf / mean_rev slots act as the canonical evidence
+  // for those signals when the primary is OLS (the default).
   const primaryStrategy = String(lastBacktestResult?.params?.strategy || 'ols').toLowerCase();
   const olsBacktest = primaryStrategy === 'ols' ? lastBacktestResult : null;
   const mfBacktest = primaryStrategy === 'multi_factor' ? lastBacktestResult : lastBacktestMf;
+  const meanRevBacktest = primaryStrategy === 'mean_reversion' ? lastBacktestResult : lastBacktestMeanRev;
 
   const decision = signalSelector.pickActiveSignal({
     olsBacktest,
     mfBacktest,
+    meanRevBacktest,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -682,6 +690,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     decisionReason: decision.reason,
     olsNetBps: decision.olsNetBps,
     mfNetBps: decision.mfNetBps,
+    meanRevNetBps: decision.meanRevNetBps,
     activeNetBps: decision.activeNetBps,
     operatorOverride,
     backtestRanAt: decision.backtestRanAt,
@@ -729,18 +738,31 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.entryFillTimeoutMin != null ? { entryFillTimeoutMin: Number(overrides.entryFillTimeoutMin) } : {}),
       ...(overrides.mfMaxHoldMin != null ? { mfMaxHoldMin: Number(overrides.mfMaxHoldMin) } : {}),
       ...(overrides.mfBreakevenTimeoutMin != null ? { mfBreakevenTimeoutMin: Number(overrides.mfBreakevenTimeoutMin) } : {}),
+      ...(overrides.mrTargetNetBpsFloor != null ? { mrTargetNetBpsFloor: Number(overrides.mrTargetNetBpsFloor) } : {}),
+      ...(overrides.mrSignalTargetMaxNetBps != null ? { mrSignalTargetMaxNetBps: Number(overrides.mrSignalTargetMaxNetBps) } : {}),
+      ...(overrides.mrStopLossBps != null ? { mrStopLossBps: Number(overrides.mrStopLossBps) } : {}),
+      ...(overrides.mrMaxHoldMin != null ? { mrMaxHoldMin: Number(overrides.mrMaxHoldMin) } : {}),
+      ...(overrides.mrBreakevenTimeoutMin != null ? { mrBreakevenTimeoutMin: Number(overrides.mrBreakevenTimeoutMin) } : {}),
+      ...(overrides.mrDropTriggerBps != null ? { mrDropTriggerBps: Number(overrides.mrDropTriggerBps) } : {}),
+      ...(overrides.mrVolMultiplier != null ? { mrVolMultiplier: Number(overrides.mrVolMultiplier) } : {}),
+      ...(overrides.mrVolConfirmMultiplier != null ? { mrVolConfirmMultiplier: Number(overrides.mrVolConfirmMultiplier) } : {}),
+      ...(overrides.mrMaxBtcDropBps != null ? { mrMaxBtcDropBps: Number(overrides.mrMaxBtcDropBps) } : {}),
+      ...(overrides.mrRsiOversold != null ? { mrRsiOversold: Number(overrides.mrRsiOversold) } : {}),
+      ...(overrides.mrDeepDropGuardBps != null ? { mrDeepDropGuardBps: Number(overrides.mrDeepDropGuardBps) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
     else if (slot === 'alt2') lastBacktestAlt2 = stored;
     else if (slot === 'mf') lastBacktestMf = stored;
+    else if (slot === 'mean_rev') lastBacktestMeanRev = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
     // Refresh the signal selector decision now that fresh evidence is in for
-    // this slot. The selector consumes the primary (OLS) and MF slots — the
-    // alt / alt2 slots are gate sensitivity studies and don't drive selection.
-    if (slot === 'primary' || slot === 'mf') {
+    // this slot. The selector consumes the primary / mf / mean_rev slots —
+    // the alt / alt2 slots are OLS-gate sensitivity studies and don't drive
+    // signal selection.
+    if (slot === 'primary' || slot === 'mf' || slot === 'mean_rev') {
       refreshSignalSelectorDecision(`after_backtest_${slot}`);
     }
     return stored;
@@ -1227,6 +1249,15 @@ app.get('/dashboard', async (req, res) => {
           gateSkipped: lastBacktestMf.gateSkipped || null,
           note: 'Multi-factor signal candidate. Compared to primary by signal selector to decide which signal the live engine uses.',
         } : null,
+        backtestMeanRev: lastBacktestMeanRev ? {
+          ranAt: lastBacktestMeanRev.ranAt,
+          windowDays: lastBacktestMeanRev.windowDays,
+          params: lastBacktestMeanRev.params,
+          overall: lastBacktestMeanRev.overall,
+          perSymbol: lastBacktestMeanRev.perSymbol,
+          gateSkipped: lastBacktestMeanRev.gateSkipped || null,
+          note: 'Mean-reversion-at-extremes signal candidate. Tiny-win strategy: enters on 1%+ capitulation drops, targets half-reversion.',
+        } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
           return {
@@ -1236,6 +1267,7 @@ app.get('/dashboard', async (req, res) => {
             decisionAt: decision.decisionAt,
             olsNetBps: decision.olsNetBps,
             mfNetBps: decision.mfNetBps,
+            meanRevNetBps: decision.meanRevNetBps,
             activeNetBps: decision.activeNetBps,
             operatorOverride: decision.operatorOverride,
             backtestRanAt: decision.backtestRanAt,
@@ -2115,6 +2147,15 @@ if (backtestSkipReason) {
       // OLS-tuned defaults are harmless here — they're only consulted on
       // the OLS code path inside replaySymbol.
     }, 'mf').catch(() => {});
+    // Mean-reversion-at-extremes signal auto-run. Provides evidence for the
+    // signal selector. Built specifically to clear the +3 bps activation
+    // threshold: enters only on volume-confirmed 1%+ drops where BTC is
+    // not correlatedly crashing AND RSI confirms exhaustion, targets half
+    // the drop magnitude (statistically high-probability mean reversion),
+    // tight 60 bps stop with 45 min max-hold.
+    await runBacktestAndStore({
+      strategy: 'mean_reversion',
+    }, 'mean_rev').catch(() => {});
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
 

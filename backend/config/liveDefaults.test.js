@@ -62,4 +62,13 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MF_BREAKEVEN_TIMEOUT_MS, '10800000');  // 3 
 assert.equal(LIVE_CRITICAL_DEFAULTS.MF_MAX_HOLD_MS, '21600000');           // 6 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '35');              // tightened from 40
 
+// Mean-reversion-at-extremes strategy. The new "tiny wins, statistically
+// guaranteed" signal — enters only on volume-confirmed capitulation drops,
+// targets half the drop magnitude with a tight 60 bps stop.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_TARGET_NET_PROFIT_BPS_FLOOR, '5');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SIGNAL_TARGET_MAX_NET_BPS, '120');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_MAX_HOLD_MS, '2700000');            // 45 min
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_BREAKEVEN_TIMEOUT_MS, '1800000');   // 30 min
+
 console.log('live defaults tests passed');

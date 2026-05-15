@@ -49,6 +49,7 @@
 
 const path = require('path');
 const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
+const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
@@ -154,6 +155,22 @@ const DEFAULTS = {
   // Live runs with their own configured defaults via the MF_* env vars.
   mfBtcLagRequired: false,
   mfVolumeRequired: false,
+  // Mean-reversion strategy params (only consulted when strategy='mean_reversion').
+  // Mirror live MR_* env knobs. Defaults match the meanReversionSignal module
+  // defaults (5 bps net floor, 120 bps net cap, 60 bps stop, 45/30 min exits).
+  mrTargetNetBpsFloor: 5,
+  mrSignalTargetMaxNetBps: 120,
+  mrStopLossBps: 60,
+  mrMaxHoldMin: 45,
+  mrBreakevenTimeoutMin: 30,
+  // Override signal-config knobs (passed through to evaluateMeanReversionSignal
+  // via the cfg parameter). Leave null to use the module defaults.
+  mrDropTriggerBps: null,
+  mrVolMultiplier: null,
+  mrVolConfirmMultiplier: null,
+  mrMaxBtcDropBps: null,
+  mrRsiOversold: null,
+  mrDeepDropGuardBps: null,
   json: false,
 };
 
@@ -424,6 +441,7 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
 
   const strategy = String(opts.strategy || 'ols').toLowerCase();
   const isMultiFactor = strategy === 'multi_factor';
+  const isMeanReversion = strategy === 'mean_reversion';
 
   for (let i = opts.predictBars; i < bars.length - 1; i += 1) {
     if (i < cooldownUntilIdx) continue;
@@ -492,6 +510,58 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       const raw = fraction * mfSig.projectedBps - fees;
       signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
       stopLossBpsAbsForTrade = Math.max(0, Number(opts.mfStopLossBps) || 0);
+    } else if (isMeanReversion) {
+      // Mean-reversion entry: pull BTC's recent return for the
+      // decorrelation gate (alts only), then evaluate the signal.
+      let btcReturnBps = null;
+      if (btcIdx) {
+        const minute = Math.floor(tsMs[i] / 60_000);
+        const btcBarIdx = btcIdx.byTs.get(minute);
+        if (Number.isFinite(btcBarIdx)) {
+          btcReturnBps = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+        }
+      }
+      // Build a window for the signal. The signal needs at least
+      // requiredBars (32 by default) closed bars; pass it a 36-bar slice
+      // and an in-progress bar (the candidate bar itself) so its
+      // dropInProgressBar() can shave the last entry as live would.
+      const need = 36;
+      if (i + 1 < need) {
+        if (!stats.skipped.mr_insufficient_history) stats.skipped.mr_insufficient_history = 0;
+        stats.skipped.mr_insufficient_history += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] });  // synthetic in-progress, dropped by signal
+      const mrConfig = {};
+      if (Number.isFinite(opts.mrDropTriggerBps)) mrConfig.dropTriggerBps = opts.mrDropTriggerBps;
+      if (Number.isFinite(opts.mrVolMultiplier)) mrConfig.volMultiplier = opts.mrVolMultiplier;
+      if (Number.isFinite(opts.mrVolConfirmMultiplier)) mrConfig.volConfirmMultiplier = opts.mrVolConfirmMultiplier;
+      if (Number.isFinite(opts.mrMaxBtcDropBps)) mrConfig.maxBtcDropBps = opts.mrMaxBtcDropBps;
+      if (Number.isFinite(opts.mrRsiOversold)) mrConfig.rsiOversold = opts.mrRsiOversold;
+      if (Number.isFinite(opts.mrDeepDropGuardBps)) mrConfig.deepDropGuardBps = opts.mrDeepDropGuardBps;
+      const mrSig = evaluateMeanReversionSignal({
+        pair: bars[i]?.S || null,
+        bars1m: window,
+        btcLeadLag: Number.isFinite(btcReturnBps) ? { recentReturnBps: btcReturnBps, ageMs: 0 } : null,
+        config: mrConfig,
+      });
+      if (!mrSig?.ok) {
+        const reason = mrSig?.reason || 'mr_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: mrSig.projectedBps };
+      // MR sizing: signal returns projectedBps = "gross target = half the
+      // drop". Net = gross - fees, clamped to [floor, cap]. Don't apply
+      // signalTargetFraction (the half-drop math IS the fraction).
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.mrTargetNetBpsFloor) || 5;
+      const cap = Number(opts.mrSignalTargetMaxNetBps) || 120;
+      const raw = mrSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Math.max(0, Number(opts.mrStopLossBps) || 0);
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -636,12 +706,18 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     // the OLS-tuned tight defaults. The May 2026 backtest at 90-min max-hold
     // showed MF hitting max_hold on 45.8% of trades; the longer MF holds
     // give the wider TP room to fill.
-    const activeMaxHoldMin = isMultiFactor
-      ? Number(opts.mfMaxHoldMin || opts.maxHoldMin || 0)
-      : Number(opts.maxHoldMin || 0);
-    const activeBreakevenMin = isMultiFactor
-      ? Number(opts.mfBreakevenTimeoutMin || opts.breakevenTimeoutMin || 45)
-      : Number(opts.breakevenTimeoutMin || 45);
+    let activeMaxHoldMin;
+    let activeBreakevenMin;
+    if (isMultiFactor) {
+      activeMaxHoldMin = Number(opts.mfMaxHoldMin || opts.maxHoldMin || 0);
+      activeBreakevenMin = Number(opts.mfBreakevenTimeoutMin || opts.breakevenTimeoutMin || 45);
+    } else if (isMeanReversion) {
+      activeMaxHoldMin = Number(opts.mrMaxHoldMin || opts.maxHoldMin || 0);
+      activeBreakevenMin = Number(opts.mrBreakevenTimeoutMin || opts.breakevenTimeoutMin || 45);
+    } else {
+      activeMaxHoldMin = Number(opts.maxHoldMin || 0);
+      activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);
+    }
     const maxHoldMs = Math.max(0, activeMaxHoldMin * 60_000);
     for (let j = entryIdx + 1; j < bars.length; j += 1) {
       const ageMs = tsMs[j] - entryTs;
@@ -896,6 +972,11 @@ async function runBacktest(overrides = {}) {
       mfBookImbalanceMode: opts.mfBookImbalanceMode,
       mfMaxHoldMin: opts.mfMaxHoldMin,
       mfBreakevenTimeoutMin: opts.mfBreakevenTimeoutMin,
+      mrTargetNetBpsFloor: opts.mrTargetNetBpsFloor,
+      mrSignalTargetMaxNetBps: opts.mrSignalTargetMaxNetBps,
+      mrStopLossBps: opts.mrStopLossBps,
+      mrMaxHoldMin: opts.mrMaxHoldMin,
+      mrBreakevenTimeoutMin: opts.mrBreakevenTimeoutMin,
       rejectNearHighEnabled: opts.rejectNearHighEnabled,
       rejectNearHighBps: opts.rejectNearHighBps,
       rejectNearHighLookbackBars: opts.rejectNearHighLookbackBars,
