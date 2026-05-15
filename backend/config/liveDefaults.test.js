@@ -28,6 +28,22 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.HONEST_EV_GATE_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_SIZING_FRACTION_OF_TARGET, '0.6');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_VOLUME_RATIO_TO_ENTER, '1.0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_BTC_LEAD_LAG_DROP_BPS, '-10');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-2.0');
+// Portfolio-drawdown gate tightened from -2.0 to -0.5 so the macro pause
+// kicks in at half a day's target P&L (operator goal: +1%/day).
+assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-0.5');
+
+// Recent-high proximity gate. Pinned ON so the production deploy refuses
+// entries within 30 bps of the last-60-minute high — the surgical fix for
+// the "we bought at the top and got stuck" failure mode that drove
+// every recent live drawdown cluster.
+assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_BPS, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
+
+// Exit-side defaults tightened so scalps that don't resolve fast recycle
+// capital instead of paying the long MTM tail.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '2700000');  // 45 min
+assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '5400000');           // 90 min
+assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '35');              // tightened from 40
 
 console.log('live defaults tests passed');

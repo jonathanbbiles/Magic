@@ -667,6 +667,11 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mfBookImbalanceMode ? { mfBookImbalanceMode: String(overrides.mfBookImbalanceMode) } : {}),
       ...(overrides.mfBtcLagRequired != null ? { mfBtcLagRequired: String(overrides.mfBtcLagRequired) === 'true' } : {}),
       ...(overrides.mfVolumeRequired != null ? { mfVolumeRequired: String(overrides.mfVolumeRequired) === 'true' } : {}),
+      ...(overrides.rejectNearHighEnabled != null ? { rejectNearHighEnabled: String(overrides.rejectNearHighEnabled) === 'true' } : {}),
+      ...(overrides.rejectNearHighBps != null ? { rejectNearHighBps: Number(overrides.rejectNearHighBps) } : {}),
+      ...(overrides.rejectNearHighLookbackBars != null ? { rejectNearHighLookbackBars: Number(overrides.rejectNearHighLookbackBars) } : {}),
+      ...(overrides.entrySpreadCostBps != null ? { entrySpreadCostBps: Number(overrides.entrySpreadCostBps) } : {}),
+      ...(overrides.entryFillTimeoutMin != null ? { entryFillTimeoutMin: Number(overrides.entryFillTimeoutMin) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -714,6 +719,11 @@ app.get('/debug/backtest', async (req, res) => {
     mfBookImbalanceMode: req.query.mfBookImbalanceMode,
     mfBtcLagRequired: req.query.mfBtcLagRequired,
     mfVolumeRequired: req.query.mfVolumeRequired,
+    rejectNearHighEnabled: req.query.rejectNearHighEnabled,
+    rejectNearHighBps: req.query.rejectNearHighBps,
+    rejectNearHighLookbackBars: req.query.rejectNearHighLookbackBars,
+    entrySpreadCostBps: req.query.entrySpreadCostBps,
+    entryFillTimeoutMin: req.query.entryFillTimeoutMin,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});

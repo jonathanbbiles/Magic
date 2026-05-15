@@ -21,6 +21,7 @@ process.env.PREDICT_BARS = '20';
 process.env.HTF_BARS = '12';
 process.env.HTF_FILTER_ENABLED = 'true';
 process.env.HTF_MIN_SLOPE_BPS_PER_BAR = '0';
+process.env.REJECT_NEAR_HIGH_ENABLED = 'false';
 process.env.MIN_NET_EDGE_BPS = '0';
 process.env.NET_EDGE_GATE_ENABLED = 'true';
 process.env.SPREAD_MAX_BPS = '50';
