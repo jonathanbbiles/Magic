@@ -474,14 +474,64 @@ const CORRECTED_FILL_PROB_ENABLED = readBoolean('CORRECTED_FILL_PROB_ENABLED', t
 const ENFORCE_GROSS_TARGET_FLOOR = readBoolean('ENFORCE_GROSS_TARGET_FLOOR', true);
 const HONEST_EV_GATE_ENABLED = readBoolean('HONEST_EV_GATE_ENABLED', true);
 const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 250));
-// Entry-signal dispatch. Default 'ols' keeps the legacy 1m-OLS slope
-// predictor live unchanged. Set to 'multi_factor' to switch to the new
-// pullback-in-uptrend signal (see backend/modules/multiFactorSignal.js).
+// Entry-signal dispatch. Two modes:
+//   'auto' (default): the runtime signal selector picks 'ols' or 'multi_factor'
+//     each scan based on the most recent backtest evidence. If neither signal
+//     has cleared SIGNAL_SELECTOR_MIN_BPS in its 30-day backtest, all entries
+//     are vetoed (skip reason: backtest_veto_active). The selector boots in
+//     "veto" state and re-evaluates after every backtest auto-run; the live
+//     engine consults its decision on every scan via getCurrentDecision().
+//   'ols' / 'multi_factor': operator override — the named signal is used
+//     regardless of backtest performance. The veto still applies UNLESS
+//     BACKTEST_VETO_ENABLED=false (see SIGNAL_SELECTOR_VETO_ENABLED below).
 // When 'multi_factor' is active the OLS-specific gates (slope_not_positive,
 // net_edge_below_min, honest_ev_below_min) are skipped — the new signal's
 // own factor vote replaces them. Structural gates (drawdown, sizing,
-// freshness, spread, vol-cap, HTF) still apply to both.
-const SIGNAL_VERSION = readEnum('SIGNAL_VERSION', ['ols', 'multi_factor'], 'ols');
+// freshness, spread, vol-cap, HTF) still apply to both signals.
+const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
+const SIGNAL_VERSION_OPERATOR_OVERRIDE = (SIGNAL_VERSION_RAW === 'ols' || SIGNAL_VERSION_RAW === 'multi_factor')
+  ? SIGNAL_VERSION_RAW
+  : null;
+const SIGNAL_VERSION_MODE = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'auto';
+// Threshold (bps) the backtest avgNetBpsPerEntry must clear for a signal
+// to be considered "validated" by the selector. Default +3 bps. Set lower
+// (e.g. 0 or negative) to relax. The veto + selector live in
+// backend/modules/signalSelector.js.
+const SIGNAL_SELECTOR_MIN_BPS = readNumber('SIGNAL_SELECTOR_MIN_BPS', 3);
+// When true (default), the selector vetos entries when no signal has cleared
+// the activation threshold. Set to false to revert to legacy behaviour
+// (trade whatever SIGNAL_VERSION says, even if backtests show losses).
+const SIGNAL_SELECTOR_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_VETO_ENABLED', true);
+// Minimum backtest sample size — below this, the result is statistically
+// meaningless and the selector falls back to veto for that signal.
+const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES', 30));
+
+const signalSelector = require('./modules/signalSelector');
+// Bootstrap: when the operator has overridden the signal AND disabled the
+// veto, allow trading from the moment the engine starts (without waiting
+// for the first backtest to complete). Otherwise the selector keeps its
+// safe default (no_backtest_completed_yet → veto until first backtest).
+signalSelector.bootstrapDecisionFromEnv({
+  operatorOverride: SIGNAL_VERSION_OPERATOR_OVERRIDE,
+  vetoEnabled: SIGNAL_SELECTOR_VETO_ENABLED,
+});
+
+// Resolve the signal version the entry path should use right now. Reads
+// the runtime selector (which is updated whenever a backtest completes).
+// Falls back to 'ols' as a last-resort label if the selector somehow
+// returns null AND trading is happening anyway (shouldn't be reachable
+// because the veto check fires first; defensive default).
+function getActiveSignalVersion() {
+  const decision = signalSelector.getCurrentDecision();
+  return decision.signalVersion || SIGNAL_VERSION_OPERATOR_OVERRIDE || 'ols';
+}
+function getSignalSelectorDecision() {
+  return signalSelector.getCurrentDecision();
+}
+// Legacy export-shape compatibility: code paths that read SIGNAL_VERSION as
+// a constant continue to work, but they always see the live decision.
+// Note: this is now a getter, not a static value.
+const SIGNAL_VERSION = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'auto';
 // Horizon (in 1-minute bars) over which we expect the take-profit to fill.
 // Defaults to BREAKEVEN_TIMEOUT_MS in minutes — i.e., the same window after
 // which the engine would otherwise replace the TP with a break-even sell.
@@ -1764,6 +1814,33 @@ async function scanAndEnter() {
   currentScanSymbolsProcessed = 0;
   skipReasonCounts.clear();
 
+  // Signal selector veto: if no signal has cleared the backtest activation
+  // threshold (default +3 bps avgNetBpsPerEntry over the last 30-day auto-
+  // backtest), refuse the scan entirely. This is the safety net that stops
+  // the bot from bleeding when the strategy doesn't have edge — exactly the
+  // failure mode the live -65 bps OLS backtest exposed. Operator can opt
+  // out via SIGNAL_SELECTOR_VETO_ENABLED=false (legacy "trade anyway").
+  const selectorDecision = getSignalSelectorDecision();
+  if (selectorDecision.tradingVeto) {
+    console.log('entry_scan_skipped_backtest_veto', {
+      reason: selectorDecision.reason,
+      operatorOverride: selectorDecision.operatorOverride,
+      olsNetBps: selectorDecision.olsNetBps,
+      mfNetBps: selectorDecision.mfNetBps,
+      decisionAt: selectorDecision.decisionAt,
+      backtestRanAt: selectorDecision.backtestRanAt,
+      minBpsToActivate: selectorDecision.config?.minBpsToActivate,
+    });
+    bumpSkipReason('backtest_veto_active');
+    currentScanState = 'idle';
+    currentScanStartedAt = null;
+    return;
+  }
+  // Pin the active signal version for this scan so every per-symbol gate +
+  // forensic field reads the same value (avoids race with a backtest that
+  // completes mid-scan and flips the selector).
+  const ACTIVE_SIGNAL_VERSION = selectorDecision.signalVersion || getActiveSignalVersion();
+
   await loadSupportedCryptoPairs();
   // Universe selection:
   //   - dynamic  → every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
@@ -1944,7 +2021,7 @@ async function scanAndEnter() {
       if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
-      const sig = SIGNAL_VERSION === 'multi_factor'
+      const sig = ACTIVE_SIGNAL_VERSION === 'multi_factor'
         ? await getMultiFactorSignalForPair(pair, quote)
         : await getPredictionSignal(pair);
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
@@ -2084,7 +2161,7 @@ async function scanAndEnter() {
       // signal: directional intent is already validated by the htfTrend +
       // turnConfirm factors, and the multi_factor signal returns
       // slopeTStat = 0 by design.
-      if (SIGNAL_VERSION === 'ols' && (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0)) {
+      if (ACTIVE_SIGNAL_VERSION === 'ols' && (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0)) {
         rejectTrade(pair, 'slope_not_positive');
         continue;
       }
@@ -2112,7 +2189,7 @@ async function scanAndEnter() {
       // against the global GROSS_TARGET_BPS double-counts the cost floor.
       // ENFORCE_GROSS_TARGET_FLOOR above already enforces the global cost
       // floor as a deterministic accounting check that applies to both signals.
-      if (SIGNAL_VERSION === 'ols' && ENFORCE_PROJECTED_COVERS_GROSS) {
+      if (ACTIVE_SIGNAL_VERSION === 'ols' && ENFORCE_PROJECTED_COVERS_GROSS) {
         const requiredGrossBps = GROSS_TARGET_BPS + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS;
         if (projectedBps < requiredGrossBps) {
           rejectTrade(pair, 'projected_below_gross_target', {
@@ -2165,7 +2242,7 @@ async function scanAndEnter() {
       // for the OLS signal (logistic CDF of a fitted slope) but not for the
       // multi_factor signal (probability is replaced by a discrete factor vote).
       // Skipped for multi_factor; the factor vote IS the net-edge proxy.
-      if (SIGNAL_VERSION === 'ols' && NET_EDGE_GATE_ENABLED) {
+      if (ACTIVE_SIGNAL_VERSION === 'ols' && NET_EDGE_GATE_ENABLED) {
         if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
           rejectTrade(pair, 'net_edge_below_min', { netEdgeBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
           continue;
@@ -2186,7 +2263,7 @@ async function scanAndEnter() {
       // barrier model parameterised by the OLS-fit drift, so it doesn't apply
       // when the active signal is multi_factor. The factor vote already handled
       // expectancy filtering.
-      if (SIGNAL_VERSION === 'ols' && HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
+      if (ACTIVE_SIGNAL_VERSION === 'ols' && HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
         rejectTrade(pair, 'honest_ev_below_min', { honestEvBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
         continue;
       }
@@ -2232,10 +2309,10 @@ async function scanAndEnter() {
         // GTC sell sits at entry × (1 + signalDerivedGrossBps/10000) instead
         // of the global GROSS_TARGET_BPS. Floor = static target (so weak
         // signals behave exactly like today), cap = SIGNAL_TARGET_MAX_NET_BPS.
-        const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps, sig.signalVersion || SIGNAL_VERSION);
+        const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
-        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || SIGNAL_VERSION);
+        const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION);
         const prediction = {
           buyOrderId: buyOrder.id,
           buyLimit: Number(buyLimitStr),
@@ -2290,7 +2367,7 @@ async function scanAndEnter() {
           recentHighRejectBps: REJECT_NEAR_HIGH_BPS,
           bookImbalance,
           bookImbalanceFeatureEnabled: ORDERBOOK_IMBALANCE_FEATURE_ENABLED,
-          signalVersion: sig.signalVersion || SIGNAL_VERSION,
+          signalVersion: sig.signalVersion || ACTIVE_SIGNAL_VERSION,
           multiFactor: sig.factors
             ? {
                 confidence: sig.confidence,
@@ -3102,6 +3179,8 @@ async function runDustCleanup() {
 }
 
 module.exports = {
+  getActiveSignalVersion,
+  getSignalSelectorDecision,
   resolveAlpacaAuth,
   getAlpacaAuthStatus,
   getAlpacaBaseStatus,

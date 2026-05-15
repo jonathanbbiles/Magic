@@ -22,6 +22,8 @@ process.env.HTF_BARS = '12';
 process.env.HTF_FILTER_ENABLED = 'true';
 process.env.HTF_MIN_SLOPE_BPS_PER_BAR = '0';
 process.env.REJECT_NEAR_HIGH_ENABLED = 'false';
+process.env.SIGNAL_VERSION = 'ols';
+process.env.SIGNAL_SELECTOR_VETO_ENABLED = 'false';
 
 const PREDICT_BARS = 20;
 const HTF_BARS = 12;

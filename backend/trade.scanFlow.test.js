@@ -21,6 +21,11 @@ process.env.HTF_BARS = '12';
 process.env.HTF_FILTER_ENABLED = 'true';
 process.env.HTF_MIN_SLOPE_BPS_PER_BAR = '0';
 process.env.REJECT_NEAR_HIGH_ENABLED = 'false';
+// Signal selector defaults to vetoing trading until a backtest completes.
+// Tests drive scanAndEnter without running backtests; opt out via the
+// operator override + veto-disable combo.
+process.env.SIGNAL_VERSION = 'ols';
+process.env.SIGNAL_SELECTOR_VETO_ENABLED = 'false';
 process.env.MIN_NET_EDGE_BPS = '0';
 process.env.NET_EDGE_GATE_ENABLED = 'true';
 process.env.SPREAD_MAX_BPS = '50';

@@ -92,13 +92,27 @@ const DEFAULTS = {
   rejectNearHighEnabled: true,
   rejectNearHighBps: 30,
   rejectNearHighLookbackBars: 60,
-  // Half-spread cost on entry (live engine rests at mid; live half-spread is
-  // ~half the tier cap). Bars don't carry quote-level spread so we apply a
-  // flat conservative estimate: 20 bps default = half of typical tier-2
-  // observed spreads (~40 bps round trip). Pass 0 via CLI/query param to
-  // disable for legacy parity; pass a smaller value (e.g. 10) for tier-1
-  // (BTC/ETH) sensitivity sweeps.
-  entrySpreadCostBps: 20,
+  // Half-spread cost on entry (live engine rests at mid; live half-spread
+  // depends heavily on the symbol's tier on Alpaca crypto). Bars don't carry
+  // quote-level spread so we apply a tier-aware estimate. Tier-1 (BTC/ETH)
+  // typically trades 10–20 bps spreads → half-spread ≈ 8 bps; tier-2 alts
+  // 30–50 bps → half-spread ≈ 18 bps; tier-3 longtail 70–120 bps →
+  // half-spread ≈ 35 bps. The flat `entrySpreadCostBps` (default null) is
+  // an override — when set, it OVERRIDES tier-aware values for every symbol.
+  // Pass 0 to disable spread charging entirely (legacy parity).
+  entrySpreadCostBps: null,
+  entrySpreadCostBpsTier1: 8,
+  entrySpreadCostBpsTier2: 18,
+  entrySpreadCostBpsTier3: 35,
+  // Tier classification for the spread-cost estimator. Defaults match
+  // backend/config/liveDefaults.js EXECUTION_TIER1_SYMBOLS / _TIER2_SYMBOLS.
+  // Anything not listed falls into tier3 (long-tail alt). A symbol-prefixed
+  // override can be passed via env var (e.g. ENTRY_SPREAD_COST_BPS_BTC=5).
+  spreadCostTier1Symbols: ['BTC/USD', 'ETH/USD'],
+  spreadCostTier2Symbols: [
+    'SOL/USD', 'AVAX/USD', 'LINK/USD', 'UNI/USD', 'DOT/USD',
+    'ADA/USD', 'XRP/USD', 'DOGE/USD', 'LTC/USD', 'BCH/USD',
+  ],
   // Entry-fill-timeout cancellation. Live cancels passive buy limits after
   // ENTRY_FILL_TIMEOUT_MS = 30 s. Backtest counts an entry as cancelled (no
   // fill, no trade record) if no bar within the next entryFillTimeoutMin
@@ -350,7 +364,24 @@ function evaluateMultiFactorEntryAt({ idx, bars, opts, btcReturnBps, symbol }) {
   });
 }
 
-function replaySymbol(bars, opts, btcBars = null) {
+// Resolve the half-spread bps to charge on entry for `symbol`. Caller
+// resolution is preferred (entrySpreadCostBps as an explicit override),
+// otherwise tiered defaults apply: tier1 (BTC/ETH) → 8 bps, tier2 (the
+// configured majors list) → 18 bps, tier3 (everything else) → 35 bps.
+function resolveBacktestSpreadCostBps(symbol, opts) {
+  if (opts.entrySpreadCostBps != null) {
+    const v = Number(opts.entrySpreadCostBps);
+    return Number.isFinite(v) ? Math.max(0, v) : 0;
+  }
+  const symUp = String(symbol || '').toUpperCase();
+  const tier1 = Array.isArray(opts.spreadCostTier1Symbols) ? opts.spreadCostTier1Symbols : [];
+  const tier2 = Array.isArray(opts.spreadCostTier2Symbols) ? opts.spreadCostTier2Symbols : [];
+  if (tier1.map((s) => s.toUpperCase()).includes(symUp)) return Math.max(0, Number(opts.entrySpreadCostBpsTier1) || 0);
+  if (tier2.map((s) => s.toUpperCase()).includes(symUp)) return Math.max(0, Number(opts.entrySpreadCostBpsTier2) || 0);
+  return Math.max(0, Number(opts.entrySpreadCostBpsTier3) || 0);
+}
+
+function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const trades = [];
   if (!Array.isArray(bars) || bars.length < opts.predictBars + 2) return trades;
   let cooldownUntilIdx = -1;
@@ -359,6 +390,10 @@ function replaySymbol(bars, opts, btcBars = null) {
   const lows = bars.map((b) => Number(b?.l));
   const volumes = bars.map((b) => Number(b?.v));
   const tsMs = bars.map((b) => Date.parse(b?.t));
+  // Resolve symbol from hint or from the first bar's S field; falls back to
+  // null which routes to tier3 (the conservative-cost bucket).
+  const resolvedSymbol = symbolHint || bars[0]?.S || null;
+  const halfSpreadBpsTierAware = resolveBacktestSpreadCostBps(resolvedSymbol, opts);
 
   // For BTC lead-lag we need to align this symbol's timestamps to BTC's bars.
   // Build the index once; resolve per-bar at gate-eval time. The caller
@@ -540,11 +575,11 @@ function replaySymbol(bars, opts, btcBars = null) {
 
     // Half-spread cost on entry. The live engine rests at mid; a passive mid
     // limit at fill time means we paid half the spread to enter. Bars don't
-    // carry quote-level spread, so this is opt-in: when entrySpreadCostBps
-    // > 0, the effective entry price is shifted up by that bps. Default 0
-    // (backwards-compatible with existing tests); auto-run sets it to the
-    // typical tier-2 half-spread.
-    const halfSpreadBps = Math.max(0, Number(opts.entrySpreadCostBps) || 0);
+    // carry quote-level spread, so we use a tier-aware estimate (resolved
+    // once per replaySymbol call; symbol-aware defaults at top of file).
+    // When opts.entrySpreadCostBps is set explicitly, that flat value is
+    // used for every symbol — operator override.
+    const halfSpreadBps = halfSpreadBpsTierAware;
     const entryPrice = halfSpreadBps > 0
       ? candidateClose * (1 + halfSpreadBps / 10000)
       : candidateClose;
@@ -719,7 +754,7 @@ async function main() {
       continue;
     }
     if (!opts.json) process.stderr.write(`${bars.length} bars … `);
-    const trades = replaySymbol(bars, opts).map((t) => ({ ...t, symbol }));
+    const trades = replaySymbol(bars, opts, null, symbol).map((t) => ({ ...t, symbol }));
     perSymbol[symbol] = { ...summarise(trades), barsFetched: bars.length };
     allTrades = allTrades.concat(trades);
     if (!opts.json) {
@@ -800,7 +835,7 @@ async function runBacktest(overrides = {}) {
       continue;
     }
     const btcBars = symbol === btcSymbol ? null : barsBySymbol[btcSymbol] || null;
-    const tradesArr = replaySymbol(bars, opts, btcBars);
+    const tradesArr = replaySymbol(bars, opts, btcBars, symbol);
     const trades = tradesArr.map((t) => ({ ...t, symbol }));
     const symbolGateSkipped = tradesArr.gateSkipped || { volume_below_min: 0, btc_leading_drop: 0, projected_below_gross_target: 0 };
     perSymbol[symbol] = {
@@ -846,6 +881,9 @@ async function runBacktest(overrides = {}) {
       rejectNearHighBps: opts.rejectNearHighBps,
       rejectNearHighLookbackBars: opts.rejectNearHighLookbackBars,
       entrySpreadCostBps: opts.entrySpreadCostBps,
+      entrySpreadCostBpsTier1: opts.entrySpreadCostBpsTier1,
+      entrySpreadCostBpsTier2: opts.entrySpreadCostBpsTier2,
+      entrySpreadCostBpsTier3: opts.entrySpreadCostBpsTier3,
       entryFillTimeoutMin: opts.entryFillTimeoutMin,
     },
     perSymbol,
