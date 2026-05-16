@@ -54,11 +54,105 @@ const fourth = applyLiveDefaultsToEnv({ force: true });
 assert.ok(fourth.skipped === LIVE_CRITICAL_KEYS.length, 'all keys set → all skipped');
 assert.equal(process.env.PHASE1_ENABLED, 'false', 'must not override explicit value on re-apply');
 
-// Cleanup: restore the original env so subsequent tests in the same process
-// see whatever they expected.
+// Cleanup before safety-override section: restore the original env so the
+// next phase of tests starts from a known state.
 for (const k of LIVE_CRITICAL_KEYS) {
   if (originals[k] === undefined) delete process.env[k];
   else process.env[k] = originals[k];
 }
+
+// ---------------------------------------------------------------------------
+// Safety overrides (2026-05-17 addition).
+//
+// SAFETY_OVERRIDES forces unsafe explicit-env values back to a safe value
+// unless the operator opts in via the escape-hatch env. Verified for the
+// ENTRY_LIMIT_PRICE_MODE=ask case — the only entry in the current map.
+// ---------------------------------------------------------------------------
+
+const { applySafetyOverridesToEnv, SAFETY_OVERRIDES } = require('./bootstrapLiveEnv');
+
+function withCapturedLog(fn) {
+  const events = [];
+  const logger = { log: (event, payload) => events.push({ event, payload }) };
+  fn(logger);
+  return events;
+}
+
+function withSafetyEnv(setup, run) {
+  const saved = {};
+  const keys = ['ENTRY_LIMIT_PRICE_MODE', 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK'];
+  for (const k of keys) saved[k] = process.env[k];
+  for (const k of keys) delete process.env[k];
+  for (const [k, v] of Object.entries(setup)) process.env[k] = v;
+  try {
+    return run();
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+// 6. Unsafe value ('ask') without escape hatch → overridden to forcedValue,
+//    config_safety_override event emitted with the discarded value.
+withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'ask' }, () => {
+  const events = withCapturedLog((logger) => {
+    const result = applySafetyOverridesToEnv({ logger });
+    assert.equal(result.overridden, 1, 'unsafe ask should be overridden');
+    assert.equal(result.bypassed, 0);
+  });
+  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick', 'ask must be replaced with bid_plus_tick');
+  const overrideEvent = events.find((e) => e.event === 'config_safety_override');
+  assert.ok(overrideEvent, 'config_safety_override must be emitted');
+  assert.equal(overrideEvent.payload.key, 'ENTRY_LIMIT_PRICE_MODE');
+  assert.equal(overrideEvent.payload.discardedValue, 'ask');
+  assert.equal(overrideEvent.payload.appliedValue, 'bid_plus_tick');
+  assert.ok(typeof overrideEvent.payload.rationale === 'string' && overrideEvent.payload.rationale.length > 0);
+});
+
+// 7. Unsafe value WITH escape hatch → preserved, bypass event emitted.
+withSafetyEnv(
+  { ENTRY_LIMIT_PRICE_MODE: 'ask', ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK: 'true' },
+  () => {
+    const events = withCapturedLog((logger) => {
+      const result = applySafetyOverridesToEnv({ logger });
+      assert.equal(result.overridden, 0);
+      assert.equal(result.bypassed, 1, 'escape hatch should record a bypass');
+    });
+    assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'ask', 'escape hatch must preserve the unsafe value');
+    const bypassEvent = events.find((e) => e.event === 'config_safety_override_bypassed');
+    assert.ok(bypassEvent, 'config_safety_override_bypassed must be emitted');
+    assert.equal(bypassEvent.payload.key, 'ENTRY_LIMIT_PRICE_MODE');
+    assert.equal(bypassEvent.payload.escapeHatchEnv, 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK');
+  },
+);
+
+// 8. Safe explicit value ('mid') → no override, no events.
+withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'mid' }, () => {
+  const events = withCapturedLog((logger) => {
+    const result = applySafetyOverridesToEnv({ logger });
+    assert.equal(result.overridden, 0);
+    assert.equal(result.bypassed, 0);
+  });
+  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'mid');
+  assert.equal(events.length, 0, 'safe value must not emit any safety event');
+});
+
+// 9. Default explicit value ('bid_plus_tick') → no override, no events.
+withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick' }, () => {
+  const events = withCapturedLog((logger) => {
+    const result = applySafetyOverridesToEnv({ logger });
+    assert.equal(result.overridden, 0);
+    assert.equal(result.bypassed, 0);
+  });
+  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick');
+  assert.equal(events.length, 0);
+});
+
+// 10. SAFETY_OVERRIDES is frozen so a stray require-time mutation can't
+//     silently disable a guardrail.
+assert.ok(Object.isFrozen(SAFETY_OVERRIDES), 'SAFETY_OVERRIDES must be frozen');
+assert.ok(Object.isFrozen(SAFETY_OVERRIDES.ENTRY_LIMIT_PRICE_MODE), 'each entry must be frozen');
 
 console.log('bootstrapLiveEnv.test passed');

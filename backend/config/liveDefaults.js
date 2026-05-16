@@ -140,9 +140,17 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
-  // bleeding when the strategy doesn't have demonstrable edge. Default
-  // threshold +3 bps net per entry, sample-size floor 30 entries.
-  SIGNAL_SELECTOR_MIN_BPS: '3',
+  // bleeding when the strategy doesn't have demonstrable edge.
+  // 2026-05-17: lowered from '3' to '0' per operator's "push everything,
+  // validate live" directive. The +3 bps margin was meant to absorb backtest
+  // noise, but with `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` still acting
+  // as the sample-size guard, any signal that fires at non-negative
+  // expectancy over >=5 backtest entries is admitted. This opens the door
+  // to marginal-edge variants (range-MR, MR-5m, MR-15m) that come online
+  // once PHASE1_ENABLED=true. The sample-size floor is the real safety net;
+  // lowering it would be the actual safety risk. Revert to '3' in Render
+  // env if live scorecard shows admitted signals are bleeding.
+  SIGNAL_SELECTOR_MIN_BPS: '0',
   // 2026-05-16 re-flip: was 'false' (2026-05-15 rollback turned the auto-veto
   // off on the theory that OLS may have been profitable LIVE pre-claude even
   // though backtests showed -37 bps). The 14-trade live scorecard accumulated
@@ -218,13 +226,17 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // soft cap) revert to legacy behavior in a single env flip. Per-layer
   // flags below let an operator disable a single layer instead of the whole
   // bundle if a specific layer is misbehaving.
-  // 2026-05-15 rollback: was 'true'. The 5 Phase 1 layers (multi-timeframe
-  // MR, range-MR, concurrent-position soft cap, adaptive sizing) were
-  // additions on top of an already over-gated entry path. None of them
-  // mapped to a user-stated request. Master kill-switch flipped OFF so
-  // they're all dormant. The code stays in place — re-enable layer-by-layer
-  // via env if live data shows we need any of them back.
-  PHASE1_ENABLED: 'false',
+  // 2026-05-17 re-enable: was 'false' (2026-05-15 rollback turned it off on
+  // the theory that the layers were over-additions on top of already over-
+  // gated OLS). With the 2026-05-16 veto-restore in place, OLS is no longer
+  // the active signal — MR-1m is, at +14.91 bps over 6 entries. That's
+  // ~$0.005/day on $84 equity: stable but not earning. Phase 1 was designed
+  // to expand the trigger surface so the same MR edge fires across more
+  // timeframes and ranges. Master kill-switch flipped back ON so the auto-
+  // backtester evaluates MR-5m / MR-15m / range-MR slots and the selector
+  // routes to the highest validated net bps. Revert via Render env
+  // PHASE1_ENABLED=false to disable all four layers atomically.
+  PHASE1_ENABLED: 'true',
   // Multi-timeframe mean reversion. Live MR signal currently runs on 1m bars
   // only. With these flags enabled, the auto-backtester also evaluates the
   // 5m and 15m variants so the signal selector can pick the timeframe with

@@ -27,13 +27,74 @@
 //     subsequent calls no-op after the first.
 //   - Exported as a function (not just side-effecting on require) so
 //     tests can re-apply explicitly after setting up their own env.
+//
+// Safety overrides (2026-05-17 addition):
+//   The "explicit env wins" rule above is generally correct — operators
+//   need a way to override defaults from Render env without redeploying.
+//   But some explicit-env values are KNOWN-UNSAFE based on prior live
+//   evidence and should be silently rejected at bootstrap (with a loud
+//   log event) unless an explicit escape-hatch env var also opts in.
+//   The SAFETY_OVERRIDES map below encodes those cases — each entry is
+//   `{ unsafeValue, forcedValue, escapeHatchEnv, rationale }`. The
+//   override loop runs BEFORE the fill-defaults loop, so the chain is:
+//     env-explicit (incl. unsafe)
+//       → safety-overridden (unsafe → forcedValue, unless escape-hatch is set)
+//       → defaults-filled (anything still undefined)
+//   The escape hatch exists so an operator with a verified emergency
+//   reason can still apply the unsafe value — they just can't do it by
+//   accident or by inheriting an old Render env from a prior session.
 
 const { LIVE_CRITICAL_DEFAULTS, LIVE_CRITICAL_KEYS } = require('./liveDefaults');
 
+const SAFETY_OVERRIDES = Object.freeze({
+  ENTRY_LIMIT_PRICE_MODE: Object.freeze({
+    unsafeValue: 'ask',
+    forcedValue: 'bid_plus_tick',
+    escapeHatchEnv: 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK',
+    rationale:
+      'Live scorecard 2026-05-15 (14 trades, 7.14% wins, expectancy -$0.074/trade) was '
+      + 'directly attributable to spread-crossing entries. The 36.85 bps avg entry spread '
+      + 'paid in that window does not fit inside any current backtest expectancy.',
+  }),
+});
+
+const SAFETY_OVERRIDE_KEYS = Object.freeze(Object.keys(SAFETY_OVERRIDES));
+
 let applied = false;
 
-function applyLiveDefaultsToEnv({ force = false } = {}) {
-  if (applied && !force) return { applied: 0, skipped: 0, total: LIVE_CRITICAL_KEYS.length };
+function applySafetyOverridesToEnv({ logger } = {}) {
+  const log = (logger && typeof logger.log === 'function') ? logger.log.bind(logger) : console.log.bind(console);
+  let overridden = 0;
+  let bypassed = 0;
+  for (const key of SAFETY_OVERRIDE_KEYS) {
+    const spec = SAFETY_OVERRIDES[key];
+    if (process.env[key] !== spec.unsafeValue) continue;
+    if (process.env[spec.escapeHatchEnv] === 'true') {
+      log('config_safety_override_bypassed', {
+        key,
+        unsafeValue: spec.unsafeValue,
+        escapeHatchEnv: spec.escapeHatchEnv,
+        rationale: spec.rationale,
+      });
+      bypassed += 1;
+      continue;
+    }
+    log('config_safety_override', {
+      key,
+      discardedValue: spec.unsafeValue,
+      appliedValue: spec.forcedValue,
+      escapeHatchEnv: spec.escapeHatchEnv,
+      rationale: spec.rationale,
+    });
+    process.env[key] = spec.forcedValue;
+    overridden += 1;
+  }
+  return { overridden, bypassed, total: SAFETY_OVERRIDE_KEYS.length };
+}
+
+function applyLiveDefaultsToEnv({ force = false, logger } = {}) {
+  if (applied && !force) return { applied: 0, skipped: 0, overridden: 0, bypassed: 0, total: LIVE_CRITICAL_KEYS.length };
+  const safety = applySafetyOverridesToEnv({ logger });
   let appliedCount = 0;
   let skippedCount = 0;
   for (const k of LIVE_CRITICAL_KEYS) {
@@ -45,11 +106,21 @@ function applyLiveDefaultsToEnv({ force = false } = {}) {
     }
   }
   applied = true;
-  return { applied: appliedCount, skipped: skippedCount, total: LIVE_CRITICAL_KEYS.length };
+  return {
+    applied: appliedCount,
+    skipped: skippedCount,
+    overridden: safety.overridden,
+    bypassed: safety.bypassed,
+    total: LIVE_CRITICAL_KEYS.length,
+  };
 }
 
 // Apply on require — most consumers want the bridge to "just work" by
 // requiring this module once at the top of their entry-point file.
 applyLiveDefaultsToEnv();
 
-module.exports = { applyLiveDefaultsToEnv };
+module.exports = {
+  applyLiveDefaultsToEnv,
+  applySafetyOverridesToEnv,
+  SAFETY_OVERRIDES,
+};

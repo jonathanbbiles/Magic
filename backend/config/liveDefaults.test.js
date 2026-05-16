@@ -62,10 +62,26 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
 // to whichever signal clears SIGNAL_SELECTOR_MIN_BPS; if none clear,
 // trading is vetoed entirely (the safety net). Set SIGNAL_VERSION='ols'
 // + VETO='false' in Render env to force-trade OLS again.
+//
+// 2026-05-17: SIGNAL_SELECTOR_MIN_BPS lowered to '0'. Sample-size guard
+// (MIN_BACKTEST_ENTRIES=5) remains the real safety net; any signal with
+// non-negative expectancy and >=5 backtest entries is admitted.
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '3');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
+
+// 2026-05-17: Phase 1 master switch re-enabled. With MR-1m as the only
+// validated signal firing ~6/30 days (~$0.005/day expectancy on $84
+// equity), Phase 1's expanded trigger surface (MR-5m, MR-15m, range-MR)
+// is the path back to meaningful trade frequency. The per-layer flags
+// are already 'true'; only the master kill-switch was off.
+assert.equal(LIVE_CRITICAL_DEFAULTS.PHASE1_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_TIMEFRAME_5M_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_TIMEFRAME_15M_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.CONCURRENT_POSITIONS_SOFT_CAP_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.ADAPTIVE_SIZING_ENABLED, 'true');
 
 // 2026-05-15 rollback: exit defaults restored to the pre-claude values.
 // MAX_HOLD_MS=6h gives positions σ-time to reach the TP. BREAKEVEN_TIMEOUT
