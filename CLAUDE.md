@@ -38,16 +38,27 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 
 ## Entry signal flag
 
-`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion clears `SIGNAL_SELECTOR_MIN_BPS` (default +3 bps net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
+`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion (plus the Phase 1 MR variants when `PHASE1_ENABLED=true`) clears `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17; sample-size guard `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` is the real safety net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
 
-## Live posture is now the code default (2026-05-16)
+## Live posture is now the code default (2026-05-16, extended 2026-05-17)
 
-The two settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:
+The settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:
 
 - `ENTRY_UNIVERSE_MODE=configured` — scopes the scan to the 12 deep-liquidity primary pairs (`ENTRY_SYMBOLS_PRIMARY`). Alpaca's quote feed for long-tail alts is chronically stale; the prior `dynamic` default lost ~19/33 symbols to the stale-quote pruner at any moment.
 - `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests one tick above the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000`, which recycles unfilled passive rests on the next scan. Replaces the prior `mid` default; do not flip to `ask` unless an emergency requires guaranteed fills — that reverts to the spread-crossing economics that drove the 14-trade live scorecard to -$0.074/trade expectancy.
+- `PHASE1_ENABLED=true` (2026-05-17) — re-enables the multi-timeframe MR (5m/15m), range-MR, concurrent-position soft cap, and adaptive sizing layers. Was disabled in the 2026-05-15 panic rollback; the bot earned nothing during the veto-only window (MR-1m alone fires ~6×/30 days). Per-layer flags (`MR_TIMEFRAME_5M_ENABLED`, `MR_TIMEFRAME_15M_ENABLED`, `RANGE_MR_ENABLED`, `CONCURRENT_POSITIONS_SOFT_CAP_ENABLED`, `ADAPTIVE_SIZING_ENABLED`) remain available for surgical disable.
+- `SIGNAL_SELECTOR_MIN_BPS=0` (2026-05-17, was `3`) — admits any signal with non-negative expectancy over ≥5 backtest entries. The sample-size floor is the actual safety net; the +3 bps margin was blocking marginal-edge variants Phase 1 unlocks.
 
-**Revert via Render env** (no code change needed): `ENTRY_UNIVERSE_MODE=dynamic` and/or `ENTRY_LIMIT_PRICE_MODE=mid|ask`.
+**Revert via Render env** (no code change needed): `ENTRY_UNIVERSE_MODE=dynamic`, `ENTRY_LIMIT_PRICE_MODE=mid|ask`, `PHASE1_ENABLED=false`, `SIGNAL_SELECTOR_MIN_BPS=3`.
+
+## Safety overrides at bootstrap (2026-05-17)
+
+`backend/config/bootstrapLiveEnv.js` exports a `SAFETY_OVERRIDES` map that hard-overrides known-unsafe explicit Render env values BEFORE the fill-defaults loop runs. Each entry has the shape `{ unsafeValue, forcedValue, escapeHatchEnv, rationale }`. The override loop emits `config_safety_override` when it fires and `config_safety_override_bypassed` when the escape-hatch env opts in to the unsafe value.
+
+Currently guarded:
+- `ENTRY_LIMIT_PRICE_MODE=ask` → forced to `bid_plus_tick` unless `ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK=true`. Rationale: the 2026-05-15 live scorecard (-$0.074/trade expectancy at 36.85 bps avg entry spread) does not fit inside any current backtest expectancy.
+
+When a future Render env value is found to silently defeat a safe code default (the same failure mode that landed the 2026-05-16 deploy with `ENTRY_LIMIT_PRICE_MODE=ask` despite the code default flipping to `bid_plus_tick`), add a new entry to `SAFETY_OVERRIDES` instead of just changing the default — that closes the failure mode permanently while still respecting verified operator intent via the escape hatch.
 
 ## Entry quote prefetch
 
