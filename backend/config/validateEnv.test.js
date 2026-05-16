@@ -64,9 +64,11 @@ withEnv({}, () => {
   assert.equal(guardrails.volCompression.minLongVolBpsTier2, 4);
   assert.equal(guardrails.marketDataCoordinator.quoteTtlMs, 3000);
   assert.equal(guardrails.entryUniverse.includeSecondary, false);
-  // Live default flipped to 'dynamic' for Phase 1 — wider universe for more
-  // mean-reversion triggers; stale-quote pruner handles per-symbol staleness.
-  assert.equal(guardrails.entryUniverse.modeEffective, 'dynamic');
+  // 2026-05-16: Live default reverted to 'configured' (12 deep-liquidity
+  // primary pairs). Live diagnostics showed Alpaca's long-tail quote feed
+  // pruning ~19/33 symbols at any moment in 'dynamic' mode. Set
+  // ENTRY_UNIVERSE_MODE=dynamic in env to re-engage the wider scan.
+  assert.equal(guardrails.entryUniverse.modeEffective, 'configured');
   assert.equal(guardrails.entryUniverse.allowDynamicUniverseInProduction, true);
   assert.equal(guardrails.engineV2.enabled, false);
   assert.equal(guardrails.engineV2.entryConfirmationSamples, 3);

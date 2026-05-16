@@ -1,7 +1,15 @@
 const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
-  ENTRY_UNIVERSE_MODE: 'dynamic',
+  // 2026-05-16: was 'dynamic'. Alpaca's quote feed is chronically stale on
+  // long-tail alts — live diagnostics observed 19/33 symbols pruned for
+  // staleness at any moment, and ~24/scan rejected with reason=stale_quote.
+  // The configured 12-pair primary universe (deep-liquidity majors) is what
+  // CLAUDE.md documents as the live-recommended posture and what the live
+  // execution-tier configuration is actually sized for. Flipped to
+  // 'configured' so the scan runs only on symbols whose quote feed is
+  // reliable. Set ENTRY_UNIVERSE_MODE=dynamic in Render env to revert.
+  ENTRY_UNIVERSE_MODE: 'configured',
   ENTRY_SYMBOLS_PRIMARY: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
   ENTRY_SYMBOLS_SECONDARY: '',
   ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'false',
@@ -96,7 +104,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_STOP_LOSS_BPS_TIER3: '100',
   MR_MAX_HOLD_MS: '2700000',
   MR_BREAKEVEN_TIMEOUT_MS: '1800000',
-  ENTRY_LIMIT_PRICE_MODE: 'mid',
+  // 2026-05-16: was 'mid'. The 14-trade live scorecard from the
+  // pre-veto window showed avgEntrySpreadBps of 36.85 — at $84 equity and
+  // 30 bps round-trip fees, paying half a spread on entry left no realistic
+  // path to a positive net. 'bid_plus_tick' rests one tick above the bid
+  // (passive, never crosses) and pairs with ENTRY_FILL_TIMEOUT_MS=30000 so
+  // unfilled rests recycle on the next scan instead of stranding capital.
+  // CLAUDE.md documents this as the live-recommended posture. Revert to
+  // 'mid' or 'ask' in Render env to restore spread-crossing entries.
+  ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
   // projected forward move doesn't cover the gross target + entry/exit

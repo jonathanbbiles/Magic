@@ -40,12 +40,14 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 
 `SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion clears `SIGNAL_SELECTOR_MIN_BPS` (default +3 bps net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
 
-## Recommended live env overrides (Render)
+## Live posture is now the code default (2026-05-16)
 
-The code defaults are conservative for development; the recommended live posture overrides them via Render env (no code change required). See the "Production deployment" section of the top-level `README.md` for the full rationale.
+The two settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:
 
-- `ENTRY_UNIVERSE_MODE=configured` — scopes the scan to the 12 deep-liquidity primary pairs (`ENTRY_SYMBOLS_PRIMARY`). Alpaca's quote feed for long-tail alts is chronically stale; `dynamic` mode loses ~13/33 symbols to the stale-quote pruner at any moment.
-- `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests below the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000` (already on by default), which recycles unfilled passive rests on the next scan. Don't add mid→ask escalation: that just reverts to legacy spread-crossing economics.
+- `ENTRY_UNIVERSE_MODE=configured` — scopes the scan to the 12 deep-liquidity primary pairs (`ENTRY_SYMBOLS_PRIMARY`). Alpaca's quote feed for long-tail alts is chronically stale; the prior `dynamic` default lost ~19/33 symbols to the stale-quote pruner at any moment.
+- `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests one tick above the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000`, which recycles unfilled passive rests on the next scan. Replaces the prior `mid` default; do not flip to `ask` unless an emergency requires guaranteed fills — that reverts to the spread-crossing economics that drove the 14-trade live scorecard to -$0.074/trade expectancy.
+
+**Revert via Render env** (no code change needed): `ENTRY_UNIVERSE_MODE=dynamic` and/or `ENTRY_LIMIT_PRICE_MODE=mid|ask`.
 
 ## Entry quote prefetch
 

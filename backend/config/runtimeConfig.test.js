@@ -113,10 +113,13 @@ withEnv({}, () => {
   assert.equal(cfg.sparseStaleToleranceMs, 15000);
   assert.equal(cfg.orderbookSparseRequireQuoteFreshMs, 5000);
   assert.equal(cfg.orderbookSparseStaleQuoteToleranceMs, 15000);
-  // Live default flipped to 'dynamic' for Phase 1: the wider universe catches
-  // mean-reversion triggers on alts the configured list misses. Stale-quote
-  // pruner still drops chronically-stale symbols at the per-symbol level.
-  assert.equal(cfg.entryUniverseModeEffective, 'dynamic');
+  // 2026-05-16: Live default reverted to 'configured'. Live diagnostics
+  // showed Alpaca's long-tail quote feed pruning ~19/33 symbols at any
+  // moment in 'dynamic' mode. The 12-pair primary universe is what the
+  // execution tiering is sized for and what CLAUDE.md documents as the
+  // recommended live posture. Set ENTRY_UNIVERSE_MODE=dynamic in env to
+  // re-engage the wider scan.
+  assert.equal(cfg.entryUniverseModeEffective, 'configured');
   assert.equal(cfg.allowDynamicUniverseInProduction, true);
   assert.equal(cfg.entryUniverseMaxSymbols, null);
   assert.equal(cfg.entryUniverseMaxSymbolsSource, 'uncapped');
