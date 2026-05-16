@@ -112,23 +112,31 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // in backend/modules/signalSelector.js. Default left empty so the live
   // engine is self-correcting out of the box; pin to 'ols' as an emergency
   // rollback if the auto-selector misbehaves.
-  // 2026-05-15 rollback: was '' (auto-select via signalSelector). Pinned to
-  // 'ols' so the bot trades the signal the user remembers working live,
-  // independent of whether the backtester thinks OLS has edge. Set blank
-  // to re-engage the auto-selector.
-  SIGNAL_VERSION: 'ols',
+  // 2026-05-16 re-flip: was 'ols' (operator pin from 2026-05-15 rollback).
+  // The 14-trade live scorecard from that rollback closed at 7.14% win
+  // rate, profit factor 0.007, expectancy -$0.074/trade — the exact
+  // "live confirms backtest pessimism" trigger the rollback comment
+  // promised would flip this back. Restored to '' (auto-select); the
+  // selector will route to whichever signal clears SIGNAL_SELECTOR_MIN_BPS
+  // (currently only mean_reversion at +23 bps over 6 entries). Pin to
+  // 'ols' in Render env to force-trade OLS again.
+  SIGNAL_VERSION: '',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
   // bleeding when the strategy doesn't have demonstrable edge. Default
   // threshold +3 bps net per entry, sample-size floor 30 entries.
   SIGNAL_SELECTOR_MIN_BPS: '3',
-  // 2026-05-15 rollback: was 'true'. The auto-veto was killing OLS entries
-  // because OLS backtests at -39 bps under the full Phase 1 gate stack, but
-  // that same OLS may have been profitable LIVE pre-claude (when none of
-  // those gates existed). Flipped OFF so OLS actually trades. If live
-  // scorecard confirms backtest pessimism, flip back on.
-  SIGNAL_SELECTOR_VETO_ENABLED: 'false',
+  // 2026-05-16 re-flip: was 'false' (2026-05-15 rollback turned the auto-veto
+  // off on the theory that OLS may have been profitable LIVE pre-claude even
+  // though backtests showed -37 bps). The 14-trade live scorecard accumulated
+  // during the no-veto window (7.14% win rate, expectancy -$0.074, profit
+  // factor 0.007) is conclusive that the backtest was not over-pessimistic —
+  // OLS bleeds live exactly as it bleeds in backtest. Restored to 'true' so
+  // entries are vetoed unless a signal clears SIGNAL_SELECTOR_MIN_BPS. Pin
+  // SIGNAL_SELECTOR_VETO_ENABLED=false in Render env to re-allow no-edge
+  // trading.
+  SIGNAL_SELECTOR_VETO_ENABLED: 'true',
   SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '5',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned

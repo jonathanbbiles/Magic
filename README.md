@@ -16,7 +16,24 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-16 re-flip: live scorecard confirmed backtest pessimism — safety net restored
+
+The 2026-05-15 rollback below ran for one day. During that window the bot closed 14 trades at a **7.14% win rate, profit factor 0.007, expectancy -$0.074/trade** (live `meta.scorecard`), and equity drifted from $85.10 to $83.53. The rollback's own escape clause read *"if live scorecard confirms backtest pessimism, flip back on"* — that trigger has been hit. The two knobs that disabled the engine's safety net have been restored to their pre-rollback values:
+
+| Key | 2026-05-15 rollback set | 2026-05-16 re-flip set | Why |
+|---|---|---|---|
+| `SIGNAL_VERSION` | `'ols'` (force-trade OLS) | `''` (auto-select) | OLS backtests at -37 bps net; live confirmed it. Auto-selector now routes only to signals that clear `SIGNAL_SELECTOR_MIN_BPS`. |
+| `SIGNAL_SELECTOR_VETO_ENABLED` | `'false'` | `'true'` | Re-engages the veto. When no signal clears +3 bps backtest, the engine refuses entries — exactly the bleed-stop the rollback bypassed. |
+
+Net effect with current backtests (OLS -37, MF -39, mean-reversion +23 bps over 6 entries): mean-reversion is the only validated signal, so the engine trades only MR until OLS or MF demonstrate edge. MR's 30-day backtest is 6/6 wins, so live frequency will be low but expectancy positive. The other 2026-05-15 entries (gates listed in the table below) remain in their loosened state — those skipped entries (volume, BTC lead-lag, projected-covers-gross) were entries that would also have failed the active signal, so reverting them is unnecessary given the veto now blocks the unvalidated signal upstream.
+
+**Rollback the re-flip** (restore the 2026-05-15 force-trade-OLS state) via Render env: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false`.
+
+---
+
 ## 2026-05-15 rollback: trust the user's live evidence over backtester pessimism
+
+> **Superseded by the 2026-05-16 re-flip above.** The two key knobs from this rollback (`SIGNAL_VERSION`, `SIGNAL_SELECTOR_VETO_ENABLED`) have been restored to pre-rollback values. The rest of the rollback (gates, exit timers, sizing) remains in effect — those settings weren't disconfirmed by the live scorecard since the active signal (now MR via the auto-selector) doesn't consult the OLS-specific gates anyway.
 
 The 10 PRs that landed on this branch between 2026-05-14 and 2026-05-15 layered backtest-driven defenses on top of an entry path that — by the user's live observation — was already winning many trades per day before any of those defenses landed. The combined effect of the defenses was to reduce trade frequency from "many per day" to "~6 per month." The user's stated complaint was specifically *"the bot bought near tops and got stuck before crashes"* — only one of the defenses (`REJECT_NEAR_HIGH`) addressed that. The rest were either backtest-driven (and the backtest may have its own pessimism) or speculative additions.
 
@@ -26,8 +43,8 @@ This rollback restores the pre-claude entry-path defaults and KEEPS only `REJECT
 
 | Key | Was | Now | Why |
 |---|---|---|---|
-| `SIGNAL_VERSION` | `''` (auto) | `'ols'` | Trade the signal the user remembers working live. |
-| `SIGNAL_SELECTOR_VETO_ENABLED` | `'true'` | `'false'` | The auto-veto was killing OLS based on a backtest that may be over-pessimistic. |
+| `SIGNAL_VERSION` | `''` (auto) | ~~`'ols'`~~ → `''` (re-flipped 2026-05-16) | See 2026-05-16 section above. |
+| `SIGNAL_SELECTOR_VETO_ENABLED` | `'true'` | ~~`'false'`~~ → `'true'` (re-flipped 2026-05-16) | See 2026-05-16 section above. |
 | `PHASE1_ENABLED` | `'true'` | `'false'` | Master kill for the 5 Phase 1 layers (multi-tf MR, range-MR, soft cap, adaptive sizing). |
 | `ENFORCE_PROJECTED_COVERS_GROSS` | `'true'` | `'false'` | Skipped 19,108 candidates in the May 2026 backtest. Not user-requested. |
 | `MIN_VOLUME_RATIO_TO_ENTER` | `'1.0'` | `'0'` | Skipped 3,810 candidates. Not user-requested. |
@@ -44,7 +61,7 @@ This rollback restores the pre-claude entry-path defaults and KEEPS only `REJECT
 - `ENTRY_UNIVERSE_MODE='dynamic'` — wider universe = more trade attempts.
 - `STOP_LOSS_ENABLED='true'`, `HONEST_EV_GATE_ENABLED='true'` — cheap sanity checks.
 
-**Verification plan:** monitor `meta.scorecard` for 7 days post-deploy. If the user's live memory is right, the account grows. If the backtester's pessimism is right (OLS at -39 bps/entry on backtest), the account bleeds tractably (~$1-2/day on $84) and we have data-driven grounds to re-enable specific gates one at a time. Either way, this is the right empirical test.
+**Verification plan (settled 2026-05-16):** the 7-day-monitor plan above closed early. After 14 closed trades the account had bled $1.57 (85.10 → 83.53), the live `meta.scorecard` reported a 7.14% win rate and 0.007 profit factor, and the rollback's "if live confirms backtest" trigger fired. Veto + auto-select have been restored — see the 2026-05-16 section at the top.
 
 ---
 

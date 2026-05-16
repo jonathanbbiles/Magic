@@ -38,7 +38,7 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 
 ## Entry signal flag
 
-`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `ols`** (legacy 1m linear-regression predictor; current production behaviour). `multi_factor` switches to the new pullback-in-uptrend signal in `backend/modules/multiFactorSignal.js`. **Do not flip the live default to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Rollback: set `SIGNAL_VERSION=ols` in Render env and restart.
+`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion clears `SIGNAL_SELECTOR_MIN_BPS` (default +3 bps net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
 
 ## Recommended live env overrides (Render)
 
