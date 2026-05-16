@@ -72,6 +72,15 @@ if (dotenvPath) {
   });
 }
 
+// Bridges LIVE_CRITICAL_DEFAULTS into process.env AFTER dotenv has loaded
+// any .env file but BEFORE any module that calls readNumber / readBoolean
+// against process.env. Without this, changes to liveDefaults.js are
+// silently ignored by trade.js because its readNumber / readBoolean
+// helpers have hardcoded fallbacks that win over the liveDefaults value.
+// Explicit env vars (from .env or Render) still take precedence — the
+// bridge only populates UNDEFINED keys.
+require('./config/bootstrapLiveEnv');
+
 const express = require('express');
 const { execSync } = require('child_process');
 const cors = require('cors');

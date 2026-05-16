@@ -97,12 +97,14 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
   assert.ok(v > 15 && v < 35, `expected vol-scaled in (15, 35), got ${v}`);
 }
 
-// 10. OLS path with high vol: clamped at the OLS cap (35, tightened from 40).
+// 10. OLS path with high vol: clamped at the OLS cap. The cap is now 40 —
+// restored from the over-tight 35 in the 2026-05-15 rollback (the bridge in
+// config/bootstrapLiveEnv.js makes liveDefaults the source of truth).
 // Same input on the multi-factor path is uncapped because MF allows wider stops.
 {
   const ols = deriveStopLossBps(20, 5, 'ols');
   const mf = deriveStopLossBps(20, 5, 'multi_factor');
-  assert.equal(ols, 35);                 // OLS cap = 35
+  assert.equal(ols, 40);                 // OLS cap = 40 (restored)
   assert.ok(mf > ols, `expected MF stop > OLS stop on high vol, got ols=${ols}, mf=${mf}`);
   assert.ok(mf <= 100, `MF stop should respect MF cap (100), got ${mf}`);
 }

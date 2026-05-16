@@ -20,6 +20,12 @@
 // This module also exposes every HTTP wrapper + snapshot getter that
 // backend/index.js imports, so the dashboard/frontend contract is preserved.
 
+// MUST be the first require: bridges LIVE_CRITICAL_DEFAULTS into
+// process.env BEFORE any of the readNumber/readBoolean calls below
+// consult process.env directly. Without this, changes to liveDefaults.js
+// are silently ignored by the trade engine.
+require('./config/bootstrapLiveEnv');
+
 const { normalizePair, toAlpacaSymbol } = require('./symbolUtils');
 const { getRuntimeConfig } = require('./config/runtimeConfig');
 const { slopeTStatFromOls, slopeProbability } = require('./modules/entryProbability');
