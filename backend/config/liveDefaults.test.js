@@ -14,13 +14,23 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_ENABLED, 'true');
 
 assert.equal(LIVE_CRITICAL_DEFAULTS.TRADE_BASE, 'https://api.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
-// Universe default flipped to 'dynamic' (Phase 1) so the live engine scans
-// every active Alpaca crypto pair (~33 symbols), not just the 12 primary
-// configured pairs. Stale-quote pruning still applies per-symbol; the wider
-// universe catches mean-reversion triggers on alts the configured list misses.
-// Set ENTRY_UNIVERSE_MODE=configured in Render env to revert.
-assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'dynamic');
+// 2026-05-16: Universe default reverted to 'configured' after live diagnostics
+// confirmed Alpaca's long-tail quote feed is chronically stale (19/33 symbols
+// pruned at any moment in the dynamic-mode logs). The 12-pair primary
+// universe is what the live execution tiering is actually sized for and what
+// CLAUDE.md documents as the recommended live posture. The dynamic-universe
+// code path remains intact; set ENTRY_UNIVERSE_MODE=dynamic in Render env to
+// re-engage it.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
+
+// 2026-05-16: Entry limit price mode flipped to 'bid_plus_tick' (rests one
+// tick above the bid, never crosses the spread). The 14-trade live scorecard
+// from the pre-veto window showed 36.85 bps avg entry spread paid — pairing
+// passive entries with the 30s ENTRY_FILL_TIMEOUT_MS recycle gives any
+// validated signal a fair shot at covering 30 bps round-trip fees.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick');
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FILL_TIMEOUT_MS, '30000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
 
