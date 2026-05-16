@@ -64,8 +64,14 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   STALE_QUOTE_PRUNE_LOOKBACK: '8',
   STALE_QUOTE_PRUNE_MIN_FRESH_RATIO: '0.4',
   STALE_QUOTE_PRUNE_PROBATION_FRESH: '2',
-  BREAKEVEN_TIMEOUT_MS: '2700000',
-  MAX_HOLD_MS: '5400000',
+  // 2026-05-15 rollback: restored from the over-tightened '2700000' / '5400000'
+  // values that systematically cut winners short. The user's pre-claude live
+  // experience was many wins per day; the tightened defaults made everything
+  // exit too fast (or pause too aggressively on portfolio drift) for that
+  // pattern to play out. 6 h max-hold + 2 h break-even-decay gives positions
+  // enough σ-time to reach the TP without being walked to break-even too soon.
+  BREAKEVEN_TIMEOUT_MS: '7200000',
+  MAX_HOLD_MS: '21600000',
   // Signal-aware exit timing for multi-factor: its wider TP target (40-150 bps
   // net) needs longer σ-time than the OLS-tuned tight defaults. The May 2026
   // auto-backtest at maxHold=90 min observed 45.8% max_hold rate dragging MF
@@ -92,7 +98,13 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_BREAKEVEN_TIMEOUT_MS: '1800000',
   ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
-  ENFORCE_PROJECTED_COVERS_GROSS: 'true',
+  // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
+  // projected forward move doesn't cover the gross target + entry/exit
+  // slippage. In the May 2026 backtest it skipped 19,108 candidates — a
+  // huge fraction of what would otherwise have been entries. Flipped OFF
+  // by default so OLS can fire at the historical rate the user remembers.
+  // Re-enable via env if live data shows it's needed.
+  ENFORCE_PROJECTED_COVERS_GROSS: 'false',
   // Entry-signal dispatch. Empty string = 'auto' (the runtime signal selector
   // picks 'ols' or 'multi_factor' based on the most recent backtest evidence).
   // Set to 'ols' or 'multi_factor' to operator-pin a signal (the veto still
@@ -100,14 +112,23 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // in backend/modules/signalSelector.js. Default left empty so the live
   // engine is self-correcting out of the box; pin to 'ols' as an emergency
   // rollback if the auto-selector misbehaves.
-  SIGNAL_VERSION: '',
+  // 2026-05-15 rollback: was '' (auto-select via signalSelector). Pinned to
+  // 'ols' so the bot trades the signal the user remembers working live,
+  // independent of whether the backtester thinks OLS has edge. Set blank
+  // to re-engage the auto-selector.
+  SIGNAL_VERSION: 'ols',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
   // bleeding when the strategy doesn't have demonstrable edge. Default
   // threshold +3 bps net per entry, sample-size floor 30 entries.
   SIGNAL_SELECTOR_MIN_BPS: '3',
-  SIGNAL_SELECTOR_VETO_ENABLED: 'true',
+  // 2026-05-15 rollback: was 'true'. The auto-veto was killing OLS entries
+  // because OLS backtests at -39 bps under the full Phase 1 gate stack, but
+  // that same OLS may have been profitable LIVE pre-claude (when none of
+  // those gates existed). Flipped OFF so OLS actually trades. If live
+  // scorecard confirms backtest pessimism, flip back on.
+  SIGNAL_SELECTOR_VETO_ENABLED: 'false',
   SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '5',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
@@ -118,13 +139,29 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MF_SIGNAL_TARGET_MAX_NET_BPS: '150',
   MF_STOP_LOSS_BPS: '100',
   STOP_LOSS_ENABLED: 'true',
-  STOP_LOSS_BPS: '35',
+  // 2026-05-15 rollback: was '35'. Restored to '40' — the pre-claude value.
+  // The tightened 35 cap fired more often and on smaller moves, cutting
+  // winners that the wider stop would have let recover.
+  STOP_LOSS_BPS: '40',
   STOP_LOSS_BPS_FLOOR: '15',
   HONEST_EV_GATE_ENABLED: 'true',
-  MIN_SIZING_FRACTION_OF_TARGET: '0.6',
-  MIN_VOLUME_RATIO_TO_ENTER: '1.0',
-  MAX_BTC_LEAD_LAG_DROP_BPS: '-10',
-  MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: '-0.5',
+  // 2026-05-15 rollback: was '0.6'. Lowered to '0.4' so the scan doesn't
+  // abort when cash gets fragmented across active positions. The previous
+  // value killed entire scans when half the cash was deployed — too tight.
+  MIN_SIZING_FRACTION_OF_TARGET: '0.4',
+  // 2026-05-15 rollback: was '1.0' (block declining-volume entries). Not a
+  // user-requested gate; restored to '0' (disabled). Skipped ~3,800 entries
+  // in the May 2026 backtest. Re-enable if live data shows it's needed.
+  MIN_VOLUME_RATIO_TO_ENTER: '0',
+  // 2026-05-15 rollback: was '-10' (block alts when BTC drops > 10 bps in
+  // last 5 bars). Macro-cascade gate, not user-requested. Restored to '0'
+  // (disabled). Skipped ~535 entries in the May 2026 backtest.
+  MAX_BTC_LEAD_LAG_DROP_BPS: '0',
+  // 2026-05-15 rollback: was '-0.5' (pause entries when portfolio unrealized
+  // P&L < -0.5%). Too tight — paused on normal market drift. Restored to
+  // '-2.0', the pre-claude default. The gate still protects against
+  // cascading drawdowns, just with realistic headroom.
+  MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: '-2.0',
   // Recent-high proximity gate: refuses entries within REJECT_NEAR_HIGH_BPS
   // of the highest close in the last REJECT_NEAR_HIGH_LOOKBACK_BARS minutes.
   // Defaults: refuse within 30 bps of the last-60-bar high. Directly blocks
@@ -157,7 +194,13 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // soft cap) revert to legacy behavior in a single env flip. Per-layer
   // flags below let an operator disable a single layer instead of the whole
   // bundle if a specific layer is misbehaving.
-  PHASE1_ENABLED: 'true',
+  // 2026-05-15 rollback: was 'true'. The 5 Phase 1 layers (multi-timeframe
+  // MR, range-MR, concurrent-position soft cap, adaptive sizing) were
+  // additions on top of an already over-gated entry path. None of them
+  // mapped to a user-stated request. Master kill-switch flipped OFF so
+  // they're all dormant. The code stays in place — re-enable layer-by-layer
+  // via env if live data shows we need any of them back.
+  PHASE1_ENABLED: 'false',
   // Multi-timeframe mean reversion. Live MR signal currently runs on 1m bars
   // only. With these flags enabled, the auto-backtester also evaluates the
   // 5m and 15m variants so the signal selector can pick the timeframe with
