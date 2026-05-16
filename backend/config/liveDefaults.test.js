@@ -44,15 +44,17 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_BPS, '30');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
 
-// 2026-05-15 rollback: SIGNAL_VERSION pinned to 'ols' so the bot trades
-// the signal the user remembers working, independent of the backtester's
-// pessimism on it. SIGNAL_SELECTOR_VETO disabled so the auto-veto doesn't
-// kill OLS entries based on a backtest that has its own bias. The
-// selector code still works — set SIGNAL_VERSION='' + VETO='true' to
-// re-engage it.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'ols');
+// 2026-05-16 re-flip: SIGNAL_VERSION restored to '' (auto-select) and
+// SIGNAL_SELECTOR_VETO_ENABLED restored to 'true'. The 14-trade live
+// scorecard accumulated under the 2026-05-15 rollback (7.14% win rate,
+// profit factor 0.007, expectancy -$0.074/trade) confirmed the backtest
+// pessimism the rollback claimed to disbelieve. The selector now routes
+// to whichever signal clears SIGNAL_SELECTOR_MIN_BPS; if none clear,
+// trading is vetoed entirely (the safety net). Set SIGNAL_VERSION='ols'
+// + VETO='false' in Render env to force-trade OLS again.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '3');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'false');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 
 // 2026-05-15 rollback: exit defaults restored to the pre-claude values.
