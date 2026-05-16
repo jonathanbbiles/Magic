@@ -1614,7 +1614,10 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
 // because the range identification window is wider).
 async function getRangeMeanReversionSignalForPair(pair) {
   try {
-    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 70, timeframe: '1Min' });
+    // limit=80: signal requires 64 closed bars; +1 for in-progress; +15
+    // headroom for symbols where Alpaca returns a slightly thin bar set
+    // (low-volume alts sometimes come back below the requested limit).
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     return evaluateRangeMeanReversionSignal({ pair, bars1m });
   } catch (err) {

@@ -24,18 +24,17 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true'
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
 
-// The five default-on entry gates added after live-diagnostic findings
-// (honest-EV, sizing-floor, volume-confirmation, BTC lead-lag, portfolio-
-// drawdown). Each was promoted to default-ON because off-by-default behaviour
-// caused realised losses in production; pinning them here so an env-var-cleared
-// incident can't silently revert exactly the protection we just added.
+// 2026-05-15 rollback: HONEST_EV_GATE stays ON (low-cost sanity check).
+// MIN_SIZING_FRACTION lowered 0.6 → 0.4 so scans don't abort on cash
+// fragmentation. MIN_VOLUME_RATIO and MAX_BTC_LEAD_LAG_DROP_BPS disabled
+// (set to 0): both are entry-blocking gates that weren't user-requested
+// and were starving OLS. MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER restored to
+// -2.0 (pre-claude value) so normal market drift doesn't pause entries.
 assert.equal(LIVE_CRITICAL_DEFAULTS.HONEST_EV_GATE_ENABLED, 'true');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_SIZING_FRACTION_OF_TARGET, '0.6');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_VOLUME_RATIO_TO_ENTER, '1.0');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_BTC_LEAD_LAG_DROP_BPS, '-10');
-// Portfolio-drawdown gate tightened from -2.0 to -0.5 so the macro pause
-// kicks in at half a day's target P&L (operator goal: +1%/day).
-assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-0.5');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_SIZING_FRACTION_OF_TARGET, '0.4');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_VOLUME_RATIO_TO_ENTER, '0');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_BTC_LEAD_LAG_DROP_BPS, '0');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-2.0');
 
 // Recent-high proximity gate. Pinned ON so the production deploy refuses
 // entries within 30 bps of the last-60-minute high — the surgical fix for
@@ -45,23 +44,27 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_BPS, '30');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
 
-// Signal selector + backtest veto. The auto-selector picks the signal with
-// highest backtest expectancy; the veto refuses entries when no signal has
-// edge. Default-ON: stops the bot from bleeding when the math shows it can't
-// be profitable.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '', 'live default empty so auto-selector runs');
+// 2026-05-15 rollback: SIGNAL_VERSION pinned to 'ols' so the bot trades
+// the signal the user remembers working, independent of the backtester's
+// pessimism on it. SIGNAL_SELECTOR_VETO disabled so the auto-veto doesn't
+// kill OLS entries based on a backtest that has its own bias. The
+// selector code still works — set SIGNAL_VERSION='' + VETO='true' to
+// re-engage it.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'ols');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '3');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'false');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 
-// Exit-side defaults tightened so scalps that don't resolve fast recycle
-// capital instead of paying the long MTM tail. Signal-aware: OLS keeps the
-// tight 90/45 min; multi-factor uses 6 h / 3 h to give its wider TP room.
-assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '2700000');  // 45 min
-assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '5400000');           // 90 min
+// 2026-05-15 rollback: exit defaults restored to the pre-claude values.
+// MAX_HOLD_MS=6h gives positions σ-time to reach the TP. BREAKEVEN_TIMEOUT
+// =2h walks the TP toward break-even on a realistic decay. STOP_LOSS_BPS
+// =40 is the OG cap — tightening to 35 cut winners short. Multi-factor
+// keeps its own 6h/3h timers (unchanged).
+assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '7200000');   // 2 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '21600000');           // 6 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.MF_BREAKEVEN_TIMEOUT_MS, '10800000');  // 3 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.MF_MAX_HOLD_MS, '21600000');           // 6 h
-assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '35');              // tightened from 40
+assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '40');               // restored from 35
 
 // Mean-reversion-at-extremes strategy. The new "tiny wins, statistically
 // guaranteed" signal — enters only on volume-confirmed capitulation drops,

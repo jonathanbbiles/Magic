@@ -16,7 +16,41 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
-## What's different right now (self-correcting overhaul, May 2026)
+## 2026-05-15 rollback: trust the user's live evidence over backtester pessimism
+
+The 10 PRs that landed on this branch between 2026-05-14 and 2026-05-15 layered backtest-driven defenses on top of an entry path that — by the user's live observation — was already winning many trades per day before any of those defenses landed. The combined effect of the defenses was to reduce trade frequency from "many per day" to "~6 per month." The user's stated complaint was specifically *"the bot bought near tops and got stuck before crashes"* — only one of the defenses (`REJECT_NEAR_HIGH`) addressed that. The rest were either backtest-driven (and the backtest may have its own pessimism) or speculative additions.
+
+This rollback restores the pre-claude entry-path defaults and KEEPS only `REJECT_NEAR_HIGH_ENABLED=true` — the one defense that maps to the user's actual request. **All other gate code remains in the codebase**, simply defaults-off, so any single gate can be re-enabled via Render env if live data shows it's needed.
+
+**Specifically reset to pre-claude values:**
+
+| Key | Was | Now | Why |
+|---|---|---|---|
+| `SIGNAL_VERSION` | `''` (auto) | `'ols'` | Trade the signal the user remembers working live. |
+| `SIGNAL_SELECTOR_VETO_ENABLED` | `'true'` | `'false'` | The auto-veto was killing OLS based on a backtest that may be over-pessimistic. |
+| `PHASE1_ENABLED` | `'true'` | `'false'` | Master kill for the 5 Phase 1 layers (multi-tf MR, range-MR, soft cap, adaptive sizing). |
+| `ENFORCE_PROJECTED_COVERS_GROSS` | `'true'` | `'false'` | Skipped 19,108 candidates in the May 2026 backtest. Not user-requested. |
+| `MIN_VOLUME_RATIO_TO_ENTER` | `'1.0'` | `'0'` | Skipped 3,810 candidates. Not user-requested. |
+| `MAX_BTC_LEAD_LAG_DROP_BPS` | `'-10'` | `'0'` | Macro-cascade gate. Not user-requested. |
+| `MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER` | `'-0.5'` | `'-2.0'` | Was pausing on normal drift. Restored to pre-claude headroom. |
+| `MIN_SIZING_FRACTION_OF_TARGET` | `'0.6'` | `'0.4'` | Scan no longer aborts on cash fragmentation. |
+| `STOP_LOSS_BPS` | `'35'` | `'40'` | Restored pre-claude cap. Tighter stops were cutting winners. |
+| `MAX_HOLD_MS` | `'5400000'` (90 m) | `'21600000'` (6 h) | Slow winners get time to recover. |
+| `BREAKEVEN_TIMEOUT_MS` | `'2700000'` (45 m) | `'7200000'` (2 h) | TP-walk-down decay restored to original timing. |
+
+**Unchanged (kept ON):**
+
+- `REJECT_NEAR_HIGH_ENABLED='true'` — the only defense the user explicitly asked for.
+- `ENTRY_UNIVERSE_MODE='dynamic'` — wider universe = more trade attempts.
+- `STOP_LOSS_ENABLED='true'`, `HONEST_EV_GATE_ENABLED='true'` — cheap sanity checks.
+
+**Verification plan:** monitor `meta.scorecard` for 7 days post-deploy. If the user's live memory is right, the account grows. If the backtester's pessimism is right (OLS at -39 bps/entry on backtest), the account bleeds tractably (~$1-2/day on $84) and we have data-driven grounds to re-enable specific gates one at a time. Either way, this is the right empirical test.
+
+---
+
+## Prior overhaul (May 2026, pre-rollback)
+
+This is the work that was rolled back above. Kept here for context — the code is still present, just defaults-off.
 
 After live diagnostics confirmed the OLS strategy was bleeding capital (−65 bps/entry honest backtest) and parameter-tuning wasn't fixing it, the engine was rewired to be self-protective and self-correcting:
 

@@ -609,7 +609,16 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isRangeMr) {
       // Phase 1: range mean-reversion entry. Smaller drops within an
       // established range, much more frequent than capitulation MR.
-      const need = 64; // matches rangeMeanReversionSignal DEFAULT_CONFIG.requiredBars
+      //
+      // Window-sizing math: bars.slice(i - need + 2, i + 1) yields need-1
+      // bars; we then append one synthetic in-progress bar (= need total).
+      // The signal calls dropInProgressBar() which strips the in-progress
+      // one, leaving need-1 CLOSED bars to evaluate. Range-MR's
+      // requiredBars=64, so we need need-1 >= 64, i.e. need >= 65. The
+      // first deploy used need=64 and silently failed every bar with
+      // `range_mr_insufficient_history` — fixing here so the signal can
+      // actually evaluate and produce backtest evidence.
+      const need = 65;
       if (i + 1 < need) {
         if (!stats.skipped.range_mr_insufficient_history) stats.skipped.range_mr_insufficient_history = 0;
         stats.skipped.range_mr_insufficient_history += 1;
