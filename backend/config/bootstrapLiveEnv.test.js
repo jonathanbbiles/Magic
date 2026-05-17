@@ -154,5 +154,81 @@ withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick' }, () => {
 //     silently disable a guardrail.
 assert.ok(Object.isFrozen(SAFETY_OVERRIDES), 'SAFETY_OVERRIDES must be frozen');
 assert.ok(Object.isFrozen(SAFETY_OVERRIDES.ENTRY_LIMIT_PRICE_MODE), 'each entry must be frozen');
+assert.ok(Object.isFrozen(SAFETY_OVERRIDES.REJECT_NEAR_HIGH_LOOKBACK_BARS), 'each entry must be frozen');
+
+// ---------------------------------------------------------------------------
+// REJECT_NEAR_HIGH_LOOKBACK_BARS safety override (2026-05-17 Stage 1).
+//
+// Live MR backtest evidence: lookback=60 rejected ~50% of candidates. Code
+// default flipped to 30; stale Render env values carrying the prior 60 get
+// forced back unless the operator explicitly opts in via the escape hatch.
+// ---------------------------------------------------------------------------
+
+function withNearHighEnv(setup, run) {
+  const saved = {};
+  const keys = ['REJECT_NEAR_HIGH_LOOKBACK_BARS', 'REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60'];
+  for (const k of keys) saved[k] = process.env[k];
+  for (const k of keys) delete process.env[k];
+  for (const [k, v] of Object.entries(setup)) process.env[k] = v;
+  try {
+    return run();
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+// 11. Stale '60' without escape hatch → forced to '30', override event emitted.
+withNearHighEnv({ REJECT_NEAR_HIGH_LOOKBACK_BARS: '60' }, () => {
+  const events = withCapturedLog((logger) => {
+    const result = applySafetyOverridesToEnv({ logger });
+    assert.equal(result.overridden, 1, 'stale 60-bar value should be overridden');
+    assert.equal(result.bypassed, 0);
+  });
+  assert.equal(process.env.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30', '60 must be replaced with 30');
+  const overrideEvent = events.find(
+    (e) => e.event === 'config_safety_override' && e.payload.key === 'REJECT_NEAR_HIGH_LOOKBACK_BARS',
+  );
+  assert.ok(overrideEvent, 'config_safety_override must be emitted for REJECT_NEAR_HIGH_LOOKBACK_BARS');
+  assert.equal(overrideEvent.payload.discardedValue, '60');
+  assert.equal(overrideEvent.payload.appliedValue, '30');
+});
+
+// 12. Stale '60' WITH escape hatch → preserved, bypass event emitted.
+withNearHighEnv(
+  { REJECT_NEAR_HIGH_LOOKBACK_BARS: '60', REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60: 'true' },
+  () => {
+    const events = withCapturedLog((logger) => {
+      const result = applySafetyOverridesToEnv({ logger });
+      assert.equal(result.overridden, 0);
+      assert.equal(result.bypassed, 1, 'escape hatch should record a bypass');
+    });
+    assert.equal(process.env.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60', 'escape hatch must preserve 60');
+    const bypassEvent = events.find(
+      (e) => e.event === 'config_safety_override_bypassed' && e.payload.key === 'REJECT_NEAR_HIGH_LOOKBACK_BARS',
+    );
+    assert.ok(bypassEvent, 'bypass event must be emitted');
+    assert.equal(bypassEvent.payload.escapeHatchEnv, 'REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60');
+  },
+);
+
+// 13. Any other explicit value ('30', '45', '90') → no override, no events.
+//     Only the specific '60' string trips the override.
+for (const safeValue of ['30', '45', '90']) {
+  withNearHighEnv({ REJECT_NEAR_HIGH_LOOKBACK_BARS: safeValue }, () => {
+    const events = withCapturedLog((logger) => {
+      const result = applySafetyOverridesToEnv({ logger });
+      assert.equal(result.overridden, 0, `value ${safeValue} must not trigger override`);
+      assert.equal(result.bypassed, 0);
+    });
+    assert.equal(process.env.REJECT_NEAR_HIGH_LOOKBACK_BARS, safeValue);
+    const overrideEvent = events.find(
+      (e) => e.event === 'config_safety_override' && e.payload.key === 'REJECT_NEAR_HIGH_LOOKBACK_BARS',
+    );
+    assert.ok(!overrideEvent, `value ${safeValue} must not emit override event`);
+  });
+}
 
 console.log('bootstrapLiveEnv.test passed');

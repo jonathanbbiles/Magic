@@ -56,6 +56,17 @@ const SAFETY_OVERRIDES = Object.freeze({
       + 'directly attributable to spread-crossing entries. The 36.85 bps avg entry spread '
       + 'paid in that window does not fit inside any current backtest expectancy.',
   }),
+  REJECT_NEAR_HIGH_LOOKBACK_BARS: Object.freeze({
+    unsafeValue: '60',
+    forcedValue: '30',
+    escapeHatchEnv: 'REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60',
+    rationale:
+      'Live 30-day MR backtest rejected 159,907 of 322,438 candidates on this gate (49.6%) at '
+      + 'lookback=60. The 60-min window pinned the gate to peaks ~45 min stale that fresh '
+      + 'capitulation entries do not actually care about. Code default flipped to 30 bars; '
+      + 'stale Render env values carrying the prior 60 get forced back so a forgotten override '
+      + 'does not silently defeat the Stage 1 trade-frequency restoration.',
+  }),
 });
 
 const SAFETY_OVERRIDE_KEYS = Object.freeze(Object.keys(SAFETY_OVERRIDES));

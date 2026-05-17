@@ -196,11 +196,20 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: '-2.0',
   // Recent-high proximity gate: refuses entries within REJECT_NEAR_HIGH_BPS
   // of the highest close in the last REJECT_NEAR_HIGH_LOOKBACK_BARS minutes.
-  // Defaults: refuse within 30 bps of the last-60-bar high. Directly blocks
-  // the "bought at the top, got stuck" failure mode.
+  // Defaults: refuse within 30 bps of the last-30-bar high.
+  //
+  // 2026-05-17 lookback flip 60 → 30: the live 30-day MR backtest rejected
+  // 159,907 of 322,438 candidates on this gate (49.6%). After a real 1%
+  // capitulation drop the price is usually well below where it was 5–10 min
+  // ago, but a 60-min lookback was still pinning the gate to peaks from
+  // 45 min ago that mean-reversion entries don't actually care about. The
+  // 30-bar window keeps the "don't buy the very top" intent intact while
+  // unblocking MR entries that have already left the recent peak. Old
+  // 60-bar value is guarded by SAFETY_OVERRIDES in bootstrapLiveEnv.js;
+  // escape hatch REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60=true.
   REJECT_NEAR_HIGH_ENABLED: 'true',
   REJECT_NEAR_HIGH_BPS: '30',
-  REJECT_NEAR_HIGH_LOOKBACK_BARS: '60',
+  REJECT_NEAR_HIGH_LOOKBACK_BARS: '30',
   CRYPTO_QUOTE_MAX_AGE_OVERRIDE_ENABLED: 'false',
   ORDERBOOK_SPARSE_FALLBACK_ENABLED: 'true',
   ORDERBOOK_SPARSE_FALLBACK_SYMBOLS: 'BTC/USD,ETH/USD',
