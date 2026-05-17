@@ -103,6 +103,7 @@ const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
+const { resolveLiveEngineFallbacks } = require('./modules/backtestEnvFallbacks');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -745,6 +746,24 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY
       || (liveSymbols ? liveSymbols.join(',') : 'BTC/USD,ETH/USD');
     const days = Math.max(1, Number(overrides.days) || BACKTEST_AUTORUN_DAYS);
+    // Env-derived fallbacks for "live engine" knobs (2026-05-17). Without
+    // these, the auto-backtest (which doesn't pass per-knob overrides) falls
+    // through to backtest_strategy.js's hardcoded DEFAULTS — e.g.
+    // rejectNearHighLookbackBars=60 even when the live engine is using 30
+    // from the env bridge. The resolver below applies the priority chain:
+    //   explicit override > process.env > backtester hardcoded default
+    // so the dashboard auto-backtest reflects the live engine instead of a
+    // stale world. /debug/backtest query-string overrides still win over env.
+    const liveEngineFallbacks = resolveLiveEngineFallbacks(overrides, process.env);
+    const {
+      rejectNearHighBps: rejectNearHighBpsResolved,
+      rejectNearHighLookbackBars: rejectNearHighLookbackBarsResolved,
+      mrDropTriggerBps: mrDropTriggerBpsResolved,
+      mrVolConfirmMultiplier: mrVolConfirmMultiplierResolved,
+      mrMaxBtcDropBps: mrMaxBtcDropBpsResolved,
+      mrRsiOversold: mrRsiOversoldResolved,
+      mrDeepDropGuardBps: mrDeepDropGuardBpsResolved,
+    } = liveEngineFallbacks;
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
       windowDays: days,
@@ -765,8 +784,8 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mfBtcLagRequired != null ? { mfBtcLagRequired: String(overrides.mfBtcLagRequired) === 'true' } : {}),
       ...(overrides.mfVolumeRequired != null ? { mfVolumeRequired: String(overrides.mfVolumeRequired) === 'true' } : {}),
       ...(overrides.rejectNearHighEnabled != null ? { rejectNearHighEnabled: String(overrides.rejectNearHighEnabled) === 'true' } : {}),
-      ...(overrides.rejectNearHighBps != null ? { rejectNearHighBps: Number(overrides.rejectNearHighBps) } : {}),
-      ...(overrides.rejectNearHighLookbackBars != null ? { rejectNearHighLookbackBars: Number(overrides.rejectNearHighLookbackBars) } : {}),
+      ...(rejectNearHighBpsResolved != null ? { rejectNearHighBps: Number(rejectNearHighBpsResolved) } : {}),
+      ...(rejectNearHighLookbackBarsResolved != null ? { rejectNearHighLookbackBars: Number(rejectNearHighLookbackBarsResolved) } : {}),
       ...(overrides.entrySpreadCostBps != null ? { entrySpreadCostBps: Number(overrides.entrySpreadCostBps) } : {}),
       ...(overrides.entryFillTimeoutMin != null ? { entryFillTimeoutMin: Number(overrides.entryFillTimeoutMin) } : {}),
       ...(overrides.mfMaxHoldMin != null ? { mfMaxHoldMin: Number(overrides.mfMaxHoldMin) } : {}),
@@ -777,12 +796,12 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mrStopLossBpsTier3 != null ? { mrStopLossBpsTier3: Number(overrides.mrStopLossBpsTier3) } : {}),
       ...(overrides.mrMaxHoldMin != null ? { mrMaxHoldMin: Number(overrides.mrMaxHoldMin) } : {}),
       ...(overrides.mrBreakevenTimeoutMin != null ? { mrBreakevenTimeoutMin: Number(overrides.mrBreakevenTimeoutMin) } : {}),
-      ...(overrides.mrDropTriggerBps != null ? { mrDropTriggerBps: Number(overrides.mrDropTriggerBps) } : {}),
+      ...(mrDropTriggerBpsResolved != null ? { mrDropTriggerBps: Number(mrDropTriggerBpsResolved) } : {}),
       ...(overrides.mrVolMultiplier != null ? { mrVolMultiplier: Number(overrides.mrVolMultiplier) } : {}),
-      ...(overrides.mrVolConfirmMultiplier != null ? { mrVolConfirmMultiplier: Number(overrides.mrVolConfirmMultiplier) } : {}),
-      ...(overrides.mrMaxBtcDropBps != null ? { mrMaxBtcDropBps: Number(overrides.mrMaxBtcDropBps) } : {}),
-      ...(overrides.mrRsiOversold != null ? { mrRsiOversold: Number(overrides.mrRsiOversold) } : {}),
-      ...(overrides.mrDeepDropGuardBps != null ? { mrDeepDropGuardBps: Number(overrides.mrDeepDropGuardBps) } : {}),
+      ...(mrVolConfirmMultiplierResolved != null ? { mrVolConfirmMultiplier: Number(mrVolConfirmMultiplierResolved) } : {}),
+      ...(mrMaxBtcDropBpsResolved != null ? { mrMaxBtcDropBps: Number(mrMaxBtcDropBpsResolved) } : {}),
+      ...(mrRsiOversoldResolved != null ? { mrRsiOversold: Number(mrRsiOversoldResolved) } : {}),
+      ...(mrDeepDropGuardBpsResolved != null ? { mrDeepDropGuardBps: Number(mrDeepDropGuardBpsResolved) } : {}),
       ...(overrides.mrTimeframe ? { mrTimeframe: String(overrides.mrTimeframe) } : {}),
       ...(overrides.rangeMrDropTriggerBps != null ? { rangeMrDropTriggerBps: Number(overrides.rangeMrDropTriggerBps) } : {}),
       ...(overrides.rangeMrMaxRangePct != null ? { rangeMrMaxRangePct: Number(overrides.rangeMrMaxRangePct) } : {}),

@@ -39,6 +39,14 @@ That signal has been restored in `backend/modules/barrierSignal.js` as a **backt
 
 ---
 
+## 2026-05-17 (visibility fix) auto-backtest now mirrors live engine knobs
+
+Discovered after the Stage 1+2 deploy: `meta.backtest.params.rejectNearHighLookbackBars` was still showing `60` on the dashboard despite the code default flipping to `30` and the live engine using `30`. Root cause: `runBacktestAndStore` in `backend/index.js` was only passing `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` to the backtester; everything else fell through to `backtest_strategy.js`'s own hardcoded `DEFAULTS` (which include `rejectNearHighLookbackBars: 60`). The auto-backtest was therefore simulating a hypothetical 60-bar world instead of reflecting what the live engine was doing with 30.
+
+New helper `backend/modules/backtestEnvFallbacks.js` resolves the seven "live engine" knobs (`rejectNearHighBps`, `rejectNearHighLookbackBars`, `mrDropTriggerBps`, `mrVolConfirmMultiplier`, `mrMaxBtcDropBps`, `mrRsiOversold`, `mrDeepDropGuardBps`) from `process.env` when the auto-backtest caller doesn't pass them explicitly. Resolution priority: `explicit override > process.env > backtester hardcoded default`. `/debug/backtest?...` query-string overrides still win (existing behavior preserved). After this lands, the dashboard auto-backtest payload reflects the live engine — Stage 1's 30-bar default and any Stage 2 MR knob flips become visible without me having to remember to plumb each one.
+
+---
+
 ## 2026-05-17 (later same day) Stage 1+2: recent-high lookback flip + MR sub-gate plumbing
 
 The dashboard's 30-day backtest payload showed 159,907 of 322,438 candidate evaluations (49.6%) rejected on `near_recent_high` and another 162,387 (50.4%) on `mr_no_drop` — together those two gates account for essentially every refusal. The drop-trigger gate has direct in-code A/B evidence backing the 100-bps threshold (loosening to 80 bps flipped expectancy from +14.91 → −24 bps net), so this PR explicitly does NOT touch it. The recent-high gate has no comparable evidence and was the safer first lever.
