@@ -38,7 +38,9 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 
 ## Entry signal flag
 
-`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion (plus the Phase 1 MR variants when `PHASE1_ENABLED=true`) clears `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17; sample-size guard `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` is the real safety net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
+`SIGNAL_VERSION` selects which entry signal the scan uses. **Default `''` (auto-select via `backend/modules/signalSelector.js`)** as of the 2026-05-16 re-flip — the selector picks whichever of OLS / multi_factor / mean_reversion / barrier (plus the Phase 1 MR variants when `PHASE1_ENABLED=true`) clears `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17; sample-size guard `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` is the real safety net) in its most recent 30-day backtest. With the selector veto on (now the default), no-edge windows refuse all entries instead of trading at -37 bps. **Do not pin to `multi_factor` until the validation gates documented in the README's "Strategy economics" SIGNAL_VERSION row have been cleared on real Alpaca bars** — the multi_factor code path ships ready-to-test, not validated. Emergency rollback to force-trade OLS regardless of backtest: `SIGNAL_VERSION=ols` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env.
+
+`SIGNAL_VERSION=barrier` (added 2026-05-17) is the **restored original signal** from commit `fbdb924` (the project's initial commit). Trade-construction signal using barrier-touch probability theory + EWMA-vol-scaled stops + EMA-based momentum + intra-spread micro-momentum + (optional) orderbook bias. Targets ~100 bps net per trade — NOT a tiny scalp; the math only works at this scale because retail Alpaca fees (~30 bps round-trip) eat any smaller target. Module at `backend/modules/barrierSignal.js`. `BARRIER_ENABLED=false` disables the auto-backtest entirely.
 
 ## Live posture is now the code default (2026-05-16, extended 2026-05-17)
 
@@ -67,7 +69,8 @@ The entry-scan quote loop batches `/latest/quotes` calls via `prefetchQuotesForC
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
-- Math: `backend/modules/entryProbability.js`, `multiFactorSignal.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
+- Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924)
+- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`

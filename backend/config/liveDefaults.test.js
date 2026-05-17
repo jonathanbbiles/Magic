@@ -83,6 +83,15 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.CONCURRENT_POSITIONS_SOFT_CAP_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ADAPTIVE_SIZING_ENABLED, 'true');
 
+// 2026-05-17: Barrier signal restored as a backtested candidate. The signal
+// (from commit fbdb924, the project's initial commit) targets ~100 bps net
+// per trade — different scale from the MR-class signals. The auto-selector
+// + veto decide whether it has live edge under current market conditions.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_STOP_LOSS_BPS, '100');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_MAX_HOLD_MS, '21600000');      // 6 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_BREAKEVEN_TIMEOUT_MS, '10800000'); // 3 h
+
 // 2026-05-15 rollback: exit defaults restored to the pre-claude values.
 // MAX_HOLD_MS=6h gives positions σ-time to reach the TP. BREAKEVEN_TIMEOUT
 // =2h walks the TP toward break-even on a realistic decay. STOP_LOSS_BPS

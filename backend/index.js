@@ -666,6 +666,11 @@ let lastBacktestMeanRev15m = null;
 // inside an established range; much more frequent triggers than the
 // capitulation MR signal.
 let lastBacktestRangeMr = null;
+// Barrier signal backtest slot — the restored original signal from commit
+// fbdb924. Targets ~100 bps net per trade via barrier-touch probability
+// theory + micro-momentum + EMA momentum. Feeds the signal selector as
+// another candidate alongside OLS/MF/MR variants.
+let lastBacktestBarrier = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -675,7 +680,7 @@ let backtestRunning = false;
 // in backend/modules/signalSelector.js; this is just the integration glue.
 function refreshSignalSelectorDecision(reason = 'manual') {
   const operatorOverrideRaw = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion'].includes(operatorOverrideRaw)
+  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion', 'barrier'].includes(operatorOverrideRaw)
     ? operatorOverrideRaw
     : null;
   const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
@@ -702,6 +707,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     meanRev5mBacktest: lastBacktestMeanRev5m,
     meanRev15mBacktest: lastBacktestMeanRev15m,
     rangeMrBacktest: lastBacktestRangeMr,
+    barrierBacktest: lastBacktestBarrier,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -717,6 +723,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     meanRev5mNetBps: decision.meanRev5mNetBps,
     meanRev15mNetBps: decision.meanRev15mNetBps,
     rangeMrNetBps: decision.rangeMrNetBps,
+    barrierNetBps: decision.barrierNetBps,
     activeNetBps: decision.activeNetBps,
     operatorOverride,
     backtestRanAt: decision.backtestRanAt,
@@ -793,13 +800,14 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     else if (slot === 'mean_rev_5m') lastBacktestMeanRev5m = stored;
     else if (slot === 'mean_rev_15m') lastBacktestMeanRev15m = stored;
     else if (slot === 'range_mr') lastBacktestRangeMr = stored;
+    else if (slot === 'barrier') lastBacktestBarrier = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
     // Refresh the signal selector decision now that fresh evidence is in for
     // this slot. The selector consumes the primary / mf / mean_rev / mean_rev_5m
-    // / mean_rev_15m / range_mr slots; alt / alt2 are sensitivity studies.
-    if (['primary', 'mf', 'mean_rev', 'mean_rev_5m', 'mean_rev_15m', 'range_mr'].includes(slot)) {
+    // / mean_rev_15m / range_mr / barrier slots; alt / alt2 are sensitivity studies.
+    if (['primary', 'mf', 'mean_rev', 'mean_rev_5m', 'mean_rev_15m', 'range_mr', 'barrier'].includes(slot)) {
       refreshSignalSelectorDecision(`after_backtest_${slot}`);
     }
     return stored;
@@ -1322,6 +1330,15 @@ app.get('/dashboard', async (req, res) => {
           gateSkipped: lastBacktestRangeMr.gateSkipped || null,
           note: 'Phase 1: range mean-reversion signal candidate. Smaller drops within established price ranges; high-frequency tiny wins.',
         } : null,
+        backtestBarrier: lastBacktestBarrier ? {
+          ranAt: lastBacktestBarrier.ranAt,
+          windowDays: lastBacktestBarrier.windowDays,
+          params: lastBacktestBarrier.params,
+          overall: lastBacktestBarrier.overall,
+          perSymbol: lastBacktestBarrier.perSymbol,
+          gateSkipped: lastBacktestBarrier.gateSkipped || null,
+          note: 'Barrier signal candidate (restored from commit fbdb924). Trade-construction signal: barrier-touch probability + micro-momentum + EMA momentum, targets ~100 bps net per trade.',
+        } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
           return {
@@ -1332,6 +1349,7 @@ app.get('/dashboard', async (req, res) => {
             olsNetBps: decision.olsNetBps,
             mfNetBps: decision.mfNetBps,
             meanRevNetBps: decision.meanRevNetBps,
+            barrierNetBps: decision.barrierNetBps,
             activeNetBps: decision.activeNetBps,
             operatorOverride: decision.operatorOverride,
             backtestRanAt: decision.backtestRanAt,
@@ -2243,6 +2261,16 @@ if (backtestSkipReason) {
       await runBacktestAndStore({
         strategy: 'range_mean_reversion',
       }, 'range_mr').catch(() => {});
+    }
+    // Barrier signal auto-run — restored original signal (commit fbdb924).
+    // Targets ~100 bps net per trade via barrier-touch probability theory.
+    // Gated on BARRIER_ENABLED so it can be turned off independently of
+    // Phase 1 (it predates Phase 1 — it's the project's original signal).
+    // Default-on so the selector sees it as a candidate from day one.
+    if (String(process.env.BARRIER_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'barrier',
+      }, 'barrier').catch(() => {});
     }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }

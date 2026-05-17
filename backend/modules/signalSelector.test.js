@@ -207,4 +207,73 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(d.reason, 'pre_backtest_operator_override_with_veto_disabled');
 }
 
+// 19. Barrier candidate wins when it has highest net bps.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: 4, entries: 200 }),
+    mfBacktest: bt({ avgNetBpsPerEntry: 6, entries: 100 }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 12, entries: 50 }),
+    barrierBacktest: bt({ avgNetBpsPerEntry: 18, entries: 80 }),
+  });
+  assert.equal(d.signalVersion, 'barrier', 'barrier wins on higher net bps');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.activeNetBps, 18);
+  assert.equal(d.barrierNetBps, 18);
+  assert.equal(d.reason, 'selected_barrier_higher_net_bps');
+}
+
+// 20. Barrier loses to MR when MR is higher.
+{
+  const d = pickActiveSignal({
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 25, entries: 30 }),
+    barrierBacktest: bt({ avgNetBpsPerEntry: 12, entries: 80 }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion');
+  assert.equal(d.activeNetBps, 25);
+  assert.equal(d.barrierNetBps, 12, 'barrier net bps still reported');
+}
+
+// 21. Barrier vetoed below sample-size floor.
+{
+  const d = pickActiveSignal({
+    barrierBacktest: bt({ avgNetBpsPerEntry: 50, entries: 3 }),
+  });
+  assert.equal(d.signalVersion, null, 'tiny sample fails floor');
+  assert.equal(d.tradingVeto, true);
+  assert.equal(d.barrierNetBps, 50, 'value still recorded');
+}
+
+// 22. Barrier as the only validated candidate → picked.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: -40, entries: 1000 }),
+    mfBacktest: bt({ avgNetBpsPerEntry: -35, entries: 800 }),
+    barrierBacktest: bt({ avgNetBpsPerEntry: 8, entries: 25 }),
+  });
+  assert.equal(d.signalVersion, 'barrier');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.reason, 'selected_barrier_only_validated');
+}
+
+// 23. Operator override to barrier — validated.
+{
+  const d = pickActiveSignal({
+    barrierBacktest: bt({ avgNetBpsPerEntry: 9, entries: 20 }),
+    operatorOverride: 'barrier',
+  });
+  assert.equal(d.signalVersion, 'barrier');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.reason, 'operator_override_validated');
+}
+
+// 24. Operator override to barrier with no backtest → use it but set veto.
+{
+  const d = pickActiveSignal({
+    operatorOverride: 'barrier',
+  });
+  assert.equal(d.signalVersion, 'barrier');
+  assert.equal(d.tradingVeto, true, 'no validation → veto fires');
+  assert.equal(d.reason, 'operator_override_not_validated');
+}
+
 console.log('signalSelector.test ok');
