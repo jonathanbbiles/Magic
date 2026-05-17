@@ -37,6 +37,7 @@ const {
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
+const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -196,6 +197,7 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_5m'
       || signalVersion === 'mean_reversion_15m') return MR_MAX_HOLD_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_MAX_HOLD_MS;
+  if (signalVersion === 'barrier') return BARRIER_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
@@ -204,6 +206,7 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_5m'
       || signalVersion === 'mean_reversion_15m') return MR_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'barrier') return BARRIER_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -286,6 +289,16 @@ const RANGE_MR_STOP_LOSS_BPS = Math.max(1, readNumber('RANGE_MR_STOP_LOSS_BPS', 
 const RANGE_MR_MAX_HOLD_MS = Math.max(60_000, readNumber('RANGE_MR_MAX_HOLD_MS', 1_800_000));
 const RANGE_MR_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('RANGE_MR_BREAKEVEN_TIMEOUT_MS', 900_000));
 
+// Barrier signal exit-timing knobs. The signal targets a larger net TP
+// (default 100 bps) than MR/Range-MR and uses a vol-scaled stop sized for
+// barrier-touch probability. Hold timing matches the multi-factor signal
+// because the per-trade target magnitude is similar (~100 bps gross). The
+// stop cap is wider than the OLS default since the TP is also wider — a
+// 35 bps stop against a 100 bps target instantly inverts the R:R.
+const BARRIER_STOP_LOSS_BPS = Math.max(1, readNumber('BARRIER_STOP_LOSS_BPS', 100));
+const BARRIER_MAX_HOLD_MS = Math.max(60_000, readNumber('BARRIER_MAX_HOLD_MS', 21_600_000));     // 6 h
+const BARRIER_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('BARRIER_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
+
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
@@ -301,6 +314,7 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
     cap = isTier3 ? MR_STOP_LOSS_BPS_TIER3 : MR_STOP_LOSS_BPS;
   }
   else if (signalVersion === 'range_mean_reversion') cap = RANGE_MR_STOP_LOSS_BPS;
+  else if (signalVersion === 'barrier') cap = BARRIER_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -600,7 +614,7 @@ const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 
 // own factor vote replaces them. Structural gates (drawdown, sizing,
 // freshness, spread, vol-cap, HTF) still apply to both signals.
 const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-const SIGNAL_VERSION_OPERATOR_OVERRIDE = ['ols', 'multi_factor', 'mean_reversion'].includes(SIGNAL_VERSION_RAW)
+const SIGNAL_VERSION_OPERATOR_OVERRIDE = ['ols', 'multi_factor', 'mean_reversion', 'barrier'].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW
   : null;
 const SIGNAL_VERSION_MODE = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'auto';
@@ -1631,6 +1645,33 @@ async function getRangeMeanReversionSignalForPair(pair) {
   }
 }
 
+// Barrier signal wrapper — restored from the project's initial commit
+// (fbdb924, Jan 18 2026). The signal needs 16 1m bars (EWMA vol + EMA
+// momentum lookback), the live quote (for spread + micro-momentum) and
+// (optionally) the orderbook for the obBias term. Fetches in parallel
+// matching the multi-factor wrapper's pattern.
+async function getBarrierSignalForPair(pair, quote = null) {
+  try {
+    const [bars1mPayload, obPayload] = await Promise.all([
+      fetchCryptoBars({ symbols: [pair], limit: 16, timeframe: '1Min' }),
+      fetchCryptoOrderbooks({ symbols: [pair] }).catch((err) => {
+        console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
+        return { orderbooks: {} };
+      }),
+    ]);
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    return evaluateBarrierSignal({
+      pair,
+      bars1m,
+      orderbook,
+      quote: quote ? { bid: Number(quote.bp), ask: Number(quote.ap) } : null,
+    });
+  } catch (err) {
+    return { ok: false, reason: 'barrier_signal_failed', error: err?.message };
+  }
+}
+
 // --- engine state -------------------------------------------------------
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
@@ -2248,6 +2289,8 @@ async function scanAndEnter() {
         sig = await getMeanReversionSignalForPair(pair, '15m');
       } else if (ACTIVE_SIGNAL_VERSION === 'range_mean_reversion') {
         sig = await getRangeMeanReversionSignalForPair(pair);
+      } else if (ACTIVE_SIGNAL_VERSION === 'barrier') {
+        sig = await getBarrierSignalForPair(pair, quote);
       } else {
         sig = await getPredictionSignal(pair);
       }

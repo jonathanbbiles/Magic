@@ -51,6 +51,7 @@ const path = require('path');
 const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal');
 const { evaluateRangeMeanReversionSignal } = require('../modules/rangeMeanReversionSignal');
+const { evaluateBarrierSignal } = require('../modules/barrierSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
@@ -181,6 +182,24 @@ const DEFAULTS = {
   rangeMrStopLossBps: 40,
   rangeMrMaxHoldMin: 30,
   rangeMrBreakevenTimeoutMin: 15,
+  // Barrier strategy params (only consulted when strategy='barrier').
+  // Mirror the BARRIER_* live env knobs so backtest parity holds.
+  barrierDesiredNetBps: 100,           // matches BARRIER_DESIRED_NET_BPS default
+  barrierStopFloorBps: 60,             // matches DEFAULT_CONFIG.stopFloorBps
+  barrierStopVolMult: 2.5,             // matches DEFAULT_CONFIG.stopVolMult
+  barrierVolHalfLifeMin: 6,            // matches DEFAULT_CONFIG.volHalfLifeMin
+  barrierEvMinBps: -1,                 // matches DEFAULT_CONFIG.evMinBps
+  barrierRiskLevel: 2,                 // matches DEFAULT_CONFIG.riskLevel
+  // Engine-level sizing clamps for the barrier-derived TP. Floor=8 keeps
+  // alignment with other tiny-target signals; cap=150 keeps the engine
+  // from posting an unreachable TP if the signal produces a freak value.
+  barrierTargetNetBpsFloor: 8,
+  barrierSignalTargetMaxNetBps: 150,
+  // Stop cap fallback when the signal's per-trade dynamic stop is missing.
+  // Matches BARRIER_STOP_LOSS_BPS default in trade.js.
+  barrierStopLossBps: 100,
+  barrierMaxHoldMin: 360,
+  barrierBreakevenTimeoutMin: 180,
   // Override signal-config knobs (passed through to evaluateMeanReversionSignal
   // via the cfg parameter). Leave null to use the module defaults.
   mrDropTriggerBps: null,
@@ -461,6 +480,7 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const isMultiFactor = strategy === 'multi_factor';
   const isMeanReversion = strategy === 'mean_reversion';
   const isRangeMr = strategy === 'range_mean_reversion';
+  const isBarrier = strategy === 'barrier';
   // Phase 1: timeframe selector for the mean-reversion signal. '1m' (default)
   // runs the existing 1m-bar logic; '5m' / '15m' synthesize coarser bars from
   // the same 1m series. The selector compares all three variants to pick the
@@ -647,6 +667,61 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       const raw = rangeSig.projectedBps - fees;
       signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
       stopLossBpsAbsForTrade = Math.max(0, Number(opts.rangeMrStopLossBps) || 0);
+    } else if (isBarrier) {
+      // Barrier signal: needs the most recent 16 1m bars + an in-progress
+      // bar (= 17 closed bars in the window so the signal sees 16 closed
+      // bars in slice(-16)). The signal is stateless; orderbook is null
+      // in backtest (matches the live caveat that orderbook bias degrades
+      // gracefully). Quote is also null in backtest (the signal falls
+      // back to the most recent close for mid + a synthetic 0-bp spread,
+      // matching the OLS/MR convention that the bar close represents the
+      // fill reference; the half-spread cost is applied downstream by
+      // halfSpreadBpsTierAware).
+      const need = 17;
+      if (i + 1 < need) {
+        if (!stats.skipped.barrier_insufficient_bars) stats.skipped.barrier_insufficient_bars = 0;
+        stats.skipped.barrier_insufficient_bars += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] });  // synthetic in-progress
+      const barrierCfg = {};
+      if (Number.isFinite(opts.barrierDesiredNetBps)) barrierCfg.desiredNetBps = opts.barrierDesiredNetBps;
+      if (Number.isFinite(opts.barrierStopFloorBps)) barrierCfg.stopFloorBps = opts.barrierStopFloorBps;
+      if (Number.isFinite(opts.barrierStopVolMult)) barrierCfg.stopVolMult = opts.barrierStopVolMult;
+      if (Number.isFinite(opts.barrierVolHalfLifeMin)) barrierCfg.volHalfLifeMin = opts.barrierVolHalfLifeMin;
+      if (Number.isFinite(opts.barrierEvMinBps)) barrierCfg.evMinBps = opts.barrierEvMinBps;
+      if (Number.isFinite(opts.barrierRiskLevel)) barrierCfg.riskLevel = opts.barrierRiskLevel;
+      if (Number.isFinite(opts.feeBpsRoundTrip)) barrierCfg.feeBpsRoundTrip = opts.feeBpsRoundTrip;
+      if (Number.isFinite(opts.entrySlippageBps)) barrierCfg.slippageBps = opts.entrySlippageBps;
+      const barrierSig = evaluateBarrierSignal({
+        pair: bars[i]?.S || null,
+        bars1m: window,
+        orderbook: null,
+        quote: null,
+        config: barrierCfg,
+      });
+      if (!barrierSig?.ok) {
+        const reason = barrierSig?.reason || 'barrier_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: barrierSig.projectedBps };
+      // Barrier sizing: signal returns projectedBps = required GROSS exit
+      // bps (already includes fees + spread + slippage to clear the
+      // desiredNetBps target). Net = projected - fees, clamped to
+      // [floor, cap]. Stop = signal's own dynamic stop (factors.stopBps).
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.barrierTargetNetBpsFloor) || 8;
+      const cap = Number(opts.barrierSignalTargetMaxNetBps) || 150;
+      const raw = barrierSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      // Use the per-trade dynamic stop the signal computed; fall back to
+      // the engine-level cap if absent.
+      stopLossBpsAbsForTrade = Number.isFinite(barrierSig.factors?.stopBps)
+        ? Math.max(0, barrierSig.factors.stopBps)
+        : Math.max(0, Number(opts.barrierStopLossBps) || 100);
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -802,6 +877,9 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isRangeMr) {
       activeMaxHoldMin = Number(opts.rangeMrMaxHoldMin || opts.maxHoldMin || 30);
       activeBreakevenMin = Number(opts.rangeMrBreakevenTimeoutMin || opts.breakevenTimeoutMin || 15);
+    } else if (isBarrier) {
+      activeMaxHoldMin = Number(opts.barrierMaxHoldMin || opts.maxHoldMin || 0);
+      activeBreakevenMin = Number(opts.barrierBreakevenTimeoutMin || opts.breakevenTimeoutMin || 180);
     } else {
       activeMaxHoldMin = Number(opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);

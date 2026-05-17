@@ -364,6 +364,110 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
   assert.equal(trades.length, 0, 'always_fail orderbook proxy must block every multi_factor entry');
 }
 
+// --- Barrier strategy in backtest ------------------------------------------
+
+// Barrier strategy: dispatch plumbing test. The signal needs 17+ bars of
+// history (16 closed + 1 in-progress) before it can evaluate. A monotonic
+// uptrend with low vol and positive momentum should fire at least one
+// entry; we assert >0 and that the per-trade target is reasonable.
+{
+  const opts = {
+    strategy: 'barrier',
+    predictBars: 16,
+    signalTargetFraction: 1.0,
+    targetNetBps: 8,
+    signalTargetMaxNetBps: 50,
+    feeBpsRoundTrip: 30,
+    breakevenTimeoutMin: 180,
+    cooldownAfterEntryBars: 10,
+    enforceProjectedCoversGross: false,
+    minVolumeRatio: 0,
+    maxBtcLeadLagDropBps: 0,
+    htfMinSlopeBpsPerBar: 0,
+    maxHoldMin: 0,
+    stopLossBps: 0,
+    rejectNearHighEnabled: false,
+    entrySpreadCostBps: 0,
+    entryFillTimeoutMin: 0,
+    barrierDesiredNetBps: 100,
+    barrierStopFloorBps: 60,
+    barrierStopVolMult: 2.5,
+    barrierVolHalfLifeMin: 6,
+    barrierEvMinBps: -1,
+    barrierRiskLevel: 2,
+    barrierTargetNetBpsFloor: 8,
+    barrierSignalTargetMaxNetBps: 150,
+    barrierStopLossBps: 100,
+    entrySlippageBps: 3,
+    exitSlippageBps: 3,
+  };
+  // Steady 5 bps/bar uptrend, 80 bars total. The first 16 bars are warmup
+  // (barrier needs 17 closed bars in window: i+1 >= 17). Subsequent bars
+  // should produce at least one signal fire.
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 80; i += 1) {
+    p *= 1 + 5 / 10000;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, 0, i * 60)).toISOString(),
+      o: p, h: p * 1.0005, l: p * 0.9995, c: p, v: 1000, S: 'BTC/USD',
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  assert.ok(trades.length >= 1, `expected >=1 barrier trade on uptrend, got ${trades.length}`);
+  for (const t of trades) {
+    assert.ok(t.targetNetBps >= 8, `target must respect floor, got ${t.targetNetBps}`);
+    assert.ok(t.targetNetBps <= 150, `target must respect cap, got ${t.targetNetBps}`);
+  }
+}
+
+// Barrier strategy: downtrend rejects via EV gate (pUp falls below 0.5 from
+// negative micro/momentum, EV computed against larger stop than TP goes
+// negative). Should produce zero entries.
+{
+  const opts = {
+    strategy: 'barrier',
+    predictBars: 16,
+    signalTargetFraction: 1.0,
+    targetNetBps: 8,
+    signalTargetMaxNetBps: 50,
+    feeBpsRoundTrip: 30,
+    breakevenTimeoutMin: 180,
+    cooldownAfterEntryBars: 10,
+    enforceProjectedCoversGross: false,
+    minVolumeRatio: 0,
+    maxBtcLeadLagDropBps: 0,
+    htfMinSlopeBpsPerBar: 0,
+    maxHoldMin: 0,
+    stopLossBps: 0,
+    rejectNearHighEnabled: false,
+    entrySpreadCostBps: 0,
+    entryFillTimeoutMin: 0,
+    barrierDesiredNetBps: 100,
+    barrierStopFloorBps: 60,
+    barrierStopVolMult: 2.5,
+    barrierVolHalfLifeMin: 6,
+    barrierEvMinBps: 0,   // tighten so any negative EV path rejects
+    barrierRiskLevel: 2,
+    barrierTargetNetBpsFloor: 8,
+    barrierSignalTargetMaxNetBps: 150,
+    barrierStopLossBps: 100,
+    entrySlippageBps: 3,
+    exitSlippageBps: 3,
+  };
+  const bars = [];
+  let p = 100;
+  for (let i = 0; i < 80; i += 1) {
+    p *= 1 - 5 / 10000;
+    bars.push({
+      t: new Date(Date.UTC(2026, 0, 1, 0, 0, i * 60)).toISOString(),
+      o: p, h: p * 1.0005, l: p * 0.9995, c: p, v: 1000, S: 'BTC/USD',
+    });
+  }
+  const trades = replaySymbol(bars, opts);
+  assert.equal(trades.length, 0, 'barrier must reject every bar in a sustained downtrend with evMinBps=0');
+}
+
 // runBacktest with a mocked global fetch (intercepts the Alpaca bars endpoint).
 {
   const origFetch = global.fetch;

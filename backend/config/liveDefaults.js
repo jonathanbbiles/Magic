@@ -271,6 +271,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // the static 10% sizing.
   ADAPTIVE_SIZING_ENABLED: 'true',
   MAX_SIZING_FRACTION_OF_TARGET: '1.5',
+  // Barrier signal — restored from commit fbdb924 (the project's initial
+  // commit). Trade-construction signal: barrier-touch probability + EWMA
+  // vol-scaled stop + EMA momentum + micro-momentum + orderbook bias.
+  // Targets ~100 bps net per trade (NOT a tiny scalp — the math only
+  // works at this scale; smaller targets are eaten by fees+slippage).
+  // BARRIER_ENABLED=false disables the auto-backtest entirely (signal
+  // selector won't see it as a candidate, and SIGNAL_VERSION=barrier
+  // becomes a no-op).
+  BARRIER_ENABLED: 'true',
+  BARRIER_STOP_LOSS_BPS: '100',
+  BARRIER_MAX_HOLD_MS: '21600000',     // 6 h (matches MF — similar TP magnitude)
+  BARRIER_BREAKEVEN_TIMEOUT_MS: '10800000',  // 3 h
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));
