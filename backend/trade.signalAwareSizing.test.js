@@ -155,4 +155,24 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
   assert.equal(noPair, 60, `MR with no pair should use tier-1/2 cap (60), got ${noPair}`);
 }
 
+// 15. Per-timeframe MR stop caps (Stage 3). At defaults the 5m and 15m
+// signal versions resolve to the SAME stop as the 1m variant — by design,
+// since MR_STOP_LOSS_BPS_5M / _15M default to MR_STOP_LOSS_BPS. This is the
+// zero-behavior-change check: until an operator sets one of the new env
+// vars, the per-timeframe dispatch produces identical numbers across all
+// three signalVersion strings.
+{
+  const tier1MrOneM = deriveStopLossBps(20, 5, 'mean_reversion', 'BTC/USD');
+  const tier1MrFiveM = deriveStopLossBps(20, 5, 'mean_reversion_5m', 'BTC/USD');
+  const tier1MrFifteenM = deriveStopLossBps(20, 5, 'mean_reversion_15m', 'BTC/USD');
+  assert.equal(tier1MrFiveM, tier1MrOneM, 'MR-5m default cap must match MR-1m');
+  assert.equal(tier1MrFifteenM, tier1MrOneM, 'MR-15m default cap must match MR-1m');
+
+  const tier3MrOneM = deriveStopLossBps(20, 5, 'mean_reversion', 'PEPE/USD');
+  const tier3MrFiveM = deriveStopLossBps(20, 5, 'mean_reversion_5m', 'PEPE/USD');
+  const tier3MrFifteenM = deriveStopLossBps(20, 5, 'mean_reversion_15m', 'PEPE/USD');
+  assert.equal(tier3MrFiveM, tier3MrOneM, 'MR-5m tier-3 default cap must match MR-1m tier-3');
+  assert.equal(tier3MrFifteenM, tier3MrOneM, 'MR-5m tier-3 default cap must match MR-1m tier-3');
+}
+
 console.log('trade.signalAwareSizing.test.js passed');

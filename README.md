@@ -39,6 +39,28 @@ That signal has been restored in `backend/modules/barrierSignal.js` as a **backt
 
 ---
 
+## 2026-05-17 Stage 3: per-timeframe MR stop caps
+
+The 30-day backtest after the visibility fix confirmed two things: Stage 1's lookback flip (60 → 30) didn't change MR-1m's entry count (still 7/month, +19.87 bps net) because `mr_no_drop` is the binding upstream gate, and the only MR variants that fire often enough to matter (MR-5m, MR-15m) currently lose money at the 60-bps tier-1/2 stop cap. MR-5m takes 54/131 = 41% stop_loss fills at avg -32.6 bps net; MR-15m takes 88/293 = 30% stop_loss fills at avg -29.2 bps net. The signal is *finding* trades — the problem is the stop is being hit too often on the coarser timeframes because their drops play out over longer windows where 60 bps of intraday noise is well within the natural intra-trade range.
+
+Lowering `MR_DROP_TRIGGER_BPS` is off the table (in-code A/B: 80-bps trigger flipped expectancy +14.91 → −24 bps net). The remaining knob path for turning MR-5m or MR-15m positive without touching the 1m signal is **widening the stop cap for the coarser timeframes only**. This PR adds that knob path.
+
+**New env vars** (defaults match the 1m cap exactly → zero behavior change until an operator opts in):
+- `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_5M_TIER3` — stop caps when the MR signal is evaluated on 5-minute bars.
+- `MR_STOP_LOSS_BPS_15M` / `MR_STOP_LOSS_BPS_15M_TIER3` — stop caps when evaluated on 15-minute bars.
+
+`deriveStopLossBps` in `backend/trade.js` now dispatches on `signalVersion` (`mean_reversion_5m`, `mean_reversion_15m`) to pick the right cap pair. The backtester (`backend/scripts/backtest_strategy.js`) follows the same dispatch based on `opts.mrTimeframe`. The env-fallback resolver (`backend/modules/backtestEnvFallbacks.js`) wires the four new env vars through to the auto-backtest so the dashboard reflects whatever value an operator sets in Render env.
+
+**The experiment to run after this lands:**
+```
+/debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100
+```
+If `overall.avgNetBpsPerEntry` is positive at the 100-bps 5m cap, set `MR_STOP_LOSS_BPS_5M=100` in Render env and the auto-selector will start admitting MR-5m as a validated signal — jumping live entry frequency from ~0.23/day (1m only) to roughly 4-5/day (1m + 5m combined). Same workflow for MR-15m with `mrTimeframe=15m&mrStopLossBps15m=120`.
+
+**Revert via Render env** (no code change needed): unset the new env vars or set them back to `60` / `100`. The 1m signal is unaffected by these knobs by construction.
+
+---
+
 ## 2026-05-17 (visibility fix) auto-backtest now mirrors live engine knobs
 
 Discovered after the Stage 1+2 deploy: `meta.backtest.params.rejectNearHighLookbackBars` was still showing `60` on the dashboard despite the code default flipping to `30` and the live engine using `30`. Root cause: `runBacktestAndStore` in `backend/index.js` was only passing `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` to the backtester; everything else fell through to `backtest_strategy.js`'s own hardcoded `DEFAULTS` (which include `rejectNearHighLookbackBars: 60`). The auto-backtest was therefore simulating a hypothetical 60-bar world instead of reflecting what the live engine was doing with 30.
@@ -383,6 +405,8 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `MR_SIGNAL_TARGET_MAX_NET_BPS` | `120` | Cap on per-trade net target for mean-reversion. Bounds the TP on freak drops; a 300-bps drop → 150 bps gross → 110 bps net (under the cap). |
 | `MR_STOP_LOSS_BPS` | `60` | Stop-loss cap for mean-reversion positions on tier-1/2 (deep-liquidity) symbols. Tight: 60 bps. The strategy thesis is "reversion happens fast or it doesn't" — wider stops just absorb the directional continuation we're fading against. Tier-3 alts use `MR_STOP_LOSS_BPS_TIER3` instead. |
 | `MR_STOP_LOSS_BPS_TIER3` | `100` | Stop-loss cap for mean-reversion positions on tier-3 (long-tail alt) symbols. Wider than the tier-1/2 cap because tier-3 spreads (~70-90 bps) consume most of the tier-1/2 cap before the trade can breathe. This makes `ENTRY_UNIVERSE_MODE=dynamic` safe to enable: without the tier-aware cap, vol-scaled MR stops were being clipped to 60 on alts where the spread floor alone already exceeded 60. Clamped at read so it cannot go below `MR_STOP_LOSS_BPS`. |
+| `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_5M_TIER3` | `60` / `100` | Per-timeframe stop caps for the MR-5m variant (2026-05-17 Stage 3). Default to the 1m caps so wiring is zero-behavior-change. Use these to widen the 5m stop independently from the 1m live signal. Live MR-5m at the 60-bps cap loses on 41% of fills at avg -32.6 bps net; widening toward 80-100 is the only knob path that could flip MR-5m positive without lowering `MR_DROP_TRIGGER_BPS` (forbidden by the in-code A/B). Backtest first: `/debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100`. |
+| `MR_STOP_LOSS_BPS_15M` / `MR_STOP_LOSS_BPS_15M_TIER3` | `60` / `100` | Same idea for the MR-15m variant. Live MR-15m at the 60-bps cap = -29.2 bps net. Per-timeframe knob lets you tune 15m independently from 1m and 5m. |
 | `MR_MAX_HOLD_MS` | `2700000` (45 min) | Hard time-based market exit for mean-reversion. Reversion that hasn't happened in 45 min isn't going to. |
 | `MR_BREAKEVEN_TIMEOUT_MS` | `1800000` (30 min) | Staircase decay window for mean-reversion: TP decays from initial target to break-even-after-fees over 30 min. |
 | `MR_DROP_TRIGGER_BPS` | `100` | Min cumulative 3-bar drop (bps) before MR considers an entry. **Do not lower below 100.** The in-code A/B (`backend/modules/meanReversionSignal.js:44-50`) showed an 80-bps trigger flipped expectancy from **+14.91 bps net (6 entries, 100% wins) to −24 bps net (27 entries, 63% wins)** because the half-drop TP shrinks toward the fee floor. Raise to require larger drops (rarer but higher-quality). |

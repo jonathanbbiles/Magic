@@ -102,6 +102,17 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // raising MR_STOP_LOSS_BPS_TIER3 widens the cushion on alts; lowering it
   // narrows the cushion (cannot go below MR_STOP_LOSS_BPS — clamped at read).
   MR_STOP_LOSS_BPS_TIER3: '100',
+  // Per-timeframe MR stop caps (2026-05-17 Stage 3). Defaults mirror the 1m
+  // caps so wiring is zero-behavior-change until an operator sets one. Use
+  // these to widen the 5m / 15m stops independently from the 1m variant
+  // that is currently the live signal — the only knob path that could turn
+  // MR-5m / MR-15m from negative to positive expectancy without lowering
+  // MR_DROP_TRIGGER_BPS (forbidden by the in-code A/B). Validate any flip
+  // via /debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m
+  MR_STOP_LOSS_BPS_5M: '60',
+  MR_STOP_LOSS_BPS_5M_TIER3: '100',
+  MR_STOP_LOSS_BPS_15M: '60',
+  MR_STOP_LOSS_BPS_15M_TIER3: '100',
   MR_MAX_HOLD_MS: '2700000',
   MR_BREAKEVEN_TIMEOUT_MS: '1800000',
   // 2026-05-16: was 'mid'. The 14-trade live scorecard from the
