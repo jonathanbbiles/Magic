@@ -59,8 +59,23 @@ The settings that used to be "recommended Render env overrides" are now the code
 
 Currently guarded:
 - `ENTRY_LIMIT_PRICE_MODE=ask` → forced to `bid_plus_tick` unless `ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK=true`. Rationale: the 2026-05-15 live scorecard (-$0.074/trade expectancy at 36.85 bps avg entry spread) does not fit inside any current backtest expectancy.
+- `REJECT_NEAR_HIGH_LOOKBACK_BARS=60` → forced to `30` unless `REJECT_NEAR_HIGH_LOOKBACK_BARS_ALLOW_60=true`. Rationale: the live 30-day MR backtest rejected 159,907 of 322,438 candidates (49.6%) on this gate at lookback=60 because the gate was pinning to peaks ~45 min stale that fresh capitulation entries don't care about. Code default flipped 60 → 30 in the same PR.
 
 When a future Render env value is found to silently defeat a safe code default (the same failure mode that landed the 2026-05-16 deploy with `ENTRY_LIMIT_PRICE_MODE=ask` despite the code default flipping to `bid_plus_tick`), add a new entry to `SAFETY_OVERRIDES` instead of just changing the default — that closes the failure mode permanently while still respecting verified operator intent via the escape hatch.
+
+## MR signal sub-gate knobs (2026-05-17 Stage 2 plumbing)
+
+The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONFIG` inside `backend/modules/meanReversionSignal.js`. They're now wired through env vars read in `backend/trade.js` and passed via the `config` parameter to `evaluateMeanReversionSignal`:
+
+| Env var | Default | Tunable? |
+|---|---|---|
+| `MR_DROP_TRIGGER_BPS` | `100` | **NO — do not lower below 100.** In-code A/B (meanReversionSignal.js:44-50): 80-bps trigger flipped expectancy +14.91 → −24 bps net. |
+| `MR_VOL_CONFIRM_MULTIPLIER` | `1.5` | Yes — cautious target for Stage 2 loosening. |
+| `MR_MAX_BTC_DROP_BPS` | `50` | Yes — widen to 75 to admit MR during mild BTC weakness. |
+| `MR_RSI_OVERSOLD` | `30` | Yes — raise toward 35-40 to admit more candidates. |
+| `MR_DEEP_DROP_GUARD_BPS` | `300` | Yes — widen to 400 only if live scorecard backs it. |
+
+Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
 ## Entry quote prefetch
 

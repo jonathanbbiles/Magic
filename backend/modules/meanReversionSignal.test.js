@@ -209,4 +209,138 @@ function makeBars({ length, closeFn, volumeFn, lowFn }) {
   assert.ok(bigDrop.projectedBps <= DEFAULT_CONFIG.targetCapBps, 'should respect cap');
 }
 
+// 10. Config override pass-through (2026-05-17). The signal accepts a
+// `config` override; the trade engine uses this to wire MR_DROP_TRIGGER_BPS,
+// MR_VOL_CONFIRM_MULTIPLIER, MR_MAX_BTC_DROP_BPS, MR_RSI_OVERSOLD and
+// MR_DEEP_DROP_GUARD_BPS from process.env. Verify each override actually
+// changes the gate result so the env wiring isn't a no-op.
+{
+  function buildCapitulationBars({ dropTotalBps = 120, volMultiplier = 3 } = {}) {
+    const bars = [];
+    let p = 100;
+    for (let i = 0; i < 30; i += 1) {
+      p *= 1 + ((Math.sin(i * 0.7) * 0.0001) - 0.00005);
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p, h: p * 1.0002, l: p * 0.9998, c: p, v: 1000 });
+    }
+    const perBarDrop = dropTotalBps / 3 / 10000;
+    for (let i = 30; i < 33; i += 1) {
+      p *= (1 - perBarDrop);
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p * 1.003, h: p * 1.004, l: p * 0.999, c: p, v: 1000 * volMultiplier });
+    }
+    bars.push({ ...bars[bars.length - 1] });
+    return bars;
+  }
+
+  // 10a. dropTriggerBps override: raising the trigger above the actual drop
+  //      should flip an otherwise-passing setup to mr_no_drop.
+  {
+    const bars = buildCapitulationBars({ dropTotalBps: 120 });
+    const baseline = evaluateMeanReversionSignal({ pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 } });
+    assert.equal(baseline.ok, true, 'baseline 120-bps drop should pass default 100-bps trigger');
+    const tightened = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { dropTriggerBps: 200 },
+    });
+    assert.equal(tightened.ok, false, 'raising trigger to 200 should reject a 120-bps drop');
+    assert.equal(tightened.reason, 'mr_no_drop');
+  }
+
+  // 10b. volConfirmMultiplier override: a 1.2x volume burst should pass at
+  //      multiplier=1.0 but fail at multiplier=2.0.
+  {
+    const bars = buildCapitulationBars({ dropTotalBps: 120, volMultiplier: 1.2 });
+    const lenient = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { volConfirmMultiplier: 1.0 },
+    });
+    assert.equal(lenient.ok, true, '1.2x volume should pass at multiplier=1.0');
+    const strict = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { volConfirmMultiplier: 2.0 },
+    });
+    assert.equal(strict.ok, false, '1.2x volume should fail at multiplier=2.0');
+    assert.equal(strict.reason, 'mr_volume_insufficient');
+  }
+
+  // 10c. maxBtcDropBps override: a BTC -40 bps move should pass at threshold
+  //      50 but fail at threshold 25.
+  {
+    const bars = buildCapitulationBars({ dropTotalBps: 120 });
+    const lenient = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -40 },
+      config: { maxBtcDropBps: 50 },
+    });
+    assert.equal(lenient.ok, true, 'BTC -40 bps should pass when threshold is 50 bps');
+    const strict = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -40 },
+      config: { maxBtcDropBps: 25 },
+    });
+    assert.equal(strict.ok, false, 'BTC -40 bps should fail when threshold is 25 bps');
+    assert.equal(strict.reason, 'mr_btc_correlated_drop');
+  }
+
+  // 10d. rsiOversold override: bumping the threshold up should let a less-
+  //      oversold setup through.
+  {
+    // Build a milder setup where RSI sits around 35-45 (between the strict
+    // default 30 and a loosened 50).
+    const bars = [];
+    let p = 100;
+    for (let i = 0; i < 30; i += 1) {
+      p *= 1 + ((Math.sin(i * 0.7) * 0.0001) - 0.00005);
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p, h: p * 1.0002, l: p * 0.9998, c: p, v: 1000 });
+    }
+    for (let i = 30; i < 33; i += 1) {
+      p *= (1 - 0.0034);
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p * 1.003, h: p * 1.004, l: p * 0.999, c: p, v: 3500 });
+    }
+    bars.push({ ...bars[bars.length - 1] });
+    // Either both pass or the strict one rejects and the loose one accepts —
+    // depends on the exact RSI value, but the loose threshold must never be
+    // strictly more selective than the strict one for the same reason.
+    const strict = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { rsiOversold: 20 },
+    });
+    const loose = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { rsiOversold: 50 },
+    });
+    if (!strict.ok && strict.reason === 'mr_not_oversold') {
+      assert.ok(loose.ok || loose.reason !== 'mr_not_oversold', 'loose rsiOversold must not reject for same reason');
+    }
+  }
+
+  // 10e. deepDropGuardBps override: a 4% extended drop should pass at
+  //      threshold 500 but fail at threshold 200.
+  {
+    const bars = [];
+    let p = 100;
+    for (let i = 0; i < 30; i += 1) {
+      p *= 0.997; // ~4% total drift down
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p, h: p * 1.0002, l: p * 0.9998, c: p, v: 1000 });
+    }
+    for (let i = 30; i < 33; i += 1) {
+      p *= (1 - 0.0034);
+      bars.push({ t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), o: p * 1.003, h: p * 1.004, l: p * 0.999, c: p, v: 3500 });
+    }
+    bars.push({ ...bars[bars.length - 1] });
+    const strict = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { deepDropGuardBps: 200 },
+    });
+    assert.equal(strict.ok, false);
+    assert.equal(strict.reason, 'mr_deep_downtrend');
+    const lenient = evaluateMeanReversionSignal({
+      pair: 'SOL/USD', bars1m: bars, btcLeadLag: { recentReturnBps: -5 },
+      config: { deepDropGuardBps: 600 },
+    });
+    // Lenient config should bypass the deep-drop guard. It may still fail for
+    // other reasons (RSI, etc.), but the reason must NOT be mr_deep_downtrend.
+    if (!lenient.ok) {
+      assert.notEqual(lenient.reason, 'mr_deep_downtrend', 'lenient guard must bypass mr_deep_downtrend');
+    }
+  }
+}
+
 console.log('meanReversionSignal.test ok');

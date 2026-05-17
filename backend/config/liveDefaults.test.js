@@ -47,12 +47,13 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_BTC_LEAD_LAG_DROP_BPS, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-2.0');
 
 // Recent-high proximity gate. Pinned ON so the production deploy refuses
-// entries within 30 bps of the last-60-minute high — the surgical fix for
-// the "we bought at the top and got stuck" failure mode that drove
-// every recent live drawdown cluster.
+// entries within 30 bps of the last-30-minute high. 2026-05-17 lookback
+// flip 60 → 30 (Stage 1 of the trade-frequency push): the 60-bar window
+// was rejecting ~50% of MR candidates by pinning the gate to peaks that
+// were 45 min stale and irrelevant to a fresh capitulation drop.
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_BPS, '30');
-assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 
 // 2026-05-16 re-flip: SIGNAL_VERSION restored to '' (auto-select) and
 // SIGNAL_SELECTOR_VETO_ENABLED restored to 'true'. The 14-trade live

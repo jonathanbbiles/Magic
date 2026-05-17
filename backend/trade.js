@@ -263,6 +263,27 @@ const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20))
 const MR_STOP_LOSS_BPS = Math.max(1, readNumber('MR_STOP_LOSS_BPS', 60));
 const MR_STOP_LOSS_BPS_TIER3 = Math.max(MR_STOP_LOSS_BPS, readNumber('MR_STOP_LOSS_BPS_TIER3', 100));
 
+// Mean-reversion signal sub-gate knobs (2026-05-17). These were previously
+// hard-coded as DEFAULT_CONFIG in modules/meanReversionSignal.js. The defaults
+// here mirror DEFAULT_CONFIG exactly, so wiring them is a zero-behavior-change
+// op until an operator sets one in Render env. DO NOT lower MR_DROP_TRIGGER_BPS
+// below 100 — the in-code A/B (meanReversionSignal.js:44-50) shows the loosened
+// 80-bps trigger flipped expectancy from +14.91 to -24 bps net. The other four
+// knobs (volume / BTC-corr / RSI / deep-drop) have no comparable live A/B yet
+// and are the safer tuning targets for the Stage 2 trade-frequency push.
+const MR_DROP_TRIGGER_BPS = Math.max(1, readNumber('MR_DROP_TRIGGER_BPS', 100));
+const MR_VOL_CONFIRM_MULTIPLIER = Math.max(0, readNumber('MR_VOL_CONFIRM_MULTIPLIER', 1.5));
+const MR_MAX_BTC_DROP_BPS = Math.max(0, readNumber('MR_MAX_BTC_DROP_BPS', 50));
+const MR_RSI_OVERSOLD = Math.max(1, Math.min(99, readNumber('MR_RSI_OVERSOLD', 30)));
+const MR_DEEP_DROP_GUARD_BPS = Math.max(1, readNumber('MR_DEEP_DROP_GUARD_BPS', 300));
+const MR_SIGNAL_CONFIG_OVERRIDES = Object.freeze({
+  dropTriggerBps: MR_DROP_TRIGGER_BPS,
+  volConfirmMultiplier: MR_VOL_CONFIRM_MULTIPLIER,
+  maxBtcDropBps: MR_MAX_BTC_DROP_BPS,
+  rsiOversold: MR_RSI_OVERSOLD,
+  deepDropGuardBps: MR_DEEP_DROP_GUARD_BPS,
+});
+
 // Phase 1: master kill switch + per-layer feature flags. PHASE1_ENABLED=false
 // reverts every Phase 1 layer to its legacy behavior in a single env flip.
 // Per-layer flags compose with the master flag (AND-gated), so an operator
@@ -1623,7 +1644,7 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
-    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe });
+    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe, config: MR_SIGNAL_CONFIG_OVERRIDES });
   } catch (err) {
     return { ok: false, reason: 'mean_reversion_signal_failed', error: err?.message };
   }
