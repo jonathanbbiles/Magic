@@ -8,11 +8,57 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ## Goals
 
-- Find tiny upward drifts in liquid crypto pairs.
-- Capture a small **net profit** per trade after fees (default **0.08%** floor, allowed range **0.05%..0.50%**). Each trade's actual TP is `SIGNAL_TARGET_FRACTION × projectedBps − fees` (default fraction `1.0` = aim for the full predicted move), clamped to `[TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS]`. The staircase exit catches misses at break-even or above so the lower TP-fill rate doesn't hurt expectancy.
+- **Two layers operating in parallel** (Phase 1, see the 2026-05-17 architecture section below):
+  - **Layer 2 — scalp base:** find volume-confirmed capitulation drops on liquid pairs; capture half-reversion (~15 bps net per trade) via the `mean_reversion` signal. Always-on.
+  - **Layer 1 — selective conviction:** subscribe to free public event sources (Phase 1: Binance/Bybit/OKX funding rates) and ask a free LLM (Gemini 2.5 Flash) whether the resulting setup is high-conviction. Trade only confident YES decisions, targeting 50–200 bps net per trade. Event-triggered, not always-on.
+- Capture a small **net profit** per trade after fees (default **0.08%** floor for the scalp layer, allowed range **0.05%..0.50%**; selective layer targets are per-trade, 0.50%..2.00%). Each trade's actual TP is `SIGNAL_TARGET_FRACTION × projectedBps − fees` (default fraction `1.0` = aim for the full predicted move), clamped to `[TARGET_NET_PROFIT_BPS, SIGNAL_TARGET_MAX_NET_BPS]`. The staircase exit catches misses at break-even or above so the lower TP-fill rate doesn't hurt expectancy.
 - **Cap the loss-side tail with a vol-scaled stop AND a hard max-hold market exit.** Each trade carries a per-trade stop sized at entry from realised volatility (`stopBps ≈ STOP_LOSS_VOL_K × σ × √STOP_LOSS_HORIZON_BARS`), clamped to `[STOP_LOSS_BPS_FLOOR, STOP_LOSS_BPS]` (default cap **40 bps**) and never tighter than `spread + STOP_OVER_SPREAD_BPS`. When live bid breaches `entry × (1 − stopBps/10000)`, the exit manager cancels the resting GTC sell and submits a market IOC sell. Independently, if the position is still held after `MAX_HOLD_MS` (default 6 h), the exit manager cancels the resting GTC sell and submits a market IOC sell regardless of price — this is the hard time-based fallback that prevents capital from sitting indefinitely in a break-even-pinned position. If neither path fires, the resting GTC sell limit is gradually walked DOWN over `BREAKEVEN_TIMEOUT_MS` (default 2 h) from the signal-derived TP toward break-even-after-fees (`entry × (1 + FEE_BPS_ROUND_TRIP/10000)`) and pinned there. Set `STOP_LOSS_ENABLED=false` and/or `MAX_HOLD_MS=0` to revert to the legacy no-realised-loss design (staircase becomes the only post-fill risk lever; stuck positions accumulate unbounded unrealised MTM in adverse drift).
 - Run unattended on a single Render instance.
 - Concurrency is bounded by available cash, not a fixed slot count.
+
+---
+
+## 2026-05-17 Phase 1: event-triggered hybrid architecture (selective conviction layer + scalp base)
+
+After seven entry signals (`ols`, `multi_factor`, `mean_reversion`, `mean_reversion_5m`, `mean_reversion_15m`, `range_mean_reversion`, `barrier`) were all evaluated on 30 days of real Alpaca bars, only MR-1m clears positive expectancy (+19.87 bps over 7 entries). That earns ~$0.005/day on the $84 account — three orders of magnitude short of the 1%/day target. The friction floor for OHLCV-only signals on retail Alpaca fees is real and binds. To escape it we add **signals from outside the OHLCV time-series** and a **meta-decision LLM gate** to filter for genuine conviction.
+
+Phase 1 introduces a parallel **selective conviction engine** (Layer 1) that runs alongside the existing MR-1m scalp base (Layer 2). It is intentionally narrow — one event source, one LLM gate, one new entry path — to prove the architecture before stacking on Reddit / GDELT / on-chain sources in subsequent phases.
+
+| Layer | What it does | When it fires | Target |
+|---|---|---|---|
+| Layer 1 — selective conviction | Polls Binance/Bybit/OKX free funding-rate endpoints. On a flip event (positive → deeply negative, or vice versa), builds a feature context for the affected symbol and asks a free LLM (Gemini 2.5 Flash, free tier 10 RPM / 500 RPD) whether to enter. On a confident YES, places a trade. | When funding crosses the threshold (~rare, days-scale). Expected 1–10 trades/day across the 12-symbol universe. | 50–150 bps net per trade. LLM-supplied target/stop, clamped to `[SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR, SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS]`. |
+| Layer 2 — MR scalp base | Existing `mean_reversion` signal. Unchanged by Phase 1. Continues evaluating every scan cycle. | Volume-confirmed capitulation drops (~6 trades/30 days). | ~15 bps net per trade. |
+
+**Why funding-rate flips, and only one source in Phase 1.** Funding settles every 8h; when perp rates flip from sustained positive (longs paying shorts) to deeply negative (shorts paying longs), it telegraphs leverage skew that has historically been contrarian at extremes. The signal is **fully outside Alpaca's spot OHLCV feed** — exactly the information the existing seven signals all read from and cannot reach. Binance/Bybit/OKX expose the data as **free public APIs** (no auth, ~500 req/5min/IP). One source first — if the LLM-gated backtest produces positive expectancy on funding-rate flips alone, Phase 2 adds news (GDELT free), Phase 3 adds social (Reddit JSON), Phase 4 adds on-chain (Etherscan free). Each phase proves edge in backtest before going live.
+
+**Phase 1 components.**
+| File | Purpose |
+|---|---|
+| `backend/modules/fundingRateMonitor.js` | Polls Binance USDM funding rates every 15 min, maintains per-symbol history, emits `funding_flip` events on threshold crossings. Free API, no auth. |
+| `backend/modules/llmGate.js` | Wraps the Gemini 2.5 Flash REST API (`gemini-2.5-flash` model) for the LLM decision. Free tier (10 RPM / 500 RPD) easily covers Layer 1's expected volume. Fail-safe: any error → `decision: NO`. |
+| `backend/modules/selectiveEngine.js` | Subscribes to event sources, builds feature context, calls llmGate, places trades via `placeSelectiveBuy`. Owns per-symbol cooldown + daily-cap guardrails. |
+| `backend/trade.js#placeSelectiveBuy` | New entry path. Same `submitOrder`/`tradePredictions`/`entryIntentState`/`tradeForensics` plumbing as the scanner, but skips the OLS/MF gates (LLM is the gate). Trades carry `signalVersion='selective_funding_flip'`. The existing GTC TP / staircase / vol-scaled stop logic owns lifecycle exactly as for every other signal. |
+| `backend/scripts/backtest_selective.js` | Replays historical funding-rate flips against historical Alpaca bars under three LLM-verdict modes (optimistic / coinflip / pessimistic). Surfaced as `meta.backtestSelective`. |
+
+**Honest expectations.** 1%/day average is aspirational. Renaissance Technologies' Medallion fund averages ~0.2%/day after fees. On a small account with no market impact, hitting 1%/day in stretches is plausible; averaging 1%/day over months is not realistically demonstrated by any retail strategy. The realistic frame: target it, measure rolling 30-day P&L, accept that some days will be −2% as part of the distribution. Layer 1 will sometimes go a full day without trading — that's correct behavior for a selective system. Veto-over-bleed: $0 days beat −2% days.
+
+**What this does NOT do.**
+- Does NOT delete MR-1m. It's the only validated candidate; it stays as Layer 2.
+- Does NOT delete OLS / MF / MR-5m / MR-15m / range-MR / barrier code or backtest slots. They remain as inactive candidates; the selector continues evaluating them.
+- Does NOT promise 1%/day. Promises a fair test of whether information outside the OHLCV time series gives the bot edge OHLCV-only signals can't reach.
+- Does NOT bypass the spread cap, drawdown gate, already-held check, or any other structural gate. Only the OLS-style edge / signal-selector gates are skipped (the LLM is the conviction filter instead).
+- Does NOT change Phase 0 behaviour when `SELECTIVE_ENGINE_ENABLED=false`. The flag is a hard kill-switch.
+
+**Configuration.** The operator provisions a free Gemini API key (https://aistudio.google.com → "Get API key") and sets `GEMINI_API_KEY` in Render env. Without the key, the engine boots but every LLM call returns `decision: NO`, so Layer 1 won't trade. Layer 2 is unaffected. See "Environment variables → Selective conviction layer" below for the full knob list.
+
+**Backtest deploy decision rule.** Inspect `meta.backtestSelective` after the auto-run completes. Deploy live only if:
+- `overall.optimistic.avgNetBpsPerEntry ≥ +30 bps net` (event has edge even with perfect LLM), AND
+- `overall.coinflip.avgNetBpsPerEntry ≥ +5 bps net` (event has edge even with noisy LLM), AND
+- `overall.coinflip.entries ≥ 10` (sample-size floor).
+
+Otherwise the funding-rate event itself doesn't have edge that the LLM can amplify, and Phase 1 should iterate the flip thresholds (or move to Phase 2's news source instead).
+
+**Rollback.** `SELECTIVE_ENGINE_ENABLED=false` in Render env disables Layer 1 entirely (no code change, no restart-loop). The MR-1m base layer continues running.
 
 ---
 
@@ -183,7 +229,7 @@ Everything else in the codebase is plumbing, telemetry, and safety rails around 
 | `backend/` | Node 22 + Express trading engine. Exposes REST routes (`/dashboard`, `/health`, `/debug/*`). |
 | `backend/trade.js` | The full trading loop — scan, predict, gate, buy, take-profit. ~1.5k lines. |
 | `backend/index.js` | Express server, route wiring, startup truth logging, dashboard meta. |
-| `backend/modules/` | Math + helpers split out of `trade.js`: `entryProbability.js`, `orderbookMetrics.js`, `tradeGuards.js`, `indicators.js`, etc. |
+| `backend/modules/` | Math + helpers split out of `trade.js`: `entryProbability.js`, `orderbookMetrics.js`, `tradeGuards.js`, `indicators.js`, etc. Phase 1 adds `fundingRateMonitor.js`, `llmGate.js`, `selectiveEngine.js`. |
 | `backend/config/` | Runtime config + env validation (`liveDefaults.js`, `validateEnv.js`, `runtimeConfig.js`). |
 | `backend/scripts/` | Operational scripts: `reconcile_predictions.js`, `check_runtime_env.js`, smoke tests. |
 | `Frontend/` | Expo (React Native) **read-only** diagnostic dashboard polling `/dashboard`. |
@@ -360,6 +406,30 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `SIGNAL_SELECTOR_MIN_BPS` | `0` | Threshold the backtest `avgNetBpsPerEntry` must clear for a signal to be considered "validated" by the auto-selector. 2026-05-17: lowered from `3` to `0`. The +3 bps margin was meant to absorb backtester noise, but `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` is the real sample-size guard — any signal with non-negative expectancy over ≥5 backtest entries is admitted. Raise (e.g. `3` or `5`) to be stricter. Set very high (e.g. `100`) to effectively force the veto on. |
 | `SIGNAL_SELECTOR_VETO_ENABLED` | `true` | When ON (default), the engine refuses ALL entries when no signal has cleared the activation threshold. This is the safety net that stops capital bleed when no strategy has demonstrable edge — the lesson from the live-observed −65 bps OLS backtest. Set `false` to revert to legacy behaviour (trade whatever `SIGNAL_VERSION` says, even if backtests show losses). |
 | `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES` | `30` | Minimum number of trade attempts in a 30-day backtest before the result counts as statistically meaningful. Below this, the signal is treated as unvalidated regardless of `avgNetBpsPerEntry`. |
+
+#### Selective conviction layer (Phase 1)
+
+The Phase 1 event-triggered hybrid architecture's Layer 1 — the funding-rate-flip → LLM-gate → selective-entry pipeline (`backend/modules/selectiveEngine.js`). Layer 2 (MR-1m scalp base) is unaffected by these knobs; they only control whether and how often Layer 1 trades. **All defaults are conservative and tuned to fit inside Gemini's free-tier rate limits (10 RPM / 500 RPD).**
+
+| Var | Default | What it does |
+| --- | --- | --- |
+| `SELECTIVE_ENGINE_ENABLED` | `true` | Master kill-switch for Layer 1. When `false`, the engine doesn't subscribe to events and no LLM calls are made; Layer 2 continues running normally. |
+| `GEMINI_API_KEY` | *(unset)* | Free Google AI Studio API key for the LLM gate. Obtain at https://aistudio.google.com. When unset, the engine boots but every LLM call returns `decision: NO`, so Layer 1 effectively idles. Layer 2 doesn't use this. |
+| `SELECTIVE_MIN_CONFIDENCE` | `65` | Minimum LLM confidence (0–100) on a YES decision required to place a trade. Lower confidence → no trade even on YES. |
+| `SELECTIVE_MAX_FIRES_PER_DAY` | `100` | Hard ceiling on Layer 1 fill attempts per 24h rolling window. Sized to stay comfortably inside Gemini's 500 RPD free-tier cap (each fire = ~1–2 LLM calls). |
+| `SELECTIVE_ENGINE_SYMBOL_COOLDOWN_MS` | `1800000` (30 min) | After Layer 1 evaluates a symbol (whether the LLM said YES or NO), refuse to re-evaluate it for this long. Prevents racing on a re-emitted flip event. |
+| `SELECTIVE_FUNDING_POLL_MS` | `900000` (15 min) | How often the funding-rate monitor polls Binance USDM. Floor 60 s. Free public API, ~500 req/5min/IP — 15 min × 12 symbols is 1 req/min, far inside the cap. |
+| `SELECTIVE_FUNDING_HISTORY_LENGTH` | `12` | Rolling per-symbol funding-rate history size. 12 readings × 8h cadence = 4 days of context. |
+| `SELECTIVE_FUNDING_FLIP_POSITIVE_BPS` | `5` | Latest-reading threshold (bps) on the positive side of a flip. A flip fires when `latest ≥ +5 bps` AND `trailing-N mean ≤ flipNegativeBps`. |
+| `SELECTIVE_FUNDING_FLIP_NEGATIVE_BPS` | `-2` | Latest-reading threshold (bps) on the negative side of a flip. Mirror condition. |
+| `SELECTIVE_FUNDING_FLIP_WINDOW` | `3` | Number of trailing readings used for the flip's "before" comparison. 3 × 8h = 24h trailing window. |
+| `SELECTIVE_FUNDING_COOLDOWN_MS` | `21600000` (6 h) | Per-symbol funding-flip emission cooldown — prevents a boundary-case from re-firing every poll. |
+| `SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR` | `50` | **Floor** for the per-trade net target on a selective entry. The LLM supplies a `targetBps` per trade; the live engine clamps to `[FLOOR, MAX]`. 50 bps net comfortably clears the ~30 bps round-trip fee threshold. |
+| `SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS` | `200` | **Cap** for the per-trade net target on a selective entry. Defensive: bounds an LLM that returns an unreasonable TP. |
+| `SELECTIVE_STOP_LOSS_BPS` | `120` | **Cap** for the per-trade stop on a selective entry. The LLM may supply a `stopBps`; the live engine clamps. Vol-scaled stop logic is bypassed for the selective signal because the LLM already considered volatility in its decision. |
+| `SELECTIVE_MAX_HOLD_MS` | `21600000` (6 h) | Hard time-based market exit for selective positions. Matches `BARRIER_MAX_HOLD_MS` — a 100 bps target needs hours of patience to fill, not minutes. |
+| `SELECTIVE_BREAKEVEN_TIMEOUT_MS` | `10800000` (3 h) | Staircase decay window for selective positions. TP decays from initial LLM target to break-even-after-fees over 3 h. |
+| `SELECTIVE_BACKTEST_ENABLED` | `true` | When `true` (default), the auto-backtester runs `scripts/backtest_selective.js` at startup alongside the existing signal slots. Result surfaces as `meta.backtestSelective`. Independent of the signal selector — selective entries have their own LLM gate at runtime. |
 
 #### Multi-factor validation gate (the auto-selector now enforces this)
 

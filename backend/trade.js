@@ -198,6 +198,7 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_15m') return MR_MAX_HOLD_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_MAX_HOLD_MS;
   if (signalVersion === 'barrier') return BARRIER_MAX_HOLD_MS;
+  if (signalVersion === 'selective_funding_flip') return SELECTIVE_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
@@ -207,6 +208,7 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_15m') return MR_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'barrier') return BARRIER_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'selective_funding_flip') return SELECTIVE_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -299,6 +301,18 @@ const BARRIER_STOP_LOSS_BPS = Math.max(1, readNumber('BARRIER_STOP_LOSS_BPS', 10
 const BARRIER_MAX_HOLD_MS = Math.max(60_000, readNumber('BARRIER_MAX_HOLD_MS', 21_600_000));     // 6 h
 const BARRIER_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('BARRIER_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
 
+// Selective (LLM-gated) signal hold / stop knobs. The selective engine
+// (Phase 1, event-triggered architecture) targets 50–150 bps net per trade
+// based on the LLM's per-trade output. These constants are the defaults
+// when the LLM omits a stop and the hard caps for hold time. Hold timing
+// mirrors barrier: a 100 bps target needs hours of patience to fill, not
+// minutes. Per-trade TP / stop floors/ceilings live near
+// ABSOLUTE_TARGET_NET_BPS_CEILING below.
+const SELECTIVE_STOP_LOSS_BPS = Math.max(1, readNumber('SELECTIVE_STOP_LOSS_BPS', 120));
+const SELECTIVE_MAX_HOLD_MS = Math.max(60_000, readNumber('SELECTIVE_MAX_HOLD_MS', 21_600_000));     // 6 h
+const SELECTIVE_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('SELECTIVE_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
+
+
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
@@ -315,6 +329,7 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
   }
   else if (signalVersion === 'range_mean_reversion') cap = RANGE_MR_STOP_LOSS_BPS;
   else if (signalVersion === 'barrier') cap = BARRIER_STOP_LOSS_BPS;
+  else if (signalVersion === 'selective_funding_flip') cap = SELECTIVE_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -726,6 +741,20 @@ const MR_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
   ABSOLUTE_TARGET_NET_BPS_CEILING,
   Math.max(MR_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('MR_SIGNAL_TARGET_MAX_NET_BPS', 120)),
 );
+// Selective (LLM-gated) signal target floor/ceiling. The LLM supplies a
+// per-trade targetBps directly via the prediction payload; these constants
+// are the floor (if LLM under-targets) and the ceiling (if the LLM
+// over-targets or omits). 50 bps net floor = comfortably above the
+// 30 bps round-trip fee threshold; 200 bps ceiling matches the absolute
+// per-trade upper bound the prior signals already respect.
+const SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(1, readNumber('SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR', 50)),
+);
+const SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS = Math.min(
+  ABSOLUTE_TARGET_NET_BPS_CEILING,
+  Math.max(SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS', 200)),
+);
 
 function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
   // Mean-reversion (1m / 5m / 15m all behave identically): projectedBps is
@@ -752,6 +781,18 @@ function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
     return Math.max(
       RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR,
       Math.min(RANGE_MR_SIGNAL_TARGET_MAX_NET_BPS, signalNet),
+    );
+  }
+  // Selective (LLM-gated): the LLM already returns a per-trade NET target
+  // via the prediction payload — projectedBps here is that NET target
+  // (already fee-adjusted by the prompt's instructions). Clamp to the
+  // selective floor/ceiling and pass through.
+  if (signalVersion === 'selective_funding_flip') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR;
+    return Math.max(
+      SELECTIVE_TARGET_NET_PROFIT_BPS_FLOOR,
+      Math.min(SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS, projected),
     );
   }
   let floor;
@@ -3451,6 +3492,182 @@ async function placeMakerLimitBuyThenSell(symbol) {
   return { ok: true, buy: buyRes?.buy || buyRes, sell: null };
 }
 
+// Selective (LLM-gated) entry path — called by backend/modules/selectiveEngine.js
+// when an event (e.g. funding-rate flip) is confirmed by the LLM gate. Mirrors
+// placeMakerLimitBuyThenSell's order primitives but populates the same
+// telemetry maps (pendingBuys, tradePredictions, entryIntentState) that the
+// exit manager reads — so the resulting position flows through the exact same
+// GTC TP / staircase / vol-scaled stop lifecycle as every other signal version.
+//
+// Inputs:
+//   - pair: Alpaca pair (e.g. 'BTC/USD')
+//   - opts.eventContext: the raw event payload (funding-flip details)
+//   - opts.llmDecision:  { decision, confidence, targetBps, stopBps, reasoning }
+//
+// Returns:
+//   { ok: true, buy: <order> }                on success
+//   { ok: false, skipped: true, reason: ... } on any pre-flight failure
+async function placeSelectiveBuy(pair, opts = {}) {
+  const normalizedPair = normalizePair(pair);
+  if (!normalizedPair) return { ok: false, skipped: true, reason: 'invalid_symbol' };
+  if (!TRADING_ENABLED) return { ok: false, skipped: true, reason: 'trading_disabled' };
+
+  const llmDecision = opts.llmDecision || {};
+  if (llmDecision.decision !== 'YES') return { ok: false, skipped: true, reason: 'llm_not_yes' };
+
+  // Already-held / open-buy check. Mirror buildHeldAndOpenSellsIndex semantics
+  // inline so we don't have to await the full helper just to learn one pair.
+  try {
+    const positions = await fetchPositions().catch(() => []);
+    if (Array.isArray(positions) && positions.some((p) => normalizePair(p?.symbol) === normalizedPair && Number(p?.qty) > 0)) {
+      return { ok: false, skipped: true, reason: 'already_held' };
+    }
+    const openOrders = await fetchOrders({ status: 'open', nested: true, limit: 500 }).catch(() => []);
+    const openBuyForPair = expandNestedOrders(openOrders).some((o) => {
+      if (normalizePair(o?.symbol) !== normalizedPair) return false;
+      if (String(o?.side || '').toLowerCase() !== 'buy') return false;
+      return isOpenLikeOrderStatus(String(o?.status || ''));
+    });
+    if (openBuyForPair) return { ok: false, skipped: true, reason: 'open_buy_pending' };
+  } catch (_) { /* defensive: fall through to attempt */ }
+
+  const quote = await getLatestQuote(normalizedPair).catch(() => null);
+  const ask = Number(quote?.ap);
+  const bid = Number(quote?.bp);
+  if (!Number.isFinite(ask) || ask <= 0) return { ok: false, skipped: true, reason: 'no_ask_available' };
+  if (!Number.isFinite(bid) || bid <= 0) return { ok: false, skipped: true, reason: 'no_bid_available' };
+
+  const mid = (ask + bid) / 2;
+  const spreadBps = mid > 0 ? ((ask - bid) / mid) * 10000 : Infinity;
+  if (spreadBps > SPREAD_MAX_BPS) return { ok: false, skipped: true, reason: 'spread_too_wide' };
+
+  const account = await fetchAccount().catch(() => null);
+  const equityRaw = account?.equity ?? account?.portfolio_value;
+  const equityNum = Number(equityRaw);
+  if (!Number.isFinite(equityNum) || equityNum <= 0) return { ok: false, skipped: true, reason: 'sizing_unavailable' };
+  const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
+  const cashNum = Number(cashRaw);
+  const availableCash = Number.isFinite(cashNum) ? cashNum : Infinity;
+  const tradeNotional = Math.min(equityNum * PORTFOLIO_SIZING_PCT, availableCash);
+  if (tradeNotional < MIN_TRADE_NOTIONAL_USD) return { ok: false, skipped: true, reason: 'insufficient_cash' };
+
+  // Entry-limit price. Mirror the live ENTRY_LIMIT_PRICE_MODE='bid_plus_tick'
+  // default: rest one tick above the bid, never cross the spread. The
+  // selective engine doesn't need its own price-mode knob in Phase 1 — using
+  // the same passive-rest economics keeps the trade comparable to MR fills.
+  const buyLimit = bid;
+
+  const buyRes = await submitOrder({
+    symbol: normalizedPair, side: 'buy', type: 'limit', time_in_force: 'gtc',
+    limit_price: String(buyLimit), notional: tradeNotional.toFixed(2),
+  }).catch((err) => ({ ok: false, errorMessage: err?.errorMessage || err?.message || String(err) }));
+
+  const buyOrder = buyRes?.buy || buyRes;
+  if (!buyOrder?.id) {
+    return { ok: false, skipped: true, reason: 'buy_rejected', errorMessage: buyRes?.errorMessage || null };
+  }
+
+  // Build the minimum prediction payload the exit manager needs. The
+  // selective engine doesn't use OLS / MF / barrier features, so those
+  // fields stay null — the exit manager already handles missing fields
+  // defensively when the signalVersion gates them out.
+  const submittedAt = Date.now();
+  const nowIso = new Date().toISOString();
+  const llmTargetBps = Number.isFinite(Number(llmDecision.targetBps)) ? Number(llmDecision.targetBps) : null;
+  const llmStopBps = Number.isFinite(Number(llmDecision.stopBps)) ? Number(llmDecision.stopBps) : null;
+  // Convert LLM target → per-trade gross/net bps via the same helper that
+  // mean-rev / range-mr use. The helper clamps to SELECTIVE floor/ceiling.
+  const signalDerivedNetBps = deriveSignalTargetNetBps(llmTargetBps, 'selective_funding_flip');
+  const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
+  // Stop: prefer LLM-supplied stop (clamped to SELECTIVE_STOP_LOSS_BPS),
+  // otherwise fall back to the vol-scaled stop the rest of the engine uses.
+  const stopLossBpsResolved = llmStopBps != null
+    ? Math.max(1, Math.min(SELECTIVE_STOP_LOSS_BPS, llmStopBps))
+    : deriveStopLossBps(null, spreadBps, 'selective_funding_flip', normalizedPair);
+
+  const prediction = {
+    buyOrderId: buyOrder.id,
+    buyLimit,
+    buyLimitPriceMode: 'selective_bid',
+    buyLimitOffsetBpsFromAsk: ask > 0 ? ((ask - buyLimit) / ask) * 10000 : 0,
+    entryFillTimeoutMs: ENTRY_FILL_TIMEOUT_MS,
+    askAtSubmit: ask,
+    bidAtSubmit: bid,
+    tradeNotional,
+    spreadBps,
+    quoteAgeMs: null,
+    projectedBps: llmTargetBps,
+    expectedMoveBps: signalDerivedGrossBps,
+    fillProbability: null,
+    feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+    grossTargetBps: signalDerivedGrossBps,
+    targetNetProfitBps: signalDerivedNetBps,
+    staticGrossTargetBps: GROSS_TARGET_BPS,
+    staticTargetNetProfitBps: TARGET_NET_PROFIT_BPS,
+    signalDerivedNetBps,
+    signalDerivedGrossBps,
+    signalSizedExitEnabled: true,
+    signalTargetMaxNetBps: SELECTIVE_SIGNAL_TARGET_MAX_NET_BPS,
+    stopLossBpsResolved,
+    staticStopLossBps: SELECTIVE_STOP_LOSS_BPS,
+    volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
+    stopOverSpreadBps: STOP_OVER_SPREAD_BPS,
+    signalVersion: 'selective_funding_flip',
+    selective: {
+      eventSource: opts.eventContext?.source || null,
+      eventDirection: opts.eventContext?.direction || null,
+      eventLatestBps: opts.eventContext?.latestBps ?? null,
+      eventTrailingMeanBps: opts.eventContext?.trailingMeanBps ?? null,
+      llmConfidence: Number.isFinite(Number(llmDecision.confidence)) ? Number(llmDecision.confidence) : null,
+      llmTargetBps,
+      llmStopBps,
+      llmReasoning: typeof llmDecision.reasoning === 'string' ? llmDecision.reasoning.slice(0, 500) : null,
+    },
+  };
+
+  pendingBuys.set(normalizedPair, { orderId: buyOrder.id, submittedAt, limit: buyLimit });
+  tradePredictions.set(normalizedPair, {
+    tradeId: buyOrder.id,
+    submittedAt,
+    prediction,
+    buyFillObserved: false,
+    actualEntryPrice: null,
+  });
+  entryIntentState.set(normalizedPair, {
+    state: 'pending_fill',
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    rejectionReason: null,
+    prediction,
+  });
+  try {
+    tradeForensics.append({
+      tradeId: buyOrder.id,
+      symbol: normalizedPair,
+      phase: 'entry_submitted',
+      ts: nowIso,
+      ...prediction,
+    });
+  } catch (err) {
+    console.warn('forensics_entry_append_failed', { symbol: normalizedPair, error: err?.message });
+  }
+  console.log('selective_entry_submitted', {
+    symbol: normalizedPair,
+    tradeId: buyOrder.id,
+    signalVersion: 'selective_funding_flip',
+    eventSource: prediction.selective.eventSource,
+    eventDirection: prediction.selective.eventDirection,
+    llmConfidence: prediction.selective.llmConfidence,
+    targetNetProfitBps: signalDerivedNetBps,
+    grossTargetBps: signalDerivedGrossBps,
+    stopLossBpsResolved,
+    notional: tradeNotional,
+    spreadBps,
+  });
+  lastSuccessfulAction = { at: nowIso, symbol: normalizedPair, action: 'selective_buy_submitted', orderId: buyOrder.id };
+  return { ok: true, buy: buyOrder, sell: null };
+}
+
 async function scanOrphanPositions() {
   const positions = await fetchPositions();
   const orders = await fetchOrders({ status: 'open', nested: true, limit: 500 });
@@ -3520,6 +3737,7 @@ module.exports = {
   filterSupportedCryptoSymbols,
   // engine
   placeMakerLimitBuyThenSell,
+  placeSelectiveBuy,
   initializeInventoryFromPositions,
   startEntryManager,
   startExitManager,

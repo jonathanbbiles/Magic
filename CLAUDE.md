@@ -70,7 +70,22 @@ The entry-scan quote loop batches `/latest/quotes` calls via `prefetchQuotesForC
 
 - Strategy loop: `backend/trade.js`
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924)
+- **Phase 1 selective (LLM-gated) layer**: `backend/modules/fundingRateMonitor.js`, `llmGate.js`, `selectiveEngine.js`. Wired in `backend/index.js`'s `startSelectiveEngine()`. Trades carry `signalVersion='selective_funding_flip'` and route through `placeSelectiveBuy` in `trade.js` (skips OLS edge gates — LLM is the conviction filter — but respects spread cap, already-held, drawdown, sizing). Backtest at `scripts/backtest_selective.js`, surfaced at `meta.backtestSelective`.
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`
+
+## Phase 1 architecture (2026-05-17)
+
+The friction floor on OHLCV-only signals is real (seven candidates tested; only MR-1m positive at +19.87 bps over 7 entries / 30 days). The path to the 1%/day target requires signals from **outside the OHLCV time series** — events, news, on-chain, derivatives — combined with a meta-decision LLM gate.
+
+Phase 1 adds **one** event source (funding-rate flips, free public APIs on Binance/Bybit/OKX) and **one** LLM gate (Gemini 2.5 Flash, free tier 10 RPM / 500 RPD). The selective engine subscribes to flip events, builds a feature context for the affected symbol, asks the LLM whether to enter, and on confident YES routes through `placeSelectiveBuy` in `trade.js`. The existing GTC TP / staircase / vol-scaled stop logic owns the post-fill lifecycle exactly as for every other signal.
+
+Layer 2 (MR-1m scalp base) is unchanged by Phase 1. The selective engine runs in parallel; both layers respect the same drawdown / sizing / concurrency rules.
+
+**Configuration:** operator provisions a free `GEMINI_API_KEY` in Render env. Without the key, the engine boots but every LLM call returns `decision: NO`, so Layer 1 idles. Layer 2 is unaffected. Master kill-switch: `SELECTIVE_ENGINE_ENABLED=false`.
+
+**Deploy decision rule:** consult `meta.backtestSelective` after the auto-run. Deploy live only if `overall.optimistic.avgNetBpsPerEntry ≥ +30 bps` AND `overall.coinflip.avgNetBpsPerEntry ≥ +5 bps` AND `overall.coinflip.entries ≥ 10`. Otherwise the event itself doesn't have edge the LLM can amplify — iterate flip thresholds or move on to Phase 2 (news / GDELT).
+
+Phase 2/3/4 (Reddit, GDELT, on-chain) will follow the same pattern: detector module → llmGate → `placeSelectiveBuy`. One source at a time; each must backtest positive before adding the next.

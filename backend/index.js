@@ -103,6 +103,10 @@ const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
+const { runBacktest: runSelectiveBacktest } = require('./scripts/backtest_selective');
+const { createFundingRateMonitor } = require('./modules/fundingRateMonitor');
+const llmGate = require('./modules/llmGate');
+const { createSelectiveEngine } = require('./modules/selectiveEngine');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -165,6 +169,7 @@ const {
   getEntryRegimeStaleThresholdMs,
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  placeSelectiveBuy,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -671,6 +676,83 @@ let lastBacktestRangeMr = null;
 // theory + micro-momentum + EMA momentum. Feeds the signal selector as
 // another candidate alongside OLS/MF/MR variants.
 let lastBacktestBarrier = null;
+// Selective (LLM-gated, Phase 1) backtest slot. Replays historical funding-
+// rate flips from Binance against historical Alpaca bars and simulates
+// trade outcomes under three LLM-verdict modes (optimistic, pessimistic,
+// coinflip). Surfaced as `meta.backtestSelective` on /dashboard. Does NOT
+// feed the signal selector (selective entries bypass the selector veto —
+// they have their own LLM gate at runtime).
+let lastBacktestSelective = null;
+// Selective engine + funding-rate monitor handles. Both stay null when the
+// engine is disabled or not yet started; the dashboard exposes their
+// snapshots when present so the operator can see whether Layer 1 is active
+// without opening Render's shell.
+let selectiveEngineHandle = null;
+let fundingRateMonitorHandle = null;
+function startSelectiveEngine() {
+  if (selectiveEngineHandle) return;
+  if (String(process.env.SELECTIVE_ENGINE_ENABLED || 'true').toLowerCase() === 'false') {
+    console.log('selective_engine_disabled_by_env');
+    return;
+  }
+  if (!process.env.GEMINI_API_KEY) {
+    // The engine can boot without the API key, but every LLM call will
+    // return decision=NO — so Layer 1 won't trade. Log loudly so the
+    // operator knows what's missing without having to read llmGate code.
+    console.log('selective_engine_started_without_gemini_api_key', {
+      hint: 'set GEMINI_API_KEY in Render env to enable LLM-gated entries',
+    });
+  }
+  const liveSymbols = Array.isArray(runtimeConfig?.configuredPrimarySymbols) && runtimeConfig.configuredPrimarySymbols.length
+    ? runtimeConfig.configuredPrimarySymbols
+    : ['BTC/USD', 'ETH/USD'];
+  fundingRateMonitorHandle = createFundingRateMonitor({
+    symbols: liveSymbols,
+    pollIntervalMs: Math.max(60_000, Number(process.env.SELECTIVE_FUNDING_POLL_MS) || 15 * 60 * 1000),
+    historyLength: Math.max(4, Number(process.env.SELECTIVE_FUNDING_HISTORY_LENGTH) || 12),
+    flipPositiveBps: Number.isFinite(Number(process.env.SELECTIVE_FUNDING_FLIP_POSITIVE_BPS))
+      ? Number(process.env.SELECTIVE_FUNDING_FLIP_POSITIVE_BPS) : 5,
+    flipNegativeBps: Number.isFinite(Number(process.env.SELECTIVE_FUNDING_FLIP_NEGATIVE_BPS))
+      ? Number(process.env.SELECTIVE_FUNDING_FLIP_NEGATIVE_BPS) : -2,
+    flipTrailingWindow: Math.max(2, Number(process.env.SELECTIVE_FUNDING_FLIP_WINDOW) || 3),
+    symbolCooldownMs: Math.max(60_000, Number(process.env.SELECTIVE_FUNDING_COOLDOWN_MS) || 6 * 60 * 60 * 1000),
+  });
+  selectiveEngineHandle = createSelectiveEngine({
+    enabled: true,
+    minConfidence: Math.max(0, Math.min(100, Number(process.env.SELECTIVE_MIN_CONFIDENCE) || 65)),
+    symbolCooldownMs: Math.max(60_000, Number(process.env.SELECTIVE_ENGINE_SYMBOL_COOLDOWN_MS) || 30 * 60 * 1000),
+    maxFiresPerDay: Math.max(1, Number(process.env.SELECTIVE_MAX_FIRES_PER_DAY) || 100),
+  }, {
+    fundingMonitor: fundingRateMonitorHandle,
+    llmGate,
+    marketData: {
+      getLatestQuote: async (pair) => {
+        try {
+          const { getLatestQuote } = require('./trade');
+          return await getLatestQuote(pair);
+        } catch { return null; }
+      },
+      getRecentBars: async (pair, n) => {
+        try {
+          const { fetchCryptoBars } = require('./trade');
+          const start = new Date(Date.now() - (n + 5) * 60_000).toISOString();
+          const out = await fetchCryptoBars({ symbols: pair, timeframe: '1Min', start, limit: n });
+          const bars = out?.bars?.[pair] || [];
+          return bars;
+        } catch { return []; }
+      },
+    },
+    placeSelectiveBuy,
+  });
+  fundingRateMonitorHandle.start();
+  selectiveEngineHandle.start();
+  console.log('selective_engine_started', {
+    symbols: liveSymbols,
+    pollIntervalMs: fundingRateMonitorHandle.config.pollIntervalMs,
+    minConfidence: selectiveEngineHandle.config.minConfidence,
+    geminiKeySet: Boolean(process.env.GEMINI_API_KEY),
+  });
+}
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -1338,6 +1420,19 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestBarrier.perSymbol,
           gateSkipped: lastBacktestBarrier.gateSkipped || null,
           note: 'Barrier signal candidate (restored from commit fbdb924). Trade-construction signal: barrier-touch probability + micro-momentum + EMA momentum, targets ~100 bps net per trade.',
+        } : null,
+        backtestSelective: lastBacktestSelective ? {
+          ranAt: lastBacktestSelective.ranAt,
+          windowDays: lastBacktestSelective.windowDays,
+          params: lastBacktestSelective.params,
+          overall: lastBacktestSelective.overall,
+          perSymbol: lastBacktestSelective.perSymbol,
+          note: 'Phase 1 selective (LLM-gated) backtest. Replays historical Binance funding-rate flips against Alpaca bars under three LLM-verdict modes. Independent of the signal selector — Layer 1 has its own LLM gate at runtime.',
+        } : null,
+        selectiveEngine: selectiveEngineHandle ? {
+          engine: selectiveEngineHandle.getSnapshot(),
+          fundingMonitor: fundingRateMonitorHandle?.getSnapshot() || null,
+          geminiKeySet: Boolean(process.env.GEMINI_API_KEY),
         } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
@@ -2149,6 +2244,7 @@ async function bootstrapTrading() {
     startEntryManager();
     startExitManager();
     console.log('exit_manager_start_attempted');
+    startSelectiveEngine();
   } else {
     console.log('trading_disabled_skip_entry_exit');
   }
@@ -2271,6 +2367,36 @@ if (backtestSkipReason) {
       await runBacktestAndStore({
         strategy: 'barrier',
       }, 'barrier').catch(() => {});
+    }
+    // Selective (LLM-gated) backtest — Phase 1 of the event-triggered hybrid
+    // architecture. Pulls historical funding-rate flips from Binance and
+    // simulates trade outcomes under (optimistic / coinflip / pessimistic)
+    // LLM verdict modes. Independent of the signal selector — the selective
+    // engine has its own LLM gate at runtime. Default-on; flip
+    // SELECTIVE_BACKTEST_ENABLED=false in Render env to disable.
+    if (String(process.env.SELECTIVE_BACKTEST_ENABLED || 'true').toLowerCase() !== 'false') {
+      try {
+        const liveSymbols = Array.isArray(runtimeConfig?.configuredPrimarySymbols) && runtimeConfig.configuredPrimarySymbols.length
+          ? runtimeConfig.configuredPrimarySymbols
+          : null;
+        const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY
+          || (liveSymbols ? liveSymbols.join(',') : 'BTC/USD,ETH/USD');
+        const result = await runSelectiveBacktest({
+          symbols: symbolsCsv,
+          windowDays: Math.max(30, BACKTEST_AUTORUN_DAYS),
+        });
+        if (result && !result.error) {
+          lastBacktestSelective = { ...result, windowDays: result.windowDays || BACKTEST_AUTORUN_DAYS };
+          console.log('selective_backtest_completed', {
+            ranAt: result.ranAt,
+            optimisticNetBps: result.overall?.optimistic?.avgNetBpsPerEntry ?? null,
+            coinflipNetBps: result.overall?.coinflip?.avgNetBpsPerEntry ?? null,
+            entries: result.overall?.optimistic?.entries ?? null,
+          });
+        }
+      } catch (err) {
+        console.warn('selective_backtest_failed', { message: err?.message || String(err) });
+      }
     }
   }, BACKTEST_AUTORUN_DELAY_MS);
 }
