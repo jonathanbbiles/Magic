@@ -145,6 +145,15 @@ Master kill: `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables the entire snapsho
 - P/E, Forward P/E, PEG, EV/EBITDA, FCF Yield, D/E ratio, institutional ownership, short interest, IV Rank / Percentile, beta vs S&P 500, Jensen's α vs SPX, VIX, put/call ratios, sector RSI — none of these have an Alpaca crypto data source. Adding them as env-var stubs that compute nothing would violate Hard Rule #4. Do not re-add as "future hooks" without first wiring an upstream feed.
 - Volume profile POC/HVN/LVN — Plan-agent finding: wrong tool for 1m timeframe. A multi-hour tool whose output on 200×1m bars (~3 h of tape) is regime-noise, not durable level information. Defer until a multi-timeframe context is wired and a clear use-case exists.
 
+## Selector diagnostic-fidelity (2026-05-18)
+
+Three diagnostic bugs were observed in deployed logs and fixed in `backend/modules/signalSelector.js` + `backend/index.js`:
+1. **`DEFAULTS.minBpsToActivate` was stuck at `3`** even though `LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS` flipped to `'0'` on 2026-05-17. The initial `latestDecision` carried the stale `3`, so the first ~6 `entry_scan_skipped_backtest_veto` log lines after boot mis-reported the activation threshold. Sync'd to `0` and `index.js`'s fallback `: 3` → `: 0`.
+2. **No-winner branch returned `backtestRanAt: null`** even when 30-day backtests had completed, leaving operators without a "when were the inputs last refreshed" answer while the veto was active. The selector now computes `mostRecentRanAt` across all provided backtests and surfaces it in both the no-winner branch and as a fallback in the winner branch.
+3. **Winner-picked branch dropped the four `microXmNetBps` fields** from its response payload — hiding microstructure-horizon values from operator diagnostics whenever a signal was actually selected. Restored.
+
+All three are observational fixes — none changes the live entry decision. When adding a new candidate slot, make sure to add its `<slot>NetBps` field to ALL three response branches in `pickActiveSignal` (operator-override, no-candidates, winner-picked) so the dashboard log payload stays consistent.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`

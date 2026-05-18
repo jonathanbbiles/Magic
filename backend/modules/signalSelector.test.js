@@ -7,7 +7,12 @@ const {
   DEFAULTS,
 } = require('./signalSelector');
 
-function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
+function bt(overall) {
+  // 2026-05-18: extract ranAt from `overall` if provided so the test-helper
+  // supports per-backtest ranAt without breaking existing call sites.
+  const { ranAt, ...rest } = overall || {};
+  return { ranAt: ranAt || '2026-01-01T00:00:00Z', overall: rest };
+}
 
 // 1. No backtests → veto.
 {
@@ -26,12 +31,15 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(d.reason, 'selected_ols_only_validated');
 }
 
-// 3. Only OLS, fails threshold → veto.
+// 3. Only OLS, fails threshold → veto. 2026-05-18: switched the failing
+//    value from +1 to -1 after DEFAULTS.minBpsToActivate moved 3 → 0; the
+//    point of the test is "below threshold should not activate", not the
+//    specific +1 value.
 {
-  const d = pickActiveSignal({ olsBacktest: bt({ avgNetBpsPerEntry: 1, entries: 100 }) });
+  const d = pickActiveSignal({ olsBacktest: bt({ avgNetBpsPerEntry: -1, entries: 100 }) });
   assert.equal(d.signalVersion, null);
   assert.equal(d.tradingVeto, true);
-  assert.equal(d.olsNetBps, 1, 'still records the value');
+  assert.equal(d.olsNetBps, -1, 'still records the value');
 }
 
 // 4. Only OLS, deeply negative → veto.
@@ -264,6 +272,69 @@ function bt(overall) { return { ranAt: '2026-01-01T00:00:00Z', overall }; }
   assert.equal(d.signalVersion, 'barrier');
   assert.equal(d.tradingVeto, false);
   assert.equal(d.reason, 'operator_override_validated');
+}
+
+// --- 2026-05-18 diagnostic-fidelity fixes ---
+
+// 25. DEFAULTS.minBpsToActivate matches the live default (0 since 2026-05-17).
+//     If this assertion fails, the early-boot veto log will mis-report the
+//     activation threshold until the first decision is computed (the bug
+//     observed in the deployed 2026-05-18 logs).
+{
+  assert.equal(DEFAULTS.minBpsToActivate, 0, 'DEFAULTS must mirror LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS');
+}
+
+// 26. Winner-picked decision payload includes all per-signal net-bps fields,
+//     including the four microstructure horizons. Previously the winner
+//     branch dropped micro5m/15m/30m/45m, hiding their values from operator
+//     diagnostics whenever a signal was actually selected.
+{
+  const d = pickActiveSignal({
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 15, entries: 30 }),
+    micro15mBacktest: bt({ avgNetBpsPerEntry: -8, entries: 30 }),
+    micro30mBacktest: bt({ avgNetBpsPerEntry: -12, entries: 30 }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion');
+  assert.equal(d.tradingVeto, false);
+  // Every per-signal slot must be present in the response (null where the
+  // backtest wasn't provided is fine; undefined-because-missing is the bug).
+  for (const slot of [
+    'olsNetBps', 'mfNetBps',
+    'meanRevNetBps', 'meanRev5mNetBps', 'meanRev15mNetBps',
+    'rangeMrNetBps', 'barrierNetBps',
+    'micro5mNetBps', 'micro15mNetBps', 'micro30mNetBps', 'micro45mNetBps',
+  ]) {
+    assert.ok(slot in d, `winner-decision missing field: ${slot}`);
+  }
+  assert.equal(d.micro15mNetBps, -8);
+  assert.equal(d.micro30mNetBps, -12);
+}
+
+// 27. No-winner decision payload surfaces the most-recent backtest ranAt.
+//     Previously `backtestRanAt: null` in the veto branch meant operators
+//     could not tell how stale the inputs to the veto decision were.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: -10, entries: 30, ranAt: '2026-05-18T19:00:00.000Z' }),
+    mfBacktest: bt({ avgNetBpsPerEntry: -20, entries: 30, ranAt: '2026-05-18T19:01:00.000Z' }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: -5, entries: 30, ranAt: '2026-05-18T19:04:00.000Z' }),
+  });
+  assert.equal(d.signalVersion, null);
+  assert.equal(d.tradingVeto, true);
+  assert.equal(d.reason, 'no_signal_passed_backtest_threshold');
+  assert.equal(d.backtestRanAt, '2026-05-18T19:04:00.000Z',
+    'veto decision should report most-recent ranAt across all backtests');
+}
+
+// 28. Winner-picked decision still reports the winner's own ranAt when set.
+{
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: -10, entries: 30, ranAt: '2026-05-18T19:04:00.000Z' }),
+    meanRevBacktest: bt({ avgNetBpsPerEntry: 15, entries: 30, ranAt: '2026-05-18T19:00:00.000Z' }),
+  });
+  assert.equal(d.signalVersion, 'mean_reversion');
+  // Bestbacktest's ranAt wins even if it isn't the most-recent overall.
+  assert.equal(d.backtestRanAt, '2026-05-18T19:00:00.000Z');
 }
 
 // 24. Operator override to barrier with no backtest → use it but set veto.
