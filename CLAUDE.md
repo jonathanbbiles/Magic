@@ -89,6 +89,12 @@ The `deriveStopLossBps` function in `backend/trade.js` dispatches the MR stop ca
 
 The backtester (`backend/scripts/backtest_strategy.js`) follows the same dispatch via `opts.mrTimeframe`. The env-fallback resolver wires all four new env vars to the auto-backtest so the dashboard reflects whatever an operator set in Render env. Validate any flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100` before deploying live.
 
+## MR stop-loss sweep diagnostic (2026-05-17 dashboard fix)
+
+`runMrStopLossSweep` in `backend/index.js` (helpers in `backend/modules/mrStopLossSweep.js`) fires the MR-5m and MR-15m backtest at multiple stop-loss caps on every restart and parks results at `meta.mrStopLossSweep`. The sweep is purely observational — the live signal selector reads only the canonical `mean_rev / mean_rev_5m / mean_rev_15m` slots, not sweep cells. Operators read the sweep, pick the cap that maximises `avgNetBpsPerEntry`, set `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_15M` in Render env, and the live selector starts admitting that timeframe on the next restart.
+
+Knobs: `MR_STOP_LOSS_SWEEP_ENABLED` (default `true`), `MR_STOP_LOSS_SWEEP_CAPS` (default `60,80,100`, bounded to 6 caps total).
+
 ## Auto-backtest env-fallback resolver (2026-05-17 visibility fix)
 
 `backend/modules/backtestEnvFallbacks.js` bridges the live engine's `process.env` values into the auto-backtest invocation in `runBacktestAndStore`. Without it, the auto-backtest passes only `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` and the rest fall through to `backtest_strategy.js`'s hardcoded `DEFAULTS` (e.g. `rejectNearHighLookbackBars: 60`) — which made the Stage 1 default flip invisible on the dashboard even though live trading was using the new value.

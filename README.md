@@ -39,6 +39,38 @@ That signal has been restored in `backend/modules/barrierSignal.js` as a **backt
 
 ---
 
+## 2026-05-17 Stage 3 sweep diagnostic on dashboard
+
+The Stage 3 PR added the per-timeframe MR stop knobs but validating "what cap should I set?" still required hand-rolling `/debug/backtest` URLs and reading the JSON — impractical from a phone front-end. This PR makes the picking-a-cap step entirely dashboard-driven.
+
+On every restart, after the regular auto-backtest chain completes, the engine now fires a sweep: MR-5m and MR-15m × three stop-loss caps (default `60 / 80 / 100`). Per-cap results land at `meta.mrStopLossSweep` with shape:
+
+```jsonc
+{
+  "mrStopLossSweep": {
+    "ranAt": "2026-05-18T...",
+    "windowDays": 30,
+    "caps": [60, 80, 100],
+    "mr5m": [
+      { "stopLossBps": 60, "overall": { "entries": 146, "avgNetBpsPerEntry": -28.08, "stopLossFills": 55, ... } },
+      { "stopLossBps": 80,  "overall": { ... } },
+      { "stopLossBps": 100, "overall": { ... } }
+    ],
+    "mr15m": [ /* same shape */ ]
+  }
+}
+```
+
+**How to read it**: find the cap that maximises `avgNetBpsPerEntry` for each timeframe. If any cap clears positive, set `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_15M` to that value in Render env — the live selector will start admitting that timeframe as a validated signal on the next restart.
+
+**Tuning knobs:**
+- `MR_STOP_LOSS_SWEEP_ENABLED` (default `true`) — disable the sweep entirely if the extra ~30–60 s of startup time is unacceptable.
+- `MR_STOP_LOSS_SWEEP_CAPS` (default `60,80,100`) — comma-separated cap list. Bounded to 6 caps total so a stray env value can't burn dozens of backtests at boot.
+
+The sweep is purely observational: the live signal selector reads only the canonical `mean_rev / mean_rev_5m / mean_rev_15m` slots, not the sweep cells. Picking a cap is still a manual env-var change.
+
+---
+
 ## 2026-05-17 Stage 3: per-timeframe MR stop caps
 
 The 30-day backtest after the visibility fix confirmed two things: Stage 1's lookback flip (60 → 30) didn't change MR-1m's entry count (still 7/month, +19.87 bps net) because `mr_no_drop` is the binding upstream gate, and the only MR variants that fire often enough to matter (MR-5m, MR-15m) currently lose money at the 60-bps tier-1/2 stop cap. MR-5m takes 54/131 = 41% stop_loss fills at avg -32.6 bps net; MR-15m takes 88/293 = 30% stop_loss fills at avg -29.2 bps net. The signal is *finding* trades — the problem is the stop is being hit too often on the coarser timeframes because their drops play out over longer windows where 60 bps of intraday noise is well within the natural intra-trade range.
