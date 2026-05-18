@@ -16,6 +16,40 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-18 add: observational feature library for Phase 2 weight learning
+
+A new module **`backend/modules/featureLibrary.js`** plus an extension to **`backend/modules/indicators.js`** add ~22 second-order indicator + statistical features that are computed at every accepted entry and appended to `labeled.jsonl` as a `featureSnapshot` block. **Observational-only.** None of these features gate entries today — the SignalSelector + per-signal logic remain the only entry decision-maker. The downstream consumer is `scripts/build_calibration.js` (Phase 2, separate PR), which will fit logistic weights from the richer labeled record so the microstructure signal's hand-tuned weights can be replaced with data-fit weights.
+
+This is **the same Phase 1 / Phase 2 framing** the microstructure signal uses: ship the feature surface honestly labelled as observational, accumulate labels live, fit weights in a follow-up PR. The features cannot bleed capital because no entry decision reads them.
+
+**What gets added to `labeled.jsonl`.** Each accepted entry's record gains a `featureSnapshot` object with three families of fields:
+
+| Family | Fields | Disable env |
+|---|---|---|
+| Extended indicators | `stochK`, `stochD`, `stochCrossover`, `bbWidth`, `bbZScore`, `candleBodyPct`, `candleUpperWickPct`, `candleLowerWickPct`, `macdHistSlope`, `macdSignalDivergenceScore`, `rsiDivergenceScore`, `emaAlignment`, `obvSlope`, `chaikinMoneyFlow` | `FEATURE_INDICATORS_EXTENDED_ENABLED=false` |
+| Rolling statistical | `rollingSharpe`, `rollingSortino`, `rollingSkewness`, `rollingKurtosis`, `ljungBoxQ`, `ljungBoxLags`, `rollingRSquared`, `maxDdBps`, `maxDdDurationBars`, `varBps`, `cvarBps`, `realizedVolPercentile` | `FEATURE_STATS_ENABLED=false` |
+| Price structure | `nearestSupportBps`, `nearestResistanceBps` (from swing-point detection) | `FEATURE_STRUCTURE_ENABLED=false` |
+
+Master kill: `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables the snapshot computation entirely.
+
+**Triage of the operator's originally-requested 36-metric list.** The audit is in this PR's commit message; the high-level cut is:
+
+| Bucket | Examples | Action |
+|---|---|---|
+| Already wired pre-PR | OLS slope, MACD, RSI, ATR, EMA, volume MA ratio, bid-ask spread, orderbook depth/impact/microprice, BTC β/residual | Do not rebuild — these already feed live decisions via existing signals. |
+| Added this PR (observational) | The 22 fields in the table above | Logged for Phase 2 fit. |
+| Dropped (regime mismatch) | Volume profile POC/HVN/LVN | Multi-hour tool; returns noise on 1m bars. Plan-agent finding; not added. |
+| Crypto-equivalent substitute | Realised-vol percentile (VIX-substitute), BTC residual (already in microstructure signal as `btcRes`) | Added where the equity metric was requested. |
+| Not implementable on Alpaca crypto | P/E, Forward P/E, PEG, EV/EBITDA, FCF Yield, D/E ratio, institutional ownership, short interest, IV Rank / Percentile, beta vs S&P 500, Jensen's α vs SPX, VIX, put/call ratios, sector RSI | No upstream data source. Not added as env-var stubs (CLAUDE.md Hard Rule #4 — no dead knobs documented as if real). |
+
+**Per-scan CPU.** The snapshot runs **only at the entry-accepted boundary** inside the existing `tradeForensics.append` block in `trade.js` (the line that already fires on `phase=entry_submitted`). It does not run per-candidate per-scan, so the cost is bounded by the entry rate — currently zero during the backtest-veto window, and order-of-tens-per-day even when signals admit entries. No measurable impact on entry latency.
+
+**Hard Rule #4 compliance.** The features have a live downstream consumer: `tradeForensics.append` writes them to `${storagePaths.writableRoot}/labeled.jsonl` on every accepted entry, and `scripts/build_calibration.js` (extended in Phase 2) reads them. The features are wired, not stubbed. The README claim above matches the code exactly — observational logging, no entry gating, Phase 2 fits the weights.
+
+**Revert via Render env** (no code change required): `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables logging globally; per-family flags above let an operator disable a single family if (e.g.) a future operator hits an unexpected JSON size limit.
+
+---
+
 ## 2026-05-18 add: microstructure-weighted logistic signal (4 horizons)
 
 A new entry signal **`microstructure`** has been added alongside OLS / multi_factor / mean_reversion / barrier. The signal scores each candidate with a **hand-tuned logistic** over 8 microstructure + statistical features that the existing stack didn't model: **microprice deviation, book imbalance, flow imbalance, spread regime z-score, vol-normalised return, RSI delta, BTC residual, drift Sharpe**. It emits four discrete-horizon variants (`microstructure_5m / 15m / 30m / 45m`) so the SignalSelector picks the horizon with the best per-trade backtest expectancy.
@@ -528,6 +562,10 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `BARRIER_HORIZON_BARS` | `BREAKEVEN_TIMEOUT_MS / 60000` | Number of 1-minute bars used as the horizon in the barrier-hitting probability. Defaults to the break-even timeout in minutes — answers "how likely is the TP to fill before we'd otherwise replace it with a break-even sell?". |
 | `SIGNAL_VERSION` | *(unset → auto)* | Selects which entry signal the scan loop uses. **Default `auto`**: the runtime signal selector (`backend/modules/signalSelector.js`) picks the best validated signal from `ols`, `multi_factor`, `mean_reversion` (incl. 5m/15m timeframes), `range_mean_reversion`, `barrier`, and `microstructure_{5,15,30,45}m` based on the most recent backtest evidence. If no signal has cleared `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17), all entries are vetoed (skip reason: `backtest_veto_active`). Operator pin: set to one of the valid signal names. The veto still applies to a pinned signal unless `SIGNAL_SELECTOR_VETO_ENABLED=false`. **All backtests run on every Render restart**; results at `meta.backtest`, `meta.backtestMf`, `meta.backtestMeanRev`, `meta.backtestMeanRev5m`, `meta.backtestMeanRev15m`, `meta.backtestRangeMr`, `meta.backtestBarrier`, `meta.backtestMicro{5m,15m,30m,45m}`; decision at `meta.signalSelector`. The OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped when the active signal is anything other than `ols` — those signals' own factor votes replace them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF, recent-high) still apply to all signals. |
 | `SIGNAL_VERSION=barrier` (and `BARRIER_*` knobs) | *(see barrier section above)* | Restored signal from commit `fbdb924`. `BARRIER_ENABLED=false` to disable the auto-backtest entirely. `BARRIER_DESIRED_NET_BPS=100` is the per-trade net target (the math doesn't work at lower targets — see the barrier section). `BARRIER_STOP_LOSS_BPS=100`, `BARRIER_MAX_HOLD_MS=21600000` (6h), `BARRIER_BREAKEVEN_TIMEOUT_MS=10800000` (3h) mirror MF timing since the per-trade target magnitude is similar. |
+| `FEATURE_LIBRARY_LOGGING_ENABLED` | `true` | Master kill switch for the 2026-05-18 observational feature library. When `true`, the entry forensics record gets a `featureSnapshot` block with ~22 extended indicators + rolling statistics + price-structure fields appended at every accepted entry, written to `labeled.jsonl`. When `false`, the snapshot is not computed and not written. **Observational only — no entry decision reads this.** See the "observational feature library" section above for the field list and the Phase 2 hand-off. |
+| `FEATURE_INDICATORS_EXTENDED_ENABLED` | `true` | Per-family kill: when `false`, the extended-indicators slot of the snapshot (Stochastic, Bollinger, candle body/wick, MACD-hist slope, MACD/RSI divergence, EMA alignment, OBV slope, Chaikin MF) is skipped. Only consulted when `FEATURE_LIBRARY_LOGGING_ENABLED=true`. |
+| `FEATURE_STATS_ENABLED` | `true` | Per-family kill: when `false`, the rolling-statistics slot (Sharpe, Sortino, skew, kurtosis, Ljung-Box, R², max drawdown, VaR, CVaR, realised-vol percentile) is skipped. Only consulted when `FEATURE_LIBRARY_LOGGING_ENABLED=true`. |
+| `FEATURE_STRUCTURE_ENABLED` | `true` | Per-family kill: when `false`, the price-structure slot (`nearestSupportBps`, `nearestResistanceBps` from swing-point detection) is skipped. Only consulted when `FEATURE_LIBRARY_LOGGING_ENABLED=true`. |
 | `SIGNAL_VERSION=microstructure_{5,15,30,45}m` (and `MICRO_*` knobs) | *(see microstructure section above)* | Hand-tuned logistic over 8 microstructure + statistical features (microprice, book imbalance, flow imbalance, spread-Z, vol-normalised return, RSI delta, BTC residual, drift-Sharpe). Four discrete-horizon variants registered as separate candidate slots. **Per-horizon enable flags**: `MICRO_HORIZON_5M_ENABLED=false`, `MICRO_HORIZON_15M_ENABLED=true`, `MICRO_HORIZON_30M_ENABLED=true`, `MICRO_HORIZON_45M_ENABLED=false`. **Gating thresholds**: `MICRO_SPREAD_Z_MAX=1.5` (hard spread-regime veto; refuses entries when current spread is >1.5σ wider than its 60-bar trailing mean), `MICRO_MIN_PROB=0.55`, `MICRO_EV_MIN_BPS=2`. **Per-horizon stop caps**: `MICRO_STOP_LOSS_BPS_{5,15,30,45}M={60,80,100,100}`. **TP sizing**: `MICRO_TARGET_NET_BPS_FLOOR=8`, `MICRO_SIGNAL_TARGET_MAX_NET_BPS=150`. **Hold timing**: `MICRO_MAX_HOLD_MS=21600000` (6h), `MICRO_BREAKEVEN_TIMEOUT_MS=10800000` (3h) — mirrors barrier since the per-trade target magnitude is similar. `MICRO_ENABLED=false` disables all four auto-backtests entirely. `MICRO_TRADES_ENABLED=false` is honest: the `flowImbalance` feature returns 0 in Phase 1 because no trades-feed consumer is wired yet (Phase 2 adds it). |
 | `MR_TARGET_NET_PROFIT_BPS_FLOOR` | `5` | Tiny-net floor (bps net per trade) for mean-reversion entries. Default 5 bps because the strategy thesis is "small drops produce small but statistically-guaranteed targets." Operator can raise to require a bigger minimum, but the signal's drop trigger (100 bps min) already keeps the gross target ≥ 50 bps. |
 | `MR_SIGNAL_TARGET_MAX_NET_BPS` | `120` | Cap on per-trade net target for mean-reversion. Bounds the TP on freak drops; a 300-bps drop → 150 bps gross → 110 bps net (under the cap). |

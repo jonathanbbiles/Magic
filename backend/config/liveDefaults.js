@@ -332,6 +332,19 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MICRO_TARGET_NET_BPS_FLOOR: '8',
   MICRO_SIGNAL_TARGET_MAX_NET_BPS: '150',
   MICRO_TRADES_ENABLED: 'false',
+  // Feature library (2026-05-18). Observational logging only — these flags
+  // gate whether the entry forensics snapshot computes the corresponding
+  // family of features and appends them to labeled.jsonl. They do NOT
+  // change entry decisions. Phase 2 will fit logistic weights from the
+  // expanded labeled.jsonl via scripts/build_calibration.js.
+  //
+  // Setting FEATURE_LIBRARY_LOGGING_ENABLED=false in Render env disables
+  // the snapshot entirely; per-family flags let an operator disable a
+  // single family if (e.g.) one family is producing oversized records.
+  FEATURE_LIBRARY_LOGGING_ENABLED: 'true',
+  FEATURE_INDICATORS_EXTENDED_ENABLED: 'true',
+  FEATURE_STATS_ENABLED: 'true',
+  FEATURE_STRUCTURE_ENABLED: 'true',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));
