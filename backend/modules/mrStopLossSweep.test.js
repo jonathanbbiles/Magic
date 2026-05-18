@@ -106,4 +106,88 @@ assert.equal(parseSweepCaps('10,20,30,40,50', undefined, 3).length, 3);
 assert.ok(Object.isFrozen(DEFAULT_CAPS), 'DEFAULT_CAPS must be frozen');
 assert.ok(Object.isFrozen(TIMEFRAMES), 'TIMEFRAMES must be frozen');
 
+// ---------------------------------------------------------------------------
+// serialize / deserialize round-trip (restart persistence).
+// ---------------------------------------------------------------------------
+
+const { serialize, deserialize, SCHEMA_VERSION } = require('./mrStopLossSweep');
+
+// 13. Round-trip preserves the sweep payload exactly.
+{
+  const sweep = {
+    ranAt: '2026-05-18T01:30:00.000Z',
+    windowDays: 30,
+    caps: [60, 80, 100],
+    mr5m: [
+      { stopLossBps: 60, overall: { entries: 146, avgNetBpsPerEntry: -28.08 } },
+      { stopLossBps: 80, overall: { entries: 140, avgNetBpsPerEntry: -15.5 } },
+      { stopLossBps: 100, overall: { entries: 134, avgNetBpsPerEntry: 4.2 } },
+    ],
+    mr15m: [
+      { stopLossBps: 60, overall: { entries: 240, avgNetBpsPerEntry: -29.2 } },
+      { stopLossBps: 80, overall: { entries: 232, avgNetBpsPerEntry: -10.1 } },
+      { stopLossBps: 100, overall: { entries: 220, avgNetBpsPerEntry: 8.0 } },
+    ],
+  };
+  const json = serialize(sweep);
+  assert.ok(typeof json === 'string', 'serialize must return a string');
+  const parsed = deserialize(json);
+  assert.deepEqual(parsed, sweep, 'round-trip must preserve the full payload');
+}
+
+// 14. serialize returns null for non-objects (defensive).
+assert.equal(serialize(null), null);
+assert.equal(serialize(undefined), null);
+assert.equal(serialize('not an object'), null);
+assert.equal(serialize(42), null);
+
+// 15. serialize embeds the schema version so future shape changes can
+//     reject older blobs.
+{
+  const json = serialize({ mr5m: [], mr15m: [] });
+  const parsed = JSON.parse(json);
+  assert.equal(parsed.schemaVersion, SCHEMA_VERSION);
+  assert.ok(parsed.sweep, 'sweep payload must be nested under .sweep');
+}
+
+// 16. deserialize rejects non-string input.
+assert.equal(deserialize(null), null);
+assert.equal(deserialize(undefined), null);
+assert.equal(deserialize(42), null);
+assert.equal(deserialize({}), null);
+
+// 17. deserialize rejects malformed JSON (returns null, no throw).
+assert.equal(deserialize('not valid json'), null);
+assert.equal(deserialize('{bad'), null);
+
+// 18. deserialize rejects mismatched schemaVersion (older on-disk blob
+//     after a schema bump must be silently ignored).
+{
+  const stale = JSON.stringify({ schemaVersion: 999, sweep: { mr5m: [], mr15m: [] } });
+  assert.equal(deserialize(stale), null, 'mismatched schema version must yield null');
+}
+
+// 19. deserialize rejects a blob missing the schemaVersion field.
+{
+  const noVersion = JSON.stringify({ sweep: { mr5m: [], mr15m: [] } });
+  assert.equal(deserialize(noVersion), null);
+}
+
+// 20. deserialize rejects a blob with the wrong sweep shape.
+{
+  const noMr5m = JSON.stringify({ schemaVersion: SCHEMA_VERSION, sweep: { mr15m: [] } });
+  assert.equal(deserialize(noMr5m), null, 'missing mr5m array must yield null');
+  const noMr15m = JSON.stringify({ schemaVersion: SCHEMA_VERSION, sweep: { mr5m: [] } });
+  assert.equal(deserialize(noMr15m), null, 'missing mr15m array must yield null');
+  const wrongType = JSON.stringify({ schemaVersion: SCHEMA_VERSION, sweep: { mr5m: 'not array', mr15m: [] } });
+  assert.equal(deserialize(wrongType), null, 'non-array mr5m must yield null');
+}
+
+// 21. deserialize handles empty arrays (a sweep where every cell failed
+//     is still a valid sweep, just with no data — return it intact).
+{
+  const empty = serialize({ ranAt: 'x', mr5m: [], mr15m: [] });
+  assert.deepEqual(deserialize(empty), { ranAt: 'x', mr5m: [], mr15m: [] });
+}
+
 console.log('mrStopLossSweep.test ok');

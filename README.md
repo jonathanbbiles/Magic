@@ -39,6 +39,21 @@ That signal has been restored in `backend/modules/barrierSignal.js` as a **backt
 
 ---
 
+## 2026-05-18 sweep persistence across restarts
+
+Same-day follow-up to the Stage 3 sweep PR. The sweep takes ~3 minutes to repopulate after a deploy, so a phone-first operator pulling logs right after a PR merge would see `meta.mrStopLossSweep = null` every time — and since PRs ship back-to-back during tuning, that's every dashboard pull during active iteration.
+
+This PR persists the last-completed sweep to disk at `${storagePaths.writableRoot}/mr_stop_loss_sweep.json`. On boot, the engine reads the file and pre-populates `meta.mrStopLossSweep` with the prior result, marked `staleFromPriorRun: true` so the dashboard can flag that the values are from the previous run. When the fresh sweep completes (~3 min later), it overwrites both memory and disk, and the flag flips back to `false`.
+
+**What you see now:**
+- Right after restart: prior sweep's numbers, `staleFromPriorRun: true`.
+- ~3 min later: current sweep's numbers, `staleFromPriorRun: false`.
+- First boot ever (no file): `null` until the first sweep completes (one-time only).
+
+**Defensive design:** corrupt or schema-mismatched files silently return null (logged via `mr_sweep_persistence_invalid`). Write failures are logged but never crash the engine. Schema is versioned so future sweep-shape changes can reject older blobs cleanly.
+
+---
+
 ## 2026-05-17 Stage 3 sweep diagnostic on dashboard
 
 The Stage 3 PR added the per-timeframe MR stop knobs but validating "what cap should I set?" still required hand-rolling `/debug/backtest` URLs and reading the JSON — impractical from a phone front-end. This PR makes the picking-a-cap step entirely dashboard-driven.

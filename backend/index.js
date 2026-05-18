@@ -104,7 +104,13 @@ const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
 const { resolveLiveEngineFallbacks } = require('./modules/backtestEnvFallbacks');
-const { parseSweepCaps, summarizeCell, DEFAULT_CAPS: MR_SWEEP_DEFAULT_CAPS } = require('./modules/mrStopLossSweep');
+const {
+  parseSweepCaps,
+  summarizeCell,
+  serialize: serializeMrSweep,
+  deserialize: deserializeMrSweep,
+  DEFAULT_CAPS: MR_SWEEP_DEFAULT_CAPS,
+} = require('./modules/mrStopLossSweep');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -681,6 +687,42 @@ let backtestRunning = false;
 // expectancy curve. Surfaced at meta.mrStopLossSweep. Disable via
 // MR_STOP_LOSS_SWEEP_ENABLED=false in Render env if startup is too slow.
 let lastMrStopLossSweep = null;
+
+// Restart persistence (2026-05-18): the sweep takes ~3 minutes to repopulate
+// after a deploy, so a phone-first operator would see meta.mrStopLossSweep =
+// null every time they pull the dashboard right after a PR merge. Load the
+// last persisted sweep at boot — marked staleFromPriorRun so the dashboard
+// can flag it — and overwrite it when the fresh sweep completes.
+function loadPersistedMrSweep() {
+  const file = storagePaths?.paths?.mrStopLossSweepFile;
+  if (!file) return null;
+  try {
+    if (!fs.existsSync(file)) return null;
+    const raw = fs.readFileSync(file, 'utf8');
+    const parsed = deserializeMrSweep(raw);
+    if (!parsed) {
+      logOnce('warn', 'mr_sweep_persistence_invalid', 'mr_sweep_persistence_invalid', { file });
+      return null;
+    }
+    return { ...parsed, staleFromPriorRun: true };
+  } catch (err) {
+    logOnce('warn', 'mr_sweep_persistence_read_failed', 'mr_sweep_persistence_read_failed', { file, error: err?.message });
+    return null;
+  }
+}
+lastMrStopLossSweep = loadPersistedMrSweep();
+
+function persistMrSweep(sweep) {
+  const file = storagePaths?.paths?.mrStopLossSweepFile;
+  if (!file) return;
+  try {
+    const payload = serializeMrSweep(sweep);
+    if (!payload) return;
+    fs.writeFileSync(file, payload, 'utf8');
+  } catch (err) {
+    console.log('mr_sweep_persistence_write_failed', { file, error: err?.message });
+  }
+}
 
 // Recompute the signal selector decision based on the most recent backtest
 // results for OLS and multi-factor. Called after every backtest auto-run +
@@ -1391,6 +1433,12 @@ app.get('/dashboard', async (req, res) => {
           caps: lastMrStopLossSweep.caps,
           mr5m: lastMrStopLossSweep.mr5m,
           mr15m: lastMrStopLossSweep.mr15m,
+          // staleFromPriorRun=true means the values were loaded from disk
+          // at boot and have not yet been refreshed by the current restart.
+          // The fresh sweep takes ~3 minutes after restart to repopulate;
+          // until then the dashboard still shows the prior result instead
+          // of null.
+          staleFromPriorRun: Boolean(lastMrStopLossSweep.staleFromPriorRun),
           note: 'Stage 3 expectancy curve: MR-5m and MR-15m at multiple stop-loss caps. Use to pick MR_STOP_LOSS_BPS_5M / MR_STOP_LOSS_BPS_15M values that flip avgNetBpsPerEntry positive without hand-rolling /debug/backtest URLs.',
         } : null,
         signalSelector: (() => {
@@ -2383,6 +2431,9 @@ async function runMrStopLossSweep() {
     }
   }
   lastMrStopLossSweep = sweep;
+  // Persist so the next restart's dashboard shows the prior result
+  // immediately (marked staleFromPriorRun) instead of null for ~3 min.
+  persistMrSweep(sweep);
   console.log('mr_stop_loss_sweep_completed', {
     ranAt,
     mr5mNetBps: sweep.mr5m.map((c) => ({ cap: c.stopLossBps, net: c.overall?.avgNetBpsPerEntry })),
