@@ -145,6 +145,21 @@ Master kill: `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables the entire snapsho
 - P/E, Forward P/E, PEG, EV/EBITDA, FCF Yield, D/E ratio, institutional ownership, short interest, IV Rank / Percentile, beta vs S&P 500, Jensen's α vs SPX, VIX, put/call ratios, sector RSI — none of these have an Alpaca crypto data source. Adding them as env-var stubs that compute nothing would violate Hard Rule #4. Do not re-add as "future hooks" without first wiring an upstream feed.
 - Volume profile POC/HVN/LVN — Plan-agent finding: wrong tool for 1m timeframe. A multi-hour tool whose output on 200×1m bars (~3 h of tape) is regime-noise, not durable level information. Defer until a multi-timeframe context is wired and a clear use-case exists.
 
+## MR per-symbol blocklists (2026-05-18)
+
+`backend/modules/symbolBlocklist.js` exposes `parseSymbolBlocklist`, `readMrBlocklistsFromEnv`, `isMrPairBlocked`, `isPairBlocked`. Live engine reads via `MR_BLOCKLISTS` at module load in `trade.js`; the auto-backtest in `index.js` reads the same env vars and passes `blockedSymbols: [...]` into `runBacktestAndStore` for the corresponding slot.
+
+| Env var | Default | Why |
+|---|---|---|
+| `MR_SYMBOL_BLOCKLIST_1M` | `BCH/USD` | BCH was 5 of 13 MR-1m entries with 4 stops at avg −66.6 bps. Excluding BCH flips MR-1m from −13.4 to +19.9 bps net over 8 winners — first signal to validate the selector post-veto. |
+| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD` | BCH mildly worse than overall on MR-5m (−42.3 vs −32.2). Consistency with 1m. |
+| `MR_SYMBOL_BLOCKLIST_15M` | *(empty)* | **DO NOT add BCH here.** BCH is one of the best symbols on MR-15m (−16.1 vs −30.7 overall); blocking it would make MR-15m worse. |
+| `RANGE_MR_SYMBOL_BLOCKLIST` | *(empty)* | No symbol has a documented edge problem here yet; knob exists so an operator can add one without a code change. |
+
+**Hard Rule #4 compliance**: the blocklists have real downstream consumers (live signal getters + auto-backtest invocations); they are NOT dead knobs. The selector validates against `meta.backtestMeanRev.params.blockedSymbols` matching `process.env.MR_SYMBOL_BLOCKLIST_1M` — if those ever diverge, the selector decision misrepresents what the live engine actually trades.
+
+**Adding a new per-symbol filter to a future signal**: extend `readMrBlocklistsFromEnv` (or add a parallel reader), wire the getter in `trade.js`, wire the auto-backtest invocation in `index.js`. The two MUST stay in sync — adding one without the other is the failure mode this module's existence prevents.
+
 ## Selector diagnostic-fidelity (2026-05-18)
 
 Three diagnostic bugs were observed in deployed logs and fixed in `backend/modules/signalSelector.js` + `backend/index.js`:

@@ -16,6 +16,43 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-18 add: per-timeframe MR symbol blocklist (BCH on 1m+5m)
+
+The 2026-05-18 30-day backtest decomposed by signal × symbol showed a sharp per-symbol asymmetry the selector was masking by averaging:
+
+| Symbol | MR-1m entries | MR-1m net bps | MR-15m entries | MR-15m net bps |
+|---|---|---|---|---|
+| BTC/USD | 1 | **+12.1** | 5 | **+10.1** |
+| SOL/USD | 2 | **+14.1** | 30 | −21.8 |
+| UNI/USD | 4 | **+16.8** | 8 | −27.4 |
+| DOGE/USD | 1 | **+51.9** | 25 | −28.7 |
+| BCH/USD | 5 | **−66.6** | 12 | **−16.1** |
+| Other 7 symbols | 0 | n/a | varies | mostly negative |
+| **Aggregate** | **13** | **−13.4** | **257** | **−30.7** |
+
+On MR-1m, BCH was 5 of 13 entries with 4 stops at avg −66.6 bps. The other 8 trades (BTC/SOL×2/UNI×4/DOGE) were ALL winners averaging **+19.9 bps net**. **The aggregate negative expectancy was entirely driven by one symbol.** Excluding BCH flips MR-1m from −13.4 to +19.9 over 8 entries — clearing the `SIGNAL_SELECTOR_MIN_BPS=0` floor and the `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` sample-size guard. MR-1m becomes the first signal to validate the selector since the 2026-05-16 veto restoration.
+
+On MR-15m, BCH is one of the **best** symbols (−16.1 vs −30.7 overall), so the blocklist is intentionally empty for the 15m variant. On MR-5m, BCH is mildly negative (−42.3 vs −32.2 overall) — doesn't fix MR-5m on its own, but is removed for consistency with 1m and to keep the signal-symbol matrix clean.
+
+**New env vars** (defaults applied at boot via `liveDefaults.js`):
+
+| Env var | Default | Rationale |
+|---|---|---|
+| `MR_SYMBOL_BLOCKLIST_1M` | `BCH/USD` | Removes the one symbol that flipped MR-1m negative. |
+| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD` | Mild improvement; consistency with 1m. |
+| `MR_SYMBOL_BLOCKLIST_15M` | *(empty)* | BCH is BEST on 15m; do not block. |
+| `RANGE_MR_SYMBOL_BLOCKLIST` | *(empty)* | No symbol has a documented edge problem here yet. |
+
+The filter is applied at TWO points to keep the live engine and the selector's backtest in sync:
+1. `getMeanReversionSignalForPair` / `getRangeMeanReversionSignalForPair` in `backend/trade.js` early-return `{ok: false, reason: 'mr_symbol_blocklisted'}` for blocked pairs (zero bars-fetched cost).
+2. `runBacktestAndStore` in `backend/index.js` passes the same blocklist to `runBacktest` for the corresponding slot. The filtered universe + blocklist are echoed at `result.params.symbols` + `result.params.blockedSymbols` for operator-facing diagnostic transparency.
+
+**The arithmetic this opens up.** MR-1m at 0.27 entries/day × ~+20 bps net × 10% sizing × $83 equity ≈ $0.005/day ≈ $1.80/year. That is — honestly — tiny. But it's the first **positive** daily expectancy the bot has on $83, and it's grounded in evidence not theory. Scale it with equity or a lower Alpaca fee tier; do not lower the gates (the in-code A/B on `MR_DROP_TRIGGER_BPS` is the receipt that wider gates destroy the edge).
+
+**Revert via Render env** (no code change required): set `MR_SYMBOL_BLOCKLIST_1M=` (empty) to restore the prior behaviour, or set it to a different symbol if a future live scorecard surfaces a different per-symbol loser.
+
+---
+
 ## 2026-05-18 add: observational feature library for Phase 2 weight learning
 
 A new module **`backend/modules/featureLibrary.js`** plus an extension to **`backend/modules/indicators.js`** add ~22 second-order indicator + statistical features that are computed at every accepted entry and appended to `labeled.jsonl` as a `featureSnapshot` block. **Observational-only.** None of these features gate entries today — the SignalSelector + per-signal logic remain the only entry decision-maker. The downstream consumer is `scripts/build_calibration.js` (Phase 2, separate PR), which will fit logistic weights from the richer labeled record so the microstructure signal's hand-tuned weights can be replaced with data-fit weights.

@@ -888,6 +888,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(mrRsiOversoldResolved != null ? { mrRsiOversold: Number(mrRsiOversoldResolved) } : {}),
       ...(mrDeepDropGuardBpsResolved != null ? { mrDeepDropGuardBps: Number(mrDeepDropGuardBpsResolved) } : {}),
       ...(overrides.mrTimeframe ? { mrTimeframe: String(overrides.mrTimeframe) } : {}),
+      ...(overrides.blockedSymbols != null ? { blockedSymbols: overrides.blockedSymbols } : {}),
       ...(overrides.rangeMrDropTriggerBps != null ? { rangeMrDropTriggerBps: Number(overrides.rangeMrDropTriggerBps) } : {}),
       ...(overrides.rangeMrMaxRangePct != null ? { rangeMrMaxRangePct: Number(overrides.rangeMrMaxRangePct) } : {}),
       ...(overrides.rangeMrTargetNetBpsFloor != null ? { rangeMrTargetNetBpsFloor: Number(overrides.rangeMrTargetNetBpsFloor) } : {}),
@@ -2432,8 +2433,18 @@ if (backtestSkipReason) {
     // not correlatedly crashing AND RSI confirms exhaustion, targets half
     // the drop magnitude (statistically high-probability mean reversion),
     // tight 60 bps stop with 45 min max-hold.
+    // Per-timeframe MR symbol blocklists (2026-05-18). Auto-backtest must
+    // use the same blocklist the live engine applies or the selector
+    // expectancy will not match what the live engine actually trades.
+    // Defaults set in liveDefaults.js (BCH/USD on 1m+5m, empty on 15m).
+    const symbolBlocklist = require('./modules/symbolBlocklist');
+    const mrBlocklist1m = symbolBlocklist.parseSymbolBlocklist(process.env.MR_SYMBOL_BLOCKLIST_1M);
+    const mrBlocklist5m = symbolBlocklist.parseSymbolBlocklist(process.env.MR_SYMBOL_BLOCKLIST_5M);
+    const mrBlocklist15m = symbolBlocklist.parseSymbolBlocklist(process.env.MR_SYMBOL_BLOCKLIST_15M);
+    const rangeMrBlocklist = symbolBlocklist.parseSymbolBlocklist(process.env.RANGE_MR_SYMBOL_BLOCKLIST);
     await runBacktestAndStore({
       strategy: 'mean_reversion',
+      blockedSymbols: mrBlocklist1m,
     }, 'mean_rev').catch(() => {});
     // Phase 1: multi-timeframe MR variants. Each runs the same MR signal at
     // a coarser timeframe (5m / 15m). Drops are larger but rarer; the selector
@@ -2444,12 +2455,14 @@ if (backtestSkipReason) {
       await runBacktestAndStore({
         strategy: 'mean_reversion',
         mrTimeframe: '5m',
+        blockedSymbols: mrBlocklist5m,
       }, 'mean_rev_5m').catch(() => {});
     }
     if (phase1Enabled && String(process.env.MR_TIMEFRAME_15M_ENABLED || 'true').toLowerCase() !== 'false') {
       await runBacktestAndStore({
         strategy: 'mean_reversion',
         mrTimeframe: '15m',
+        blockedSymbols: mrBlocklist15m,
       }, 'mean_rev_15m').catch(() => {});
     }
     // Phase 1: range mean-reversion auto-run. Smaller drops within established
@@ -2457,6 +2470,7 @@ if (backtestSkipReason) {
     if (phase1Enabled && String(process.env.RANGE_MR_ENABLED || 'true').toLowerCase() !== 'false') {
       await runBacktestAndStore({
         strategy: 'range_mean_reversion',
+        blockedSymbols: rangeMrBlocklist,
       }, 'range_mr').catch(() => {});
     }
     // Barrier signal auto-run — restored original signal (commit fbdb924).
