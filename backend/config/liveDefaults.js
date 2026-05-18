@@ -345,6 +345,29 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   FEATURE_INDICATORS_EXTENDED_ENABLED: 'true',
   FEATURE_STATS_ENABLED: 'true',
   FEATURE_STRUCTURE_ENABLED: 'true',
+  // Per-timeframe MR symbol blocklists (2026-05-18).
+  //
+  // Evidence from the 2026-05-18 live backtest (30-day window):
+  // - MR-1m: 13 entries, 9 wins (69%), avgNetBps -13.4. BCH/USD: 5 entries,
+  //   4 stops, avgNetBps -66.6. Other 8 trades (BTC/SOL×2/UNI×4/DOGE) were
+  //   all winners averaging +19.9 bps net. BCH single-handedly flipped
+  //   MR-1m from positive to negative expectancy.
+  // - MR-5m: 153 entries, avgNetBps -32.2. BCH/USD: 5 entries, 3 stops,
+  //   avgNetBps -42.3 (worse than overall). Doesn't fix MR-5m alone but
+  //   doesn't make it worse either; removed for consistency with 1m.
+  // - MR-15m: 257 entries, avgNetBps -30.7. BCH/USD: 12 entries, 0 stops,
+  //   avgNetBps -16.1 — BCH is actually one of the BEST symbols on 15m.
+  //   Blocklist is INTENTIONALLY EMPTY for 15m.
+  // - Range-MR: 72 entries. BCH/USD: 0 entries (nothing to filter).
+  //
+  // The 1m exclusion is the change that moves the needle: excluding BCH
+  // flips MR-1m from -13.4 to +19.9 bps net over 8 entries (≥5 sample
+  // floor cleared), making it the first signal to validate the selector
+  // since the veto restoration. Operator can override via Render env.
+  MR_SYMBOL_BLOCKLIST_1M: 'BCH/USD',
+  MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD',
+  MR_SYMBOL_BLOCKLIST_15M: '',
+  RANGE_MR_SYMBOL_BLOCKLIST: '',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));

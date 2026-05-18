@@ -1179,9 +1179,20 @@ async function main() {
 // values the live engine uses.
 async function runBacktest(overrides = {}) {
   const opts = { ...DEFAULTS, ...overrides };
-  const symbols = Array.isArray(opts.symbols)
+  const rawSymbols = Array.isArray(opts.symbols)
     ? opts.symbols
     : String(opts.symbols).split(',').map((s) => s.trim()).filter(Boolean);
+  // Symbol blocklist (2026-05-18). Filter applies before any bar fetching so
+  // a blocked pair costs zero data. Honest about what was excluded via the
+  // `blockedSymbols` echo in result.params below.
+  const blockedSet = new Set(
+    (Array.isArray(opts.blockedSymbols)
+      ? opts.blockedSymbols
+      : String(opts.blockedSymbols || '').split(',')
+    ).map((s) => String(s || '').trim().toUpperCase()).filter(Boolean),
+  );
+  const symbols = rawSymbols.filter((s) => !blockedSet.has(String(s).toUpperCase()));
+  const blockedSymbolsApplied = rawSymbols.filter((s) => blockedSet.has(String(s).toUpperCase()));
   const dataBase = (opts.dataBase || process.env.DATA_BASE || 'https://data.alpaca.markets').replace(/\/+$/, '');
   const keyId = opts.apiKey || process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY;
   const secret = opts.apiSecret || process.env.APCA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY || process.env.ALPACA_API_SECRET_KEY;
@@ -1243,6 +1254,7 @@ async function runBacktest(overrides = {}) {
     params: {
       strategy: strategyName,
       symbols,
+      blockedSymbols: blockedSymbolsApplied,
       start: opts.start,
       end: opts.end,
       predictBars: opts.predictBars,

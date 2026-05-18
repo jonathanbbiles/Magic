@@ -541,6 +541,89 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
     assert.ok(result.perSymbol['ETH/USD'], 'ETH should have stats');
     assert.ok(result.overall.entries > 0, 'should produce entries on uptrend');
 
+    // 2026-05-18: blockedSymbols option filters out pairs before fetch.
+    // Confirms that the live MR-1m blocklist (BCH/USD) actually excludes
+    // a symbol from the backtest universe — the dashboard expectancy must
+    // reflect what the live engine trades, not the unfiltered universe.
+    const blockedResult = await runBacktest({
+      symbols: ['BTC/USD', 'ETH/USD', 'BCH/USD'],
+      blockedSymbols: ['BCH/USD'],
+      start: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      windowDays: 1,
+      predictBars: 10,
+      minProjectedBps: 5,
+      signalTargetFraction: 0.5,
+      targetNetBps: 8,
+      signalTargetMaxNetBps: 50,
+      feeBpsRoundTrip: 40,
+      breakevenTimeoutMin: 240,
+      cooldownAfterEntryBars: 20,
+      enforceProjectedCoversGross: false,
+      maxHoldMin: 0,
+      stopLossBps: 0,
+      rejectNearHighEnabled: false,
+      entrySpreadCostBps: 0,
+      entryFillTimeoutMin: 0,
+    });
+    assert.ok(blockedResult.perSymbol['BTC/USD'], 'BTC kept');
+    assert.ok(blockedResult.perSymbol['ETH/USD'], 'ETH kept');
+    assert.ok(!blockedResult.perSymbol['BCH/USD'], 'BCH must be filtered out of perSymbol');
+    assert.deepEqual(blockedResult.params.symbols, ['BTC/USD', 'ETH/USD'],
+      'params.symbols echoes only the symbols that ran');
+    assert.deepEqual(blockedResult.params.blockedSymbols, ['BCH/USD'],
+      'params.blockedSymbols echoes what was filtered (diagnostic visibility)');
+
+    // 2026-05-18: case-insensitive symbol matching. An operator who set
+    // MR_SYMBOL_BLOCKLIST_1M="bch/usd" (lowercase) in Render env should
+    // still see BCH/USD filtered.
+    const caseResult = await runBacktest({
+      symbols: ['BTC/USD', 'BCH/USD'],
+      blockedSymbols: ['bch/usd'],
+      start: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      windowDays: 1,
+      predictBars: 10,
+      minProjectedBps: 5,
+      signalTargetFraction: 0.5,
+      targetNetBps: 8,
+      signalTargetMaxNetBps: 50,
+      feeBpsRoundTrip: 40,
+      breakevenTimeoutMin: 240,
+      cooldownAfterEntryBars: 20,
+      enforceProjectedCoversGross: false,
+      maxHoldMin: 0,
+      stopLossBps: 0,
+      rejectNearHighEnabled: false,
+      entrySpreadCostBps: 0,
+      entryFillTimeoutMin: 0,
+    });
+    assert.ok(!caseResult.perSymbol['BCH/USD'], 'lowercase blocklist still filters BCH');
+
+    // 2026-05-18: empty / unset blocklist preserves the full universe and
+    // surfaces an empty array in params for diagnostic transparency.
+    const emptyResult = await runBacktest({
+      symbols: ['BTC/USD', 'ETH/USD'],
+      start: '2026-01-01T00:00:00Z',
+      end: '2026-01-01T01:00:00Z',
+      windowDays: 1,
+      predictBars: 10,
+      minProjectedBps: 5,
+      signalTargetFraction: 0.5,
+      targetNetBps: 8,
+      signalTargetMaxNetBps: 50,
+      feeBpsRoundTrip: 40,
+      breakevenTimeoutMin: 240,
+      cooldownAfterEntryBars: 20,
+      enforceProjectedCoversGross: false,
+      maxHoldMin: 0,
+      stopLossBps: 0,
+      rejectNearHighEnabled: false,
+      entrySpreadCostBps: 0,
+      entryFillTimeoutMin: 0,
+    });
+    assert.deepEqual(emptyResult.params.blockedSymbols, [], 'no blocklist → empty echo');
+
     global.fetch = origFetch;
     if (origKey === undefined) delete process.env.APCA_API_KEY_ID; else process.env.APCA_API_KEY_ID = origKey;
     if (origSecret === undefined) delete process.env.APCA_API_SECRET_KEY; else process.env.APCA_API_SECRET_KEY = origSecret;

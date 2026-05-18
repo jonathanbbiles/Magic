@@ -373,6 +373,13 @@ const FEATURE_INDICATORS_EXTENDED_ENABLED = readBoolean('FEATURE_INDICATORS_EXTE
 const FEATURE_STATS_ENABLED = readBoolean('FEATURE_STATS_ENABLED', true);
 const FEATURE_STRUCTURE_ENABLED = readBoolean('FEATURE_STRUCTURE_ENABLED', true);
 
+// Per-timeframe MR symbol blocklists (2026-05-18). Filtered live; the
+// auto-backtest in index.js passes the same blocklists so the selector
+// expectancy reflects what the live engine actually trades. Defaults set
+// by the live-defaults bootstrap; rationale in liveDefaults.js.
+const symbolBlocklist = require('./modules/symbolBlocklist');
+const MR_BLOCKLISTS = symbolBlocklist.readMrBlocklistsFromEnv(process.env);
+
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
@@ -1723,6 +1730,12 @@ async function getMultiFactorSignalForPair(pair, quote) {
 // to satisfy meanReversionSignal.requiredBars + headroom for the drop +
 // in-progress bar.
 async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
+  // Per-timeframe blocklist guard (2026-05-18). Refuses entries on symbols
+  // documented as structural losers for this MR timeframe. Returns BEFORE
+  // any network call so a blocked pair costs zero bars-fetched per scan.
+  if (symbolBlocklist.isMrPairBlocked(pair, timeframe, MR_BLOCKLISTS)) {
+    return { ok: false, reason: 'mr_symbol_blocklisted' };
+  }
   try {
     // Fetch enough 1m bars to support 1m, 5m (×5), or 15m (×15) aggregation.
     // 36 bars × 15 = 540 bars covers the 15m variant at requiredBars=32.
@@ -1742,6 +1755,13 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
 // established range; only needs 1m bars (more of them than capitulation MR
 // because the range identification window is wider).
 async function getRangeMeanReversionSignalForPair(pair) {
+  // Symbol blocklist (2026-05-18). Same pattern as MR — Range-MR ships with
+  // an empty blocklist by default (no symbol has a documented edge problem
+  // here yet); the knob exists so an operator can add one without a code
+  // change if the live scorecard surfaces one.
+  if (symbolBlocklist.isPairBlocked(pair, MR_BLOCKLISTS.rangeMr)) {
+    return { ok: false, reason: 'range_mr_symbol_blocklisted' };
+  }
   try {
     // limit=80: signal requires 64 closed bars; +1 for in-progress; +15
     // headroom for symbols where Alpaca returns a slightly thin bar set

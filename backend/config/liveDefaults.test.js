@@ -154,4 +154,16 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_INDICATORS_EXTENDED_ENABLED, 'true')
 assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_STATS_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_STRUCTURE_ENABLED, 'true');
 
+// 2026-05-18 per-timeframe MR symbol blocklists. BCH/USD on MR-1m: 5 entries,
+// 4 stops, -66 bps avg in the live backtest. Excluding it flips MR-1m from
+// -13.4 to +19.9 bps net over 8 entries (all winners) — the only signal in
+// any of the 8 backtested slots that has a path to validation under current
+// fees. MR-15m's blocklist is INTENTIONALLY EMPTY because BCH is one of the
+// best 15m symbols (-16.1 vs -30.7 overall); blocking BCH there would make
+// MR-15m worse.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_1M, 'BCH/USD');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_5M, 'BCH/USD');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_15M, '');
+assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_SYMBOL_BLOCKLIST, '');
+
 console.log('live defaults tests passed');
