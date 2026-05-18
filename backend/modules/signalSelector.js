@@ -27,10 +27,14 @@
 
 const DEFAULTS = {
   // Minimum avgNetBpsPerEntry a signal must clear in its most recent
-  // backtest to be considered "validated" for live use. Default +3 bps.
-  // Set to a negative number to allow worse-than-even signals through
-  // (operator escape hatch).
-  minBpsToActivate: 3,
+  // backtest to be considered "validated" for live use.
+  // 2026-05-17: lowered from 3 → 0. The +3 bps margin was meant to absorb
+  // backtester noise, but `minBacktestEntries=5` is the real sample-size
+  // guard; any signal with non-negative expectancy over ≥5 backtest entries
+  // is admitted. Mirrors the LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS
+  // value so the early-boot diagnostic log (which reads this fallback before
+  // any decision has been computed) matches what the runtime will use.
+  minBpsToActivate: 0,
   // When true (default), refuse all entries when no signal has cleared
   // the activation threshold. Set false to revert to legacy behaviour
   // (trade whatever SIGNAL_VERSION says, even if backtests show losses).
@@ -200,6 +204,23 @@ function pickActiveSignal({
     };
   }
 
+  // Most recent ranAt across every backtest the selector saw. Useful when
+  // the veto is active (no winner): the operator needs to know how stale the
+  // inputs feeding that decision are. Previously the no-winner branch
+  // returned `backtestRanAt: null`, which left operators with no answer to
+  // "when was the most recent backtest" except via the per-strategy meta
+  // fields on /dashboard.
+  const mostRecentRanAt = (() => {
+    let latest = null;
+    for (const bt of Object.values(allBacktests)) {
+      const ts = bt?.ranAt;
+      if (typeof ts === 'string' && (latest == null || ts > latest)) {
+        latest = ts;
+      }
+    }
+    return latest;
+  })();
+
   // No override — pick the best validated signal, or veto.
   if (candidates.length === 0) {
     return {
@@ -222,7 +243,7 @@ function pickActiveSignal({
       candidates,
       operatorOverride: null,
       config: cfg,
-      backtestRanAt: null,
+      backtestRanAt: mostRecentRanAt,
     };
   }
   const best = candidates[0];
@@ -241,11 +262,15 @@ function pickActiveSignal({
     meanRev15mNetBps,
     rangeMrNetBps,
     barrierNetBps,
+    micro5mNetBps,
+    micro15mNetBps,
+    micro30mNetBps,
+    micro45mNetBps,
     activeNetBps: best.netBps,
     candidates,
     operatorOverride: null,
     config: cfg,
-    backtestRanAt: bestBacktest?.ranAt || null,
+    backtestRanAt: bestBacktest?.ranAt || mostRecentRanAt,
   };
 }
 

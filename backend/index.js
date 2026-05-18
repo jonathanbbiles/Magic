@@ -746,7 +746,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     : null;
   const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
     ? Number(process.env.SIGNAL_SELECTOR_MIN_BPS)
-    : 3;
+    : 0;
   const vetoEnabled = !['0', 'false', 'no', 'off']
     .includes(String(process.env.SIGNAL_SELECTOR_VETO_ENABLED || 'true').toLowerCase());
   const minBacktestEntries = Math.max(1, Number(process.env.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES) || 5);
