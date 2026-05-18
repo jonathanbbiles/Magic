@@ -145,6 +145,26 @@ Master kill: `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables the entire snapsho
 - P/E, Forward P/E, PEG, EV/EBITDA, FCF Yield, D/E ratio, institutional ownership, short interest, IV Rank / Percentile, beta vs S&P 500, Jensen's α vs SPX, VIX, put/call ratios, sector RSI — none of these have an Alpaca crypto data source. Adding them as env-var stubs that compute nothing would violate Hard Rule #4. Do not re-add as "future hooks" without first wiring an upstream feed.
 - Volume profile POC/HVN/LVN — Plan-agent finding: wrong tool for 1m timeframe. A multi-hour tool whose output on 200×1m bars (~3 h of tape) is regime-noise, not durable level information. Defer until a multi-timeframe context is wired and a clear use-case exists.
 
+## Signal-aware universal gates (2026-05-18)
+
+Three universal entry gates in `scanAndEnter` were originally OLS-shaped but were firing (or about to fire) on signals that don't fit the original assumption. The 2026-05-18 gate analysis (PR followup) narrowed each:
+
+1. **`projected_below_min`** (`trade.js:~2647`): now OLS-only via `if (ACTIVE_SIGNAL_VERSION === 'ols' && projectedBps < MIN_PROJECTED_BPS_TO_ENTER)`. Reason: `projectedBps` for multi_factor / barrier / microstructure means the signal's own per-trade TP target (ATR-derived, barrier-touch, horizon-fixed) — not a forward-move prediction. Refusing those at 15 bps would block setups where the signal wants a 100+ bps net TP (barrier) or horizon-bounded TP (micro). Mirrors the existing OLS-only dispatch on `slope_not_positive`, `projected_below_gross_target`, `net_edge_below_min`, `honest_ev_below_min`.
+
+2. **`near_recent_high`** (`trade.js:~2510`): now bypassed for `signalVersion ∈ {barrier, microstructure_5m/15m/30m/45m}`. Reason: those signals can legitimately want to buy near-recent-high setups (barrier-touch continuations, microprice-driven breakouts). For all other signals (OLS, multi_factor, MR family) the gate still applies — for MR specifically the gate is structurally moot because `mr_no_drop` fires first inside the signal evaluator. The bypass sets `recentHighGateResult = {ok: true, recentHigh: null, recentHighBps: null, signalBypass: true}` so the downstream forensics record stays consistent shape-wise.
+
+3. **HTF gate** (`trade.js:~2559`): unchanged but documented. The HTF check (`getHigherTimeframeSignal`) is structurally contradictory with the MR family (MR buys downtrends; HTF refuses downtrends). The gate doesn't break MR today only because `mr_no_drop` fires first inside the signal evaluator. A new code block comment at `trade.js:~2559` warns against (a) re-ordering this gate before signal evaluation, or (b) loosening `mr_no_drop` without first making HTF signal-aware. The two gates compose only by accident.
+
+**Hard Rule #4 compliance**: each narrowing has a real consumer (the signal whose entries it would otherwise block). The bypasses are not dead knobs.
+
+## Backtest env-fallback resolver, boolean knobs (2026-05-18)
+
+`backend/modules/backtestEnvFallbacks.js` previously only resolved numeric env vars. Extended to also resolve boolean env vars via a new `ENV_BOOLEAN_FALLBACKS` map (currently `{ enforceProjectedCoversGross: 'ENFORCE_PROJECTED_COVERS_GROSS' }`).
+
+Bug it fixes: `liveDefaults.js` has `ENFORCE_PROJECTED_COVERS_GROSS: 'false'` (per the 2026-05-15 rollback) but `backtest_strategy.js DEFAULTS` had it true. The auto-backtest was therefore simulating a stricter gate than the live engine actually applied, misrepresenting the inputs to the SignalSelector. Same failure mode the resolver was originally created to prevent — just for a boolean knob.
+
+`parseEnvBoolean` follows the same conventions as the live engine's `readBoolean`: accepts `1/true/yes/on` as true, `0/false/no/off` as false, anything else stays unset (let the backtester apply its own default). When extending: add new boolean knobs to `ENV_BOOLEAN_FALLBACKS`, wire the resolved value into `runBacktestAndStore`'s call to `runBacktest` in `index.js`.
+
 ## MR per-symbol blocklists (2026-05-18)
 
 `backend/modules/symbolBlocklist.js` exposes `parseSymbolBlocklist`, `readMrBlocklistsFromEnv`, `isMrPairBlocked`, `isPairBlocked`. Live engine reads via `MR_BLOCKLISTS` at module load in `trade.js`; the auto-backtest in `index.js` reads the same env vars and passes `blockedSymbols: [...]` into `runBacktestAndStore` for the corresponding slot.

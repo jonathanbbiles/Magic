@@ -41,12 +41,31 @@ const ENV_NUMBER_FALLBACKS = Object.freeze({
   microSignalTargetMaxNetBps: 'MICRO_SIGNAL_TARGET_MAX_NET_BPS',
 });
 
+// Boolean knobs follow the same resolution chain (explicit > env > undefined).
+// Added 2026-05-18: ENFORCE_PROJECTED_COVERS_GROSS was the canonical example
+// of the failure mode this resolver exists to fix. liveDefaults.js had it at
+// 'false' (the 2026-05-15 rollback), but the backtester's own DEFAULTS had it
+// at true. The auto-backtest was therefore simulating a stricter gate than
+// the live engine actually applied, misrepresenting the selector inputs.
+const ENV_BOOLEAN_FALLBACKS = Object.freeze({
+  enforceProjectedCoversGross: 'ENFORCE_PROJECTED_COVERS_GROSS',
+});
+
 function parseEnvNumber(raw) {
   if (raw == null) return undefined;
   const trimmed = String(raw).trim();
   if (trimmed === '') return undefined;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseEnvBoolean(raw) {
+  if (raw == null) return undefined;
+  const trimmed = String(raw).trim().toLowerCase();
+  if (trimmed === '') return undefined;
+  if (['1', 'true', 'yes', 'on'].includes(trimmed)) return true;
+  if (['0', 'false', 'no', 'off'].includes(trimmed)) return false;
+  return undefined;
 }
 
 function resolveLiveEngineFallbacks(overrides = {}, env = process.env) {
@@ -63,10 +82,27 @@ function resolveLiveEngineFallbacks(overrides = {}, env = process.env) {
     const fromEnv = parseEnvNumber(env[envKey]);
     if (fromEnv !== undefined) resolved[overrideKey] = fromEnv;
   }
+  for (const [overrideKey, envKey] of Object.entries(ENV_BOOLEAN_FALLBACKS)) {
+    const explicit = overrides[overrideKey];
+    if (typeof explicit === 'boolean') {
+      resolved[overrideKey] = explicit;
+      continue;
+    }
+    if (typeof explicit === 'string') {
+      const parsed = parseEnvBoolean(explicit);
+      if (parsed !== undefined) {
+        resolved[overrideKey] = parsed;
+        continue;
+      }
+    }
+    const fromEnv = parseEnvBoolean(env[envKey]);
+    if (fromEnv !== undefined) resolved[overrideKey] = fromEnv;
+  }
   return resolved;
 }
 
 module.exports = {
   resolveLiveEngineFallbacks,
   ENV_NUMBER_FALLBACKS,
+  ENV_BOOLEAN_FALLBACKS,
 };

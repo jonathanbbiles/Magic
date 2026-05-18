@@ -2507,13 +2507,36 @@ async function scanAndEnter() {
       // REJECT_NEAR_HIGH_LOOKBACK_BARS minutes. Buying at local tops is the
       // dominant source of stuck positions; this gate uses already-fetched
       // closes (no extra Alpaca call).
-      const recentHighGateResult = evaluateRecentHighGate({
-        closes: sig.closes,
-        bid,
-        lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
-        rejectBps: REJECT_NEAR_HIGH_BPS,
-        enabled: REJECT_NEAR_HIGH_ENABLED,
-      });
+      // near_recent_high: refuse entries within REJECT_NEAR_HIGH_BPS of the
+      // highest close in the last REJECT_NEAR_HIGH_LOOKBACK_BARS bars.
+      //
+      // 2026-05-18 narrowed to non-continuation signals: this gate was
+      // designed for OLS ("don't buy the very top"). It is appropriate for
+      // OLS, multi_factor, and the MR family (where it's effectively dormant
+      // because mr_no_drop fires first). It is INAPPROPRIATE for the barrier
+      // and microstructure signals — those signals can legitimately want to
+      // buy near-recent-high setups (barrier-touch continuations,
+      // microprice-driven breakouts). The gate is bypassed for
+      // signalVersion ∈ {barrier, microstructure_5m/15m/30m/45m}.
+      //
+      // Live impact today: zero — barrier and microstructure are both
+      // backtest-negative and the selector hasn't admitted either. The bypass
+      // matters the moment one of them validates and the selector starts
+      // routing live entries to it.
+      const recentHighSignalApplies = ![
+        'barrier',
+        'microstructure_5m', 'microstructure_15m',
+        'microstructure_30m', 'microstructure_45m',
+      ].includes(ACTIVE_SIGNAL_VERSION);
+      const recentHighGateResult = recentHighSignalApplies
+        ? evaluateRecentHighGate({
+            closes: sig.closes,
+            bid,
+            lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
+            rejectBps: REJECT_NEAR_HIGH_BPS,
+            enabled: REJECT_NEAR_HIGH_ENABLED,
+          })
+        : { ok: true, recentHigh: null, recentHighBps: null, signalBypass: true };
       if (!recentHighGateResult.ok && recentHighGateResult.reason === 'near_recent_high') {
         rejectTrade(pair, 'near_recent_high', {
           recentHigh: recentHighGateResult.recentHigh,
@@ -2556,6 +2579,23 @@ async function scanAndEnter() {
 
       // Higher-timeframe confirmation: don't buy a 1m bounce inside a 5m
       // downtrend.
+      //
+      // 2026-05-18 note: HTF is structurally contradictory with the MR family
+      // (mean_reversion, mean_reversion_5m/15m, range_mean_reversion). MR's
+      // thesis is "buy a capitulation drop" — which by definition implies the
+      // higher-timeframe is below its EMA. If the HTF gate ever ran for MR
+      // candidates, it would refuse ~100% of valid setups.
+      //
+      // Why this isn't a live bug today: MR's signal-internal mr_no_drop
+      // gate (in meanReversionSignal.js) rejects ~99% of bars BEFORE the
+      // signal evaluator returns ok. The rare candidate that survives mr_no_drop
+      // also tends to have a high enough HTF slope to clear this check. So
+      // HTF only fires on the tail of MR candidates where ordering happens
+      // to save us.
+      //
+      // DO NOT re-order this block to run BEFORE the signal evaluator. DO NOT
+      // loosen mr_no_drop without first making HTF signal-aware. The two
+      // gates compose only by accident; the accident is what keeps MR alive.
       const htf = await getHigherTimeframeSignal(pair);
       if (!htf.ok) {
         rejectTrade(pair, htf.reason || 'htf_rejected');
@@ -2638,13 +2678,24 @@ async function scanAndEnter() {
         continue;
       }
 
-      // Projection-magnitude floor. After lowering TARGET_NET_PROFIT_BPS to
-      // 8 in PR #362, the EV gate (MIN_NET_EDGE_BPS=2) lets through entries
-      // with sub-3 bps projected moves — essentially noise. Live: BCH was
-      // accepted with projectedBps=2.6 and honestEvBps=-54. Refuse trades
-      // whose projected forward move is below MIN_PROJECTED_BPS_TO_ENTER
-      // (default 15 = ~3× modelled slippage, roughly half a fee round-trip).
-      if (projectedBps < MIN_PROJECTED_BPS_TO_ENTER) {
+      // Projection-magnitude floor (OLS-only, 2026-05-18 narrowing). After
+      // lowering TARGET_NET_PROFIT_BPS to 8 in PR #362, the EV gate
+      // (MIN_NET_EDGE_BPS=2) lets through entries with sub-3 bps projected
+      // moves — essentially noise. Live: BCH was accepted with
+      // projectedBps=2.6 and honestEvBps=-54. The 15-bps floor (~3× modelled
+      // slippage, roughly half a fee round-trip) blocks those.
+      //
+      // 2026-05-18 narrowed to OLS-only: `projectedBps` is OLS-flavoured
+      // (linear-regression forward projection over PREDICT_BARS). For
+      // multi_factor, barrier, and microstructure_*, projectedBps is repurposed
+      // to mean the signal's own per-trade TP target (ATR-derived,
+      // barrier-touch-derived, or horizon-fixed). Comparing those against a
+      // 15-bps "forward move" floor would refuse setups where the signal
+      // wants a 100+ bps net TP (barrier) or a horizon-bounded TP (micro).
+      // Other OLS-only gates (slope_not_positive, projected_below_gross_target,
+      // net_edge_below_min, honest_ev_below_min) already use the same
+      // signal-version dispatch — this brings projected_below_min in line.
+      if (ACTIVE_SIGNAL_VERSION === 'ols' && projectedBps < MIN_PROJECTED_BPS_TO_ENTER) {
         rejectTrade(pair, 'projected_below_min', {
           projectedBps,
           minProjectedBps: MIN_PROJECTED_BPS_TO_ENTER,
