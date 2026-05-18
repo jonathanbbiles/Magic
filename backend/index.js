@@ -104,6 +104,7 @@ const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
 const { resolveLiveEngineFallbacks } = require('./modules/backtestEnvFallbacks');
+const { parseSweepCaps, summarizeCell, DEFAULT_CAPS: MR_SWEEP_DEFAULT_CAPS } = require('./modules/mrStopLossSweep');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -674,6 +675,12 @@ let lastBacktestRangeMr = null;
 let lastBacktestBarrier = null;
 let lastBacktestError = null;
 let backtestRunning = false;
+
+// 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
+// backtest at three stop-loss caps so the dashboard can show the
+// expectancy curve. Surfaced at meta.mrStopLossSweep. Disable via
+// MR_STOP_LOSS_SWEEP_ENABLED=false in Render env if startup is too slow.
+let lastMrStopLossSweep = null;
 
 // Recompute the signal selector decision based on the most recent backtest
 // results for OLS and multi-factor. Called after every backtest auto-run +
@@ -1371,6 +1378,20 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestBarrier.perSymbol,
           gateSkipped: lastBacktestBarrier.gateSkipped || null,
           note: 'Barrier signal candidate (restored from commit fbdb924). Trade-construction signal: barrier-touch probability + micro-momentum + EMA momentum, targets ~100 bps net per trade.',
+        } : null,
+        // Stage 3 MR stop-loss sweep — observational diagnostic, fires at
+        // each restart. Shows mean_reversion at three stop-loss caps per
+        // timeframe so the dashboard surfaces the expectancy curve directly.
+        // The signal selector does NOT consume these slots; it reads only the
+        // canonical mean_rev / mean_rev_5m / mean_rev_15m results. Set
+        // MR_STOP_LOSS_SWEEP_ENABLED=false to disable.
+        mrStopLossSweep: lastMrStopLossSweep ? {
+          ranAt: lastMrStopLossSweep.ranAt,
+          windowDays: lastMrStopLossSweep.windowDays,
+          caps: lastMrStopLossSweep.caps,
+          mr5m: lastMrStopLossSweep.mr5m,
+          mr15m: lastMrStopLossSweep.mr15m,
+          note: 'Stage 3 expectancy curve: MR-5m and MR-15m at multiple stop-loss caps. Use to pick MR_STOP_LOSS_BPS_5M / MR_STOP_LOSS_BPS_15M values that flip avgNetBpsPerEntry positive without hand-rolling /debug/backtest URLs.',
         } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
@@ -2305,7 +2326,69 @@ if (backtestSkipReason) {
         strategy: 'barrier',
       }, 'barrier').catch(() => {});
     }
+    // 2026-05-17 Stage 3 sweep: backtest MR-5m and MR-15m at three stop-loss
+    // caps each (60 / 80 / 100 by default) so the dashboard can show the
+    // expectancy curve without operator hand-rolling /debug/backtest URLs.
+    // Disable via MR_STOP_LOSS_SWEEP_ENABLED=false if the extra 30-60 s of
+    // startup time is unacceptable.
+    if (String(process.env.MR_STOP_LOSS_SWEEP_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runMrStopLossSweep().catch((err) => {
+        console.log('mr_stop_loss_sweep_failed', { error: err?.message });
+      });
+    }
   }, BACKTEST_AUTORUN_DELAY_MS);
+}
+
+// MR stop-loss sweep helper. Fires the MR-5m and MR-15m backtest at each of
+// the configured caps and parks the per-cap overall stats in
+// lastMrStopLossSweep so the dashboard can render the expectancy curve at a
+// glance. Uses runBacktest directly (not runBacktestAndStore) to avoid
+// triggering signal-selector re-decisions for each sweep cell — the sweep
+// is observational; the live-engine selector still reads from the canonical
+// mean_rev / mean_rev_5m / mean_rev_15m slots.
+async function runMrStopLossSweep() {
+  const liveSymbols = Array.isArray(runtimeConfig?.configuredPrimarySymbols) && runtimeConfig.configuredPrimarySymbols.length
+    ? runtimeConfig.configuredPrimarySymbols
+    : null;
+  const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY
+    || (liveSymbols ? liveSymbols.join(',') : 'BTC/USD,ETH/USD');
+  const windowDays = BACKTEST_AUTORUN_DAYS;
+  const caps = parseSweepCaps(process.env.MR_STOP_LOSS_SWEEP_CAPS, MR_SWEEP_DEFAULT_CAPS);
+  const ranAt = new Date().toISOString();
+  const sweep = { ranAt, windowDays, caps, mr5m: [], mr15m: [] };
+  console.log('mr_stop_loss_sweep_started', { ranAt, caps, windowDays });
+  for (const cap of caps) {
+    for (const tf of ['5m', '15m']) {
+      try {
+        const result = await runBacktest({
+          symbols: symbolsCsv,
+          windowDays,
+          strategy: 'mean_reversion',
+          mrTimeframe: tf,
+          mrStopLossBps: cap,
+          mrStopLossBpsTier3: Math.max(cap, 100),
+          mrStopLossBps5m: cap,
+          mrStopLossBps5mTier3: Math.max(cap, 100),
+          mrStopLossBps15m: cap,
+          mrStopLossBps15mTier3: Math.max(cap, 100),
+        });
+        const cell = summarizeCell(cap, result);
+        if (tf === '5m') sweep.mr5m.push(cell);
+        else sweep.mr15m.push(cell);
+      } catch (err) {
+        const cell = { stopLossBps: cap, overall: null, error: err?.message || 'unknown' };
+        if (tf === '5m') sweep.mr5m.push(cell);
+        else sweep.mr15m.push(cell);
+      }
+    }
+  }
+  lastMrStopLossSweep = sweep;
+  console.log('mr_stop_loss_sweep_completed', {
+    ranAt,
+    mr5mNetBps: sweep.mr5m.map((c) => ({ cap: c.stopLossBps, net: c.overall?.avgNetBpsPerEntry })),
+    mr15mNetBps: sweep.mr15m.map((c) => ({ cap: c.stopLossBps, net: c.overall?.avgNetBpsPerEntry })),
+  });
+  return sweep;
 }
 
 recordEquitySnapshot();
