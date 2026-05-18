@@ -110,6 +110,15 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '40');               // resto
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_TARGET_NET_PROFIT_BPS_FLOOR, '5');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SIGNAL_TARGET_MAX_NET_BPS, '120');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS, '60');
+// 2026-05-17 Stage 3: per-timeframe MR stop caps. Defaults mirror the 1m
+// values so wiring is zero-behavior-change. If a future change wants the
+// 5m / 15m variants to default to a wider cap (e.g. backtest evidence flips
+// MR-5m positive at 100 bps), bump the default here and the same-PR-update
+// docs in README + CLAUDE.md will keep the doc/code aligned.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M_TIER3, '100');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_15M, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_15M_TIER3, '100');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_MAX_HOLD_MS, '2700000');            // 45 min
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_BREAKEVEN_TIMEOUT_MS, '1800000');   // 30 min
 

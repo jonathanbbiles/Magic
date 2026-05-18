@@ -167,6 +167,14 @@ const DEFAULTS = {
   // have wider spreads; the tier-aware cap lets the backtest model their
   // actual realized stop distance instead of clipping to the tier-1/2 60.
   mrStopLossBpsTier3: 100,
+  // Per-timeframe MR stop caps (2026-05-17 Stage 3). When null, the 5m / 15m
+  // backtests fall back to the 1m mrStopLossBps / mrStopLossBpsTier3 values
+  // so behavior is unchanged until an operator sets one. Use to widen the
+  // coarser-timeframe stops without touching the 1m live signal.
+  mrStopLossBps5m: null,
+  mrStopLossBps5mTier3: null,
+  mrStopLossBps15m: null,
+  mrStopLossBps15mTier3: null,
   mrMaxHoldMin: 45,
   mrBreakevenTimeoutMin: 30,
   // Phase 1: timeframe selector for the MR signal in this backtest run.
@@ -617,14 +625,25 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       // Tier-aware MR stop. Tier-1/2 = mrStopLossBps (default 60); tier-3
       // = mrStopLossBpsTier3 (default 100, wider headroom for alts). Mirrors
       // the live deriveStopLossBps tier dispatch in backend/trade.js.
+      // Per-timeframe (2026-05-17 Stage 3): 5m / 15m use their own caps
+      // when set, falling back to the 1m caps when not.
       const tier1 = Array.isArray(opts.spreadCostTier1Symbols) ? opts.spreadCostTier1Symbols : [];
       const tier2 = Array.isArray(opts.spreadCostTier2Symbols) ? opts.spreadCostTier2Symbols : [];
       const symUp = String(resolvedSymbol || '').toUpperCase();
       const isTier3 = !(tier1.map((s) => s.toUpperCase()).includes(symUp)
         || tier2.map((s) => s.toUpperCase()).includes(symUp));
-      const mrCap = isTier3
-        ? Math.max(0, Number(opts.mrStopLossBpsTier3) || 0)
-        : Math.max(0, Number(opts.mrStopLossBps) || 0);
+      const baseTier12Cap = Math.max(0, Number(opts.mrStopLossBps) || 0);
+      const baseTier3Cap = Math.max(0, Number(opts.mrStopLossBpsTier3) || 0);
+      let tier12Cap = baseTier12Cap;
+      let tier3Cap = baseTier3Cap;
+      if (mrTimeframe === '5m') {
+        tier12Cap = opts.mrStopLossBps5m != null ? Math.max(0, Number(opts.mrStopLossBps5m)) : baseTier12Cap;
+        tier3Cap = opts.mrStopLossBps5mTier3 != null ? Math.max(0, Number(opts.mrStopLossBps5mTier3)) : baseTier3Cap;
+      } else if (mrTimeframe === '15m') {
+        tier12Cap = opts.mrStopLossBps15m != null ? Math.max(0, Number(opts.mrStopLossBps15m)) : baseTier12Cap;
+        tier3Cap = opts.mrStopLossBps15mTier3 != null ? Math.max(0, Number(opts.mrStopLossBps15mTier3)) : baseTier3Cap;
+      }
+      const mrCap = isTier3 ? tier3Cap : tier12Cap;
       stopLossBpsAbsForTrade = mrCap;
     } else if (isRangeMr) {
       // Phase 1: range mean-reversion entry. Smaller drops within an

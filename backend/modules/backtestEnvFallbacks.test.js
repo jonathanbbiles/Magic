@@ -99,6 +99,36 @@ const { resolveLiveEngineFallbacks } = require('./backtestEnvFallbacks');
   assert.equal(r.mrDeepDropGuardBps, 300);
 }
 
+// 9b. Per-timeframe MR stop caps flow through (Stage 3). Each env key maps
+// to its own resolved field so the backtester can pick the right cap based
+// on mrTimeframe.
+{
+  const r = resolveLiveEngineFallbacks({}, {
+    MR_STOP_LOSS_BPS_5M: '100',
+    MR_STOP_LOSS_BPS_5M_TIER3: '140',
+    MR_STOP_LOSS_BPS_15M: '120',
+    MR_STOP_LOSS_BPS_15M_TIER3: '160',
+  });
+  assert.equal(r.mrStopLossBps5m, 100);
+  assert.equal(r.mrStopLossBps5mTier3, 140);
+  assert.equal(r.mrStopLossBps15m, 120);
+  assert.equal(r.mrStopLossBps15mTier3, 160);
+}
+
+// 9c. Per-timeframe stop caps obey the standard precedence chain (override
+// wins, env fills in, unset stays absent so the backtester falls back to
+// the 1m caps).
+{
+  const r = resolveLiveEngineFallbacks(
+    { mrStopLossBps5m: 90 },
+    { MR_STOP_LOSS_BPS_5M: '100', MR_STOP_LOSS_BPS_15M: '120' },
+  );
+  assert.equal(r.mrStopLossBps5m, 90, 'override beats env');
+  assert.equal(r.mrStopLossBps15m, 120, 'env fills in');
+  assert.ok(!('mrStopLossBps5mTier3' in r), 'unset stays absent');
+  assert.ok(!('mrStopLossBps15mTier3' in r), 'unset stays absent');
+}
+
 // 10. Both recent-high knobs flow through.
 {
   const r = resolveLiveEngineFallbacks({}, {

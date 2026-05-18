@@ -263,6 +263,20 @@ const STOP_OVER_SPREAD_BPS = Math.max(0, readNumber('STOP_OVER_SPREAD_BPS', 20))
 const MR_STOP_LOSS_BPS = Math.max(1, readNumber('MR_STOP_LOSS_BPS', 60));
 const MR_STOP_LOSS_BPS_TIER3 = Math.max(MR_STOP_LOSS_BPS, readNumber('MR_STOP_LOSS_BPS_TIER3', 100));
 
+// Per-timeframe MR stop caps (2026-05-17 Stage 3 plumbing). The 5m / 15m MR
+// variants currently lose money in backtest with stop_loss ~41% of fills at
+// the 60-bps tier-1/2 cap (live 30-day stats: MR-5m -32.6 bps net, MR-15m
+// -29.2 bps net). Widening the stop for the coarser timeframes is the only
+// move that could flip them positive without lowering MR_DROP_TRIGGER_BPS
+// (the in-code A/B forbids the latter). Defaults mirror the 1m cap exactly
+// so wiring is zero-behavior-change until an operator sets one in Render
+// env. Always validate a knob flip with the per-timeframe backtest URL:
+//   /debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100
+const MR_STOP_LOSS_BPS_5M = Math.max(1, readNumber('MR_STOP_LOSS_BPS_5M', MR_STOP_LOSS_BPS));
+const MR_STOP_LOSS_BPS_5M_TIER3 = Math.max(MR_STOP_LOSS_BPS_5M, readNumber('MR_STOP_LOSS_BPS_5M_TIER3', MR_STOP_LOSS_BPS_TIER3));
+const MR_STOP_LOSS_BPS_15M = Math.max(1, readNumber('MR_STOP_LOSS_BPS_15M', MR_STOP_LOSS_BPS));
+const MR_STOP_LOSS_BPS_15M_TIER3 = Math.max(MR_STOP_LOSS_BPS_15M, readNumber('MR_STOP_LOSS_BPS_15M_TIER3', MR_STOP_LOSS_BPS_TIER3));
+
 // Mean-reversion signal sub-gate knobs (2026-05-17). These were previously
 // hard-coded as DEFAULT_CONFIG in modules/meanReversionSignal.js. The defaults
 // here mirror DEFAULT_CONFIG exactly, so wiring them is a zero-behavior-change
@@ -329,10 +343,19 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
     // Tier-aware MR cap: tier-3 alts need wider headroom because their
     // spreads alone consume most of the tier-1/2 cap. Falls back to the
     // tier-1/2 cap when pair is null (e.g. legacy callers in tests).
-    // All three MR timeframes share the same cap — the timeframe affects
-    // trigger frequency, not stop economics.
+    // Per-timeframe split (2026-05-17 Stage 3): 5m and 15m have their own
+    // caps so an operator can widen the coarser-timeframe stops without
+    // touching the 1m variant that is currently the live signal. Defaults
+    // all match the 1m cap, so this is a no-op until an operator sets a
+    // _5M / _15M env override.
     const isTier3 = pair && typeof resolveSymbolTier === 'function' && resolveSymbolTier(pair) === 'tier3';
-    cap = isTier3 ? MR_STOP_LOSS_BPS_TIER3 : MR_STOP_LOSS_BPS;
+    if (signalVersion === 'mean_reversion_5m') {
+      cap = isTier3 ? MR_STOP_LOSS_BPS_5M_TIER3 : MR_STOP_LOSS_BPS_5M;
+    } else if (signalVersion === 'mean_reversion_15m') {
+      cap = isTier3 ? MR_STOP_LOSS_BPS_15M_TIER3 : MR_STOP_LOSS_BPS_15M;
+    } else {
+      cap = isTier3 ? MR_STOP_LOSS_BPS_TIER3 : MR_STOP_LOSS_BPS;
+    }
   }
   else if (signalVersion === 'range_mean_reversion') cap = RANGE_MR_STOP_LOSS_BPS;
   else if (signalVersion === 'barrier') cap = BARRIER_STOP_LOSS_BPS;

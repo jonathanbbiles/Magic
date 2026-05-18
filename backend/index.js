@@ -763,6 +763,10 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       mrMaxBtcDropBps: mrMaxBtcDropBpsResolved,
       mrRsiOversold: mrRsiOversoldResolved,
       mrDeepDropGuardBps: mrDeepDropGuardBpsResolved,
+      mrStopLossBps5m: mrStopLossBps5mResolved,
+      mrStopLossBps5mTier3: mrStopLossBps5mTier3Resolved,
+      mrStopLossBps15m: mrStopLossBps15mResolved,
+      mrStopLossBps15mTier3: mrStopLossBps15mTier3Resolved,
     } = liveEngineFallbacks;
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
@@ -794,6 +798,10 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mrSignalTargetMaxNetBps != null ? { mrSignalTargetMaxNetBps: Number(overrides.mrSignalTargetMaxNetBps) } : {}),
       ...(overrides.mrStopLossBps != null ? { mrStopLossBps: Number(overrides.mrStopLossBps) } : {}),
       ...(overrides.mrStopLossBpsTier3 != null ? { mrStopLossBpsTier3: Number(overrides.mrStopLossBpsTier3) } : {}),
+      ...(mrStopLossBps5mResolved != null ? { mrStopLossBps5m: Number(mrStopLossBps5mResolved) } : {}),
+      ...(mrStopLossBps5mTier3Resolved != null ? { mrStopLossBps5mTier3: Number(mrStopLossBps5mTier3Resolved) } : {}),
+      ...(mrStopLossBps15mResolved != null ? { mrStopLossBps15m: Number(mrStopLossBps15mResolved) } : {}),
+      ...(mrStopLossBps15mTier3Resolved != null ? { mrStopLossBps15mTier3: Number(mrStopLossBps15mTier3Resolved) } : {}),
       ...(overrides.mrMaxHoldMin != null ? { mrMaxHoldMin: Number(overrides.mrMaxHoldMin) } : {}),
       ...(overrides.mrBreakevenTimeoutMin != null ? { mrBreakevenTimeoutMin: Number(overrides.mrBreakevenTimeoutMin) } : {}),
       ...(mrDropTriggerBpsResolved != null ? { mrDropTriggerBps: Number(mrDropTriggerBpsResolved) } : {}),
@@ -876,6 +884,12 @@ app.get('/debug/backtest', async (req, res) => {
     entryFillTimeoutMin: req.query.entryFillTimeoutMin,
     mfMaxHoldMin: req.query.mfMaxHoldMin,
     mfBreakevenTimeoutMin: req.query.mfBreakevenTimeoutMin,
+    // Per-timeframe MR stop caps (2026-05-17 Stage 3). Sweep via:
+    //   ?strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100
+    mrStopLossBps5m: req.query.mrStopLossBps5m,
+    mrStopLossBps5mTier3: req.query.mrStopLossBps5mTier3,
+    mrStopLossBps15m: req.query.mrStopLossBps15m,
+    mrStopLossBps15mTier3: req.query.mrStopLossBps15mTier3,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});

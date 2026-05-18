@@ -77,6 +77,18 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Per-timeframe MR stop caps (2026-05-17 Stage 3)
+
+The `deriveStopLossBps` function in `backend/trade.js` dispatches the MR stop cap by `signalVersion` (`mean_reversion`, `mean_reversion_5m`, `mean_reversion_15m`). Each timeframe has its own tier-1/2 + tier-3 cap pair:
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MR_STOP_LOSS_BPS` / `MR_STOP_LOSS_BPS_TIER3` | `60` / `100` | 1m caps. Currently the live signal — leave alone unless the live scorecard says otherwise. |
+| `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_5M_TIER3` | `60` / `100` | 5m caps. Default to the 1m values; widening (try 80-100) is the only path to flip MR-5m positive without lowering `MR_DROP_TRIGGER_BPS`. |
+| `MR_STOP_LOSS_BPS_15M` / `MR_STOP_LOSS_BPS_15M_TIER3` | `60` / `100` | 15m caps. Same idea as 5m. |
+
+The backtester (`backend/scripts/backtest_strategy.js`) follows the same dispatch via `opts.mrTimeframe`. The env-fallback resolver wires all four new env vars to the auto-backtest so the dashboard reflects whatever an operator set in Render env. Validate any flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m&mrStopLossBps5m=100` before deploying live.
+
 ## Auto-backtest env-fallback resolver (2026-05-17 visibility fix)
 
 `backend/modules/backtestEnvFallbacks.js` bridges the live engine's `process.env` values into the auto-backtest invocation in `runBacktestAndStore`. Without it, the auto-backtest passes only `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` and the rest fall through to `backtest_strategy.js`'s hardcoded `DEFAULTS` (e.g. `rejectNearHighLookbackBars: 60`) — which made the Stage 1 default flip invisible on the dashboard even though live trading was using the new value.

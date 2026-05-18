@@ -19,6 +19,13 @@ const ENV_NUMBER_FALLBACKS = Object.freeze({
   mrMaxBtcDropBps: 'MR_MAX_BTC_DROP_BPS',
   mrRsiOversold: 'MR_RSI_OVERSOLD',
   mrDeepDropGuardBps: 'MR_DEEP_DROP_GUARD_BPS',
+  // Per-timeframe MR stop caps (2026-05-17 Stage 3). When unset, the
+  // backtester falls back to the 1m mrStopLossBps / mrStopLossBpsTier3
+  // values so behavior is unchanged until an operator opts in.
+  mrStopLossBps5m: 'MR_STOP_LOSS_BPS_5M',
+  mrStopLossBps5mTier3: 'MR_STOP_LOSS_BPS_5M_TIER3',
+  mrStopLossBps15m: 'MR_STOP_LOSS_BPS_15M',
+  mrStopLossBps15mTier3: 'MR_STOP_LOSS_BPS_15M_TIER3',
 });
 
 function parseEnvNumber(raw) {
