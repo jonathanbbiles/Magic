@@ -1725,7 +1725,6 @@ const pendingBuys = new Map();            // symbol -> { orderId, submittedAt }
 const positionFirstSeenAt = new Map();    // symbol -> ms epoch at first reconcile observation
 const tradePredictions = new Map();       // symbol -> { tradeId, submittedAt, prediction, buyFillObserved, actualEntryPrice }
 const skipReasonCounts = new Map();
-const rollingSkipReasons = new Map();
 const rollingSkipByReasonAndSymbol = [];
 const lastQuoteUpdateBySymbol = new Map();
 
@@ -1789,7 +1788,18 @@ function setEngineState(state, reason) {
 function bumpSkipReason(reason) {
   if (!reason) return;
   skipReasonCounts.set(reason, (skipReasonCounts.get(reason) || 0) + 1);
-  rollingSkipReasons.set(reason, (rollingSkipReasons.get(reason) || 0) + 1);
+}
+
+function computeRollingSkipReasonCounts() {
+  const cutoff = Date.now() - REJECTION_WINDOW_MS;
+  while (rollingSkipByReasonAndSymbol.length > 0 && rollingSkipByReasonAndSymbol[0].ts < cutoff) {
+    rollingSkipByReasonAndSymbol.shift();
+  }
+  const counts = {};
+  for (const row of rollingSkipByReasonAndSymbol) {
+    counts[row.reason] = (counts[row.reason] || 0) + 1;
+  }
+  return counts;
 }
 
 function rejectTrade(pair, reason, details = {}) {
@@ -1890,7 +1900,7 @@ function getEntryDiagnosticsSnapshot() {
     entryScan: lastEntryScanSummary,
     predictorCandidates: null,
     skipReasonsBySymbol: {},
-    topSkipReasonsRolling: mapToObject(rollingSkipReasons),
+    topSkipReasonsRolling: computeRollingSkipReasonCounts(),
     entryManager: getTradingManagerStatus().entryManagerHeartbeat,
     gating: {},
     quoteFreshness: {
