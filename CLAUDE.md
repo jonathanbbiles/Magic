@@ -47,7 +47,7 @@ node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor acros
 The settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:
 
 - `ENTRY_UNIVERSE_MODE=configured` — scopes the scan to the 12 deep-liquidity primary pairs (`ENTRY_SYMBOLS_PRIMARY`). Alpaca's quote feed for long-tail alts is chronically stale; the prior `dynamic` default lost ~19/33 symbols to the stale-quote pruner at any moment.
-- `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests one tick above the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000`, which recycles unfilled passive rests on the next scan. Replaces the prior `mid` default; do not flip to `ask` unless an emergency requires guaranteed fills — that reverts to the spread-crossing economics that drove the 14-trade live scorecard to -$0.074/trade expectancy.
+- `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` — rests one tick above the bid, never crosses the spread. Pairs with `ENTRY_FILL_TIMEOUT_MS=30000`, which recycles unfilled passive rests on the next scan. Replaces the prior `mid` default; do not flip to `ask` unless an emergency requires guaranteed fills — that reverts to the spread-crossing economics that drove the 14-trade live scorecard to -$0.074/trade expectancy. **This is the maximum maker enforcement available on Alpaca crypto.** Verified 2026-05-18 against the v2 `/orders` schema and the alpaca-py `LimitOrderRequest`: supported order types are only `market` / `limit` / `stop_limit`, supported TIF only `gtc` / `ioc`. There is no `post_only` flag and no "reject-on-cross" semantics. Maker vs. taker is determined purely by whether the resting limit price crosses the book at fill time; the only API-level lever is the limit price itself. If observed fees diverge from the 30 bps round-trip assumption, the only remedy is to flip `FEE_BPS_ROUND_TRIP` (see "Fee audit procedure" below) — not to add a non-existent API flag.
 - `PHASE1_ENABLED=true` (2026-05-17) — re-enables the multi-timeframe MR (5m/15m), range-MR, concurrent-position soft cap, and adaptive sizing layers. Was disabled in the 2026-05-15 panic rollback; the bot earned nothing during the veto-only window (MR-1m alone fires ~6×/30 days). Per-layer flags (`MR_TIMEFRAME_5M_ENABLED`, `MR_TIMEFRAME_15M_ENABLED`, `RANGE_MR_ENABLED`, `CONCURRENT_POSITIONS_SOFT_CAP_ENABLED`, `ADAPTIVE_SIZING_ENABLED`) remain available for surgical disable.
 - `SIGNAL_SELECTOR_MIN_BPS=0` (2026-05-17, was `3`) — admits any signal with non-negative expectancy over ≥5 backtest entries. The sample-size floor is the actual safety net; the +3 bps margin was blocking marginal-edge variants Phase 1 unlocks.
 
@@ -103,7 +103,25 @@ The sweep takes ~3 minutes to repopulate after a deploy. For phone-first workflo
 
 `backend/modules/backtestEnvFallbacks.js` bridges the live engine's `process.env` values into the auto-backtest invocation in `runBacktestAndStore`. Without it, the auto-backtest passes only `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` and the rest fall through to `backtest_strategy.js`'s hardcoded `DEFAULTS` (e.g. `rejectNearHighLookbackBars: 60`) — which made the Stage 1 default flip invisible on the dashboard even though live trading was using the new value.
 
-Resolution priority for the seven knobs (`rejectNearHighBps`, `rejectNearHighLookbackBars`, `mrDropTriggerBps`, `mrVolConfirmMultiplier`, `mrMaxBtcDropBps`, `mrRsiOversold`, `mrDeepDropGuardBps`): `explicit override > process.env > backtester hardcoded default`. When adding a new env-tunable live-engine knob, extend `ENV_NUMBER_FALLBACKS` in `backtestEnvFallbacks.js` so the dashboard auto-backtest stays in sync.
+Resolution priority for the seven base knobs (`rejectNearHighBps`, `rejectNearHighLookbackBars`, `mrDropTriggerBps`, `mrVolConfirmMultiplier`, `mrMaxBtcDropBps`, `mrRsiOversold`, `mrDeepDropGuardBps`) plus the per-timeframe MR stop caps and `feeBpsRoundTrip` (added 2026-05-18): `explicit override > process.env > backtester hardcoded default`. When adding a new env-tunable live-engine knob, extend `ENV_NUMBER_FALLBACKS` in `backtestEnvFallbacks.js` so the dashboard auto-backtest stays in sync.
+
+## Fee audit procedure (2026-05-18)
+
+The backtester and the live engine both assume `FEE_BPS_ROUND_TRIP=30` by default (`backend/trade.js:116`, `backend/scripts/backtest_strategy.js:71`). Every signal's expectancy in the dashboard auto-backtest is computed against that assumption. If actual Alpaca fees differ materially, several currently-negative signals could flip viable (or several currently-positive ones could turn out worse than reported) without any code change beyond an env flip.
+
+**Why this audit, and not a `post_only` PR**: Alpaca's crypto API exposes no `post_only` flag (verified 2026-05-18 against the v2 `/orders` schema and alpaca-py `LimitOrderRequest` — see the `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` note above). The only API-level lever for maker vs. taker classification is the limit price itself, which `bid_plus_tick` already maxes out. So validating the `FEE_BPS_ROUND_TRIP=30` assumption against real fills is the only Alpaca-side knob that can shift expectancy without a venue change.
+
+Procedure for an operator to validate the assumption against real fills:
+
+1. Alpaca dashboard → Account → Activity → export the last 14+ closed crypto trades as CSV.
+2. For each fill, compute `actual_fee_bps = (fee_charged_usd / fill_notional_usd) × 10000`. Sum the entry-leg + exit-leg bps for the per-trade round-trip.
+3. Average across the 14 trades. Compare against the `FEE_BPS_ROUND_TRIP=30` assumption.
+4. Decision rule:
+   - **Observed < 25 bps round-trip**: maker fills are happening more than assumed. Set `FEE_BPS_ROUND_TRIP=<observed>` in Render env; the dashboard auto-backtest now picks it up via the `backtestEnvFallbacks` resolver and every signal's expectancy recomputes on the next `/debug/backtest?refresh=true`. Likely flips MR-1m higher and pulls BTC/AVAX/SOL multi-factor closer to break-even.
+   - **Observed 25–35 bps**: assumption is accurate; no action.
+   - **Observed > 35 bps**: taker classification is happening despite `bid_plus_tick`. Investigate by checking each order's `filled_avg_price` vs. the bid at order-fill time; if many fills crossed the book, tighten `SPREAD_MAX_BPS_TIER*` or the bid-staleness tolerance. **There is no API-level fix** — the only structural remedy would be a venue swap to a maker-rebate exchange (Kraken/Bybit/Bitget), which is out of scope without explicit go-ahead.
+
+The single env knob (`FEE_BPS_ROUND_TRIP`) is the only code-side lever the audit can pull on the current venue. Threading it through the resolver was the 2026-05-18 wiring fix.
 
 ## Entry quote prefetch
 

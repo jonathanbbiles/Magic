@@ -129,6 +129,26 @@ const { resolveLiveEngineFallbacks } = require('./backtestEnvFallbacks');
   assert.ok(!('mrStopLossBps15mTier3' in r), 'unset stays absent');
 }
 
+// 9d. Round-trip fee assumption flows through (2026-05-18). The live engine
+// reads FEE_BPS_ROUND_TRIP from env; without this entry the dashboard
+// auto-backtest would keep simulating 30 bps round-trip even after an
+// operator flipped the env to a CSV-audited value.
+{
+  const r = resolveLiveEngineFallbacks({}, { FEE_BPS_ROUND_TRIP: '20' });
+  assert.equal(r.feeBpsRoundTrip, 20, 'FEE_BPS_ROUND_TRIP env flows through');
+}
+{
+  const r = resolveLiveEngineFallbacks(
+    { feeBpsRoundTrip: 25 },
+    { FEE_BPS_ROUND_TRIP: '20' },
+  );
+  assert.equal(r.feeBpsRoundTrip, 25, 'override beats env for fee knob');
+}
+{
+  const r = resolveLiveEngineFallbacks({}, {});
+  assert.ok(!('feeBpsRoundTrip' in r), 'unset fee env stays absent so backtester default wins');
+}
+
 // 10. Both recent-high knobs flow through.
 {
   const r = resolveLiveEngineFallbacks({}, {

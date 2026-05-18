@@ -816,6 +816,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       mrStopLossBps5mTier3: mrStopLossBps5mTier3Resolved,
       mrStopLossBps15m: mrStopLossBps15mResolved,
       mrStopLossBps15mTier3: mrStopLossBps15mTier3Resolved,
+      feeBpsRoundTrip: feeBpsRoundTripResolved,
     } = liveEngineFallbacks;
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
@@ -867,6 +868,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.rangeMrStopLossBps != null ? { rangeMrStopLossBps: Number(overrides.rangeMrStopLossBps) } : {}),
       ...(overrides.rangeMrMaxHoldMin != null ? { rangeMrMaxHoldMin: Number(overrides.rangeMrMaxHoldMin) } : {}),
       ...(overrides.rangeMrBreakevenTimeoutMin != null ? { rangeMrBreakevenTimeoutMin: Number(overrides.rangeMrBreakevenTimeoutMin) } : {}),
+      ...(feeBpsRoundTripResolved != null ? { feeBpsRoundTrip: Number(feeBpsRoundTripResolved) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;

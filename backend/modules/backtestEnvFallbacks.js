@@ -26,6 +26,15 @@ const ENV_NUMBER_FALLBACKS = Object.freeze({
   mrStopLossBps5mTier3: 'MR_STOP_LOSS_BPS_5M_TIER3',
   mrStopLossBps15m: 'MR_STOP_LOSS_BPS_15M',
   mrStopLossBps15mTier3: 'MR_STOP_LOSS_BPS_15M_TIER3',
+  // Round-trip fee assumption (2026-05-18). The live engine reads
+  // FEE_BPS_ROUND_TRIP at trade.js:116 and bakes it into every gross/net
+  // target. The backtester defaults to 30 in its own DEFAULTS; without this
+  // resolver entry, an operator who flips FEE_BPS_ROUND_TRIP in Render env
+  // (e.g. after auditing the Alpaca activity CSV) would see live trading
+  // recompute its targets but the dashboard auto-backtest would still
+  // simulate the old 30-bps world. Wiring this through closes the same gap
+  // the 2026-05-17 resolver closed for the recent-high and MR sub-gate knobs.
+  feeBpsRoundTrip: 'FEE_BPS_ROUND_TRIP',
 });
 
 function parseEnvNumber(raw) {
