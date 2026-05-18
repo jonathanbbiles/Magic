@@ -123,11 +123,34 @@ The entry-scan quote loop batches `/latest/quotes` calls via `prefetchQuotesForC
 
 **Phase 2 (deferred, separate PR)**: Extend `scripts/build_calibration.js` to fit logistic weights from `labeled.jsonl`; persist learned weights to `data/microstructure_weights.json`; load at runtime with hand-tuned fallback. Wire `MICRO_TRADES_ENABLED=true` after adding the trades consumer + per-symbol β estimation. Do NOT lower `MICRO_MIN_PROB` or `MICRO_EV_MIN_BPS` from their Phase 1 values until Phase 2 weights ship — the hand-tuned scorecard is the conservative case; loosening gates ahead of fit-data is the failure mode this whole framework guards against.
 
+## Feature library (2026-05-18)
+
+`backend/modules/featureLibrary.js` plus the extended primitives in `backend/modules/indicators.js` log a `featureSnapshot` object at every accepted entry into the `tradeForensics.append({phase: 'entry_submitted', ...})` call at `trade.js:~2848`. **Observational only — no signal or gate reads this.** The features land in `${storagePaths.writableRoot}/labeled.jsonl` so Phase 2's calibration script can fit logistic weights over a richer feature surface than the prediction-time scalars alone.
+
+Three families × ~22 fields:
+- **Extended indicators** (`indicators.js` extensions): `stochastic` (K/D/crossover), `bollingerBands` (width + Z-score), `candleBodyWickRatio` (body/upper-wick/lower-wick fractions), `macdHistogramSlope`, `macdSignalDivergence` (score in {-1, 0, +1}), `rsiPriceDivergence` (same shape), `emaAlignmentScore` (signed in [-1, +1]), `obvSlope`, `chaikinMoneyFlow`. Gate: `FEATURE_INDICATORS_EXTENDED_ENABLED`.
+- **Rolling statistical** (`featureLibrary.js`): `rollingSharpe`, `rollingSortino`, `rollingSkewness`, `rollingKurtosis`, `ljungBoxStat` (Q + lags), `rollingRSquared`, `rollingMaxDrawdown` (bps + duration), `historicalVaR`, `historicalCVaR`, `realizedVolPercentile`. Gate: `FEATURE_STATS_ENABLED`.
+- **Price structure** (`featureLibrary.js`): `supportResistanceProximity` returns `nearestSupportBps` + `nearestResistanceBps` from swing-point detection. Gate: `FEATURE_STRUCTURE_ENABLED`.
+
+Master kill: `FEATURE_LIBRARY_LOGGING_ENABLED=false` disables the entire snapshot. Default-on.
+
+**Wiring**:
+1. Each signal getter in `trade.js` (`getMultiFactorSignalForPair`, `getMeanReversionSignalForPair`, `getRangeMeanReversionSignalForPair`, `getBarrierSignalForPair`, `getMicrostructureSignalForPair`) attaches `sig.featureBars = { bars1m, bars5m?, bars15m?, orderbook? }` after evaluating the signal — bars are fetched once per scan and discarded today, so this is a 2-line addition each.
+2. `scanAndEnter` calls `buildFeatureSnapshot({ bars1m: sig?.featureBars?.bars1m, closes: sig?.closes, quote, orderbook, candidatePrice: ask, enable: {...} })` inside the `try { tradeForensics.append(...) }` block at `trade.js:~2848`. The result is spread into the appended record as `featureSnapshot`.
+3. The call runs ONLY at the entry-accepted boundary — after gates have passed and the buy is submitted to Alpaca. Do not move it earlier into `scanAndEnter`; per-candidate computation would bloat `labeled.jsonl` 30:1 with no calibration consumer for rejected-candidate features yet.
+
+**Hard Rule #4 compliance**: the live consumer is `tradeForensics.append`, which writes the snapshot to `labeled.jsonl`. `scripts/build_calibration.js` will read those records in Phase 2. The features are wired (not stubbed), and the README claim above matches the code exactly — observational logging, no entry gating, Phase 2 fits the weights. Anyone adding more features should mirror this Phase 1 / Phase 2 framing.
+
+**Triage of the originally-requested equity-style metrics that are NOT added**:
+- P/E, Forward P/E, PEG, EV/EBITDA, FCF Yield, D/E ratio, institutional ownership, short interest, IV Rank / Percentile, beta vs S&P 500, Jensen's α vs SPX, VIX, put/call ratios, sector RSI — none of these have an Alpaca crypto data source. Adding them as env-var stubs that compute nothing would violate Hard Rule #4. Do not re-add as "future hooks" without first wiring an upstream feed.
+- Volume profile POC/HVN/LVN — Plan-agent finding: wrong tool for 1m timeframe. A multi-hour tool whose output on 200×1m bars (~3 h of tape) is regime-noise, not durable level information. Defer until a multi-timeframe context is wired and a clear use-case exists.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
-- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js`
+- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
+- Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`

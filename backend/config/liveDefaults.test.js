@@ -145,4 +145,13 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_15M_TIER3, '100');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_MAX_HOLD_MS, '2700000');            // 45 min
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_BREAKEVEN_TIMEOUT_MS, '1800000');   // 30 min
 
+// 2026-05-18 feature library. Observational-only — these flags control
+// whether the entry forensics snapshot computes and appends the
+// corresponding feature family to labeled.jsonl. They do not gate entries.
+// Drift these to 'false' to disable logging without changing live behaviour.
+assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_LIBRARY_LOGGING_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_INDICATORS_EXTENDED_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_STATS_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_STRUCTURE_ENABLED, 'true');
+
 console.log('live defaults tests passed');

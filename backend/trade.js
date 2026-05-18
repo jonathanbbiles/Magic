@@ -41,6 +41,7 @@ const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal } = require('./modules/microstructureSignal');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
+const { buildFeatureSnapshot } = require('./modules/featureLibrary');
 const closedTradeStats = require('./modules/closedTradeStats');
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
@@ -363,6 +364,14 @@ const MICRO_EV_MIN_BPS = readNumber('MICRO_EV_MIN_BPS', 2);
 const MICRO_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('MICRO_TARGET_NET_BPS_FLOOR', 8));
 const MICRO_SIGNAL_TARGET_MAX_NET_BPS = Math.max(MICRO_TARGET_NET_BPS_FLOOR, readNumber('MICRO_SIGNAL_TARGET_MAX_NET_BPS', 150));
 const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
+
+// Feature library (2026-05-18) — observational-only logging into the entry
+// forensics record. None of these flags gate entries; they only control
+// whether the corresponding family of features is computed and written.
+const FEATURE_LIBRARY_LOGGING_ENABLED = readBoolean('FEATURE_LIBRARY_LOGGING_ENABLED', true);
+const FEATURE_INDICATORS_EXTENDED_ENABLED = readBoolean('FEATURE_INDICATORS_EXTENDED_ENABLED', true);
+const FEATURE_STATS_ENABLED = readBoolean('FEATURE_STATS_ENABLED', true);
+const FEATURE_STRUCTURE_ENABLED = readBoolean('FEATURE_STRUCTURE_ENABLED', true);
 
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
@@ -1692,7 +1701,7 @@ async function getMultiFactorSignalForPair(pair, quote) {
     const bars15m = bars15mPayload?.bars?.[pair] || bars15mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
-    return evaluateMultiFactorSignal({
+    const sig = evaluateMultiFactorSignal({
       pair,
       bars1m,
       bars5m,
@@ -1701,6 +1710,8 @@ async function getMultiFactorSignalForPair(pair, quote) {
       quote: quote ? { bid: Number(quote.bp), ask: Number(quote.ap) } : null,
       btcLeadLag,
     });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m, bars5m, bars15m, orderbook };
+    return sig;
   } catch (err) {
     return { ok: false, reason: 'multi_factor_signal_failed', error: err?.message };
   }
@@ -1719,7 +1730,9 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
-    return evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe, config: MR_SIGNAL_CONFIG_OVERRIDES });
+    const sig = evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe, config: MR_SIGNAL_CONFIG_OVERRIDES });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
+    return sig;
   } catch (err) {
     return { ok: false, reason: 'mean_reversion_signal_failed', error: err?.message };
   }
@@ -1735,7 +1748,9 @@ async function getRangeMeanReversionSignalForPair(pair) {
     // (low-volume alts sometimes come back below the requested limit).
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
-    return evaluateRangeMeanReversionSignal({ pair, bars1m });
+    const sig = evaluateRangeMeanReversionSignal({ pair, bars1m });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
+    return sig;
   } catch (err) {
     return { ok: false, reason: 'range_mean_reversion_signal_failed', error: err?.message };
   }
@@ -1757,12 +1772,14 @@ async function getBarrierSignalForPair(pair, quote = null) {
     ]);
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
-    return evaluateBarrierSignal({
+    const sig = evaluateBarrierSignal({
       pair,
       bars1m,
       orderbook,
       quote: quote ? { bid: Number(quote.bp), ask: Number(quote.ap) } : null,
     });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m, orderbook };
+    return sig;
   } catch (err) {
     return { ok: false, reason: 'barrier_signal_failed', error: err?.message };
   }
@@ -1796,7 +1813,7 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
       bidSize: Number(quote.bs),
       askSize: Number(quote.as),
     } : null;
-    return evaluateMicrostructureSignal({
+    const sig = evaluateMicrostructureSignal({
       pair,
       bars1m,
       orderbook,
@@ -1812,6 +1829,8 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
         tradesEnabled: MICRO_TRADES_ENABLED,
       },
     });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m, orderbook };
+    return sig;
   } catch (err) {
     return { ok: false, reason: 'microstructure_signal_failed', error: err?.message };
   }
@@ -2844,6 +2863,31 @@ async function scanAndEnter() {
           buyFillObserved: false,
           actualEntryPrice: null,
         });
+        // Feature library snapshot (2026-05-18). Observational-only — runs
+        // ONLY at the entry-accepted boundary (already inside try) so live
+        // entry latency is unaffected. Do not move this call earlier into
+        // scanAndEnter; per-candidate computation would bloat labeled.jsonl
+        // 30:1 and gain nothing until rejected-candidate calibration is in
+        // scope (separate, future PR).
+        let featureSnapshot = null;
+        if (FEATURE_LIBRARY_LOGGING_ENABLED) {
+          try {
+            featureSnapshot = buildFeatureSnapshot({
+              bars1m: sig?.featureBars?.bars1m || null,
+              closes: Array.isArray(sig?.closes) ? sig.closes : null,
+              quote: { bid, ask },
+              orderbook: sig?.featureBars?.orderbook || null,
+              candidatePrice: ask,
+              enable: {
+                indicators: FEATURE_INDICATORS_EXTENDED_ENABLED,
+                stats: FEATURE_STATS_ENABLED,
+                structure: FEATURE_STRUCTURE_ENABLED,
+              },
+            });
+          } catch (err) {
+            console.warn('feature_snapshot_failed', { symbol: pair, error: err?.message });
+          }
+        }
         try {
           tradeForensics.append({
             tradeId: buyOrder.id,
@@ -2851,6 +2895,7 @@ async function scanAndEnter() {
             phase: 'entry_submitted',
             ts: nowIso,
             ...prediction,
+            featureSnapshot,
           });
         } catch (err) {
           console.warn('forensics_entry_append_failed', { symbol: pair, error: err?.message });
