@@ -101,6 +101,8 @@ Disable everything with `BACKTEST_AUTORUN_ENABLED=false` (e.g. while debugging u
 - **BTC lead-lag gate** (`MAX_BTC_LEAD_LAG_DROP_BPS`, default `-10`): refuse non-BTC entries when BTC's last-5-bar return is more negative than threshold. Alts lag BTC by 30–90 s in crypto, so a fresh BTC drop is a leading indicator alt momentum is about to reverse.
 - **Portfolio-drawdown gate** (`MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER`, default `-2.0%`): refuse ALL new entries when the live book's aggregate unrealized P&L (sum / cost-basis, %) is below threshold. The missing macro filter — per-symbol gates have no portfolio context, so without this they all individually pass during a broad market top while the book is already bleeding.
 - **Volatility gate**: skip if realized vol exceeds `VOLATILITY_MAX_BPS`.
+- **Microstructure-confirm gate** (`backend/trade.js` `shouldEnterTrade`): after the spread / slippage / volatility checks pass, require at least one of three microstructure signals on the last few 1m closes — momentum confirm (≥70% of `MICRO_MOMENTUM_TICKS` recent ticks closed up), mean-reversion confirm (price below EMA by ≥ `MICRO_MEAN_REVERSION_MIN_DEV_BPS`), or stable-quote confirm (`spreadBps ≤ TIGHT_QUOTE_MAX_BPS` and `volatilityBps ≤ STABLE_QUOTE_VOL_MAX_BPS`). Skip reason: `micro_signal_missing`.
+- **Short-term-dip gate** (`backend/trade.js` predictor): refuse entries when the last 4 closed 1m bars contain ≥3 down moves AND the tail drawdown is ≤ −8 bps, EXCEPT for symbols in `MAJOR_ASSET_DIP_EXCEPTION` (BTC/ETH/SOL) where dips are treated as buyable. Skip reason: `short_term_dip`.
 - **Exit price**: a static GTC limit, never a stop or trailing exit.
 
 ### Diagnosing expectancy
