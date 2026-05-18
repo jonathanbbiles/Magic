@@ -69,6 +69,10 @@ function getBacktestForSignal(version, backtests) {
   if (version === 'mean_reversion_15m') return backtests.meanRev15mBacktest || null;
   if (version === 'range_mean_reversion') return backtests.rangeMrBacktest || null;
   if (version === 'barrier') return backtests.barrierBacktest || null;
+  if (version === 'microstructure_5m') return backtests.micro5mBacktest || null;
+  if (version === 'microstructure_15m') return backtests.micro15mBacktest || null;
+  if (version === 'microstructure_30m') return backtests.micro30mBacktest || null;
+  if (version === 'microstructure_45m') return backtests.micro45mBacktest || null;
   return backtests.olsBacktest || null;  // 'ols' or fallback
 }
 
@@ -80,7 +84,11 @@ function pickActiveSignal({
   meanRev15mBacktest = null,
   rangeMrBacktest = null,
   barrierBacktest = null,
-  operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion' | 'mean_reversion_5m' | 'mean_reversion_15m' | 'range_mean_reversion' | 'barrier' | null
+  micro5mBacktest = null,
+  micro15mBacktest = null,
+  micro30mBacktest = null,
+  micro45mBacktest = null,
+  operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion[_5m|_15m]' | 'range_mean_reversion' | 'barrier' | 'microstructure_{5,15,30,45}m' | null
   config = {},
 } = {}) {
   const cfg = { ...DEFAULTS, ...(config || {}) };
@@ -100,6 +108,14 @@ function pickActiveSignal({
   const rangeMrEntries = readBacktestEntries(rangeMrBacktest);
   const barrierNetBps = readBacktestNetBps(barrierBacktest);
   const barrierEntries = readBacktestEntries(barrierBacktest);
+  const micro5mNetBps = readBacktestNetBps(micro5mBacktest);
+  const micro5mEntries = readBacktestEntries(micro5mBacktest);
+  const micro15mNetBps = readBacktestNetBps(micro15mBacktest);
+  const micro15mEntries = readBacktestEntries(micro15mBacktest);
+  const micro30mNetBps = readBacktestNetBps(micro30mBacktest);
+  const micro30mEntries = readBacktestEntries(micro30mBacktest);
+  const micro45mNetBps = readBacktestNetBps(micro45mBacktest);
+  const micro45mEntries = readBacktestEntries(micro45mBacktest);
 
   const candidates = [];
   if (olsNetBps != null && olsEntries >= cfg.minBacktestEntries && olsNetBps >= cfg.minBpsToActivate) {
@@ -123,13 +139,34 @@ function pickActiveSignal({
   if (barrierNetBps != null && barrierEntries >= cfg.minBacktestEntries && barrierNetBps >= cfg.minBpsToActivate) {
     candidates.push({ version: 'barrier', netBps: barrierNetBps, entries: barrierEntries });
   }
+  if (micro5mNetBps != null && micro5mEntries >= cfg.minBacktestEntries && micro5mNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'microstructure_5m', netBps: micro5mNetBps, entries: micro5mEntries });
+  }
+  if (micro15mNetBps != null && micro15mEntries >= cfg.minBacktestEntries && micro15mNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'microstructure_15m', netBps: micro15mNetBps, entries: micro15mEntries });
+  }
+  if (micro30mNetBps != null && micro30mEntries >= cfg.minBacktestEntries && micro30mNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'microstructure_30m', netBps: micro30mNetBps, entries: micro30mEntries });
+  }
+  if (micro45mNetBps != null && micro45mEntries >= cfg.minBacktestEntries && micro45mNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'microstructure_45m', netBps: micro45mNetBps, entries: micro45mEntries });
+  }
   candidates.sort((a, b) => b.netBps - a.netBps);
 
-  const allBacktests = { olsBacktest, mfBacktest, meanRevBacktest, meanRev5mBacktest, meanRev15mBacktest, rangeMrBacktest, barrierBacktest };
+  const allBacktests = {
+    olsBacktest, mfBacktest, meanRevBacktest, meanRev5mBacktest, meanRev15mBacktest,
+    rangeMrBacktest, barrierBacktest,
+    micro5mBacktest, micro15mBacktest, micro30mBacktest, micro45mBacktest,
+  };
 
   // Operator override wins on signal version. Veto still applies unless
   // disabled — the override picks WHICH signal, not whether to trade at all.
-  const allowedOverrides = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion', 'barrier'];
+  const allowedOverrides = [
+    'ols', 'multi_factor',
+    'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m',
+    'range_mean_reversion', 'barrier',
+    'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+  ];
   if (allowedOverrides.includes(operatorOverride)) {
     const overrideBacktest = getBacktestForSignal(operatorOverride, allBacktests);
     const overrideNetBps = readBacktestNetBps(overrideBacktest);
@@ -151,6 +188,10 @@ function pickActiveSignal({
       meanRev15mNetBps,
       rangeMrNetBps,
       barrierNetBps,
+      micro5mNetBps,
+      micro15mNetBps,
+      micro30mNetBps,
+      micro45mNetBps,
       activeNetBps: overrideNetBps,
       candidates,
       operatorOverride,
@@ -173,6 +214,10 @@ function pickActiveSignal({
       meanRev15mNetBps,
       rangeMrNetBps,
       barrierNetBps,
+      micro5mNetBps,
+      micro15mNetBps,
+      micro30mNetBps,
+      micro45mNetBps,
       activeNetBps: null,
       candidates,
       operatorOverride: null,
@@ -221,6 +266,10 @@ let latestDecision = {
   meanRev15mNetBps: null,
   rangeMrNetBps: null,
   barrierNetBps: null,
+  micro5mNetBps: null,
+  micro15mNetBps: null,
+  micro30mNetBps: null,
+  micro45mNetBps: null,
   activeNetBps: null,
   candidates: [],
   operatorOverride: null,
@@ -241,7 +290,12 @@ function getCurrentDecision() {
 // Helper: when the operator has set SIGNAL_VERSION but vetoEnabled=false,
 // boot-time pre-backtest state should still respect the operator's choice.
 function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true } = {}) {
-  const allowed = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion', 'barrier'];
+  const allowed = [
+    'ols', 'multi_factor',
+    'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m',
+    'range_mean_reversion', 'barrier',
+    'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+  ];
   if (!vetoEnabled && allowed.includes(operatorOverride)) {
     latestDecision = {
       signalVersion: operatorOverride,

@@ -26,6 +26,19 @@ const ENV_NUMBER_FALLBACKS = Object.freeze({
   mrStopLossBps5mTier3: 'MR_STOP_LOSS_BPS_5M_TIER3',
   mrStopLossBps15m: 'MR_STOP_LOSS_BPS_15M',
   mrStopLossBps15mTier3: 'MR_STOP_LOSS_BPS_15M_TIER3',
+  // Microstructure signal knobs. The same priority chain (explicit override >
+  // env > backtester default) keeps the auto-backtest in sync with whatever
+  // an operator set in Render env — without this, a tuned MICRO_MIN_PROB
+  // would be invisible on the dashboard's auto-backtest result.
+  microSpreadZMax: 'MICRO_SPREAD_Z_MAX',
+  microMinProb: 'MICRO_MIN_PROB',
+  microEvMinBps: 'MICRO_EV_MIN_BPS',
+  microStopLossBps5m: 'MICRO_STOP_LOSS_BPS_5M',
+  microStopLossBps15m: 'MICRO_STOP_LOSS_BPS_15M',
+  microStopLossBps30m: 'MICRO_STOP_LOSS_BPS_30M',
+  microStopLossBps45m: 'MICRO_STOP_LOSS_BPS_45M',
+  microTargetNetBpsFloor: 'MICRO_TARGET_NET_BPS_FLOOR',
+  microSignalTargetMaxNetBps: 'MICRO_SIGNAL_TARGET_MAX_NET_BPS',
 });
 
 function parseEnvNumber(raw) {

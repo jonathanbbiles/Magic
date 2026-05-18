@@ -109,11 +109,25 @@ Resolution priority for the seven knobs (`rejectNearHighBps`, `rejectNearHighLoo
 
 The entry-scan quote loop batches `/latest/quotes` calls via `prefetchQuotesForCandidates` in `backend/trade.js` (helper near `fetchCryptoQuotes`, invocation just before the per-symbol loop in `scanAndEnter`). Default `ENTRY_PREFETCH_QUOTES=true`, `ENTRY_PREFETCH_CHUNK_SIZE=8`. The per-symbol loop reads from the prefetched Map first and falls back to a single-symbol fetch only when a chunk failed. Rollback: `ENTRY_PREFETCH_QUOTES=false` in Render env (no code change).
 
+## Microstructure signal (2026-05-18)
+
+`SIGNAL_VERSION=microstructure_{5,15,30,45}m` (added 2026-05-18) — hand-tuned logistic over 8 microstructure + statistical features: microprice deviation (Glosten-Milgrom dominant 1-step predictor), book imbalance, flow imbalance (Lee-Ready aggressor tick rule), spread-regime z-score, EWMA-σ-normalised return, RSI(14) delta, BTC residual (β=1.0 in Phase 1), drift-Sharpe ((EMA(3)−EMA(10))/σ). Signal fires when `p ≥ MICRO_MIN_PROB` AND `EV ≥ MICRO_EV_MIN_BPS` AND `spreadZ < MICRO_SPREAD_Z_MAX`. Module at `backend/modules/microstructureSignal.js`. Four discrete-horizon variants registered as separate selector candidates with per-horizon TP target + stop floor (5m: 40/60, 15m: 60/80, 30m: 80/100, 45m: 100/100 bps). The hand-tuned weights are theory-anchored and documented in the module header so any reader can audit them — `w_micro=1.20` (largest positive), `w_btcRes=−0.30` (only negative), `β0=−0.20` (slight prior against entry).
+
+**Phase 1 deliberate-zero contributions** (NOT dead knobs — both honestly documented):
+- `flowImbalance` returns 0 because `MICRO_TRADES_ENABLED=false` is the Phase 1 default. Phase 2 wires a `/v1beta3/crypto/us/latest/trades` consumer + flips the default.
+- Per-symbol β stays at 1.0 because no per-symbol fit data exists yet. Phase 2 estimates β from `labeled.jsonl`.
+
+**Per-horizon enable flags**: `MICRO_HORIZON_5M_ENABLED=false`, `MICRO_HORIZON_15M_ENABLED=true`, `MICRO_HORIZON_30M_ENABLED=true`, `MICRO_HORIZON_45M_ENABLED=false`. Two enabled by default to keep the selector sample-size guard (`SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5`) easy to clear; operators flip the 5m / 45m flags on after backtest evidence accumulates. `MICRO_ENABLED=false` is the master kill — disables all four auto-backtests so the selector silently drops the candidates.
+
+**Selector veto behavior unchanged**: microstructure variants must clear `SIGNAL_SELECTOR_MIN_BPS=0` over ≥5 backtest entries before the selector admits any of them live, identical to every other signal. No pinning by default, no veto bypass.
+
+**Phase 2 (deferred, separate PR)**: Extend `scripts/build_calibration.js` to fit logistic weights from `labeled.jsonl`; persist learned weights to `data/microstructure_weights.json`; load at runtime with hand-tuned fallback. Wire `MICRO_TRADES_ENABLED=true` after adding the trades consumer + per-symbol β estimation. Do NOT lower `MICRO_MIN_PROB` or `MICRO_EV_MIN_BPS` from their Phase 1 values until Phase 2 weights ship — the hand-tuned scorecard is the conservative case; loosening gates ahead of fit-data is the failure mode this whole framework guards against.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
-- Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924)
-- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js`, `indicators.js`
+- Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
+- Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`

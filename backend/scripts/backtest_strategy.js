@@ -52,6 +52,7 @@ const { evaluateMultiFactorSignal } = require('../modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal');
 const { evaluateRangeMeanReversionSignal } = require('../modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('../modules/barrierSignal');
+const { evaluateMicrostructureSignal } = require('../modules/microstructureSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
@@ -216,6 +217,36 @@ const DEFAULTS = {
   mrMaxBtcDropBps: null,
   mrRsiOversold: null,
   mrDeepDropGuardBps: null,
+  // Microstructure signal params (only consulted when strategy='microstructure').
+  // The signal evaluates at one of the four supported horizons (5/15/30/45 min);
+  // microHorizon selects which one. Per-horizon TP target + stop floor come from
+  // the signal module's HORIZON_DEFAULTS but operators can override via the
+  // microDesiredNetBps* / microStopFloorBps* knobs (Phase 2 hooks). Gating
+  // thresholds (microSpreadZMax / microMinProb / microEvMinBps) mirror the
+  // module's DEFAULT_CONFIG so backtest-vs-live parity holds.
+  microHorizon: '15m',
+  microSpreadZMax: 1.5,
+  microMinProb: 0.55,
+  microEvMinBps: 2,
+  microStopVolMult: 2.5,
+  microVolHalfLifeMin: 6,
+  microSlippageBps: 3,
+  // Engine-level sizing clamps for the microstructure-derived TP. Floor=8 keeps
+  // alignment with other tiny-target signals; cap=150 prevents the engine
+  // from posting an unreachable TP if the signal's gross-exit math produces
+  // a freak value (e.g. wide-spread inflation).
+  microTargetNetBpsFloor: 8,
+  microSignalTargetMaxNetBps: 150,
+  // Per-horizon stop caps (passed to deriveStopLossBps live; replayed here as
+  // the post-signal stopLossBpsAbsForTrade). Defaults mirror the module's
+  // HORIZON_DEFAULTS so operator-unset Render env behaves identically to the
+  // pure module config. Operators can widen / tighten per horizon via env.
+  microStopLossBps5m: 60,
+  microStopLossBps15m: 80,
+  microStopLossBps30m: 100,
+  microStopLossBps45m: 100,
+  microMaxHoldMin: 360,
+  microBreakevenTimeoutMin: 180,
   json: false,
 };
 
@@ -489,6 +520,16 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const isMeanReversion = strategy === 'mean_reversion';
   const isRangeMr = strategy === 'range_mean_reversion';
   const isBarrier = strategy === 'barrier';
+  const isMicrostructure = strategy === 'microstructure';
+  // Microstructure signal evaluates at one of four discrete horizons. Parse
+  // the suffix once per replaySymbol call so the per-bar loop just reads the
+  // resolved number.
+  const microHorizonMinutes = (() => {
+    if (!isMicrostructure) return null;
+    const raw = String(opts.microHorizon || '15m').toLowerCase().replace(/m$/, '');
+    const n = Number(raw);
+    return [5, 15, 30, 45].includes(n) ? n : 15;
+  })();
   // Phase 1: timeframe selector for the mean-reversion signal. '1m' (default)
   // runs the existing 1m-bar logic; '5m' / '15m' synthesize coarser bars from
   // the same 1m series. The selector compares all three variants to pick the
@@ -741,6 +782,71 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       stopLossBpsAbsForTrade = Number.isFinite(barrierSig.factors?.stopBps)
         ? Math.max(0, barrierSig.factors.stopBps)
         : Math.max(0, Number(opts.barrierStopLossBps) || 100);
+    } else if (isMicrostructure) {
+      // Microstructure signal needs 60 1m bars (matches the module's
+      // DEFAULT_CONFIG.barLookback1m so backtest-vs-live parity holds) +
+      // 1 synthetic in-progress bar = 61 closed bars in the window. The
+      // signal is stateless; orderbook + quote + recentTrades degrade
+      // gracefully when absent (the same backtest pattern as barrier).
+      const need = 61;
+      if (i + 1 < need) {
+        if (!stats.skipped.micro_insufficient_history) stats.skipped.micro_insufficient_history = 0;
+        stats.skipped.micro_insufficient_history += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] });  // synthetic in-progress
+      // BTC residual: pull BTC's 5-bar return for the alt path.
+      let btcReturnBps = null;
+      if (btcIdx) {
+        const minute = Math.floor(tsMs[i] / 60_000);
+        const btcBarIdx = btcIdx.byTs.get(minute);
+        if (Number.isFinite(btcBarIdx)) {
+          btcReturnBps = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+        }
+      }
+      const microCfg = {
+        spreadZMax: Number(opts.microSpreadZMax),
+        minProb: Number(opts.microMinProb),
+        evMinBps: Number(opts.microEvMinBps),
+        stopVolMult: Number(opts.microStopVolMult),
+        volHalfLifeMin: Number(opts.microVolHalfLifeMin),
+        slippageBps: Number(opts.microSlippageBps),
+        feeBpsRoundTrip: Number(opts.feeBpsRoundTrip) || 30,
+        // tradesEnabled stays false in backtest — no historical trades feed.
+        tradesEnabled: false,
+      };
+      const microSig = evaluateMicrostructureSignal({
+        pair: bars[i]?.S || null,
+        bars1m: window,
+        orderbook: null,
+        quote: null,
+        btcLeadLag: Number.isFinite(btcReturnBps) ? { recentReturnBps: btcReturnBps, ageMs: 0 } : null,
+        horizonMinutes: microHorizonMinutes,
+        config: microCfg,
+      });
+      if (!microSig?.ok) {
+        const reason = microSig?.reason || 'micro_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: microSig.projectedBps };
+      // Microstructure sizing: signal returns projectedBps = required GROSS
+      // exit bps (already includes fees + spread + slippage). Net = gross −
+      // fees, clamped to [floor, cap]. Stop = signal's dynamic stopBps from
+      // factors.stopBps (vol-scaled).
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.microTargetNetBpsFloor) || 8;
+      const cap = Number(opts.microSignalTargetMaxNetBps) || 150;
+      const raw = microSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Number.isFinite(microSig.factors?.stopBps)
+        ? Math.max(0, microSig.factors.stopBps)
+        : (microHorizonMinutes === 5 ? Number(opts.microStopLossBps5m) || 60
+          : microHorizonMinutes === 15 ? Number(opts.microStopLossBps15m) || 80
+          : microHorizonMinutes === 30 ? Number(opts.microStopLossBps30m) || 100
+          : Number(opts.microStopLossBps45m) || 100);
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -899,6 +1005,9 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isBarrier) {
       activeMaxHoldMin = Number(opts.barrierMaxHoldMin || opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.barrierBreakevenTimeoutMin || opts.breakevenTimeoutMin || 180);
+    } else if (isMicrostructure) {
+      activeMaxHoldMin = Number(opts.microMaxHoldMin || opts.maxHoldMin || 0);
+      activeBreakevenMin = Number(opts.microBreakevenTimeoutMin || opts.breakevenTimeoutMin || 180);
     } else {
       activeMaxHoldMin = Number(opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);

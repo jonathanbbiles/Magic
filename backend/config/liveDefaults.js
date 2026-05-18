@@ -303,6 +303,35 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   BARRIER_STOP_LOSS_BPS: '100',
   BARRIER_MAX_HOLD_MS: '21600000',     // 6 h (matches MF — similar TP magnitude)
   BARRIER_BREAKEVEN_TIMEOUT_MS: '10800000',  // 3 h
+  // Microstructure signal — hand-tuned logistic over 8 microstructure +
+  // statistical features (microprice, book imbalance, flow imbalance,
+  // spread-Z, vol-normalised return, RSI delta, BTC residual, drift-Sharpe).
+  // Targets sub-100-bps gross at four discrete horizons (5/15/30/45 min);
+  // SignalSelector picks the horizon with the best per-trade backtest
+  // expectancy. Phase 1 ships 15m + 30m enabled; 5m + 45m gated behind
+  // their per-horizon flags so an operator can flip them on once backtest
+  // evidence accumulates without diluting selector sample sizes.
+  //
+  // MICRO_TRADES_ENABLED=false is honest — flowImbalance contribution is
+  // zero in Phase 1 because no /v1beta3/crypto/us/latest/trades consumer
+  // exists yet. Phase 2 wires the trades feed + flips this default.
+  MICRO_ENABLED: 'true',
+  MICRO_HORIZON_5M_ENABLED: 'false',
+  MICRO_HORIZON_15M_ENABLED: 'true',
+  MICRO_HORIZON_30M_ENABLED: 'true',
+  MICRO_HORIZON_45M_ENABLED: 'false',
+  MICRO_SPREAD_Z_MAX: '1.5',
+  MICRO_MIN_PROB: '0.55',
+  MICRO_EV_MIN_BPS: '2',
+  MICRO_STOP_LOSS_BPS_5M: '60',
+  MICRO_STOP_LOSS_BPS_15M: '80',
+  MICRO_STOP_LOSS_BPS_30M: '100',
+  MICRO_STOP_LOSS_BPS_45M: '100',
+  MICRO_MAX_HOLD_MS: '21600000',          // 6 h (matches barrier — similar TP magnitude)
+  MICRO_BREAKEVEN_TIMEOUT_MS: '10800000', // 3 h
+  MICRO_TARGET_NET_BPS_FLOOR: '8',
+  MICRO_SIGNAL_TARGET_MAX_NET_BPS: '150',
+  MICRO_TRADES_ENABLED: 'false',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));
