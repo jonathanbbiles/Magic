@@ -72,10 +72,46 @@ function summarizeCell(stopLossBps, result) {
   };
 }
 
+// Schema version for the persisted sweep blob. Bump when the on-disk shape
+// changes incompatibly so deserialize can reject older payloads cleanly.
+const SCHEMA_VERSION = 1;
+
+// Serialize a sweep result for persistence. Adds a schema version so older
+// on-disk blobs can be rejected if the shape ever changes incompatibly.
+// Caller is responsible for the actual file I/O.
+function serialize(sweep) {
+  if (!sweep || typeof sweep !== 'object') return null;
+  return JSON.stringify({ schemaVersion: SCHEMA_VERSION, sweep });
+}
+
+// Deserialize a persisted sweep blob. Returns null on any parse error,
+// missing schema version, or incompatible schema — callers should treat
+// null as "no prior sweep available" and let the next live sweep populate.
+// Defensive by design: a corrupt persistence file should not crash boot.
+function deserialize(rawJson) {
+  if (!rawJson || typeof rawJson !== 'string') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch (_) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.schemaVersion !== SCHEMA_VERSION) return null;
+  const sweep = parsed.sweep;
+  if (!sweep || typeof sweep !== 'object') return null;
+  // Defensive shape check: must have the two timeframe arrays we expect.
+  if (!Array.isArray(sweep.mr5m) || !Array.isArray(sweep.mr15m)) return null;
+  return sweep;
+}
+
 module.exports = {
   DEFAULT_CAPS,
   TIMEFRAMES,
+  SCHEMA_VERSION,
   parseSweepCaps,
   buildSweepPlan,
   summarizeCell,
+  serialize,
+  deserialize,
 };

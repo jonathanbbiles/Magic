@@ -95,6 +95,10 @@ The backtester (`backend/scripts/backtest_strategy.js`) follows the same dispatc
 
 Knobs: `MR_STOP_LOSS_SWEEP_ENABLED` (default `true`), `MR_STOP_LOSS_SWEEP_CAPS` (default `60,80,100`, bounded to 6 caps total).
 
+## Sweep persistence across restarts (2026-05-18)
+
+The sweep takes ~3 minutes to repopulate after a deploy. For phone-first workflows where operators pull logs right after a PR merge, the dashboard would show `meta.mrStopLossSweep = null` every time. To eliminate that gap, the sweep result is now persisted to `${storagePaths.writableRoot}/mr_stop_loss_sweep.json` on completion. At boot, `loadPersistedMrSweep` in `index.js` reads the file and pre-populates `lastMrStopLossSweep` marked `staleFromPriorRun: true`. When the current restart's sweep completes, both memory and disk get overwritten and the flag flips to `false`. Defensive: corrupt files or schema-mismatched blobs return `null` (logged via `mr_sweep_persistence_invalid`); write failures are logged but never crash. Schema version is embedded so future shape changes can reject older blobs.
+
 ## Auto-backtest env-fallback resolver (2026-05-17 visibility fix)
 
 `backend/modules/backtestEnvFallbacks.js` bridges the live engine's `process.env` values into the auto-backtest invocation in `runBacktestAndStore`. Without it, the auto-backtest passes only `signalTargetFraction` / `minVolumeRatio` / `maxBtcLeadLagDropBps` and the rest fall through to `backtest_strategy.js`'s hardcoded `DEFAULTS` (e.g. `rejectNearHighLookbackBars: 60`) — which made the Stage 1 default flip invisible on the dashboard even though live trading was using the new value.
