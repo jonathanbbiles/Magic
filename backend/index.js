@@ -679,6 +679,17 @@ let lastBacktestRangeMr = null;
 // theory + micro-momentum + EMA momentum. Feeds the signal selector as
 // another candidate alongside OLS/MF/MR variants.
 let lastBacktestBarrier = null;
+// Microstructure signal backtest slots — hand-tuned logistic over 8
+// microstructure + statistical features (microprice, book imbalance, flow
+// imbalance, spread-Z, vol-normalised return, RSI delta, BTC residual,
+// drift-Sharpe). Emitted at four discrete horizons; each variant has its
+// own backtest slot so the signal selector can pick the horizon with the
+// best per-trade expectancy on real Alpaca bars. Phase 1 ships with 15m +
+// 30m enabled at boot; 5m + 45m are gated behind MICRO_HORIZON_*_ENABLED.
+let lastBacktestMicro5m = null;
+let lastBacktestMicro15m = null;
+let lastBacktestMicro30m = null;
+let lastBacktestMicro45m = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -758,6 +769,10 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     meanRev15mBacktest: lastBacktestMeanRev15m,
     rangeMrBacktest: lastBacktestRangeMr,
     barrierBacktest: lastBacktestBarrier,
+    micro5mBacktest: lastBacktestMicro5m,
+    micro15mBacktest: lastBacktestMicro15m,
+    micro30mBacktest: lastBacktestMicro30m,
+    micro45mBacktest: lastBacktestMicro45m,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -774,6 +789,10 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     meanRev15mNetBps: decision.meanRev15mNetBps,
     rangeMrNetBps: decision.rangeMrNetBps,
     barrierNetBps: decision.barrierNetBps,
+    micro5mNetBps: decision.micro5mNetBps,
+    micro15mNetBps: decision.micro15mNetBps,
+    micro30mNetBps: decision.micro30mNetBps,
+    micro45mNetBps: decision.micro45mNetBps,
     activeNetBps: decision.activeNetBps,
     operatorOverride,
     backtestRanAt: decision.backtestRanAt,
@@ -816,6 +835,15 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       mrStopLossBps5mTier3: mrStopLossBps5mTier3Resolved,
       mrStopLossBps15m: mrStopLossBps15mResolved,
       mrStopLossBps15mTier3: mrStopLossBps15mTier3Resolved,
+      microSpreadZMax: microSpreadZMaxResolved,
+      microMinProb: microMinProbResolved,
+      microEvMinBps: microEvMinBpsResolved,
+      microStopLossBps5m: microStopLossBps5mResolved,
+      microStopLossBps15m: microStopLossBps15mResolved,
+      microStopLossBps30m: microStopLossBps30mResolved,
+      microStopLossBps45m: microStopLossBps45mResolved,
+      microTargetNetBpsFloor: microTargetNetBpsFloorResolved,
+      microSignalTargetMaxNetBps: microSignalTargetMaxNetBpsResolved,
     } = liveEngineFallbacks;
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
@@ -867,6 +895,21 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.rangeMrStopLossBps != null ? { rangeMrStopLossBps: Number(overrides.rangeMrStopLossBps) } : {}),
       ...(overrides.rangeMrMaxHoldMin != null ? { rangeMrMaxHoldMin: Number(overrides.rangeMrMaxHoldMin) } : {}),
       ...(overrides.rangeMrBreakevenTimeoutMin != null ? { rangeMrBreakevenTimeoutMin: Number(overrides.rangeMrBreakevenTimeoutMin) } : {}),
+      ...(overrides.microHorizon ? { microHorizon: String(overrides.microHorizon) } : {}),
+      ...(microSpreadZMaxResolved != null ? { microSpreadZMax: Number(microSpreadZMaxResolved) } : {}),
+      ...(microMinProbResolved != null ? { microMinProb: Number(microMinProbResolved) } : {}),
+      ...(microEvMinBpsResolved != null ? { microEvMinBps: Number(microEvMinBpsResolved) } : {}),
+      ...(overrides.microStopVolMult != null ? { microStopVolMult: Number(overrides.microStopVolMult) } : {}),
+      ...(overrides.microVolHalfLifeMin != null ? { microVolHalfLifeMin: Number(overrides.microVolHalfLifeMin) } : {}),
+      ...(overrides.microSlippageBps != null ? { microSlippageBps: Number(overrides.microSlippageBps) } : {}),
+      ...(microTargetNetBpsFloorResolved != null ? { microTargetNetBpsFloor: Number(microTargetNetBpsFloorResolved) } : {}),
+      ...(microSignalTargetMaxNetBpsResolved != null ? { microSignalTargetMaxNetBps: Number(microSignalTargetMaxNetBpsResolved) } : {}),
+      ...(microStopLossBps5mResolved != null ? { microStopLossBps5m: Number(microStopLossBps5mResolved) } : {}),
+      ...(microStopLossBps15mResolved != null ? { microStopLossBps15m: Number(microStopLossBps15mResolved) } : {}),
+      ...(microStopLossBps30mResolved != null ? { microStopLossBps30m: Number(microStopLossBps30mResolved) } : {}),
+      ...(microStopLossBps45mResolved != null ? { microStopLossBps45m: Number(microStopLossBps45mResolved) } : {}),
+      ...(overrides.microMaxHoldMin != null ? { microMaxHoldMin: Number(overrides.microMaxHoldMin) } : {}),
+      ...(overrides.microBreakevenTimeoutMin != null ? { microBreakevenTimeoutMin: Number(overrides.microBreakevenTimeoutMin) } : {}),
     });
     const stored = { ...result, windowDays: days };
     if (slot === 'alt') lastBacktestAlt = stored;
@@ -877,13 +920,22 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     else if (slot === 'mean_rev_15m') lastBacktestMeanRev15m = stored;
     else if (slot === 'range_mr') lastBacktestRangeMr = stored;
     else if (slot === 'barrier') lastBacktestBarrier = stored;
+    else if (slot === 'micro_5m') lastBacktestMicro5m = stored;
+    else if (slot === 'micro_15m') lastBacktestMicro15m = stored;
+    else if (slot === 'micro_30m') lastBacktestMicro30m = stored;
+    else if (slot === 'micro_45m') lastBacktestMicro45m = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
     // Refresh the signal selector decision now that fresh evidence is in for
     // this slot. The selector consumes the primary / mf / mean_rev / mean_rev_5m
     // / mean_rev_15m / range_mr / barrier slots; alt / alt2 are sensitivity studies.
-    if (['primary', 'mf', 'mean_rev', 'mean_rev_5m', 'mean_rev_15m', 'range_mr', 'barrier'].includes(slot)) {
+    if ([
+      'primary', 'mf',
+      'mean_rev', 'mean_rev_5m', 'mean_rev_15m',
+      'range_mr', 'barrier',
+      'micro_5m', 'micro_15m', 'micro_30m', 'micro_45m',
+    ].includes(slot)) {
       refreshSignalSelectorDecision(`after_backtest_${slot}`);
     }
     return stored;
@@ -1420,6 +1472,49 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestBarrier.perSymbol,
           gateSkipped: lastBacktestBarrier.gateSkipped || null,
           note: 'Barrier signal candidate (restored from commit fbdb924). Trade-construction signal: barrier-touch probability + micro-momentum + EMA momentum, targets ~100 bps net per trade.',
+        } : null,
+        // Microstructure signal candidates — hand-tuned logistic over 8
+        // microstructure + statistical features, evaluated at four discrete
+        // horizons. Each variant is a separate signal-selector candidate;
+        // Phase 1 ships with 15m + 30m enabled. flowImbalance contribution
+        // is zero until MICRO_TRADES_ENABLED=true (Phase 2 wires the trades
+        // feed) — documented honestly so operators don't treat the knob as
+        // a live A/B lever.
+        backtestMicro5m: lastBacktestMicro5m ? {
+          ranAt: lastBacktestMicro5m.ranAt,
+          windowDays: lastBacktestMicro5m.windowDays,
+          params: lastBacktestMicro5m.params,
+          overall: lastBacktestMicro5m.overall,
+          perSymbol: lastBacktestMicro5m.perSymbol,
+          gateSkipped: lastBacktestMicro5m.gateSkipped || null,
+          note: 'Microstructure signal candidate at 5m horizon. Hand-tuned logistic over microprice, book imbalance, spread-Z, vol-normalised return, RSI delta, BTC residual, drift-Sharpe (flow imbalance is Phase 2). Disabled by default — set MICRO_HORIZON_5M_ENABLED=true to admit.',
+        } : null,
+        backtestMicro15m: lastBacktestMicro15m ? {
+          ranAt: lastBacktestMicro15m.ranAt,
+          windowDays: lastBacktestMicro15m.windowDays,
+          params: lastBacktestMicro15m.params,
+          overall: lastBacktestMicro15m.overall,
+          perSymbol: lastBacktestMicro15m.perSymbol,
+          gateSkipped: lastBacktestMicro15m.gateSkipped || null,
+          note: 'Microstructure signal candidate at 15m horizon (enabled by default).',
+        } : null,
+        backtestMicro30m: lastBacktestMicro30m ? {
+          ranAt: lastBacktestMicro30m.ranAt,
+          windowDays: lastBacktestMicro30m.windowDays,
+          params: lastBacktestMicro30m.params,
+          overall: lastBacktestMicro30m.overall,
+          perSymbol: lastBacktestMicro30m.perSymbol,
+          gateSkipped: lastBacktestMicro30m.gateSkipped || null,
+          note: 'Microstructure signal candidate at 30m horizon (enabled by default).',
+        } : null,
+        backtestMicro45m: lastBacktestMicro45m ? {
+          ranAt: lastBacktestMicro45m.ranAt,
+          windowDays: lastBacktestMicro45m.windowDays,
+          params: lastBacktestMicro45m.params,
+          overall: lastBacktestMicro45m.overall,
+          perSymbol: lastBacktestMicro45m.perSymbol,
+          gateSkipped: lastBacktestMicro45m.gateSkipped || null,
+          note: 'Microstructure signal candidate at 45m horizon. Disabled by default — set MICRO_HORIZON_45M_ENABLED=true to admit.',
         } : null,
         // Stage 3 MR stop-loss sweep — observational diagnostic, fires at
         // each restart. Shows mean_reversion at three stop-loss caps per
@@ -2373,6 +2468,43 @@ if (backtestSkipReason) {
       await runBacktestAndStore({
         strategy: 'barrier',
       }, 'barrier').catch(() => {});
+    }
+    // Microstructure signal auto-run — hand-tuned logistic over 8
+    // microstructure + statistical features (microprice, book imbalance,
+    // flow imbalance, spread-Z, vol-normalised return, RSI delta, BTC
+    // residual, drift-Sharpe). Four discrete horizons (5/15/30/45 min)
+    // each register as their own selector candidate; the selector picks
+    // the horizon with the best per-trade expectancy on real Alpaca bars.
+    //
+    // MICRO_ENABLED is the master switch (default 'true'). The per-horizon
+    // _ENABLED flags decide which variants fire at boot — Phase 1 ships
+    // with 15m + 30m on, 5m + 45m off. The signal selector silently drops
+    // un-enabled candidates rather than admitting them via veto bypass.
+    if (String(process.env.MICRO_ENABLED || 'true').toLowerCase() !== 'false') {
+      if (String(process.env.MICRO_HORIZON_5M_ENABLED || 'false').toLowerCase() === 'true') {
+        await runBacktestAndStore({
+          strategy: 'microstructure',
+          microHorizon: '5m',
+        }, 'micro_5m').catch(() => {});
+      }
+      if (String(process.env.MICRO_HORIZON_15M_ENABLED || 'true').toLowerCase() !== 'false') {
+        await runBacktestAndStore({
+          strategy: 'microstructure',
+          microHorizon: '15m',
+        }, 'micro_15m').catch(() => {});
+      }
+      if (String(process.env.MICRO_HORIZON_30M_ENABLED || 'true').toLowerCase() !== 'false') {
+        await runBacktestAndStore({
+          strategy: 'microstructure',
+          microHorizon: '30m',
+        }, 'micro_30m').catch(() => {});
+      }
+      if (String(process.env.MICRO_HORIZON_45M_ENABLED || 'false').toLowerCase() === 'true') {
+        await runBacktestAndStore({
+          strategy: 'microstructure',
+          microHorizon: '45m',
+        }, 'micro_45m').catch(() => {});
+      }
     }
     // 2026-05-17 Stage 3 sweep: backtest MR-5m and MR-15m at three stop-loss
     // caps each (60 / 80 / 100 by default) so the dashboard can show the

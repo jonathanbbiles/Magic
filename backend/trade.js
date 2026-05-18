@@ -38,6 +38,7 @@ const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
+const { evaluateMicrostructureSignal } = require('./modules/microstructureSignal');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
@@ -198,6 +199,10 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_15m') return MR_MAX_HOLD_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_MAX_HOLD_MS;
   if (signalVersion === 'barrier') return BARRIER_MAX_HOLD_MS;
+  if (signalVersion === 'microstructure_5m'
+      || signalVersion === 'microstructure_15m'
+      || signalVersion === 'microstructure_30m'
+      || signalVersion === 'microstructure_45m') return MICRO_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
@@ -207,6 +212,10 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'mean_reversion_15m') return MR_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'range_mean_reversion') return RANGE_MR_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'barrier') return BARRIER_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'microstructure_5m'
+      || signalVersion === 'microstructure_15m'
+      || signalVersion === 'microstructure_30m'
+      || signalVersion === 'microstructure_45m') return MICRO_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -334,6 +343,27 @@ const BARRIER_STOP_LOSS_BPS = Math.max(1, readNumber('BARRIER_STOP_LOSS_BPS', 10
 const BARRIER_MAX_HOLD_MS = Math.max(60_000, readNumber('BARRIER_MAX_HOLD_MS', 21_600_000));     // 6 h
 const BARRIER_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('BARRIER_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
 
+// Microstructure signal env knobs. Per-horizon TP target + stop floor mirror
+// the module's HORIZON_DEFAULTS so an operator-unset env behaves identically
+// to the pure module config. Hold-times match barrier (6 h max, 3 h
+// break-even decay) since the per-trade target magnitude (40–100 bps net)
+// occupies the same band. The four MICRO_HORIZON_*_ENABLED flags gate
+// whether each horizon's auto-backtest fires at boot — the SignalSelector
+// silently drops un-enabled candidates rather than admitting them via the
+// veto bypass.
+const MICRO_STOP_LOSS_BPS_5M = Math.max(1, readNumber('MICRO_STOP_LOSS_BPS_5M', 60));
+const MICRO_STOP_LOSS_BPS_15M = Math.max(1, readNumber('MICRO_STOP_LOSS_BPS_15M', 80));
+const MICRO_STOP_LOSS_BPS_30M = Math.max(1, readNumber('MICRO_STOP_LOSS_BPS_30M', 100));
+const MICRO_STOP_LOSS_BPS_45M = Math.max(1, readNumber('MICRO_STOP_LOSS_BPS_45M', 100));
+const MICRO_MAX_HOLD_MS = Math.max(60_000, readNumber('MICRO_MAX_HOLD_MS', 21_600_000));            // 6 h
+const MICRO_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('MICRO_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
+const MICRO_SPREAD_Z_MAX = readNumber('MICRO_SPREAD_Z_MAX', 1.5);
+const MICRO_MIN_PROB = readNumber('MICRO_MIN_PROB', 0.55);
+const MICRO_EV_MIN_BPS = readNumber('MICRO_EV_MIN_BPS', 2);
+const MICRO_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('MICRO_TARGET_NET_BPS_FLOOR', 8));
+const MICRO_SIGNAL_TARGET_MAX_NET_BPS = Math.max(MICRO_TARGET_NET_BPS_FLOOR, readNumber('MICRO_SIGNAL_TARGET_MAX_NET_BPS', 150));
+const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
+
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
   if (signalVersion === 'multi_factor') cap = MF_STOP_LOSS_BPS;
@@ -359,6 +389,10 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
   }
   else if (signalVersion === 'range_mean_reversion') cap = RANGE_MR_STOP_LOSS_BPS;
   else if (signalVersion === 'barrier') cap = BARRIER_STOP_LOSS_BPS;
+  else if (signalVersion === 'microstructure_5m') cap = MICRO_STOP_LOSS_BPS_5M;
+  else if (signalVersion === 'microstructure_15m') cap = MICRO_STOP_LOSS_BPS_15M;
+  else if (signalVersion === 'microstructure_30m') cap = MICRO_STOP_LOSS_BPS_30M;
+  else if (signalVersion === 'microstructure_45m') cap = MICRO_STOP_LOSS_BPS_45M;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -658,7 +692,10 @@ const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 
 // own factor vote replaces them. Structural gates (drawdown, sizing,
 // freshness, spread, vol-cap, HTF) still apply to both signals.
 const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-const SIGNAL_VERSION_OPERATOR_OVERRIDE = ['ols', 'multi_factor', 'mean_reversion', 'barrier'].includes(SIGNAL_VERSION_RAW)
+const SIGNAL_VERSION_OPERATOR_OVERRIDE = [
+  'ols', 'multi_factor', 'mean_reversion', 'barrier',
+  'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW
   : null;
 const SIGNAL_VERSION_MODE = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'auto';
@@ -784,6 +821,21 @@ function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
     if (!Number.isFinite(projected)) return MR_TARGET_NET_PROFIT_BPS_FLOOR;
     const signalNet = projected - FEE_BPS_ROUND_TRIP;
     return Math.max(MR_TARGET_NET_PROFIT_BPS_FLOOR, Math.min(MR_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  }
+  // Microstructure (all four horizons): projectedBps is the required GROSS
+  // exit (signal-internal math already includes fees + spread + slippage to
+  // meet the per-horizon desiredNet target). Net = gross − fees, clamped to
+  // the microstructure floor/cap. Mirrors the barrier signal's sizing
+  // convention, just with a tighter floor since the smaller-horizon variants
+  // target sub-100-bps gross.
+  if (signalVersion === 'microstructure_5m'
+      || signalVersion === 'microstructure_15m'
+      || signalVersion === 'microstructure_30m'
+      || signalVersion === 'microstructure_45m') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return MICRO_TARGET_NET_BPS_FLOOR;
+    const signalNet = projected - FEE_BPS_ROUND_TRIP;
+    return Math.max(MICRO_TARGET_NET_BPS_FLOOR, Math.min(MICRO_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
   }
   // Range mean-reversion: projectedBps is the half-distance to the range
   // midpoint. Same conversion pattern as MR — gross to net by subtracting
@@ -1716,6 +1768,55 @@ async function getBarrierSignalForPair(pair, quote = null) {
   }
 }
 
+// Microstructure signal wrapper. The signal needs 60 1m bars (RSI(14) +
+// 60-bar spread/sigma windows) plus the live quote (for spread + microprice)
+// and (optionally) the orderbook for the bookImbalance term. Pattern matches
+// the barrier wrapper — orderbook fetch is non-fatal, signal degrades to
+// neutral when missing. recentTrades stays null until Phase 2 wires a
+// /v1beta3/crypto/us/latest/trades consumer; the signal's tradesEnabled
+// config flag is gated by MICRO_TRADES_ENABLED env and silently returns
+// flowImbalance=0 in Phase 1 so the contribution is zero.
+async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
+  try {
+    const [bars1mPayload, obPayload] = await Promise.all([
+      fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' }),
+      fetchCryptoOrderbooks({ symbols: [pair] }).catch((err) => {
+        console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
+        return { orderbooks: {} };
+      }),
+    ]);
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
+    // Live quote shape includes top-of-book sizes when available; the
+    // microprice computation falls back to neutral microBias if absent.
+    const quoteForSignal = quote ? {
+      bid: Number(quote.bp),
+      ask: Number(quote.ap),
+      bidSize: Number(quote.bs),
+      askSize: Number(quote.as),
+    } : null;
+    return evaluateMicrostructureSignal({
+      pair,
+      bars1m,
+      orderbook,
+      quote: quoteForSignal,
+      btcLeadLag,
+      recentTrades: null,
+      horizonMinutes,
+      config: {
+        spreadZMax: MICRO_SPREAD_Z_MAX,
+        minProb: MICRO_MIN_PROB,
+        evMinBps: MICRO_EV_MIN_BPS,
+        feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+        tradesEnabled: MICRO_TRADES_ENABLED,
+      },
+    });
+  } catch (err) {
+    return { ok: false, reason: 'microstructure_signal_failed', error: err?.message };
+  }
+}
+
 // --- engine state -------------------------------------------------------
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
@@ -2345,6 +2446,14 @@ async function scanAndEnter() {
         sig = await getRangeMeanReversionSignalForPair(pair);
       } else if (ACTIVE_SIGNAL_VERSION === 'barrier') {
         sig = await getBarrierSignalForPair(pair, quote);
+      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_5m') {
+        sig = await getMicrostructureSignalForPair(pair, quote, 5);
+      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_15m') {
+        sig = await getMicrostructureSignalForPair(pair, quote, 15);
+      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_30m') {
+        sig = await getMicrostructureSignalForPair(pair, quote, 30);
+      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') {
+        sig = await getMicrostructureSignalForPair(pair, quote, 45);
       } else {
         sig = await getPredictionSignal(pair);
       }

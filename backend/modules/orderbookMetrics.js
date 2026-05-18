@@ -195,8 +195,73 @@ function computeOrderbookMetrics(orderbook, quote, config) {
   };
 }
 
+// Microprice — the size-weighted mid that, under Glosten-Milgrom, is the
+// single best 1-step-ahead predictor of the future mid. When the bid is
+// deeper than the ask, microprice sits above mid (more pressure to buy than
+// sell); the dollar-volume of the better-rated side pulls the print toward
+// it. Returns microBias normalised by spread so it can be combined with
+// other [-1, +1] features without rescaling per pair.
+//
+// Inputs:
+//   quote: { bid, ask, bidSize, askSize } — sizes optional; falls back to
+//          imbalance from the top-of-book depth when absent.
+// Output:
+//   { microprice, microBias, mid, spreadBps } — all null when inputs invalid.
+function computeMicroprice(quote) {
+  const bid = Number(quote?.bid);
+  const ask = Number(quote?.ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) {
+    return { microprice: null, microBias: null, mid: null, spreadBps: null };
+  }
+  const mid = (bid + ask) / 2;
+  const spread = ask - bid;
+  const spreadBps = (spread / mid) * 10000;
+  const bidSize = Number(quote?.bidSize);
+  const askSize = Number(quote?.askSize);
+  // Without sizes the microprice degenerates to mid — return that explicitly
+  // so callers can detect the no-bias case via microBias===0.
+  if (!Number.isFinite(bidSize) || !Number.isFinite(askSize) || bidSize <= 0 || askSize <= 0) {
+    return { microprice: mid, microBias: 0, mid, spreadBps };
+  }
+  const microprice = (ask * bidSize + bid * askSize) / (bidSize + askSize);
+  // Normalize the deviation by half-spread so |microBias| <= 1 in the bound.
+  // (microprice - mid) is bounded by spread/2 by construction.
+  const halfSpread = Math.max(1e-12, spread / 2);
+  const microBias = clamp((microprice - mid) / halfSpread, -1, 1);
+  return { microprice, microBias, mid, spreadBps };
+}
+
+// Z-score of the current spread vs a trailing series of recent spreads. Used
+// as a regime gate: when spreadZ is high (current spread > recent mean by
+// several stdevs), the cost-of-entry is regime-elevated and scalping the
+// passive-entry economics is unlikely to clear fees. Caller passes a flat
+// array of recent spreadBps values plus the current; returns z-score and
+// the mean/stdev for diagnostics. Returns 0 for the z when the trailing
+// series has fewer than 2 observations or zero stdev (caller treats as
+// "no regime signal" rather than veto).
+function computeSpreadZScore(currentSpreadBps, trailingSpreadsBps) {
+  const cur = Number(currentSpreadBps);
+  if (!Number.isFinite(cur)) return { z: 0, mean: null, stdev: null };
+  const sample = Array.isArray(trailingSpreadsBps)
+    ? trailingSpreadsBps.map((v) => Number(v)).filter((v) => Number.isFinite(v) && v >= 0)
+    : [];
+  if (sample.length < 2) return { z: 0, mean: null, stdev: null };
+  const n = sample.length;
+  const mean = sample.reduce((s, v) => s + v, 0) / n;
+  let varianceSum = 0;
+  for (const v of sample) {
+    const d = v - mean;
+    varianceSum += d * d;
+  }
+  const stdev = Math.sqrt(varianceSum / Math.max(1, n - 1));
+  if (!Number.isFinite(stdev) || stdev <= 0) return { z: 0, mean, stdev: 0 };
+  return { z: (cur - mean) / stdev, mean, stdev };
+}
+
 module.exports = {
   computeOrderbookMetrics,
   computeDepthForSide,
   estimateBuyImpactBps,
+  computeMicroprice,
+  computeSpreadZScore,
 };

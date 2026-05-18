@@ -93,6 +93,29 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_STOP_LOSS_BPS, '100');
 assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_MAX_HOLD_MS, '21600000');      // 6 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_BREAKEVEN_TIMEOUT_MS, '10800000'); // 3 h
 
+// Microstructure signal — Phase 1 defaults. 15m + 30m horizons enabled at
+// boot; 5m + 45m gated off so the SignalSelector sample-size guard isn't
+// diluted by under-fired variants. flowImbalance feature returns 0 in
+// Phase 1 because MICRO_TRADES_ENABLED=false — Phase 2 wires the
+// /v1beta3/crypto/us/latest/trades consumer and flips this default.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_5M_ENABLED, 'false');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_15M_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_30M_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_45M_ENABLED, 'false');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_SPREAD_Z_MAX, '1.5');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_MIN_PROB, '0.55');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_EV_MIN_BPS, '2');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_STOP_LOSS_BPS_5M, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_STOP_LOSS_BPS_15M, '80');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_STOP_LOSS_BPS_30M, '100');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_STOP_LOSS_BPS_45M, '100');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_MAX_HOLD_MS, '21600000');        // 6 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_BREAKEVEN_TIMEOUT_MS, '10800000'); // 3 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_TARGET_NET_BPS_FLOOR, '8');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_SIGNAL_TARGET_MAX_NET_BPS, '150');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_TRADES_ENABLED, 'false');
+
 // 2026-05-15 rollback: exit defaults restored to the pre-claude values.
 // MAX_HOLD_MS=6h gives positions σ-time to reach the TP. BREAKEVEN_TIMEOUT
 // =2h walks the TP toward break-even on a realistic decay. STOP_LOSS_BPS

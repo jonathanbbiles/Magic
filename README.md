@@ -16,6 +16,61 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-18 add: microstructure-weighted logistic signal (4 horizons)
+
+A new entry signal **`microstructure`** has been added alongside OLS / multi_factor / mean_reversion / barrier. The signal scores each candidate with a **hand-tuned logistic** over 8 microstructure + statistical features that the existing stack didn't model: **microprice deviation, book imbalance, flow imbalance, spread regime z-score, vol-normalised return, RSI delta, BTC residual, drift Sharpe**. It emits four discrete-horizon variants (`microstructure_5m / 15m / 30m / 45m`) so the SignalSelector picks the horizon with the best per-trade backtest expectancy.
+
+The signal is **NOT** pinned by default. Like every other candidate, it must clear `SIGNAL_SELECTOR_MIN_BPS=0` over `SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES=5` entries on the 30-day backtest before the selector admits it live — no special-casing, no operator override required for the auto-path, no veto bypass.
+
+**Why this signal.** Microstructure theory (Glosten-Milgrom, Kyle) identifies the orderbook + recent trades as the single largest source of 1-step directional information at scalp horizons. The four existing signals each ask one structural question and read closed-bar prices only — none of them capture next-tick book/flow asymmetry, which is exactly the information that distinguishes a passive `bid_plus_tick` entry that fills profitably from one that gets adversely selected. Adding this candidate lets the selector compare microstructure-informed entries against the closed-bar-only signals on real Alpaca backtest evidence.
+
+**Scoring rule (hand-tuned weights — Phase 1).** Weights are theory-anchored and documented in the module header so any reader can audit them:
+
+```
+score = -0.20
+      + 1.20 · microBias       # microprice − mid, normalised by half-spread
+      + 0.80 · flowImbalance   # aggressor-side volume share (Phase 1: returns 0)
+      + 0.50 · bookImbalance   # top-N bid-vs-ask depth share
+      + 0.40 · volNormReturn   # last-bar return / EWMA σ
+      + 0.40 · driftSharpe     # (EMA(3) − EMA(10)) / σ
+      + 0.30 · rsiDelta        # RSI(14) over last 3 bars, scaled
+      - 0.30 · btcResidual     # alt return minus β·BTC return (β=1.0)
+p = sigmoid(score) clamped [0.05, 0.95]
+```
+
+The signal fires when `p ≥ MICRO_MIN_PROB` AND `EV ≥ MICRO_EV_MIN_BPS` AND `spreadZ < MICRO_SPREAD_Z_MAX` (a hard spread-regime veto: when entry cost is regime-elevated, refuse the trade).
+
+| Add | What it does |
+|---|---|
+| `backend/modules/microstructureSignal.js` | The signal evaluator. Pure function; reuses `barrierSignal.ewmaSigmaFromCloses`, `indicators.{ema,rsiSeries}`, `orderbookMetrics.computeOrderbookMetrics`. |
+| `backend/modules/orderbookMetrics.js` (extended) | New helpers: `computeMicroprice(quote)` and `computeSpreadZScore(current, trailing)`. |
+| `backend/scripts/backtest_strategy.js` (extended) | `--strategy=microstructure --microHorizon={5m|15m|30m|45m}` dispatches the new evaluator with parity-tracked stop sizing. |
+| `backend/modules/signalSelector.js` (extended) | Registers `microstructure_5m / 15m / 30m / 45m` as candidate slots reading `meta.backtestMicro{5m,15m,30m,45m}`. |
+| `backend/trade.js` (extended) | New live-engine wrapper `getMicrostructureSignalForPair`. Dispatched from `scanAndEnter` by signal version. `deriveStopLossBps` + `deriveSignalTargetNetBps` extended with per-horizon caps. |
+| `backend/index.js` (extended) | Four new `runBacktestAndStore` invocations gated by `MICRO_HORIZON_*_ENABLED` flags. Results surface at `meta.backtestMicro{5m,15m,30m,45m}`. |
+| Per-horizon enable flags | `MICRO_HORIZON_5M_ENABLED=false`, `MICRO_HORIZON_15M_ENABLED=true`, `MICRO_HORIZON_30M_ENABLED=true`, `MICRO_HORIZON_45M_ENABLED=false`. Two enabled by default — keeps the selector sample-size floor easy to clear; operators flip the other two on after evidence accumulates. |
+| Operator pin via `SIGNAL_VERSION` | `SIGNAL_VERSION=microstructure_15m` (or `_5m / _30m / _45m`). Veto still applies. |
+
+**Per-horizon trade construction.** Each horizon has its own TP target and stop floor (modelled on the barrier signal's vol-scaled stop):
+
+| Variant | TP net target | Stop floor | EWMA σ lookback | Default |
+|---|---|---|---|---|
+| `microstructure_5m`  | 40 bps  | 60 bps  | 15 bars | OFF |
+| `microstructure_15m` | 60 bps  | 80 bps  | 30 bars | ON |
+| `microstructure_30m` | 80 bps  | 100 bps | 60 bars | ON |
+| `microstructure_45m` | 100 bps | 100 bps | 60 bars | OFF |
+
+The actual stop is `max(stopFloorBps, sigma_ewma · MICRO_STOP_VOL_MULT)`, so vol regime dictates the dynamic part with the floor protecting against vol-calc collapse — same shape the barrier signal already uses.
+
+**What this signal does NOT promise.** It is not guaranteed to backtest positive on current market regime. The hand-tuned weights are theory-anchored, not data-fit; the SignalSelector + veto refuse to trade the signal until backtest evidence clears the floor. **Phase 2 (separate PR, not shipped here)** will replace the hand-tuned weights with weights learned from `labeled.jsonl` via an extension of `scripts/build_calibration.js`, plus wire `MICRO_TRADES_ENABLED=true` once a `/v1beta3/crypto/us/latest/trades` consumer exists for the `flowImbalance` feature. In Phase 1 `flowImbalance` returns 0, so its `w_flow=0.80` weight contributes nothing to the score — this is documented honestly so the knob isn't treated as a live A/B lever.
+
+**Revert via Render env**:
+- `MICRO_ENABLED=false` — disable all four auto-backtests; SignalSelector won't see microstructure as a candidate.
+- `MICRO_HORIZON_15M_ENABLED=false` (and/or `_30M`) — disable a single horizon.
+- `SIGNAL_VERSION=mean_reversion` — pin back to MR-1m (the previous validated default).
+
+---
+
 ## 2026-05-17 restore: original barrier signal added as backtested candidate
 
 The operator's recollection — and the git history — confirms that the project's *initial* commit (`fbdb924`, Jan 18 2026) shipped a coherent statistical entry signal that was very different from the current OLS / multi-factor / mean-reversion stack: a **trade-construction signal** built on barrier-touch probability theory (driftless random-walk first-touch), EWMA-volatility-scaled stops, EMA-based momentum, intra-spread micro-momentum, and orderbook bias. The operator reports it was achieving roughly **1%/day** account growth before it was replaced in PR #10 (commit `9d3093f`, Jan 23 2026) by `predictor.js`, and then through hundreds of subsequent PRs by the current stack.
@@ -471,8 +526,9 @@ EXPO_PUBLIC_BACKEND_URL=http://localhost:3000 npx expo start -c
 | `HONEST_EV_GATE_ENABLED` | `true` | When `true`, the EV calculation charges the non-fill branch a `STUCK_LOSS_ASSUMED_BPS` penalty so the asymmetric "no stop-loss" structure is priced honestly (`E[net] = p·targetNet − (1−p)·stuckLoss`). Default flipped from `false` after live diagnostics observed entries (BCH at `projectedBps=2.6, honestEvBps=-54`; DOGE at `honestEvBps=-3.7`) clearing the cheaper net-edge gate while having negative honest expectancy — exactly the trades the no-stop design has no way to recover from. Set to `false` to revert to the legacy permissive behaviour. Skip reason: `honest_ev_below_min`. |
 | `STUCK_LOSS_ASSUMED_BPS` | `250` | Bps of MTM loss assumed for positions that don't recover above break-even. Only consulted when `HONEST_EV_GATE_ENABLED=true`. Default raised from `100` → `250` after live diagnostics measured the actual unrealized drawdown on an 11-position stuck cluster at ~270 bps per position — the previous 100 bps assumption was systematically rating marginal entries +EV when reality was -EV. Calibrate by running `node scripts/simulate_strategy.js` and reading `avg_loss` for your target regime. |
 | `BARRIER_HORIZON_BARS` | `BREAKEVEN_TIMEOUT_MS / 60000` | Number of 1-minute bars used as the horizon in the barrier-hitting probability. Defaults to the break-even timeout in minutes — answers "how likely is the TP to fill before we'd otherwise replace it with a break-even sell?". |
-| `SIGNAL_VERSION` | *(unset → auto)* | Selects which entry signal the scan loop uses. **Default `auto`**: the runtime signal selector (`backend/modules/signalSelector.js`) picks the best validated signal from `ols`, `multi_factor`, `mean_reversion` (incl. 5m/15m timeframes), `range_mean_reversion`, and `barrier` based on the most recent backtest evidence. If no signal has cleared `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17), all entries are vetoed (skip reason: `backtest_veto_active`). Operator pin: set to one of the valid signal names. The veto still applies to a pinned signal unless `SIGNAL_SELECTOR_VETO_ENABLED=false`. **All backtests run on every Render restart**; results at `meta.backtest`, `meta.backtestMf`, `meta.backtestMeanRev`, `meta.backtestMeanRev5m`, `meta.backtestMeanRev15m`, `meta.backtestRangeMr`, `meta.backtestBarrier`; decision at `meta.signalSelector`. The OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped when the active signal is anything other than `ols` — those signals' own factor votes replace them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF, recent-high) still apply to all signals. |
+| `SIGNAL_VERSION` | *(unset → auto)* | Selects which entry signal the scan loop uses. **Default `auto`**: the runtime signal selector (`backend/modules/signalSelector.js`) picks the best validated signal from `ols`, `multi_factor`, `mean_reversion` (incl. 5m/15m timeframes), `range_mean_reversion`, `barrier`, and `microstructure_{5,15,30,45}m` based on the most recent backtest evidence. If no signal has cleared `SIGNAL_SELECTOR_MIN_BPS` (default `0` since 2026-05-17), all entries are vetoed (skip reason: `backtest_veto_active`). Operator pin: set to one of the valid signal names. The veto still applies to a pinned signal unless `SIGNAL_SELECTOR_VETO_ENABLED=false`. **All backtests run on every Render restart**; results at `meta.backtest`, `meta.backtestMf`, `meta.backtestMeanRev`, `meta.backtestMeanRev5m`, `meta.backtestMeanRev15m`, `meta.backtestRangeMr`, `meta.backtestBarrier`, `meta.backtestMicro{5m,15m,30m,45m}`; decision at `meta.signalSelector`. The OLS-specific gates (`slope_not_positive`, `net_edge_below_min`, `honest_ev_below_min`, `projected_below_gross_target`) are skipped when the active signal is anything other than `ols` — those signals' own factor votes replace them. Structural gates (drawdown, sizing, freshness, spread, vol-cap, HTF, recent-high) still apply to all signals. |
 | `SIGNAL_VERSION=barrier` (and `BARRIER_*` knobs) | *(see barrier section above)* | Restored signal from commit `fbdb924`. `BARRIER_ENABLED=false` to disable the auto-backtest entirely. `BARRIER_DESIRED_NET_BPS=100` is the per-trade net target (the math doesn't work at lower targets — see the barrier section). `BARRIER_STOP_LOSS_BPS=100`, `BARRIER_MAX_HOLD_MS=21600000` (6h), `BARRIER_BREAKEVEN_TIMEOUT_MS=10800000` (3h) mirror MF timing since the per-trade target magnitude is similar. |
+| `SIGNAL_VERSION=microstructure_{5,15,30,45}m` (and `MICRO_*` knobs) | *(see microstructure section above)* | Hand-tuned logistic over 8 microstructure + statistical features (microprice, book imbalance, flow imbalance, spread-Z, vol-normalised return, RSI delta, BTC residual, drift-Sharpe). Four discrete-horizon variants registered as separate candidate slots. **Per-horizon enable flags**: `MICRO_HORIZON_5M_ENABLED=false`, `MICRO_HORIZON_15M_ENABLED=true`, `MICRO_HORIZON_30M_ENABLED=true`, `MICRO_HORIZON_45M_ENABLED=false`. **Gating thresholds**: `MICRO_SPREAD_Z_MAX=1.5` (hard spread-regime veto; refuses entries when current spread is >1.5σ wider than its 60-bar trailing mean), `MICRO_MIN_PROB=0.55`, `MICRO_EV_MIN_BPS=2`. **Per-horizon stop caps**: `MICRO_STOP_LOSS_BPS_{5,15,30,45}M={60,80,100,100}`. **TP sizing**: `MICRO_TARGET_NET_BPS_FLOOR=8`, `MICRO_SIGNAL_TARGET_MAX_NET_BPS=150`. **Hold timing**: `MICRO_MAX_HOLD_MS=21600000` (6h), `MICRO_BREAKEVEN_TIMEOUT_MS=10800000` (3h) — mirrors barrier since the per-trade target magnitude is similar. `MICRO_ENABLED=false` disables all four auto-backtests entirely. `MICRO_TRADES_ENABLED=false` is honest: the `flowImbalance` feature returns 0 in Phase 1 because no trades-feed consumer is wired yet (Phase 2 adds it). |
 | `MR_TARGET_NET_PROFIT_BPS_FLOOR` | `5` | Tiny-net floor (bps net per trade) for mean-reversion entries. Default 5 bps because the strategy thesis is "small drops produce small but statistically-guaranteed targets." Operator can raise to require a bigger minimum, but the signal's drop trigger (100 bps min) already keeps the gross target ≥ 50 bps. |
 | `MR_SIGNAL_TARGET_MAX_NET_BPS` | `120` | Cap on per-trade net target for mean-reversion. Bounds the TP on freak drops; a 300-bps drop → 150 bps gross → 110 bps net (under the cap). |
 | `MR_STOP_LOSS_BPS` | `60` | Stop-loss cap for mean-reversion positions on tier-1/2 (deep-liquidity) symbols. Tight: 60 bps. The strategy thesis is "reversion happens fast or it doesn't" — wider stops just absorb the directional continuation we're fading against. Tier-3 alts use `MR_STOP_LOSS_BPS_TIER3` instead. |
