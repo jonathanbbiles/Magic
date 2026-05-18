@@ -93,7 +93,7 @@ The backtester (`backend/scripts/backtest_strategy.js`) follows the same dispatc
 
 `runMrStopLossSweep` in `backend/index.js` (helpers in `backend/modules/mrStopLossSweep.js`) fires the MR-5m and MR-15m backtest at multiple stop-loss caps on every restart and parks results at `meta.mrStopLossSweep`. The sweep is purely observational — the live signal selector reads only the canonical `mean_rev / mean_rev_5m / mean_rev_15m` slots, not sweep cells. Operators read the sweep, pick the cap that maximises `avgNetBpsPerEntry`, set `MR_STOP_LOSS_BPS_5M` / `MR_STOP_LOSS_BPS_15M` in Render env, and the live selector starts admitting that timeframe on the next restart.
 
-Knobs: `MR_STOP_LOSS_SWEEP_ENABLED` (default `true`), `MR_STOP_LOSS_SWEEP_CAPS` (default `60,80,100`, bounded to 6 caps total).
+Knobs: `MR_STOP_LOSS_SWEEP_ENABLED` (default `true`), `MR_STOP_LOSS_SWEEP_CAPS` (default `80,120,160,200`, bounded to 6 caps total). The default was extended from `60,80,100` on 2026-05-18 after the first sweep settled the MR-5m question (curve peaks at 80, degrades at 100) and revealed MR-15m was still monotonically improving at 100 — the new caps extend the MR-15m expectancy curve to see where it flattens or flips positive.
 
 ## Sweep persistence across restarts (2026-05-18)
 
