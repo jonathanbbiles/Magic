@@ -152,4 +152,74 @@ const { resolveLiveEngineFallbacks } = require('./backtestEnvFallbacks');
   assert.ok(!('rejectNearHighBps' in r), 'absent key stays absent');
 }
 
+// --- 2026-05-18 boolean fallback: ENFORCE_PROJECTED_COVERS_GROSS ---
+// Regression guard for the doc-vs-code drift identified by the gate analysis:
+// liveDefaults.js has ENFORCE_PROJECTED_COVERS_GROSS=false but the backtester's
+// hardcoded DEFAULTS had it true, so the auto-backtest was simulating a
+// stricter gate than the live engine. The bridge needs to plumb this through.
+
+// 12. Boolean env value 'false' resolves to false (not undefined, not string).
+{
+  const r = resolveLiveEngineFallbacks({}, { ENFORCE_PROJECTED_COVERS_GROSS: 'false' });
+  assert.equal(r.enforceProjectedCoversGross, false);
+  assert.equal(typeof r.enforceProjectedCoversGross, 'boolean');
+}
+
+// 13. Boolean env value 'true' resolves to true.
+{
+  const r = resolveLiveEngineFallbacks({}, { ENFORCE_PROJECTED_COVERS_GROSS: 'true' });
+  assert.equal(r.enforceProjectedCoversGross, true);
+}
+
+// 14. Common falsy / truthy aliases parse correctly (matches live engine's
+//     readBoolean conventions: 0/1, yes/no, on/off).
+{
+  for (const v of ['0', 'no', 'off', 'False', 'NO']) {
+    const r = resolveLiveEngineFallbacks({}, { ENFORCE_PROJECTED_COVERS_GROSS: v });
+    assert.equal(r.enforceProjectedCoversGross, false, `'${v}' must parse to false`);
+  }
+  for (const v of ['1', 'yes', 'on', 'TRUE', 'On']) {
+    const r = resolveLiveEngineFallbacks({}, { ENFORCE_PROJECTED_COVERS_GROSS: v });
+    assert.equal(r.enforceProjectedCoversGross, true, `'${v}' must parse to true`);
+  }
+}
+
+// 15. Empty / whitespace / garbage env values stay unset (let backtester
+//     apply its own default, same convention as the numeric fallbacks).
+{
+  for (const v of ['', '   ', 'maybe', 'tru']) {
+    const r = resolveLiveEngineFallbacks({}, { ENFORCE_PROJECTED_COVERS_GROSS: v });
+    assert.ok(!('enforceProjectedCoversGross' in r),
+      `garbage env value '${v}' must not pin the resolver`);
+  }
+}
+
+// 16. Explicit override (boolean) wins over env.
+{
+  const r = resolveLiveEngineFallbacks(
+    { enforceProjectedCoversGross: true },
+    { ENFORCE_PROJECTED_COVERS_GROSS: 'false' },
+  );
+  assert.equal(r.enforceProjectedCoversGross, true, 'override beats env');
+}
+
+// 17. Explicit override (string) coerces and wins over env.
+{
+  const r = resolveLiveEngineFallbacks(
+    { enforceProjectedCoversGross: 'false' },
+    { ENFORCE_PROJECTED_COVERS_GROSS: 'true' },
+  );
+  assert.equal(r.enforceProjectedCoversGross, false, 'string override coerces and beats env');
+}
+
+// 18. Override null/undefined falls back to env (so /debug/backtest handlers
+//     don't clobber the env value when the query param is absent).
+{
+  const r = resolveLiveEngineFallbacks(
+    { enforceProjectedCoversGross: undefined },
+    { ENFORCE_PROJECTED_COVERS_GROSS: 'false' },
+  );
+  assert.equal(r.enforceProjectedCoversGross, false);
+}
+
 console.log('backtestEnvFallbacks.test ok');

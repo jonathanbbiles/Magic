@@ -16,6 +16,30 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-18 cleanup: signal-aware universal gates + backtest fallback fix
+
+The gate analysis surfaced three universal entry gates in `scanAndEnter` that were OLS-shaped and either firing on the wrong signals or about to fire on signals where the gate's assumption no longer holds. Plus a doc-vs-code drift on the backtest side. This PR is the cleanup:
+
+### 1. `projected_below_min` → OLS-only (`backend/trade.js:~2647`)
+`MIN_PROJECTED_BPS_TO_ENTER=15` was being checked against `projectedBps` regardless of active signal. But `projectedBps` is **OLS-flavoured** — for multi_factor / barrier / microstructure it carries a different meaning (signal's own per-trade TP target, not a forward move prediction). Refusing those at 15 bps would block setups where the signal wants a 100+ bps TP. Now wrapped in `ACTIVE_SIGNAL_VERSION === 'ols'`, matching the existing dispatch on `slope_not_positive`, `projected_below_gross_target`, `net_edge_below_min`, `honest_ev_below_min`. Live impact today: zero (MR is active, doesn't hit this gate). Changes the moment the selector picks a non-OLS signal.
+
+### 2. `near_recent_high` → bypassed for barrier + microstructure (`backend/trade.js:~2510`)
+This gate (within 30 bps of last-30-bar high) was designed for OLS ("don't buy the very top"). It's appropriate for OLS + multi_factor + MR family. It's **inappropriate** for barrier and microstructure, which can legitimately want to buy near-recent-high setups (barrier-touch continuations, microprice breakouts). Now bypassed when `signalVersion ∈ {barrier, microstructure_5m/15m/30m/45m}`. Bypass returns `{ok: true, recentHigh: null, recentHighBps: null, signalBypass: true}` so the forensics record stays consistent. Live impact today: zero (barrier and microstructure are both backtest-negative; selector hasn't admitted either). Changes when they validate.
+
+### 3. HTF gate documented as load-bearing-by-accident (`backend/trade.js:~2559`)
+The HTF check is structurally contradictory with MR's thesis (MR buys downtrends; HTF refuses downtrends). The gate doesn't break MR today only because `mr_no_drop` fires first inside the signal evaluator. Added a code-block comment warning against (a) re-ordering this gate before signal evaluation, (b) loosening `mr_no_drop` without first making HTF signal-aware. No behaviour change — just making the load-bearing accident explicit so a future change doesn't accidentally break MR.
+
+### 4. `ENFORCE_PROJECTED_COVERS_GROSS` bridge (`backend/modules/backtestEnvFallbacks.js`)
+The live default in `liveDefaults.js` is `'false'` (per the 2026-05-15 rollback). The backtester's hardcoded `DEFAULTS` had it `true`. The auto-backtest was therefore simulating a stricter gate than the live engine actually applied — misrepresenting the inputs to the SignalSelector. Same failure mode the env-fallback resolver was originally created to fix; the resolver just didn't handle booleans. Extended with a new `ENV_BOOLEAN_FALLBACKS` map + `parseEnvBoolean` helper. `runBacktestAndStore` in `index.js` now wires the resolved value through to `runBacktest`.
+
+**Verification after deploy**: the live `meta.backtest.params.enforceProjectedCoversGross` field should now read `false` (matching live), not `true`. The OLS backtest expectancy may shift slightly (the gate currently filters 6,365 candidates per primary run); the selector will see the true live-engine expectancy.
+
+**Hard Rule #4 compliance**: every narrowing has a real downstream consumer (the signal whose entries it would otherwise block). The bypasses are evidence-backed by the gate analysis, not stub flags.
+
+**Revert via Render env**: set `SIGNAL_VERSION=ols` to force the old projected_below_min path. Set `ENFORCE_PROJECTED_COVERS_GROSS=true` in Render env to restore the strict gate for both live and backtest.
+
+---
+
 ## 2026-05-18 add: per-timeframe MR symbol blocklist (BCH on 1m+5m)
 
 The 2026-05-18 30-day backtest decomposed by signal × symbol showed a sharp per-symbol asymmetry the selector was masking by averaging:

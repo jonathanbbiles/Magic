@@ -844,6 +844,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       microStopLossBps45m: microStopLossBps45mResolved,
       microTargetNetBpsFloor: microTargetNetBpsFloorResolved,
       microSignalTargetMaxNetBps: microSignalTargetMaxNetBpsResolved,
+      enforceProjectedCoversGross: enforceProjectedCoversGrossResolved,
     } = liveEngineFallbacks;
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
@@ -865,6 +866,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mfBtcLagRequired != null ? { mfBtcLagRequired: String(overrides.mfBtcLagRequired) === 'true' } : {}),
       ...(overrides.mfVolumeRequired != null ? { mfVolumeRequired: String(overrides.mfVolumeRequired) === 'true' } : {}),
       ...(overrides.rejectNearHighEnabled != null ? { rejectNearHighEnabled: String(overrides.rejectNearHighEnabled) === 'true' } : {}),
+      ...(enforceProjectedCoversGrossResolved !== undefined ? { enforceProjectedCoversGross: Boolean(enforceProjectedCoversGrossResolved) } : {}),
       ...(rejectNearHighBpsResolved != null ? { rejectNearHighBps: Number(rejectNearHighBpsResolved) } : {}),
       ...(rejectNearHighLookbackBarsResolved != null ? { rejectNearHighLookbackBars: Number(rejectNearHighLookbackBarsResolved) } : {}),
       ...(overrides.entrySpreadCostBps != null ? { entrySpreadCostBps: Number(overrides.entrySpreadCostBps) } : {}),
