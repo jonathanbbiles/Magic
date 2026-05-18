@@ -4,7 +4,13 @@
 // Splitting the cap-parsing and sweep-plan generation into a pure helper
 // lets the tests verify the plan shape without needing Alpaca creds.
 
-const DEFAULT_CAPS = Object.freeze([60, 80, 100]);
+// 2026-05-18 cap extension: the first sweep (caps=60,80,100) settled the
+// MR-5m question — net peaked at 80 (−31.6 bps) and degraded at 100 — so
+// re-testing those caps wastes 6 cells per restart. MR-15m showed
+// monotonic improvement (60→80→100 net = −31.5 → −30.0 → −26.9) and the
+// curve is still climbing, so the next useful question is whether it
+// flips positive at 140-200. New default sweep: 80,120,160,200.
+const DEFAULT_CAPS = Object.freeze([80, 120, 160, 200]);
 const TIMEFRAMES = Object.freeze(['5m', '15m']);
 
 // Parse the MR_STOP_LOSS_SWEEP_CAPS env var into a deduped, ordered array

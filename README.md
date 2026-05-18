@@ -39,6 +39,29 @@ That signal has been restored in `backend/modules/barrierSignal.js` as a **backt
 
 ---
 
+## 2026-05-18 extended sweep caps after first pass settled MR-5m
+
+The first sweep with `caps=[60,80,100]` produced these results:
+
+| Cap | MR-5m net | MR-15m net |
+|---|---|---|
+| 60 | −31.9 | −31.5 |
+| 80 | **−31.6** ← MR-5m peak | −30.0 |
+| 100 | −33.4 | **−26.9** ← MR-15m best so far |
+
+**MR-5m is dead at any cap.** The curve peaked at 80 bps (−31.6) and degraded at 100, meaning wider stops hit at deeper levels and cost more per stop than they save in stops-not-triggered. No tested cap admits MR-5m to positive expectancy.
+
+**MR-15m is monotonically improving but not yet positive.** 60→80→100 net improved by ~4.5 bps per step. The curve is still climbing. The next useful question is whether it flips positive at 140-200.
+
+This PR bumps the default `MR_STOP_LOSS_SWEEP_CAPS` from `60,80,100` to `80,120,160,200`. The new sweep:
+- Drops `60` (proven inferior to 80 on both timeframes).
+- Drops `100` from the 5m result space (proven worse than 80 for MR-5m).
+- Extends to `120, 160, 200` to map the MR-15m curve until it flattens or flips positive.
+
+Once the next sweep completes (~3 min after redeploy), the dashboard's `meta.mrStopLossSweep` will show all 4 caps × 2 timeframes. If MR-15m flips positive at any cap, the follow-up PR sets `MR_STOP_LOSS_BPS_15M` to that value as the new default. If it's still negative at 200, we accept MR-1m as the only validated signal and stop tweaking the stop cap.
+
+---
+
 ## 2026-05-18 sweep persistence across restarts
 
 Same-day follow-up to the Stage 3 sweep PR. The sweep takes ~3 minutes to repopulate after a deploy, so a phone-first operator pulling logs right after a PR merge would see `meta.mrStopLossSweep = null` every time — and since PRs ship back-to-back during tuning, that's every dashboard pull during active iteration.
