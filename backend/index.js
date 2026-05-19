@@ -114,6 +114,7 @@ const {
 const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
+const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -758,6 +759,21 @@ const GATE_REJECTION_AUDIT_COSTLY_BPS = Number.isFinite(Number(process.env.GATE_
 const GATE_REJECTION_AUDIT_JUSTIFIED_BPS = Number.isFinite(Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS))
   ? Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS)
   : -10;
+
+// Phase 2 microstructure calibration status (2026-05-20). Surfaces sample
+// progress toward the build_microstructure_weights.js --min-samples floor
+// and the on-disk weights file's metadata. Observational only — does not
+// run the calibration itself (operator action by design, see CLAUDE.md).
+const MICRO_CALIBRATION_STATUS_ENABLED = String(
+  process.env.MICRO_CALIBRATION_STATUS_ENABLED || 'true',
+).toLowerCase() !== 'false';
+const MICRO_CALIBRATION_MIN_SAMPLES = Math.max(
+  1,
+  Number(process.env.MICRO_CALIBRATION_MIN_SAMPLES) || microCalibrationStatus.DEFAULT_MIN_SAMPLES,
+);
+const MICRO_WEIGHTS_FILE_PATH = String(
+  process.env.MICRO_WEIGHTS_FILE || './data/microstructure_weights.json',
+).trim() || './data/microstructure_weights.json';
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1700,6 +1716,30 @@ app.get('/dashboard', async (req, res) => {
               sampleSize: 0,
               byReason: [],
               costliestGates: [],
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Phase 2 microstructure calibration status. Tells the operator
+        // how many labelled microstructure samples have accumulated in
+        // trade_forensics.jsonl, how many more are needed for the build
+        // script's --min-samples floor, and (if present) the metadata of
+        // the currently-loaded learned weights file. Pure read-side —
+        // does NOT run the fit. Operator action remains explicit by
+        // design (see CLAUDE.md "Phase 2 microstructure calibration").
+        microstructureCalibration: MICRO_CALIBRATION_STATUS_ENABLED ? (() => {
+          try {
+            return microCalibrationStatus.buildCalibrationStatus({
+              forensicsPath: storagePaths?.paths?.tradeForensicsFile || null,
+              weightsPath: MICRO_WEIGHTS_FILE_PATH,
+              minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+            });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              samplesAvailable: 0,
+              minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+              ready: false,
               error: err?.message,
             };
           }

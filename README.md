@@ -1,5 +1,18 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: microstructure calibration status diagnostic
+
+Phase 2 weight-fitting (`build_microstructure_weights.js`) refuses to fit below the `--min-samples=500` safety floor, but operators previously had no dashboard-side way to know how close the sample count was. This PR adds `meta.microstructureCalibration` with `samplesAvailable`, `samplesNeeded`, `ready`, and (when present) the on-disk weights file's metadata (sampleCount, accuracy, logLoss). Observational only — does NOT run the fit; operator action stays explicit by design.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MICRO_CALIBRATION_STATUS_ENABLED` | `true` | Master kill — `meta.microstructureCalibration` becomes `null` when disabled. |
+| `MICRO_CALIBRATION_MIN_SAMPLES` | `500` | Mirrors the build script's `--min-samples` default. The dashboard's `ready` flag flips true when `samplesAvailable ≥ this`. |
+
+The sample-counting logic reuses `extractSamples` from `build_microstructure_weights.js` so the dashboard number matches what the script would actually fit on — preventing the "dashboard says ready, script says insufficient_samples" silent-drift failure mode.
+
+---
+
 Automated crypto trading bot that runs on Alpaca's **live** trading API. It scans a configured set of crypto pairs every few seconds, opens a small position when recent price action looks favorable, and immediately sets a take-profit limit on fill.
 
 > **This is a live trading system. Real money is at risk every time it runs.** Never point it at production until you've read the [Production deployment](#production-deployment) section.
