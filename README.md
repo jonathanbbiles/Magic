@@ -1,5 +1,68 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: market regime detector (Phase 1, observational)
+
+`backend/scripts/simulate_strategy.js` shows expectancy is **strongly negative in flat or adverse drift regimes** (−49 bps/trade flat, −1382 bps/trade adverse) and only positive under benign drift (+1 bps/trade at +0.5 bps/min). That table has been a static README reference — operators had no real-time read of "which row of the table are we in right now."
+
+This PR adds a Phase 1 observational classifier that piggybacks on the existing BTC scan: every time `recordBtcLeadLagSnapshot` fires, it also computes OLS-slope drift + log-return σ over the last `MARKET_REGIME_LOOKBACK_BARS` (default 60) BTC closes, classifies into one of the simulator's five buckets, and stores it. The dashboard surfaces `meta.marketRegime = { regime, driftBpsPerMin, sigmaBpsPerMin, expectancyEstimate, ... }`.
+
+Classification rules (mirror `simulate_strategy.js`'s regime conventions):
+- `adverse` — drift ≤ −0.25 bps/min (simulator expectancy: **−1382 bps/trade**, worst case)
+- `benign` — drift ≥ +0.25 bps/min (simulator: **+1.00 bps/trade**, only profitable regime)
+- `flat` — drift between ±0.25 (simulator: −49 bps/trade)
+- `quiet` — flat drift + σ ≤ 6 bps/min (simulator: −51 bps/trade)
+- `wild` — flat drift + σ ≥ 20 bps/min (simulator: −55 bps/trade)
+- `insufficient_data` — fewer than 2 valid closes available
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MARKET_REGIME_DETECTOR_ENABLED` | `true` | Master kill — disables classification entirely; `meta.marketRegime` becomes `null`. |
+| `MARKET_REGIME_LOOKBACK_BARS` | `60` | Window length for drift + σ computation. Tracks the simulator's 60-min window convention. |
+| `MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN` | `0.25` | Drift threshold (inclusive) above which regime = benign. |
+| `MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN` | `-0.25` | Drift threshold (inclusive) below which regime = adverse. |
+| `MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN` | `6` | σ threshold (inclusive) below which flat-drift bars classify as quiet. |
+| `MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN` | `20` | σ threshold (inclusive) above which flat-drift bars classify as wild. |
+
+**Phase 1 = observational only.** NO entry gate, signal, or sizing decision reads `regime` in this PR. Confirmed by the wiring: `recordBtcLeadLagSnapshot` stores it; `meta.marketRegime` is the only consumer. The dashboard pairs each regime label with the simulator's expectancy for that regime so the operator sees both "we're in adverse" AND "the simulator estimates −1382 bps/trade for adverse" in one place.
+
+**Phase 2 (separate PR, not shipped here)** will wire a regime veto: when `regime === 'adverse'` over N consecutive snapshots, refuse all new entries until the regime label clears. That follow-up is intentionally split so the classifier's thresholds can be validated against live BTC bars — and against `closedTradeStats` realized expectancy by regime label — before any trading behaviour changes.
+
+**Hard Rule #4 compliance**: the classifier is wired (`marketRegimeDetector.summarizeRegime` is called from `recordBtcLeadLagSnapshot`; the result is surfaced at `meta.marketRegime`). It is NOT a stub knob. Phase 2's gate consumer is documented above as the planned follow-up.
+
+---
+
+## 2026-05-20 add: microstructure trades-feed shadow observer
+
+The microstructure signal's `flowImbalance` feature requires Alpaca's `/v1beta3/crypto/{loc}/trades` feed. Until `MICRO_TRADES_ENABLED=true`, the live signal scores `flowImbalance=0` so the `w_flow=0.80` weight contributes nothing — exactly what CLAUDE.md documents. The validation problem was that an operator had no dashboard-side way to see what flow values the feed would produce **before** flipping the live flag.
+
+This PR adds a shadow observer. With `MICRO_TRADES_SHADOW_ENABLED=true` (the default), every microstructure scan now also fetches recent trades and computes `computeFlowImbalance(trades, true)` — but the result is **observed-only**, written to `sig.shadowFlowImbalance` and rolled into a 500-entry tracker. The dashboard surfaces the rolling per-symbol distribution at `meta.microstructureFlowShadow` (mean, abs-mean, stddev, non-zero fraction) so operators can answer:
+
+1. **Is flow data actually arriving for the symbols I trade?** If `nonZeroFraction` is near 0, Alpaca's trades endpoint is silent and flipping `MICRO_TRADES_ENABLED=true` would do nothing — flag stays off.
+2. **When flow is non-zero, what's its directional distribution?** Mean/stddev tells whether flow is a signal worth wiring into scoring or noise centred on zero.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MICRO_TRADES_SHADOW_ENABLED` | `true` | Master kill — when false, no trades fetch, no shadow tracker. |
+
+The live scoring path is unchanged: `MICRO_TRADES_ENABLED=false` still produces `flowImbalance=0` in `evaluateMicrostructureSignal`. The shadow value never feeds the score. Once an operator confirms via the dashboard that the feed is healthy and flow values look directional, the existing `MICRO_TRADES_ENABLED=true` flip becomes evidence-backed instead of a leap-of-faith Phase 2 transition.
+
+**Hard Rule #4 compliance**: the shadow value is consumed by the rolling tracker + `meta.microstructureFlowShadow`. No gate, signal, or sizing decision reads it. The fetch piggybacks on the existing `Promise.all` in `getMicrostructureSignalForPair`, so there's no added scan latency vs the pre-PR path when shadow is on.
+
+---
+
+## 2026-05-20 add: microstructure calibration status diagnostic
+
+Phase 2 weight-fitting (`build_microstructure_weights.js`) refuses to fit below the `--min-samples=500` safety floor, but operators previously had no dashboard-side way to know how close the sample count was. This PR adds `meta.microstructureCalibration` with `samplesAvailable`, `samplesNeeded`, `ready`, and (when present) the on-disk weights file's metadata (sampleCount, accuracy, logLoss). Observational only — does NOT run the fit; operator action stays explicit by design.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MICRO_CALIBRATION_STATUS_ENABLED` | `true` | Master kill — `meta.microstructureCalibration` becomes `null` when disabled. |
+| `MICRO_CALIBRATION_MIN_SAMPLES` | `500` | Mirrors the build script's `--min-samples` default. The dashboard's `ready` flag flips true when `samplesAvailable ≥ this`. |
+
+The sample-counting logic reuses `extractSamples` from `build_microstructure_weights.js` so the dashboard number matches what the script would actually fit on — preventing the "dashboard says ready, script says insufficient_samples" silent-drift failure mode.
+
+---
+
 Automated crypto trading bot that runs on Alpaca's **live** trading API. It scans a configured set of crypto pairs every few seconds, opens a small position when recent price action looks favorable, and immediately sets a take-profit limit on fill.
 
 > **This is a live trading system. Real money is at risk every time it runs.** Never point it at production until you've read the [Production deployment](#production-deployment) section.

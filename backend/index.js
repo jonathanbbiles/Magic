@@ -114,6 +114,8 @@ const {
 const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
+const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
+const microFlowShadow = require('./modules/microstructureFlowShadow');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -176,6 +178,8 @@ const {
   getEntryRegimeStaleThresholdMs,
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getMicroFlowShadowTrackerSnapshot,
+  getMarketRegimeSnapshot,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -758,6 +762,28 @@ const GATE_REJECTION_AUDIT_COSTLY_BPS = Number.isFinite(Number(process.env.GATE_
 const GATE_REJECTION_AUDIT_JUSTIFIED_BPS = Number.isFinite(Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS))
   ? Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS)
   : -10;
+
+// Phase 2 microstructure calibration status (2026-05-20). Surfaces sample
+// progress toward the build_microstructure_weights.js --min-samples floor
+// and the on-disk weights file's metadata. Observational only — does not
+// run the calibration itself (operator action by design, see CLAUDE.md).
+const MICRO_CALIBRATION_STATUS_ENABLED = String(
+  process.env.MICRO_CALIBRATION_STATUS_ENABLED || 'true',
+).toLowerCase() !== 'false';
+const MICRO_CALIBRATION_MIN_SAMPLES = Math.max(
+  1,
+  Number(process.env.MICRO_CALIBRATION_MIN_SAMPLES) || microCalibrationStatus.DEFAULT_MIN_SAMPLES,
+);
+const MICRO_WEIGHTS_FILE_PATH = String(
+  process.env.MICRO_WEIGHTS_FILE || './data/microstructure_weights.json',
+).trim() || './data/microstructure_weights.json';
+
+// Microstructure trades-feed shadow tracker (2026-05-20). Mirrors trade.js's
+// MICRO_TRADES_SHADOW_ENABLED gate — when off, the meta field becomes null
+// to avoid surfacing a stale tracker that isn't being fed.
+const MICRO_TRADES_SHADOW_ENABLED = String(
+  process.env.MICRO_TRADES_SHADOW_ENABLED || 'true',
+).toLowerCase() !== 'false';
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1700,6 +1726,68 @@ app.get('/dashboard', async (req, res) => {
               sampleSize: 0,
               byReason: [],
               costliestGates: [],
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Phase 2 microstructure calibration status. Tells the operator
+        // how many labelled microstructure samples have accumulated in
+        // trade_forensics.jsonl, how many more are needed for the build
+        // script's --min-samples floor, and (if present) the metadata of
+        // the currently-loaded learned weights file. Pure read-side —
+        // does NOT run the fit. Operator action remains explicit by
+        // design (see CLAUDE.md "Phase 2 microstructure calibration").
+        microstructureCalibration: MICRO_CALIBRATION_STATUS_ENABLED ? (() => {
+          try {
+            return microCalibrationStatus.buildCalibrationStatus({
+              forensicsPath: storagePaths?.paths?.tradeForensicsFile || null,
+              weightsPath: MICRO_WEIGHTS_FILE_PATH,
+              minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+            });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              samplesAvailable: 0,
+              minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+              ready: false,
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Microstructure trades-feed shadow observer. When
+        // MICRO_TRADES_SHADOW_ENABLED=true (default), recent trades are
+        // fetched on every microstructure scan and flowImbalance is
+        // computed observationally — even when MICRO_TRADES_ENABLED=false
+        // keeps the live scoring path at flow=0. The dashboard surfaces
+        // the rolling per-symbol distribution so operators can validate
+        // the trades feed before flipping MICRO_TRADES_ENABLED live.
+        // Market regime classifier (Phase 1, observational). Reads the
+        // most recent BTC snapshot from trade.js and labels current
+        // drift × σ as one of the simulator's five regime buckets,
+        // alongside the simulator's expected per-trade bps for that
+        // regime. Lets operators see at a glance which row of the
+        // simulator table they're currently inside. No gate or signal
+        // reads this in Phase 1.
+        marketRegime: (() => {
+          try {
+            const snap = typeof getMarketRegimeSnapshot === 'function'
+              ? getMarketRegimeSnapshot() : null;
+            return snap || null;
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), regime: 'detector_failed', error: err?.message };
+          }
+        })(),
+        microstructureFlowShadow: MICRO_TRADES_SHADOW_ENABLED ? (() => {
+          try {
+            const snapshot = typeof getMicroFlowShadowTrackerSnapshot === 'function'
+              ? getMicroFlowShadowTrackerSnapshot() : [];
+            return microFlowShadow.buildShadowMeta({ snapshot });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              observedSamples: 0,
+              bySymbol: [],
+              overall: null,
               error: err?.message,
             };
           }
