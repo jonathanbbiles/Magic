@@ -180,6 +180,67 @@ Bug it fixes: `liveDefaults.js` has `ENFORCE_PROJECTED_COVERS_GROSS: 'false'` (p
 
 **Adding a new per-symbol filter to a future signal**: extend `readMrBlocklistsFromEnv` (or add a parallel reader), wire the getter in `trade.js`, wire the auto-backtest invocation in `index.js`. The two MUST stay in sync — adding one without the other is the failure mode this module's existence prevents.
 
+## Diagnostic + calibration bundle (2026-05-19)
+
+A 5-piece PR that improves diagnostics and unlocks Phase 2 microstructure calibration without changing live entry behavior at default settings.
+
+### 1. Doc-vs-code env-var audit (`backend/scripts/env_var_audit.js`)
+
+Mechanically enforces Hard Rule #4: every env var documented in `README.md` or `CLAUDE.md` must be read in `backend/`. Runs in `npm run test:scripts`. The audit currently scans 77 source files, finds 157 documented env vars, and asserts all are read. When a future PR adds a doc entry without wiring it, the test fails with the unbacked name.
+
+The audit caught 3 pre-existing drift bugs on first run — `BARRIER_DESIRED_NET_BPS`, `BARRIER_EV_MIN_BPS`, and `MICRO_STOP_VOL_MULT` were documented as tunable but hardcoded in `DEFAULT_CONFIG`. All three are now wired through `readNumber()` in `trade.js` with defaults matching the prior hardcoded values (zero-behavior-change unless an operator sets one). Don't bypass this audit by adding things to `NON_ENV_ALLOWLIST` without rationale — that's the inverse of the rule.
+
+### 2. Drift alerter (`backend/modules/driftAlerter.js`)
+
+Compares the average realized net bps over the last N closed trades to the most recent backtest's predicted expectancy. Surfaces `meta.drift` (overall + per-signal) and flags alert when `|predicted − realized| > DRIFT_ALERT_THRESHOLD_BPS` (default 50). Observational only — does NOT gate entries. The reconcile script is offline-only and runs at operator initiative; this gives the dashboard a continuous live-vs-predicted check.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `DRIFT_ALERT_ENABLED` | `true` | Master kill — disables drift computation entirely (meta.drift becomes null). |
+| `DRIFT_ALERT_MIN_TRADES` | `10` | Sample-size floor before drift is computed. Below this returns ok=false reason=insufficient_sample. |
+| `DRIFT_ALERT_THRESHOLD_BPS` | `50` | Divergence threshold for the alert flag. Smaller = more sensitive. |
+| `DRIFT_ALERT_LOOKBACK_TRADES` | `100` | Window over which realized expectancy is averaged. |
+
+### 3. Per-symbol expectancy auditor (`backend/modules/perSymbolExpectancyAudit.js`)
+
+Aggregates recent closed-trade records into a `(symbol × signalVersion)` grid + an outlier list. The dashboard surfaces `meta.perSymbolExpectancy.outliers` — symbols with ≥ `PER_SYMBOL_AUDIT_MIN_ENTRIES` trades AND `avgNetBps ≤ PER_SYMBOL_AUDIT_OUTLIER_BPS`. Operators read this list and decide whether to add a symbol to `MR_SYMBOL_BLOCKLIST_*` in Render env — exactly the manual BCH-on-MR-1m workflow from 2026-05-18, but data-driven and continuous.
+
+The CLI `node backend/scripts/audit_per_symbol_expectancy.js` reads `closed_trade_stats.jsonl` directly so an operator can slice the data offline without standing up the server.
+
+`closedTradeStats.append` in `trade.js:~3640` now tags each record with `signalVersion: pred.prediction?.signalVersion ?? null` — without that tag every signal's results collapse into one bucket and outliers hide.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `PER_SYMBOL_AUDIT_ENABLED` | `true` | Master kill — meta.perSymbolExpectancy becomes null. |
+| `PER_SYMBOL_AUDIT_MIN_ENTRIES` | `5` | Minimum (symbol × signal) sample size before a cell can be flagged outlier. |
+| `PER_SYMBOL_AUDIT_OUTLIER_BPS` | `-20` | avgNetBps threshold below which a cell is flagged. |
+| `PER_SYMBOL_AUDIT_LOOKBACK_TRADES` | `1000` | Window of closed-trade records consumed. |
+
+### 4. Crypto trades feed (`backend/modules/cryptoTrades.js`)
+
+Wires Alpaca `/v1beta3/crypto/{loc}/trades` for the microstructure signal's `flowImbalance` (Lee-Ready aggressor) feature. With `MICRO_TRADES_ENABLED=true`, `getMicrostructureSignalForPair` in `trade.js` pre-fetches the last 60 s of trades alongside bars + orderbook in a single `Promise.all` — no added scan latency. With the env var false (the default), the fetch is skipped entirely and the signal's `computeFlowImbalance` returns 0 — identical to the Phase 1 path.
+
+**Validate before flipping `MICRO_TRADES_ENABLED=true`**: run `/debug/backtest?strategy=microstructure&microHorizon=15m` first to confirm the trades feed contributes positively. The hand-tuned weights gave `flow` a `0.80` coefficient as a placeholder — once flow data is live, expect the 15m microstructure backtest expectancy to either step up (confirming the theory) or step down (signalling weight retune is needed before live exposure).
+
+### 5. Phase 2 microstructure calibration (`backend/scripts/build_microstructure_weights.js`)
+
+Reads `trade_forensics.jsonl`, joins entry records (which now include `microstructureFeatures` at decision time) with their exit updates by `tradeId`, and fits a logistic over the 8 microstructure features. Writes `data/microstructure_weights.json` with schema-versioned shape. The microstructure signal's module-init `loadLearnedWeights()` reads that file and uses the learned weights when present + valid; falls back to hand-tuned `DEFAULT_WEIGHTS` when the file is missing, corrupt, or below the safety floor.
+
+**Hard safety floor**: `--min-samples=500` (default). Below this, the script writes nothing and exits cleanly with `microstructure_weights_refused`. The hand-tuned scorecard is the conservative case; fitting on a tiny sample would severely overfit. Do NOT lower the floor without a held-out validation set.
+
+**Operator workflow**:
+1. Let the bot run with `SIGNAL_VERSION=microstructure_15m` (or auto-select) and `MICRO_TRADES_ENABLED=true` (after #4 validates) for enough trades to accumulate ≥ 500 samples in `trade_forensics.jsonl`.
+2. Run `node backend/scripts/build_microstructure_weights.js`. Inspect output `metrics.accuracy` and `metrics.logLoss` before deploying.
+3. Restart the bot. The signal's module-init logs the loaded weights' `sampleCount` and `accuracy` so logs make the swap visible.
+4. To roll back: delete `data/microstructure_weights.json` and restart — the signal reverts to hand-tuned priors with no code change.
+
+The fit starts from `DEFAULT_WEIGHTS` as priors, so a 500-sample fit produces a small perturbation around theory-driven values rather than overwriting them entirely. This is the spec'd Phase 1 → Phase 2 transition from CLAUDE.md's earlier microstructure section.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MICRO_WEIGHTS_FILE` | `./data/microstructure_weights.json` | Path the runtime reads at module init. |
+| `MICRO_WEIGHTS_LOAD_ENABLED` | `true` | Set false to force hand-tuned weights regardless of disk state. |
+
 ## Selector diagnostic-fidelity (2026-05-18)
 
 Three diagnostic bugs were observed in deployed logs and fixed in `backend/modules/signalSelector.js` + `backend/index.js`:
@@ -195,6 +256,8 @@ All three are observational fixes — none changes the live entry decision. When
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
+- Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`
+- Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
 - Diagnostic frontend (read-only): `Frontend/`
