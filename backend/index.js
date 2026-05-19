@@ -111,6 +111,8 @@ const {
   deserialize: deserializeMrSweep,
   DEFAULT_CAPS: MR_SWEEP_DEFAULT_CAPS,
 } = require('./modules/mrStopLossSweep');
+const driftAlerter = require('./modules/driftAlerter');
+const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -692,6 +694,34 @@ let lastBacktestMicro30m = null;
 let lastBacktestMicro45m = null;
 let lastBacktestError = null;
 let backtestRunning = false;
+
+// Drift alerter (2026-05-19). Compares realised expectancy from closed
+// trades against the most recent backtest's predicted expectancy and
+// surfaces a `drift` field on dashboard meta. Observational only —
+// nothing here gates entries. The whole point is to catch silent model
+// decay before it bleeds through 30 days of trading without notice.
+const DRIFT_ALERT_ENABLED = String(process.env.DRIFT_ALERT_ENABLED || 'true').toLowerCase() !== 'false';
+const DRIFT_ALERT_MIN_TRADES = Math.max(1, Number(process.env.DRIFT_ALERT_MIN_TRADES) || 10);
+const DRIFT_ALERT_THRESHOLD_BPS = Number.isFinite(Number(process.env.DRIFT_ALERT_THRESHOLD_BPS))
+  ? Number(process.env.DRIFT_ALERT_THRESHOLD_BPS)
+  : 50;
+const DRIFT_ALERT_LOOKBACK_TRADES = Math.max(
+  DRIFT_ALERT_MIN_TRADES,
+  Number(process.env.DRIFT_ALERT_LOOKBACK_TRADES) || 100,
+);
+// Per-symbol expectancy auditor (2026-05-19). Aggregates recent
+// closedTradeStats records into a (symbol × signalVersion) grid so the
+// operator can pick which symbols to add to MR_SYMBOL_BLOCKLIST_*
+// without hand-grepping logs. Observational only.
+const PER_SYMBOL_AUDIT_ENABLED = String(process.env.PER_SYMBOL_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
+const PER_SYMBOL_AUDIT_MIN_ENTRIES = Math.max(1, Number(process.env.PER_SYMBOL_AUDIT_MIN_ENTRIES) || 5);
+const PER_SYMBOL_AUDIT_OUTLIER_BPS = Number.isFinite(Number(process.env.PER_SYMBOL_AUDIT_OUTLIER_BPS))
+  ? Number(process.env.PER_SYMBOL_AUDIT_OUTLIER_BPS)
+  : -20;
+const PER_SYMBOL_AUDIT_LOOKBACK_TRADES = Math.max(
+  PER_SYMBOL_AUDIT_MIN_ENTRIES,
+  Number(process.env.PER_SYMBOL_AUDIT_LOOKBACK_TRADES) || 1000,
+);
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1557,6 +1587,57 @@ app.get('/dashboard', async (req, res) => {
             vetoEnabled: decision.config?.vetoEnabled,
           };
         })(),
+        // Live-vs-predicted drift alerter. Observational-only — surfaces
+        // when realised expectancy diverges from the most recent backtest
+        // by more than DRIFT_ALERT_THRESHOLD_BPS over the last N closed
+        // trades. Does NOT gate entries. Set DRIFT_ALERT_ENABLED=false to
+        // disable the computation (the field becomes null on meta).
+        drift: DRIFT_ALERT_ENABLED ? (() => {
+          try {
+            return driftAlerter.buildDriftMeta({
+              closedTrades: closedTradeStats.getRecent(DRIFT_ALERT_LOOKBACK_TRADES),
+              backtestsBySignal: {
+                ols: lastBacktestResult,
+                multi_factor: lastBacktestMf,
+                mean_reversion: lastBacktestMeanRev,
+                mean_reversion_5m: lastBacktestMeanRev5m,
+                mean_reversion_15m: lastBacktestMeanRev15m,
+                range_mean_reversion: lastBacktestRangeMr,
+                barrier: lastBacktestBarrier,
+                microstructure_5m: lastBacktestMicro5m,
+                microstructure_15m: lastBacktestMicro15m,
+                microstructure_30m: lastBacktestMicro30m,
+                microstructure_45m: lastBacktestMicro45m,
+              },
+              overallPredictedAvgNetBps: lastBacktestResult?.overall?.avgNetBpsPerEntry ?? null,
+              overallBacktestRanAt: lastBacktestResult?.ranAt ?? null,
+              config: {
+                minTrades: DRIFT_ALERT_MIN_TRADES,
+                thresholdBps: DRIFT_ALERT_THRESHOLD_BPS,
+              },
+            });
+          } catch (err) {
+            return { overall: { ok: false, reason: 'drift_compute_failed', error: err?.message }, perSignal: {} };
+          }
+        })() : null,
+        // Per-symbol expectancy auditor — observational outlier detector
+        // over recent closed trades. Operators read
+        // meta.perSymbolExpectancy.outliers to populate MR_SYMBOL_BLOCKLIST_*
+        // env vars without hand-grepping logs. In-memory aggregation —
+        // cheap enough to compute per-request, no separate refresh loop.
+        perSymbolExpectancy: PER_SYMBOL_AUDIT_ENABLED ? (() => {
+          try {
+            return perSymbolAudit.buildAudit({
+              records: closedTradeStats.getRecent(PER_SYMBOL_AUDIT_LOOKBACK_TRADES),
+              config: {
+                minEntries: PER_SYMBOL_AUDIT_MIN_ENTRIES,
+                outlierBps: PER_SYMBOL_AUDIT_OUTLIER_BPS,
+              },
+            });
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), sampleSize: 0, grid: [], outliers: [], error: err?.message };
+          }
+        })() : null,
         connectionState: {
           hasLastHttpError: Boolean(lastError),
           alpaca: getAlpacaAuthStatus(),

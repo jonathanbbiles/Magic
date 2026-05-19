@@ -16,6 +16,52 @@ Automated crypto trading bot that runs on Alpaca's **live** trading API. It scan
 
 ---
 
+## 2026-05-19 add: diagnostic + calibration bundle (5 features)
+
+A single PR adds five independent diagnostics + calibration tools. All five are observational by default — none changes live entry behavior at default settings. Full rationale in `CLAUDE.md` under "Diagnostic + calibration bundle (2026-05-19)".
+
+### 1. Doc-vs-code env-var audit (`backend/scripts/env_var_audit.js`)
+
+Mechanical Hard Rule #4 enforcement. Runs as part of `npm run test:scripts`. Scans `README.md` + `CLAUDE.md` for env var names (must contain underscore, alphanumeric trailing char) and asserts every one is read in `backend/` via `process.env.X`, `readNumber`, `readBoolean`, `readEnum`, etc. On first run it caught 3 doc-drift bugs (`BARRIER_DESIRED_NET_BPS`, `BARRIER_EV_MIN_BPS`, `MICRO_STOP_VOL_MULT` were documented as tunable but only present as hardcoded constants); all three are now wired through `readNumber()` in `trade.js`.
+
+### 2. Live-vs-predicted drift alerter (`backend/modules/driftAlerter.js`)
+
+Compares the realised expectancy over the last N closed trades to the most recent backtest's predicted expectancy. Surfaces `meta.drift` (overall + per-signal). When the divergence exceeds `DRIFT_ALERT_THRESHOLD_BPS` (default 50), the alert flips on. Observational only — does not gate entries. `closedTradeStats.append` now tags each record with `signalVersion` so the per-signal slice is meaningful.
+
+### 3. Per-symbol expectancy auditor (`backend/modules/perSymbolExpectancyAudit.js`)
+
+Aggregates recent closed-trade records into a `(symbol × signalVersion)` grid, sorted worst-first, with an `outliers` list of `(symbol × signal)` cells that have ≥ `PER_SYMBOL_AUDIT_MIN_ENTRIES` trades AND `avgNetBps ≤ PER_SYMBOL_AUDIT_OUTLIER_BPS` (default 5, −20). Generalises the BCH-on-MR-1m manual discovery into a continuous diagnostic. Operators read `meta.perSymbolExpectancy.outliers` and set `MR_SYMBOL_BLOCKLIST_*` env vars to act. Companion CLI at `backend/scripts/audit_per_symbol_expectancy.js` for offline slicing.
+
+### 4. Crypto trades feed (`backend/modules/cryptoTrades.js`)
+
+Wires Alpaca `/v1beta3/crypto/{loc}/trades` for the microstructure signal's `flowImbalance` feature. With `MICRO_TRADES_ENABLED=true`, recent trades are pre-fetched alongside bars + orderbook in the existing `Promise.all` — no added latency. Default `MICRO_TRADES_ENABLED=false`; operator opts in once the backtest at `/debug/backtest?strategy=microstructure&microHorizon=15m` confirms positive contribution.
+
+### 5. Phase 2 microstructure weight calibration (`backend/scripts/build_microstructure_weights.js`)
+
+Reads `trade_forensics.jsonl`, joins entries (which now record `microstructureFeatures` at decision time) with their exit updates, fits a logistic over the 8 features. Writes `data/microstructure_weights.json`. The microstructure signal's module-init `loadLearnedWeights()` reads that file with fallback to hand-tuned `DEFAULT_WEIGHTS`.
+
+**Hard safety floor**: refuses to fit below 500 samples (`--min-samples`). The fit starts from `DEFAULT_WEIGHTS` as priors so a small-sample fit produces a small perturbation, not an overwrite. To roll back: delete `data/microstructure_weights.json` and restart. The script does not run automatically — calibration is an explicit operator action.
+
+### Env vars added in this PR
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `DRIFT_ALERT_ENABLED` | `true` | Master kill for the drift alerter. |
+| `DRIFT_ALERT_MIN_TRADES` | `10` | Minimum closed trades before drift is computed. |
+| `DRIFT_ALERT_THRESHOLD_BPS` | `50` | `|predicted − realized|` divergence threshold. |
+| `DRIFT_ALERT_LOOKBACK_TRADES` | `100` | Window over which realised expectancy averages. |
+| `PER_SYMBOL_AUDIT_ENABLED` | `true` | Master kill for the per-symbol auditor. |
+| `PER_SYMBOL_AUDIT_MIN_ENTRIES` | `5` | Minimum trades before a `(symbol × signal)` cell can be flagged. |
+| `PER_SYMBOL_AUDIT_OUTLIER_BPS` | `-20` | avgNetBps threshold below which a cell is flagged as outlier. |
+| `PER_SYMBOL_AUDIT_LOOKBACK_TRADES` | `1000` | Window of closed-trade records consumed. |
+| `MICRO_WEIGHTS_FILE` | `./data/microstructure_weights.json` | Path the runtime reads at module init. |
+| `MICRO_WEIGHTS_LOAD_ENABLED` | `true` | Force hand-tuned weights when false. |
+| `BARRIER_DESIRED_NET_BPS` | `100` | Barrier signal per-trade net target. Wired through (previously hardcoded). |
+| `BARRIER_EV_MIN_BPS` | `-1` | Barrier signal EV gate floor. Wired through (previously hardcoded). |
+| `MICRO_STOP_VOL_MULT` | `2.5` | Microstructure `stopBps = max(floor, σ × this)`. Wired through (previously hardcoded). |
+
+---
+
 ## 2026-05-18 cleanup: signal-aware universal gates + backtest fallback fix
 
 The gate analysis surfaced three universal entry gates in `scanAndEnter` that were OLS-shaped and either firing on the wrong signals or about to fire on signals where the gate's assumption no longer holds. Plus a doc-vs-code drift on the backtest side. This PR is the cleanup:

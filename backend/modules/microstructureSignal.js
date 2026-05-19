@@ -86,6 +86,8 @@
 // extension of scripts/build_calibration.js. Wire MICRO_TRADES_ENABLED=true
 // once a /v1beta3/crypto/us/latest/trades consumer exists for flowImbalance.
 
+const fs = require('fs');
+const path = require('path');
 const { rsiSeries, ema } = require('./indicators');
 const { computeOrderbookMetrics, computeMicroprice, computeSpreadZScore } = require('./orderbookMetrics');
 const { ewmaSigmaFromCloses } = require('./barrierSignal');
@@ -94,8 +96,11 @@ const BPS = 10000;
 
 // Hand-tuned Phase 1 weights. See the module header for the rationale of
 // each value. The weights live in a module-level frozen object so the test
-// suite can assert they're stable and a future Phase 2 PR can swap to a
-// loaded JSON without changing the call sites that read them.
+// suite can assert they're stable. Phase 2's calibration script
+// (scripts/build_microstructure_weights.js) reads labeled.jsonl, fits a
+// logistic over the 8 features, and writes the learned weights to
+// MICRO_WEIGHTS_FILE; loadLearnedWeights() below picks them up at module
+// init with a fallback to these priors.
 const DEFAULT_WEIGHTS = Object.freeze({
   beta0: -0.20,
   micro: 1.20,
@@ -106,6 +111,47 @@ const DEFAULT_WEIGHTS = Object.freeze({
   rsi: 0.30,
   btcRes: -0.30,
 });
+
+const WEIGHTS_FILE = String(process.env.MICRO_WEIGHTS_FILE || './data/microstructure_weights.json').trim()
+  || './data/microstructure_weights.json';
+const WEIGHTS_LOAD_ENABLED = String(process.env.MICRO_WEIGHTS_LOAD_ENABLED || 'true').toLowerCase() !== 'false';
+
+// Load learned weights from disk. Returns null when the file is missing,
+// malformed, or fails the structural / schema-version checks — callers
+// treat null as "use DEFAULT_WEIGHTS" so a corrupt or absent file never
+// crashes boot and never silently degrades live trading.
+function loadLearnedWeights({ filePath = WEIGHTS_FILE } = {}) {
+  if (!WEIGHTS_LOAD_ENABLED) return null;
+  try {
+    const absPath = path.resolve(filePath);
+    if (!fs.existsSync(absPath)) return null;
+    const raw = fs.readFileSync(absPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.schemaVersion !== 1) return null;
+    if (parsed.ok !== true) return null;
+    const w = parsed.weights;
+    if (!w || typeof w !== 'object') return null;
+    const out = { beta0: Number(w.beta0) };
+    for (const key of ['micro', 'flow', 'book', 'volRet', 'drift', 'rsi', 'btcRes']) {
+      if (!Number.isFinite(Number(w[key]))) return null;
+      out[key] = Number(w[key]);
+    }
+    if (!Number.isFinite(out.beta0)) return null;
+    return Object.freeze(out);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Active weights resolved at module-init time. Live signal calls use this
+// reference; if MICRO_WEIGHTS_FILE was present + valid the learned weights
+// run, otherwise hand-tuned. The runtime does NOT mtime-reload during a
+// process lifetime — calibration is an offline batch and the operator
+// restarts the bot to pick up new weights (mirrors mrStopLossSweep's
+// "operator reads, sets env, restart" pattern).
+const learnedAtInit = loadLearnedWeights();
+const ACTIVE_WEIGHTS = learnedAtInit || DEFAULT_WEIGHTS;
 
 // Per-horizon trade-construction config. The keys match horizonMinutes
 // values that the live engine and backtester pass in. Each variant sets
@@ -153,9 +199,10 @@ const DEFAULT_CONFIG = Object.freeze({
   // Flow imbalance: signal returns 0 when MICRO_TRADES_ENABLED=false (Phase 1
   // default). Passing recentTrades unlocks the feature in test fixtures.
   tradesEnabled: false,
-  // Logistic weights — passed through to allow Phase 2 to swap learned
-  // values without changing call sites.
-  weights: DEFAULT_WEIGHTS,
+  // Logistic weights — resolved at module init from MICRO_WEIGHTS_FILE
+  // when present + valid, else falls through to hand-tuned DEFAULT_WEIGHTS.
+  // Per-call config can still override (test fixtures do this).
+  weights: ACTIVE_WEIGHTS,
 });
 
 function clamp(v, lo, hi) {
@@ -485,7 +532,9 @@ module.exports = {
   computeBtcResidual,
   computeFlowImbalance,
   buildSpreadSeriesFromBars,
+  loadLearnedWeights,
   DEFAULT_CONFIG,
   DEFAULT_WEIGHTS,
+  ACTIVE_WEIGHTS,
   HORIZON_DEFAULTS,
 };

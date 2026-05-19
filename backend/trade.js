@@ -39,6 +39,7 @@ const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal')
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal } = require('./modules/microstructureSignal');
+const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
@@ -343,6 +344,13 @@ const RANGE_MR_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('RANGE_MR_BREA
 const BARRIER_STOP_LOSS_BPS = Math.max(1, readNumber('BARRIER_STOP_LOSS_BPS', 100));
 const BARRIER_MAX_HOLD_MS = Math.max(60_000, readNumber('BARRIER_MAX_HOLD_MS', 21_600_000));     // 6 h
 const BARRIER_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('BARRIER_BREAKEVEN_TIMEOUT_MS', 10_800_000));  // 3 h
+// Barrier signal internal knobs — previously documented in README/CLAUDE.md
+// as tunable but hardcoded in barrierSignal.js's DEFAULT_CONFIG. Wired
+// here so the doc claim "BARRIER_DESIRED_NET_BPS=100 default" is honest.
+// Defaults mirror DEFAULT_CONFIG so unset env behaves identically to the
+// pure module config (zero-behavior-change unless an operator sets one).
+const BARRIER_DESIRED_NET_BPS = Math.max(1, readNumber('BARRIER_DESIRED_NET_BPS', 100));
+const BARRIER_EV_MIN_BPS = readNumber('BARRIER_EV_MIN_BPS', -1);
 
 // Microstructure signal env knobs. Per-horizon TP target + stop floor mirror
 // the module's HORIZON_DEFAULTS so an operator-unset env behaves identically
@@ -364,6 +372,11 @@ const MICRO_EV_MIN_BPS = readNumber('MICRO_EV_MIN_BPS', 2);
 const MICRO_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('MICRO_TARGET_NET_BPS_FLOOR', 8));
 const MICRO_SIGNAL_TARGET_MAX_NET_BPS = Math.max(MICRO_TARGET_NET_BPS_FLOOR, readNumber('MICRO_SIGNAL_TARGET_MAX_NET_BPS', 150));
 const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
+// Stop = max(stopFloorBps, sigma · MICRO_STOP_VOL_MULT). stopFloorBps
+// comes from per-horizon HORIZON_DEFAULTS; this multiplier is shared
+// across horizons. Previously hardcoded; wired here so the README claim
+// of vol-scaled stops is reflected in env-tunable behaviour.
+const MICRO_STOP_VOL_MULT = Math.max(0.1, readNumber('MICRO_STOP_VOL_MULT', 2.5));
 
 // Feature library (2026-05-18) — observational-only logging into the entry
 // forensics record. None of these flags gate entries; they only control
@@ -1797,6 +1810,11 @@ async function getBarrierSignalForPair(pair, quote = null) {
       bars1m,
       orderbook,
       quote: quote ? { bid: Number(quote.bp), ask: Number(quote.ap) } : null,
+      config: {
+        desiredNetBps: BARRIER_DESIRED_NET_BPS,
+        evMinBps: BARRIER_EV_MIN_BPS,
+        feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+      },
     });
     if (sig && typeof sig === 'object') sig.featureBars = { bars1m, orderbook };
     return sig;
@@ -1815,15 +1833,31 @@ async function getBarrierSignalForPair(pair, quote = null) {
 // flowImbalance=0 in Phase 1 so the contribution is zero.
 async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
   try {
-    const [bars1mPayload, obPayload] = await Promise.all([
+    // Phase 2 (2026-05-19): when MICRO_TRADES_ENABLED=true the recent
+    // trades fetch piggybacks on the existing bars+orderbook fan-out so
+    // there's no added scan latency vs the Phase 1 path. When disabled
+    // (the default), we skip the fetch entirely and the signal's
+    // computeFlowImbalance returns 0 — identical to the prior behavior.
+    const tradesFetch = MICRO_TRADES_ENABLED
+      ? fetchRecentTrades({
+          request: (args) => alpacaRequest({ base: 'data', ...args }),
+          symbols: [pair],
+        }).catch((err) => {
+          console.warn('crypto_trades_fetch_failed', { symbol: pair, error: err?.message });
+          return {};
+        })
+      : Promise.resolve({});
+    const [bars1mPayload, obPayload, tradesBySymbol] = await Promise.all([
       fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' }),
       fetchCryptoOrderbooks({ symbols: [pair] }).catch((err) => {
         console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
         return { orderbooks: {} };
       }),
+      tradesFetch,
     ]);
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    const recentTrades = tradesBySymbol?.[pair] || tradesBySymbol?.[toAlpacaSymbol(pair)] || null;
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
     // Live quote shape includes top-of-book sizes when available; the
     // microprice computation falls back to neutral microBias if absent.
@@ -1839,13 +1873,14 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
       orderbook,
       quote: quoteForSignal,
       btcLeadLag,
-      recentTrades: null,
+      recentTrades,
       horizonMinutes,
       config: {
         spreadZMax: MICRO_SPREAD_Z_MAX,
         minProb: MICRO_MIN_PROB,
         evMinBps: MICRO_EV_MIN_BPS,
         feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
+        stopVolMult: MICRO_STOP_VOL_MULT,
         tradesEnabled: MICRO_TRADES_ENABLED,
       },
     });
@@ -2925,6 +2960,30 @@ async function scanAndEnter() {
                 btcLagOk: sig.factors.btcLag?.ok,
               }
             : null,
+          // Microstructure feature snapshot (2026-05-19) — recorded only
+          // when the active signal is one of the microstructure horizons.
+          // Phase 2's scripts/build_microstructure_weights.js reads these
+          // back from trade_forensics.jsonl to fit the logistic weights.
+          // Storing the 8 features at decision time avoids re-fetching bars
+          // / orderbook / trades to reconstruct them post-hoc.
+          microstructureFeatures: (() => {
+            const sv = String(sig.signalVersion || '').toLowerCase();
+            if (!sv.startsWith('microstructure_')) return null;
+            const f = sig.factors || {};
+            return {
+              microBias: Number.isFinite(Number(f.microBias)) ? Number(f.microBias) : null,
+              bookImbalance: Number.isFinite(Number(f.bookImbalance)) ? Number(f.bookImbalance) : null,
+              flowImbalance: Number.isFinite(Number(f.flowImbalance)) ? Number(f.flowImbalance) : null,
+              spreadZ: Number.isFinite(Number(f.spreadZ)) ? Number(f.spreadZ) : null,
+              volNormReturn: Number.isFinite(Number(f.volNormReturn)) ? Number(f.volNormReturn) : null,
+              rsiDelta: Number.isFinite(Number(f.rsiDelta)) ? Number(f.rsiDelta) : null,
+              btcResidual: Number.isFinite(Number(f.btcResidual)) ? Number(f.btcResidual) : null,
+              driftSharpe: Number.isFinite(Number(f.driftSharpe)) ? Number(f.driftSharpe) : null,
+              score: Number.isFinite(Number(f.score)) ? Number(f.score) : null,
+              p: Number.isFinite(Number(f.p)) ? Number(f.p) : null,
+              horizonMinutes: Number.isFinite(Number(sig.horizonMinutes)) ? Number(sig.horizonMinutes) : null,
+            };
+          })(),
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
         tradePredictions.set(pair, {
@@ -3622,6 +3681,11 @@ async function reconcileExits() {
         closedTradeStats.append({
           tradeId: pred.tradeId,
           symbol: pair,
+          // signalVersion tag (2026-05-19) lets the per-symbol expectancy
+          // auditor and drift alerter break out realised P&L by signal,
+          // not just aggregate. Without this tag both diagnostics collapse
+          // every signal's results into one bucket and outliers hide.
+          signalVersion: pred.prediction?.signalVersion ?? null,
           netPnlUsd,
           grossPnlUsd,
           holdSeconds,
