@@ -241,6 +241,26 @@ The fit starts from `DEFAULT_WEIGHTS` as priors, so a 500-sample fit produces a 
 | `MICRO_WEIGHTS_FILE` | `./data/microstructure_weights.json` | Path the runtime reads at module init. |
 | `MICRO_WEIGHTS_LOAD_ENABLED` | `true` | Set false to force hand-tuned weights regardless of disk state. |
 
+## Gate-rejection audit (2026-05-19)
+
+Answers the question the snapshot diagnostics structurally can't: "did the gates reject candidates that would have been profitable?" The expectancy figures across every signal are computed only on the gate-passing path — gates that reject 99% of bars are invisible in those numbers. The audit measures the gate-failing path by storing a small forensic record at the moment of rejection and grading it later against the realised forward price.
+
+**Wiring** (Hard Rule #4-compliant; capture and grader are wired, no dead knobs):
+1. **Capture** in `backend/trade.js`. `scanAndEnter` sets a module-level `currentScanAuditCandidate = { symbol, midPx, signalVersion }` right after the freshness/prune checks pass (line ~2548) and clears it at iteration boundaries. `rejectTrade()` reads this context — when set and the rejection reason is not in `gateRejectionAudit.EXCLUDED_REASONS`, it calls `gateRejectionAudit.capture()` with the candidate's mid-price + active signal version. Pre-quote rejects (`no_quote`, `stale_quote`, `pruned_stale_quotes`) fire before the context is bound, so they are skipped automatically; the `EXCLUDED_REASONS` set is the second line of defence.
+2. **Grader** in `backend/index.js`. A `setInterval` started at boot (`runGateAuditGradeCycle`) calls `gateRejectionAudit.gradePending({fetchBars: fetchCryptoBars, forwardHorizonMs, ...})` every `GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS` (default 60s). For each pending capture whose `forwardHorizonMs` has elapsed, the grader fetches the last `fetchLimit=120` 1m bars for that symbol, finds the bar at `capturedTsMs + forwardHorizonMs`, computes `forwardBps = ((closePx − midPx) / midPx) × 10000`, and moves the record into the graded buffer (also persisted to `${writableRoot}/gate_rejection_audit.jsonl`).
+3. **Aggregator** in `backend/index.js`. `buildAudit()` aggregates the graded buffer into a per-reason and per-(reason × signalVersion) grid, sorted most-costly-first, with a `costliestGates` shortlist for operators. Surfaced at `meta.gateRejectionAudit`.
+
+**Verdict thresholds**: `gate_costly` when avgForwardBps > `GATE_REJECTION_AUDIT_COSTLY_BPS` (default +10), `gate_justified` when below `GATE_REJECTION_AUDIT_JUSTIFIED_BPS` (default −10), `noise` between, `insufficient_sample` below `GATE_REJECTION_AUDIT_MIN_ENTRIES` (default 10). Symmetric +/−10 default deliberately tighter than the drift alerter's ±50 bps because the audit horizon (20 min) is much shorter than a typical trade hold, so the natural variance of forwardBps is also smaller.
+
+**Persistence**: pending captures are in-memory only — restarts lose ≤ `forwardHorizonMs` worth (default 20 min). Graded records persist to JSONL; at module load the last `GATE_REJECTION_AUDIT_MAX_GRADED_RECENT` records (default 10000) are tail-read back into memory so the dashboard is non-empty after restart. Disable via `GATE_REJECTION_AUDIT_HYDRATE_AT_BOOT=false` (used by the test file to keep tests hermetic).
+
+**Limitations** documented in the module header — read them before extending:
+- Single forward horizon. Barrier / microstructure signals target 1-6 h holds, so a 20-min audit grades them on the wrong unit. The per-signal backtest expectancy is the right tool for those — DO NOT collapse the two diagnostics.
+- "Forward return at horizon" is directional, not a trade-structure simulation. A gate that rejects a candidate whose mid-price rises +30 bps over 20 min is `gate_costly` here, but the actual trade outcome depends on staircase decay, stop-loss timing, intra-bar path.
+- Excluded reasons are data-quality / capital-constraint rejects (no usable mid-price to grade against, or no price-aware gate to tune).
+
+**Adding a new excludable reason**: extend `EXCLUDED_REASONS` in `gateRejectionAudit.js` only if the reason is genuinely not gradeable. Most new rejection reasons SHOULD be audited — that's the whole point.
+
 ## Selector diagnostic-fidelity (2026-05-18)
 
 Three diagnostic bugs were observed in deployed logs and fixed in `backend/modules/signalSelector.js` + `backend/index.js`:
@@ -256,7 +276,7 @@ All three are observational fixes — none changes the live entry decision. When
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
-- Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`
+- Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`

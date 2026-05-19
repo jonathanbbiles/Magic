@@ -49,6 +49,7 @@ function resolveStoragePaths() {
     equitySnapshotsFile: path.join(writableRoot, 'equity_snapshots.jsonl'),
     runSnapshotFile: path.join(writableRoot, 'run_snapshot.json'),
     mrStopLossSweepFile: path.join(writableRoot, 'mr_stop_loss_sweep.json'),
+    gateRejectionAuditFile: path.join(writableRoot, 'gate_rejection_audit.jsonl'),
     riskKillSwitchFile: path.resolve(String(process.env.RISK_KILL_SWITCH_FILE || path.join(writableRoot, 'KILL_SWITCH')).trim()),
   };
 
