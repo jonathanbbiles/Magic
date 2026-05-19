@@ -116,6 +116,7 @@ const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
 const microFlowShadow = require('./modules/microstructureFlowShadow');
+const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -180,6 +181,7 @@ const {
   getSignalSelectorDecision,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
+  getStaleQuoteRetryTrackerSnapshot,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -1777,6 +1779,26 @@ app.get('/dashboard', async (req, res) => {
             return { ranAt: new Date().toISOString(), regime: 'detector_failed', error: err?.message };
           }
         })(),
+        // Stale-quote single-symbol retry diagnostic (2026-05-20). Per-symbol
+        // recoveryRate is the actionable number — < 10% means the retry isn't
+        // helping for that symbol and the operator should consider blocklisting
+        // it or contacting Alpaca about chronic feed staleness.
+        staleQuoteRetry: (() => {
+          try {
+            const snapshot = typeof getStaleQuoteRetryTrackerSnapshot === 'function'
+              ? getStaleQuoteRetryTrackerSnapshot() : [];
+            return staleQuoteRetryStats.buildRetryStats({ snapshot });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              attempts: 0,
+              recoveries: 0,
+              recoveryRate: null,
+              bySymbol: [],
+              error: err?.message,
+            };
+          }
+        })(),
         microstructureFlowShadow: MICRO_TRADES_SHADOW_ENABLED ? (() => {
           try {
             const snapshot = typeof getMicroFlowShadowTrackerSnapshot === 'function'
@@ -2732,28 +2754,41 @@ if (backtestSkipReason) {
     // with 15m + 30m on, 5m + 45m off. The signal selector silently drops
     // un-enabled candidates rather than admitting them via veto bypass.
     if (String(process.env.MICRO_ENABLED || 'true').toLowerCase() !== 'false') {
+      // Per-horizon symbol blocklists (2026-05-20). Pass the same blocklist
+      // the live engine uses so the auto-backtest expectancy reflects what
+      // the live engine will actually trade — see Hard Rule #4 + the MR
+      // parallel above. Default 30m blocklist in liveDefaults.js excludes
+      // UNI/DOT/LTC/BCH/LINK per the 2026-05-19 diagnostic snapshot.
+      const microBlocklist5m = symbolBlocklist.parseSymbolBlocklist(process.env.MICRO_SYMBOL_BLOCKLIST_5M);
+      const microBlocklist15m = symbolBlocklist.parseSymbolBlocklist(process.env.MICRO_SYMBOL_BLOCKLIST_15M);
+      const microBlocklist30m = symbolBlocklist.parseSymbolBlocklist(process.env.MICRO_SYMBOL_BLOCKLIST_30M);
+      const microBlocklist45m = symbolBlocklist.parseSymbolBlocklist(process.env.MICRO_SYMBOL_BLOCKLIST_45M);
       if (String(process.env.MICRO_HORIZON_5M_ENABLED || 'false').toLowerCase() === 'true') {
         await runBacktestAndStore({
           strategy: 'microstructure',
           microHorizon: '5m',
+          blockedSymbols: microBlocklist5m,
         }, 'micro_5m').catch(() => {});
       }
       if (String(process.env.MICRO_HORIZON_15M_ENABLED || 'true').toLowerCase() !== 'false') {
         await runBacktestAndStore({
           strategy: 'microstructure',
           microHorizon: '15m',
+          blockedSymbols: microBlocklist15m,
         }, 'micro_15m').catch(() => {});
       }
       if (String(process.env.MICRO_HORIZON_30M_ENABLED || 'true').toLowerCase() !== 'false') {
         await runBacktestAndStore({
           strategy: 'microstructure',
           microHorizon: '30m',
+          blockedSymbols: microBlocklist30m,
         }, 'micro_30m').catch(() => {});
       }
       if (String(process.env.MICRO_HORIZON_45M_ENABLED || 'false').toLowerCase() === 'true') {
         await runBacktestAndStore({
           strategy: 'microstructure',
           microHorizon: '45m',
+          blockedSymbols: microBlocklist45m,
         }, 'micro_45m').catch(() => {});
       }
     }

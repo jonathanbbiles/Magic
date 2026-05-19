@@ -42,6 +42,7 @@ const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./module
 const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
 const marketRegimeDetector = require('./modules/marketRegimeDetector');
+const { createRetryTracker: createStaleQuoteRetryTracker } = require('./modules/staleQuoteRetryStats');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
@@ -384,6 +385,17 @@ const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
 // Default on so validation data accumulates automatically.
 const MICRO_TRADES_SHADOW_ENABLED = readBoolean('MICRO_TRADES_SHADOW_ENABLED', true);
 
+// Stale-quote single-symbol retry fallback (2026-05-20). When prefetched
+// quote ageMs exceeds the stale threshold, retry the symbol with the
+// single-symbol /latest/quotes endpoint. Alpaca's bulk endpoint can be
+// stale for specific symbols while the single-symbol endpoint returns
+// fresher data — observed for ETH/SOL/AVAX/XRP/LTC in the 2026-05-19
+// diagnostic snapshot. Default-on; the existing pruner takes over if the
+// retry doesn't recover, so worst case is one extra Alpaca call per stale
+// symbol per scan. Opt out via STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false.
+const STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED = readBoolean(
+  'STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED', true);
+
 // Market regime detector (Phase 1, 2026-05-20). Observational classifier
 // over recent BTC closes — labels current regime (adverse/benign/flat/
 // quiet/wild) and surfaces the simulator's expected per-trade bps for
@@ -442,6 +454,11 @@ const GATE_REJECTION_AUDIT_ENABLED = readBoolean('GATE_REJECTION_AUDIT_ENABLED',
 // by the live-defaults bootstrap; rationale in liveDefaults.js.
 const symbolBlocklist = require('./modules/symbolBlocklist');
 const MR_BLOCKLISTS = symbolBlocklist.readMrBlocklistsFromEnv(process.env);
+// Per-horizon microstructure blocklists (2026-05-20). Same shared-with-
+// backtest pattern as MR_BLOCKLISTS so the auto-backtest result matches
+// the live universe. The 30m default in liveDefaults.js seeds the symbols
+// flagged catastrophic by the 2026-05-19 diagnostic snapshot.
+const MICRO_BLOCKLISTS = symbolBlocklist.readMicroBlocklistsFromEnv(process.env);
 
 function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair = null) {
   let cap;
@@ -1604,6 +1621,7 @@ async function getPredictionSignal(pair) {
       timeframe: '1Min',
     });
     const bars = payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars);
     const closedBars = bars.slice(0, -1);
     const closes = closedBars.map((b) => Number(b?.c)).filter((v) => Number.isFinite(v) && v > 0);
     const volumes = closedBars.map((b) => Number(b?.v)).filter((v) => Number.isFinite(v) && v >= 0);
@@ -1770,6 +1788,7 @@ async function getMultiFactorSignalForPair(pair, quote) {
     const bars5m = bars5mPayload?.bars?.[pair] || bars5mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const bars15m = bars15mPayload?.bars?.[pair] || bars15mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
     const sig = evaluateMultiFactorSignal({
       pair,
@@ -1805,6 +1824,7 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
     const limit = timeframe === '15m' ? 540 : (timeframe === '5m' ? 180 : 36);
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
     const sig = evaluateMeanReversionSignal({ pair, bars1m, btcLeadLag, timeframe, config: MR_SIGNAL_CONFIG_OVERRIDES });
     if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
@@ -1831,6 +1851,7 @@ async function getRangeMeanReversionSignalForPair(pair) {
     // (low-volume alts sometimes come back below the requested limit).
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
     const sig = evaluateRangeMeanReversionSignal({ pair, bars1m });
     if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
     return sig;
@@ -1855,6 +1876,7 @@ async function getBarrierSignalForPair(pair, quote = null) {
     ]);
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
     const sig = evaluateBarrierSignal({
       pair,
       bars1m,
@@ -1884,6 +1906,15 @@ function getMicroFlowShadowTrackerSnapshot() {
   return microFlowShadowTracker.snapshot();
 }
 
+// Stale-quote retry tracker (2026-05-20). Records every single-symbol
+// retry attempt + outcome for dashboard surface. Per-symbol recoveryRate
+// is the actionable number: < 10% means the fallback isn't helping and
+// the symbol should be blocklisted or the operator should contact Alpaca.
+const staleQuoteRetryTracker = createStaleQuoteRetryTracker({ windowSize: 500 });
+function getStaleQuoteRetryTrackerSnapshot() {
+  return staleQuoteRetryTracker.snapshot();
+}
+
 // Microstructure signal wrapper. The signal needs 60 1m bars (RSI(14) +
 // 60-bar spread/sigma windows) plus the live quote (for spread + microprice)
 // and (optionally) the orderbook for the bookImbalance term. Pattern matches
@@ -1895,6 +1926,15 @@ function getMicroFlowShadowTrackerSnapshot() {
 // the flow value observationally — feeding the microFlowShadowTracker so
 // the dashboard surfaces it without touching live scoring.
 async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
+  // Per-horizon symbol blocklist (2026-05-20). Same early-return pattern as
+  // MR — refuses entries on symbols whose per-trade expectancy is documented
+  // as structurally negative for this horizon. Costs zero Alpaca calls for
+  // a blocked pair. The auto-backtest applies the same filter via the
+  // micro-blocklist plumbing in runBacktestAndStore (index.js) so the
+  // selector validates the signal on the SAME universe the live engine trades.
+  if (symbolBlocklist.isMicroPairBlocked(pair, horizonMinutes, MICRO_BLOCKLISTS)) {
+    return { ok: false, reason: 'micro_symbol_blocklisted' };
+  }
   try {
     // Fetch trades when EITHER live scoring or shadow observation is on.
     // Shadow mode is default-on so validation data accumulates automatically;
@@ -1921,6 +1961,7 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
     const orderbook = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
     const recentTrades = tradesBySymbol?.[pair] || tradesBySymbol?.[toAlpacaSymbol(pair)] || null;
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
     const btcLeadLag = pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot();
     // Live quote shape includes top-of-book sizes when available; the
     // microprice computation falls back to neutral microBias if absent.
@@ -1994,6 +2035,38 @@ const BTC_LEAD_LAG_SYMBOL = 'BTC/USD';
 const BTC_LEAD_LAG_MAX_AGE_MS = 5 * 60 * 1000;
 let btcLeadLagSnapshot = null;
 let marketRegimeSnapshot = null;
+
+// Regime update is decoupled from sig.ok so the dashboard's marketRegime
+// field doesn't silently go null whenever the active signal (e.g. MR-1m)
+// returns ok=false for non-data reasons like mr_no_drop. Called from each
+// signal wrapper right after bars are fetched, BEFORE the signal's gates
+// fire. Same closes already in memory; no extra Alpaca call. Observational
+// only — no gate or signal reads marketRegimeSnapshot.
+function maybeUpdateMarketRegimeFromBars(pair, bars1m) {
+  if (!MARKET_REGIME_DETECTOR_ENABLED) return;
+  if (pair !== BTC_LEAD_LAG_SYMBOL) return;
+  if (!Array.isArray(bars1m) || bars1m.length < 2) return;
+  try {
+    const closes = [];
+    for (const bar of bars1m) {
+      const c = Number(bar?.c ?? bar?.close);
+      if (Number.isFinite(c) && c > 0) closes.push(c);
+    }
+    if (closes.length < 2) return;
+    const summary = marketRegimeDetector.summarizeRegime({
+      closes,
+      lookbackBars: MARKET_REGIME_LOOKBACK_BARS,
+      thresholds: {
+        benignDriftBpsPerMin: MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN,
+        adverseDriftBpsPerMin: MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN,
+        quietSigmaBpsPerMin: MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN,
+        wildSigmaBpsPerMin: MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN,
+      },
+    });
+    marketRegimeSnapshot = { ...summary, capturedAt: Date.now() };
+  } catch (_) { /* observational; never fatal */ }
+}
+
 function recordBtcLeadLagSnapshot(sig) {
   if (!sig || !sig.ok) return;
   const closes = Array.isArray(sig.closes) ? sig.closes : [];
@@ -2012,25 +2085,6 @@ function recordBtcLeadLagSnapshot(sig) {
     volumeRatio: Number.isFinite(sig.volumeRatio) ? sig.volumeRatio : null,
     capturedAt: Date.now(),
   };
-  // Market regime classifier piggybacks on the BTC scan — same closes
-  // already in memory, no extra Alpaca call. Stored separately because
-  // the regime label is conceptually distinct from BTC lead-lag (which
-  // is alt-specific). Observational only; nothing reads this for gating.
-  if (MARKET_REGIME_DETECTOR_ENABLED && closes.length >= 2) {
-    try {
-      const summary = marketRegimeDetector.summarizeRegime({
-        closes,
-        lookbackBars: MARKET_REGIME_LOOKBACK_BARS,
-        thresholds: {
-          benignDriftBpsPerMin: MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN,
-          adverseDriftBpsPerMin: MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN,
-          quietSigmaBpsPerMin: MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN,
-          wildSigmaBpsPerMin: MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN,
-        },
-      });
-      marketRegimeSnapshot = { ...summary, capturedAt: Date.now() };
-    } catch (_) { /* observational; never fatal */ }
-  }
 }
 function getBtcLeadLagSnapshot() {
   if (!btcLeadLagSnapshot) return null;
@@ -2615,17 +2669,65 @@ async function scanAndEnter() {
     try {
       let payload;
       const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
+      const usedPrefetched = Boolean(prefetched);
       if (prefetched) {
         payload = { quotes: { [pair]: prefetched } };
       } else {
         payload = await fetchCryptoQuotes({ symbols: [pair] });
       }
-      const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
+      let quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
-      const quoteTsMs = quoteTimestampMs(quote) || 0;
+      let quoteTsMs = quoteTimestampMs(quote) || 0;
+      let nowMs = Date.now();
+      let ageMs = nowMs - quoteTsMs;
+      // Stale-quote single-symbol retry (2026-05-20). When a prefetched
+      // quote is stale, retry once via the single-symbol endpoint. Alpaca's
+      // bulk endpoint occasionally lags the single-symbol endpoint for
+      // specific symbols (observed for ETH/SOL/AVAX/XRP/LTC in the
+      // 2026-05-19 dashboard snapshot). The retry is bounded — one extra
+      // Alpaca call per stale prefetched quote per scan, capped by the
+      // entry universe size. Every attempt is tracked so the dashboard
+      // shows per-symbol recovery rate.
+      const prefetchedStale = usedPrefetched
+        && (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS));
+      if (prefetchedStale && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED) {
+        const prefetchedAgeMs = ageMs;
+        let retryError = null;
+        let retriedAgeMs = null;
+        let recovered = false;
+        try {
+          const retryPayload = await fetchCryptoQuotes({ symbols: [pair] });
+          const retryQuote = retryPayload?.quotes?.[pair]
+            || retryPayload?.quotes?.[toAlpacaSymbol(pair)]
+            || null;
+          if (retryQuote) {
+            const retryTsMs = quoteTimestampMs(retryQuote) || 0;
+            const retryNowMs = Date.now();
+            const retryAge = retryNowMs - retryTsMs;
+            retriedAgeMs = retryAge;
+            if (Number.isFinite(retryAge)
+              && retryAge < ageMs
+              && retryAge <= (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) {
+              // Single-symbol returned a fresher, non-stale quote — adopt it.
+              quote = retryQuote;
+              quoteTsMs = retryTsMs;
+              nowMs = retryNowMs;
+              ageMs = retryAge;
+              recovered = true;
+            }
+          }
+        } catch (err) {
+          retryError = err?.message || 'fetch_failed';
+        }
+        staleQuoteRetryTracker.record({
+          symbol: pair,
+          prefetchedAgeMs,
+          retriedAgeMs,
+          recovered,
+          error: retryError,
+        });
+      }
       if (quoteTsMs > 0) lastQuoteUpdateBySymbol.set(pair, quoteTsMs);
-      const nowMs = Date.now();
-      const ageMs = nowMs - quoteTsMs;
       quoteFreshness.record(pair, ageMs);
       const quoteFingerprint = `${Number(quote.bp)}:${Number(quote.ap)}:${quoteTsMs}`;
       const previousFingerprint = lastQuoteFingerprintBySymbol.get(pair) || null;
@@ -3991,6 +4093,7 @@ module.exports = {
   getActiveSignalVersion,
   getSignalSelectorDecision,
   getMicroFlowShadowTrackerSnapshot,
+  getStaleQuoteRetryTrackerSnapshot,
   resolveAlpacaAuth,
   getAlpacaAuthStatus,
   getAlpacaBaseStatus,

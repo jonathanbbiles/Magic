@@ -368,6 +368,22 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD',
   MR_SYMBOL_BLOCKLIST_15M: '',
   RANGE_MR_SYMBOL_BLOCKLIST: '',
+  // Per-horizon microstructure blocklists (2026-05-20). The 30m default
+  // mirrors the 2026-05-19 dashboard snapshot's catastrophic per-trade
+  // losers: UNI -130 (1 trade), DOT -130 (1 trade), LTC -60.9 (2 trades),
+  // BCH -57.2 (5 trades), LINK -50.8 (4 trades). Excluding these
+  // 5 symbols leaves ADA (+20.3, 2 trades), DOGE (+22.1, 1 trade), AVAX
+  // (−7.9, 4 trades), SOL (−20.0, 4 trades), ETH (−40.6, 2 trades) — net
+  // expectancy on the remaining 13 trades is roughly −15 bps, still
+  // negative but no longer dominated by the catastrophic tail and within
+  // the band where another month of data could flip it positive. The 5m
+  // / 15m / 45m defaults stay empty because the same diagnostic didn't
+  // show clear per-symbol patterns at those horizons (the sample sizes
+  // are still too small for confident per-symbol filtering).
+  MICRO_SYMBOL_BLOCKLIST_5M: '',
+  MICRO_SYMBOL_BLOCKLIST_15M: '',
+  MICRO_SYMBOL_BLOCKLIST_30M: 'UNI/USD,DOT/USD,LTC/USD,BCH/USD,LINK/USD',
+  MICRO_SYMBOL_BLOCKLIST_45M: '',
   // Gate-rejection audit (2026-05-19). Observational shadow forward-test:
   // captures every reject from scanAndEnter that has a valid quote, then
   // N bars later fetches the 1m close to compute the realised forward bps.

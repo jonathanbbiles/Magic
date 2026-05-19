@@ -1,5 +1,48 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: 4 diagnostics-driven fixes from the 2026-05-19 live snapshot
+
+A single PR shipping four fixes targeted at problems the 2026-05-19 dashboard surfaced. Each is independent and observational-by-default where it touches a live decision.
+
+### 1. Stale-quote single-symbol retry fallback (`STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED`)
+
+The 2026-05-19 snapshot showed 5 of 12 symbols (ETH/SOL/AVAX/XRP/LTC) chronically pruned for stale quotes — `freshRatio` of 0.25 each, meaning the bot is operationally blind on ~half the universe most scans. The hypothesis: Alpaca's bulk `/latest/quotes` endpoint occasionally lags the single-symbol endpoint for specific symbols, even though the per-symbol fetch returns fresh data milliseconds later.
+
+When a prefetched quote is detected stale, the live engine now retries once via the single-symbol endpoint. If the retry returns a fresher non-stale quote, it's adopted and the scan proceeds. If the retry is also stale (or fails), the existing `stale_quote` rejection fires. Bounded cost: one extra Alpaca call per stale prefetched quote per scan, capped by the universe size.
+
+Every retry attempt + outcome is recorded to `meta.staleQuoteRetry` (per-symbol `attempts`, `recoveries`, `recoveryRate`, `avgPrefetchedAgeMs`, `avgRetriedAgeMs`). If recoveryRate is < 10% for a symbol, the retry isn't helping and the operator should either blocklist that symbol or contact Alpaca about feed staleness — that's a data-feed problem, not something code can fix.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED` | `true` | Master kill — when false, no retry, no tracker writes. |
+
+### 2. Per-horizon microstructure symbol blocklist
+
+The 2026-05-19 30-day backtest decomposed by signal × symbol revealed a BCH-on-MR-1m-style asymmetry on microstructure_30m: UNI (−130 bps over 1 trade), DOT (−130 over 1), LTC (−60.9 over 2), BCH (−57.2 over 5), LINK (−50.8 over 4) drove the aggregate to −39 bps. The other 5 symbols averaged closer to flat (ADA +20.3, DOGE +22.1, AVAX −7.9, SOL −20.0, ETH −40.6).
+
+Mirrors the existing `MR_SYMBOL_BLOCKLIST_*` infrastructure exactly:
+- Live signal: `getMicrostructureSignalForPair` returns `{ ok: false, reason: 'micro_symbol_blocklisted' }` for blocked pairs (zero Alpaca calls).
+- Auto-backtest: the `runBacktestAndStore` calls in `index.js` pass `blockedSymbols` matching the live config so the selector's expectancy reflects the live universe (Hard Rule #4 + the MR parallel).
+
+| Env var | Default | Rationale |
+|---|---|---|
+| `MICRO_SYMBOL_BLOCKLIST_5M` | *(empty)* | Sample sizes still too small to identify per-symbol losers. |
+| `MICRO_SYMBOL_BLOCKLIST_15M` | *(empty)* | Sample sizes still too small. |
+| `MICRO_SYMBOL_BLOCKLIST_30M` | `UNI/USD,DOT/USD,LTC/USD,BCH/USD,LINK/USD` | Removes the 5 symbols dragging 30m expectancy to −39 bps. Expected post-block expectancy: ~−15 bps over remaining 13 trades — still negative but no longer dominated by catastrophic tail. |
+| `MICRO_SYMBOL_BLOCKLIST_45M` | *(empty)* | Horizon currently disabled (`MICRO_HORIZON_45M_ENABLED=false`). |
+
+### 3. Fix: market regime classifier now works regardless of active signal
+
+The market regime detector (added 2026-05-19) hooked into `recordBtcLeadLagSnapshot`, which only fires when the active signal's BTC scan returns `ok=true`. With MR-1m active, BTC scans return `ok=false` ~100% of the time (no capitulation drop on BTC right now), so `meta.marketRegime` stayed `null` indefinitely.
+
+Fixed by adding `maybeUpdateMarketRegimeFromBars(pair, bars1m)` called from each signal wrapper (MR, MF, range-MR, barrier, microstructure, OLS) immediately after bars are fetched but BEFORE the signal evaluator runs. Now the regime updates on every BTC scan, regardless of which signal is active or whether the signal accepts the bar pattern. Still piggybacks on already-fetched bars; no extra Alpaca call.
+
+### 4. Doc: MR-15m stop-loss widening is exhausted
+
+The 2026-05-19 sweep at caps `[80, 120, 160, 200]` produced MR-15m expectancy `[−31.2, −27.9, −22.6, −22.5]`. The marginal improvement from 160 → 200 was 0.12 bps — the curve has converged at roughly −22.5 bps and **MR-15m will not flip positive via stop-loss widening alone.** Operators should freeze `MR_STOP_LOSS_BPS_15M` at its current value and look elsewhere for MR-15m edge (per-symbol blocklist would be the natural next try, mirroring the BCH-on-MR-1m and UNI/DOT-on-microstructure_30m discoveries).
+
+---
+
 ## 2026-05-20 add: market regime detector (Phase 1, observational)
 
 `backend/scripts/simulate_strategy.js` shows expectancy is **strongly negative in flat or adverse drift regimes** (−49 bps/trade flat, −1382 bps/trade adverse) and only positive under benign drift (+1 bps/trade at +0.5 bps/min). That table has been a static README reference — operators had no real-time read of "which row of the table are we in right now."

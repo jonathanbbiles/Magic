@@ -5,6 +5,8 @@ const {
   isPairBlocked,
   readMrBlocklistsFromEnv,
   isMrPairBlocked,
+  readMicroBlocklistsFromEnv,
+  isMicroPairBlocked,
 } = require('./symbolBlocklist');
 
 // 1. Empty string, null, undefined all → [].
@@ -124,6 +126,57 @@ const {
 {
   assert.equal(isMrPairBlocked('BCH/USD', '1m', null), false);
   assert.equal(isMrPairBlocked('BCH/USD', '1m', undefined), false);
+}
+
+// 13. readMicroBlocklistsFromEnv: reads all four micro horizons.
+{
+  const env = {
+    MICRO_SYMBOL_BLOCKLIST_30M: 'UNI/USD,DOT/USD,LTC/USD,BCH/USD,LINK/USD',
+    MICRO_SYMBOL_BLOCKLIST_15M: 'SOL/USD',
+  };
+  const b = readMicroBlocklistsFromEnv(env);
+  assert.equal(b.micro5m.size, 0);
+  assert.equal(b.micro15m.size, 1);
+  assert.ok(b.micro15m.has('SOL/USD'));
+  assert.equal(b.micro30m.size, 5);
+  assert.ok(b.micro30m.has('UNI/USD'));
+  assert.ok(b.micro30m.has('DOT/USD'));
+  assert.ok(b.micro30m.has('LTC/USD'));
+  assert.ok(b.micro30m.has('BCH/USD'));
+  assert.ok(b.micro30m.has('LINK/USD'));
+  assert.equal(b.micro45m.size, 0);
+}
+
+// 14. isMicroPairBlocked dispatches by horizon — critical because the
+//     2026-05-19 diagnostic showed different per-symbol losers at each
+//     horizon; a 30m blocklist should NOT silently apply to 15m.
+{
+  const b = readMicroBlocklistsFromEnv({
+    MICRO_SYMBOL_BLOCKLIST_30M: 'UNI/USD,DOT/USD',
+    MICRO_SYMBOL_BLOCKLIST_15M: 'SOL/USD',
+  });
+  assert.equal(isMicroPairBlocked('UNI/USD', 30, b), true);
+  assert.equal(isMicroPairBlocked('DOT/USD', 30, b), true);
+  assert.equal(isMicroPairBlocked('UNI/USD', 15, b), false, '15m blocklist does not include UNI');
+  assert.equal(isMicroPairBlocked('SOL/USD', 15, b), true);
+  assert.equal(isMicroPairBlocked('SOL/USD', 30, b), false);
+  assert.equal(isMicroPairBlocked('BTC/USD', 30, b), false);
+}
+
+// 15. isMicroPairBlocked: unknown horizon → false (degrades safely).
+{
+  const b = readMicroBlocklistsFromEnv({
+    MICRO_SYMBOL_BLOCKLIST_30M: 'UNI/USD',
+  });
+  assert.equal(isMicroPairBlocked('UNI/USD', 99, b), false);
+  assert.equal(isMicroPairBlocked('UNI/USD', null, b), false);
+  assert.equal(isMicroPairBlocked('UNI/USD', undefined, b), false);
+}
+
+// 16. isMicroPairBlocked: null blocklists → false (defensive).
+{
+  assert.equal(isMicroPairBlocked('UNI/USD', 30, null), false);
+  assert.equal(isMicroPairBlocked('UNI/USD', 30, undefined), false);
 }
 
 console.log('symbolBlocklist.test.js passed');

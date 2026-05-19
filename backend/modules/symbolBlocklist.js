@@ -42,10 +42,37 @@ function isMrPairBlocked(pair, timeframe, blocklists) {
   return isPairBlocked(pair, blocklists.mr1m);
 }
 
+// Per-horizon microstructure blocklists. Same pattern as MR — gate live
+// signal getter AND auto-backtest invocation by an identical set so the
+// selector validates the signal on the same universe the live engine will
+// actually trade. The 30m default is seeded with the symbols whose per-
+// trade expectancy was catastrophically negative in the 2026-05-19
+// dashboard snapshot (UNI -130, DOT -130, LTC -60, BCH -57, LINK -51).
+function readMicroBlocklistsFromEnv(env = process.env) {
+  return {
+    micro5m: blocklistAsSet(env.MICRO_SYMBOL_BLOCKLIST_5M),
+    micro15m: blocklistAsSet(env.MICRO_SYMBOL_BLOCKLIST_15M),
+    micro30m: blocklistAsSet(env.MICRO_SYMBOL_BLOCKLIST_30M),
+    micro45m: blocklistAsSet(env.MICRO_SYMBOL_BLOCKLIST_45M),
+  };
+}
+
+function isMicroPairBlocked(pair, horizonMinutes, blocklists) {
+  if (!blocklists) return false;
+  const h = Number(horizonMinutes);
+  if (h === 5) return isPairBlocked(pair, blocklists.micro5m);
+  if (h === 15) return isPairBlocked(pair, blocklists.micro15m);
+  if (h === 30) return isPairBlocked(pair, blocklists.micro30m);
+  if (h === 45) return isPairBlocked(pair, blocklists.micro45m);
+  return false;
+}
+
 module.exports = {
   parseSymbolBlocklist,
   blocklistAsSet,
   isPairBlocked,
   readMrBlocklistsFromEnv,
   isMrPairBlocked,
+  readMicroBlocklistsFromEnv,
+  isMicroPairBlocked,
 };
