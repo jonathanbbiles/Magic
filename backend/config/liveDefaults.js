@@ -368,6 +368,31 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD',
   MR_SYMBOL_BLOCKLIST_15M: '',
   RANGE_MR_SYMBOL_BLOCKLIST: '',
+  // Gate-rejection audit (2026-05-19). Observational shadow forward-test:
+  // captures every reject from scanAndEnter that has a valid quote, then
+  // N bars later fetches the 1m close to compute the realised forward bps.
+  // Aggregates per-reason at meta.gateRejectionAudit so operators can see
+  // which gates rejected candidates that would have been profitable.
+  // Default-ON because the capture+grade overhead is bounded (one fetch
+  // per symbol per minute, capped at 40 captures graded per cycle); the
+  // value of having a real "is the gate costing us money" answer beats
+  // the opportunity cost of running blind. Flip to 'false' in Render env
+  // to disable both capture and grading entirely.
+  GATE_REJECTION_AUDIT_ENABLED: 'true',
+  // Forward horizon in 1m bars. Default 20 mirrors the OLS/MR-1m backtester's
+  // predictBars=20, giving an apples-to-apples comparison against the same
+  // forward window used to evaluate signal expectancy. Operators wanting
+  // to grade barrier / microstructure setups (which target 1-6 h holds)
+  // can extend this — but the signal selector already gives those
+  // signals their own per-trade backtest expectancy, which is the better
+  // tool for that question.
+  GATE_REJECTION_AUDIT_FORWARD_BARS: '20',
+  GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS: '60000',
+  GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE: '40',
+  GATE_REJECTION_AUDIT_STALE_MIN: '360',
+  GATE_REJECTION_AUDIT_MIN_ENTRIES: '10',
+  GATE_REJECTION_AUDIT_COSTLY_BPS: '10',
+  GATE_REJECTION_AUDIT_JUSTIFIED_BPS: '-10',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));

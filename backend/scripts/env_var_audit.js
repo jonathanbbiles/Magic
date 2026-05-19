@@ -46,6 +46,7 @@ const NON_ENV_ALLOWLIST = new Set([
   'NON_ENV_ALLOWLIST',
   'SCHEMA_VERSION',
   'TIMEFRAMES',
+  'EXCLUDED_REASONS',
   // Internal JS local-variable names referenced by name in module headers
   'ACTIVE_SIGNAL_VERSION',
   'CALIBRATION_RELOAD_MS',

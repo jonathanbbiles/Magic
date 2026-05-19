@@ -44,6 +44,7 @@ const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
 const closedTradeStats = require('./modules/closedTradeStats');
+const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
 const runtimeConfig = getRuntimeConfig(process.env);
@@ -385,6 +386,16 @@ const FEATURE_LIBRARY_LOGGING_ENABLED = readBoolean('FEATURE_LIBRARY_LOGGING_ENA
 const FEATURE_INDICATORS_EXTENDED_ENABLED = readBoolean('FEATURE_INDICATORS_EXTENDED_ENABLED', true);
 const FEATURE_STATS_ENABLED = readBoolean('FEATURE_STATS_ENABLED', true);
 const FEATURE_STRUCTURE_ENABLED = readBoolean('FEATURE_STRUCTURE_ENABLED', true);
+
+// Gate-rejection audit (2026-05-19) — observational shadow forward-test of
+// rejected candidates. When ENABLED, every reject from inside scanAndEnter
+// that has a valid quote is captured with its mid-price and signal version;
+// the index.js grader fetches the 1m close N minutes later and aggregates
+// per-reason forward return so operators can see which gates rejected
+// candidates that would have been profitable. NEVER read by the live entry
+// path. Set GATE_REJECTION_AUDIT_ENABLED=false in Render env to disable
+// capture entirely (the grader in index.js also reads this flag).
+const GATE_REJECTION_AUDIT_ENABLED = readBoolean('GATE_REJECTION_AUDIT_ENABLED', true);
 
 // Per-timeframe MR symbol blocklists (2026-05-18). Filtered live; the
 // auto-backtest in index.js passes the same blocklists so the selector
@@ -1977,6 +1988,17 @@ function computeRollingSkipReasonCounts() {
   return counts;
 }
 
+// Per-iteration scan context for the gate-rejection audit. Set by
+// scanAndEnter at the top of each candidate iteration once a valid
+// bid/ask is in hand; cleared at iteration boundary. rejectTrade reads
+// this to capture the rejected candidate's mid-price + signal version
+// for later forward-bar grading. Module-level state (rather than a
+// per-call parameter) keeps the rejectTrade signature unchanged for
+// every existing caller.
+let currentScanAuditCandidate = null;
+function setScanAuditCandidate(candidate) { currentScanAuditCandidate = candidate; }
+function clearScanAuditCandidate() { currentScanAuditCandidate = null; }
+
 function rejectTrade(pair, reason, details = {}) {
   bumpSkipReason(reason);
   rollingSkipByReasonAndSymbol.push({ ts: Date.now(), symbol: pair || 'unknown', reason: reason || 'unknown' });
@@ -1984,6 +2006,25 @@ function rejectTrade(pair, reason, details = {}) {
     rollingSkipByReasonAndSymbol.shift();
   }
   console.log('entry_rejected', { symbol: pair, reason, ...details });
+
+  // Gate-rejection audit capture. Observational only — never affects the
+  // entry decision. Context is only set after a valid quote is bound, so
+  // early data-quality rejects (no_quote, stale_quote, etc.) fall through
+  // with `currentScanAuditCandidate=null` and are skipped. The module's
+  // own EXCLUDED_REASONS set is a second line of defence in case a future
+  // refactor moves a data-quality reject into the post-quote window.
+  if (GATE_REJECTION_AUDIT_ENABLED
+      && currentScanAuditCandidate
+      && currentScanAuditCandidate.symbol === pair) {
+    try {
+      gateRejectionAudit.capture({
+        symbol: pair,
+        reason,
+        midPx: currentScanAuditCandidate.midPx,
+        signalVersion: currentScanAuditCandidate.signalVersion,
+      });
+    } catch (_) { /* never fail the entry path on audit bookkeeping */ }
+  }
 }
 
 function getRejectionWindowStats() {
@@ -2460,6 +2501,11 @@ async function scanAndEnter() {
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
+    // Per-iteration: clear the gate-audit context from the previous symbol
+    // so a rejectTrade emitted before this iteration binds context can't
+    // mis-attribute the rejection. Bind happens inside the try block once
+    // a valid bid/ask is in hand.
+    clearScanAuditCandidate();
     // Phase 1: concurrent-position soft cap. Once we've placed enough buys
     // this scan to reach the soft cap, skip remaining candidates with a
     // diagnostic skip reason so the dashboard can show the cap is biting.
@@ -2494,6 +2540,25 @@ async function scanAndEnter() {
         // classifying it as stale solely due to provider timestamp lag.
       } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
       if (STALE_QUOTE_PRUNE_ENABLED && quoteFreshness.isPruned(pair)) { rejectTrade(pair, 'pruned_stale_quotes', { ageMs }); continue; }
+
+      // Bind the gate-audit context now that we have a freshness-passing
+      // quote. All subsequent rejects (spread_too_wide, prediction_rejected,
+      // near_recent_high, htf_*, projected_below_min, slope_not_positive,
+      // signal-internal reasons, etc.) get captured for forward-bar grading.
+      // Data-quality rejects above this line (no_quote/stale_quote/pruned)
+      // have already fired with no audit context and are also defended in
+      // depth by gateRejectionAudit.EXCLUDED_REASONS.
+      if (GATE_REJECTION_AUDIT_ENABLED) {
+        const auditBid = Number(quote.bp);
+        const auditAsk = Number(quote.ap);
+        if (Number.isFinite(auditBid) && Number.isFinite(auditAsk) && auditBid > 0 && auditAsk > 0) {
+          setScanAuditCandidate({
+            symbol: pair,
+            midPx: (auditBid + auditAsk) / 2,
+            signalVersion: ACTIVE_SIGNAL_VERSION,
+          });
+        }
+      }
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
@@ -3086,6 +3151,10 @@ async function scanAndEnter() {
   lastEntryScanSummary = summary;
   lastEntryScanAt = new Date().toISOString();
   currentScanState = 'idle';
+  // Defensive: clear the gate-audit context so a rejectTrade emitted from
+  // anywhere outside scanAndEnter (post-fill diagnostics, exit-manager
+  // rejects, etc.) doesn't mis-attribute to the last scanned symbol.
+  clearScanAuditCandidate();
   setEngineState('ready', 'scan_completed');
 }
 

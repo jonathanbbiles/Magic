@@ -113,6 +113,7 @@ const {
 } = require('./modules/mrStopLossSweep');
 const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
+const gateRejectionAudit = require('./modules/gateRejectionAudit');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -722,6 +723,41 @@ const PER_SYMBOL_AUDIT_LOOKBACK_TRADES = Math.max(
   PER_SYMBOL_AUDIT_MIN_ENTRIES,
   Number(process.env.PER_SYMBOL_AUDIT_LOOKBACK_TRADES) || 1000,
 );
+
+// Gate-rejection audit (2026-05-19). The capture happens inside trade.js;
+// the grader runs here on a periodic interval. Forward-bar horizon is
+// configured in bars (each bar = 1 minute) so a single integer maps
+// transparently to the user-facing "grade rejects against the 1m close
+// N minutes later" semantics. The grader fetches up to maxPerCycle
+// captures every gradeIntervalMs; expired pending (> staleMin minutes
+// old) are dropped without grading.
+const GATE_REJECTION_AUDIT_ENABLED = String(process.env.GATE_REJECTION_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
+const GATE_REJECTION_AUDIT_FORWARD_BARS = Math.max(
+  1,
+  Number(process.env.GATE_REJECTION_AUDIT_FORWARD_BARS) || 20,
+);
+const GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS = Math.max(
+  5000,
+  Number(process.env.GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS) || 60000,
+);
+const GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE = Math.max(
+  1,
+  Number(process.env.GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE) || 40,
+);
+const GATE_REJECTION_AUDIT_STALE_MIN = Math.max(
+  GATE_REJECTION_AUDIT_FORWARD_BARS,
+  Number(process.env.GATE_REJECTION_AUDIT_STALE_MIN) || 360,
+);
+const GATE_REJECTION_AUDIT_MIN_ENTRIES = Math.max(
+  1,
+  Number(process.env.GATE_REJECTION_AUDIT_MIN_ENTRIES) || 10,
+);
+const GATE_REJECTION_AUDIT_COSTLY_BPS = Number.isFinite(Number(process.env.GATE_REJECTION_AUDIT_COSTLY_BPS))
+  ? Number(process.env.GATE_REJECTION_AUDIT_COSTLY_BPS)
+  : 10;
+const GATE_REJECTION_AUDIT_JUSTIFIED_BPS = Number.isFinite(Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS))
+  ? Number(process.env.GATE_REJECTION_AUDIT_JUSTIFIED_BPS)
+  : -10;
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1636,6 +1672,36 @@ app.get('/dashboard', async (req, res) => {
             });
           } catch (err) {
             return { ranAt: new Date().toISOString(), sampleSize: 0, grid: [], outliers: [], error: err?.message };
+          }
+        })() : null,
+        // Gate-rejection audit (2026-05-19). Per-reason aggregate of forward
+        // bps for every reject the live engine captured during scanAndEnter.
+        // Operators read `costliestGates` to find gates that rejected
+        // candidates whose forward return was positive on average — the
+        // "did the gate cost us money" question the snapshot diagnostics
+        // cannot answer in isolation. Observational only.
+        gateRejectionAudit: GATE_REJECTION_AUDIT_ENABLED ? (() => {
+          try {
+            const audit = gateRejectionAudit.buildAudit({
+              config: {
+                minEntries: GATE_REJECTION_AUDIT_MIN_ENTRIES,
+                costlyThresholdBps: GATE_REJECTION_AUDIT_COSTLY_BPS,
+                justifiedThresholdBps: GATE_REJECTION_AUDIT_JUSTIFIED_BPS,
+              },
+            });
+            return {
+              ...audit,
+              forwardBars: GATE_REJECTION_AUDIT_FORWARD_BARS,
+              lastGradeResult: lastGateAuditGradeResult,
+            };
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              sampleSize: 0,
+              byReason: [],
+              costliestGates: [],
+              error: err?.message,
+            };
           }
         })() : null,
         connectionState: {
@@ -2675,6 +2741,39 @@ recordEquitySnapshot();
 setInterval(() => {
   recordEquitySnapshot();
 }, EQUITY_SNAPSHOT_MS);
+
+// Gate-rejection audit grader (2026-05-19). Walks the in-memory pending
+// captures every GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS, fetches the 1m
+// close at capture+forwardBars minutes, computes forward bps, and moves
+// the record into the graded buffer (also appended to disk for offline
+// analysis). Observational only — no entry path reads from this.
+let lastGateAuditGradeResult = null;
+async function runGateAuditGradeCycle() {
+  if (!GATE_REJECTION_AUDIT_ENABLED) return;
+  try {
+    const result = await gateRejectionAudit.gradePending({
+      fetchBars: fetchCryptoBars,
+      forwardHorizonMs: GATE_REJECTION_AUDIT_FORWARD_BARS * 60_000,
+      maxPerCycle: GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE,
+      staleAfterMs: GATE_REJECTION_AUDIT_STALE_MIN * 60_000,
+    });
+    lastGateAuditGradeResult = result;
+    if (result.graded > 0 || result.expired > 0) {
+      console.log('gate_audit_grade_cycle', result);
+    }
+  } catch (err) {
+    console.warn('gate_audit_grade_cycle_failed', { error: err?.message || err });
+  }
+}
+if (GATE_REJECTION_AUDIT_ENABLED) {
+  setInterval(runGateAuditGradeCycle, GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS);
+  console.log('gate_audit_grader_started', {
+    forwardBars: GATE_REJECTION_AUDIT_FORWARD_BARS,
+    gradeIntervalMs: GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS,
+    maxPerCycle: GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE,
+    staleMin: GATE_REJECTION_AUDIT_STALE_MIN,
+  });
+}
 
 bootstrapTrading().catch((err) => {
   console.error('bootstrap_step_failed', {

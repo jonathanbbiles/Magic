@@ -42,6 +42,28 @@ Reads `trade_forensics.jsonl`, joins entries (which now record `microstructureFe
 
 **Hard safety floor**: refuses to fit below 500 samples (`--min-samples`). The fit starts from `DEFAULT_WEIGHTS` as priors so a small-sample fit produces a small perturbation, not an overwrite. To roll back: delete `data/microstructure_weights.json` and restart. The script does not run automatically — calibration is an explicit operator action.
 
+---
+
+## 2026-05-19 add: gate-rejection audit (shadow forward-test)
+
+Answers the "did the gates cost us money" question that the snapshot diagnostics structurally can't: a gate that rejects candidates is invisible in expectancy numbers because those numbers are computed only on the gate-passing path. The audit captures every reject from `scanAndEnter` that has a valid quote (mid-price + signal version stored in `trade.js`'s module-level scan context), then `GATE_REJECTION_AUDIT_FORWARD_BARS` minutes later the index.js grader fetches the 1m close, computes the realised forward bps, and persists the graded record to `gate_rejection_audit.jsonl`. The dashboard surfaces a per-reason aggregate at `meta.gateRejectionAudit` with verdicts:
+
+- `gate_justified` — avg forward bps clearly negative (`< GATE_REJECTION_AUDIT_JUSTIFIED_BPS`, default −10). The gate rejected losers on average; the diagnostic supports keeping it.
+- `gate_costly` — avg forward bps clearly positive (`> GATE_REJECTION_AUDIT_COSTLY_BPS`, default +10). The gate rejected winners on average; the diagnostic is the evidence operators previously didn't have.
+- `noise` — avg forward bps within `[justified, costly]`. The gate isn't measurably costing or saving money over the audit window.
+- `insufficient_sample` — fewer than `GATE_REJECTION_AUDIT_MIN_ENTRIES` graded records (default 10).
+
+The aggregate ships an extra `bySignalAndReason` slice so the same reason (e.g. `near_recent_high`) can have a different verdict under different signals (e.g. `gate_costly` under OLS vs `gate_justified` under MR-1m). The top-level `costliestGates` array is the actionable list: gates currently graded as false-positive-prone, sorted worst-first.
+
+**Excluded reasons** (`gateRejectionAudit.EXCLUDED_REASONS`): `no_quote`, `stale_quote`, `pruned_stale_quotes`, `invalid_quote`, `invalid_ask`, `invalid_bid`, `invalid_spread`, `concurrent_position_cap`. These are data-quality / capital-constraint rejects with no trustworthy mid-price to grade against; including them would pollute aggregates with rejections that no gate tuning could fix.
+
+**Honest limitations**:
+- The forward horizon is a single value (default 20 min = matches the OLS/MR-1m `predictBars=20` backtester convention). For barrier / microstructure signals that target 1-6 h holds, this audit grades them on the wrong unit. The selector's per-signal backtest expectancy remains the right tool for those.
+- "Forward return at horizon" is a directional measure, not a simulation of the bot's actual TP/stop/breakeven exit structure. A gate that rejects a candidate whose mid-price rises +30 bps over 20 min is `gate_costly` by this audit, but the actual trade outcome depends on intra-bar path, staircase decay, and stop-loss timing.
+- Pending captures are in-memory only. Restarts lose ≤ `forwardHorizonMs` worth of captures (default 20 min). Graded records are persisted to disk and re-hydrated at boot so the dashboard aggregate survives across deploys.
+
+**Hard Rule #4 compliance**: the consumer is the dashboard meta plus the offline `gate_rejection_audit.jsonl` reader. No live entry decision reads from this module — verified by the wiring: `trade.js`'s `rejectTrade()` calls `gateRejectionAudit.capture()` AFTER the rejection is already final, and `scanAndEnter` never reads from the audit module.
+
 ### Env vars added in this PR
 
 | Env var | Default | Purpose |
@@ -59,6 +81,17 @@ Reads `trade_forensics.jsonl`, joins entries (which now record `microstructureFe
 | `BARRIER_DESIRED_NET_BPS` | `100` | Barrier signal per-trade net target. Wired through (previously hardcoded). |
 | `BARRIER_EV_MIN_BPS` | `-1` | Barrier signal EV gate floor. Wired through (previously hardcoded). |
 | `MICRO_STOP_VOL_MULT` | `2.5` | Microstructure `stopBps = max(floor, σ × this)`. Wired through (previously hardcoded). |
+| `GATE_REJECTION_AUDIT_ENABLED` | `true` | Master kill for the gate-rejection audit. Disables both capture and grading when false. |
+| `GATE_REJECTION_AUDIT_FORWARD_BARS` | `20` | Forward horizon in 1m bars. Mirrors backtester `predictBars=20`. |
+| `GATE_REJECTION_AUDIT_GRADE_INTERVAL_MS` | `60000` | How often the grader walks the pending captures. |
+| `GATE_REJECTION_AUDIT_MAX_GRADE_PER_CYCLE` | `40` | Cap on captures graded per cycle (Alpaca rate-limit budget). |
+| `GATE_REJECTION_AUDIT_STALE_MIN` | `360` | Pending captures older than this (minutes) are dropped without grading. |
+| `GATE_REJECTION_AUDIT_MIN_ENTRIES` | `10` | Sample-size floor before a (reason × signal) cell gets a verdict. |
+| `GATE_REJECTION_AUDIT_COSTLY_BPS` | `10` | avgForwardBps above this → `gate_costly` verdict. |
+| `GATE_REJECTION_AUDIT_JUSTIFIED_BPS` | `-10` | avgForwardBps below this → `gate_justified` verdict. |
+| `GATE_REJECTION_AUDIT_MAX_PENDING` | `5000` | In-memory pending-captures ring buffer cap. |
+| `GATE_REJECTION_AUDIT_MAX_GRADED_RECENT` | `10000` | In-memory graded-records cap (older still on disk). |
+| `GATE_REJECTION_AUDIT_HYDRATE_AT_BOOT` | `true` | Tail-read recent graded records from disk at module load. |
 
 ---
 
