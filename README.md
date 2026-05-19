@@ -1,5 +1,36 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: market regime detector (Phase 1, observational)
+
+`backend/scripts/simulate_strategy.js` shows expectancy is **strongly negative in flat or adverse drift regimes** (−49 bps/trade flat, −1382 bps/trade adverse) and only positive under benign drift (+1 bps/trade at +0.5 bps/min). That table has been a static README reference — operators had no real-time read of "which row of the table are we in right now."
+
+This PR adds a Phase 1 observational classifier that piggybacks on the existing BTC scan: every time `recordBtcLeadLagSnapshot` fires, it also computes OLS-slope drift + log-return σ over the last `MARKET_REGIME_LOOKBACK_BARS` (default 60) BTC closes, classifies into one of the simulator's five buckets, and stores it. The dashboard surfaces `meta.marketRegime = { regime, driftBpsPerMin, sigmaBpsPerMin, expectancyEstimate, ... }`.
+
+Classification rules (mirror `simulate_strategy.js`'s regime conventions):
+- `adverse` — drift ≤ −0.25 bps/min (simulator expectancy: **−1382 bps/trade**, worst case)
+- `benign` — drift ≥ +0.25 bps/min (simulator: **+1.00 bps/trade**, only profitable regime)
+- `flat` — drift between ±0.25 (simulator: −49 bps/trade)
+- `quiet` — flat drift + σ ≤ 6 bps/min (simulator: −51 bps/trade)
+- `wild` — flat drift + σ ≥ 20 bps/min (simulator: −55 bps/trade)
+- `insufficient_data` — fewer than 2 valid closes available
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MARKET_REGIME_DETECTOR_ENABLED` | `true` | Master kill — disables classification entirely; `meta.marketRegime` becomes `null`. |
+| `MARKET_REGIME_LOOKBACK_BARS` | `60` | Window length for drift + σ computation. Tracks the simulator's 60-min window convention. |
+| `MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN` | `0.25` | Drift threshold (inclusive) above which regime = benign. |
+| `MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN` | `-0.25` | Drift threshold (inclusive) below which regime = adverse. |
+| `MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN` | `6` | σ threshold (inclusive) below which flat-drift bars classify as quiet. |
+| `MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN` | `20` | σ threshold (inclusive) above which flat-drift bars classify as wild. |
+
+**Phase 1 = observational only.** NO entry gate, signal, or sizing decision reads `regime` in this PR. Confirmed by the wiring: `recordBtcLeadLagSnapshot` stores it; `meta.marketRegime` is the only consumer. The dashboard pairs each regime label with the simulator's expectancy for that regime so the operator sees both "we're in adverse" AND "the simulator estimates −1382 bps/trade for adverse" in one place.
+
+**Phase 2 (separate PR, not shipped here)** will wire a regime veto: when `regime === 'adverse'` over N consecutive snapshots, refuse all new entries until the regime label clears. That follow-up is intentionally split so the classifier's thresholds can be validated against live BTC bars — and against `closedTradeStats` realized expectancy by regime label — before any trading behaviour changes.
+
+**Hard Rule #4 compliance**: the classifier is wired (`marketRegimeDetector.summarizeRegime` is called from `recordBtcLeadLagSnapshot`; the result is surfaced at `meta.marketRegime`). It is NOT a stub knob. Phase 2's gate consumer is documented above as the planned follow-up.
+
+---
+
 ## 2026-05-20 add: microstructure trades-feed shadow observer
 
 The microstructure signal's `flowImbalance` feature requires Alpaca's `/v1beta3/crypto/{loc}/trades` feed. Until `MICRO_TRADES_ENABLED=true`, the live signal scores `flowImbalance=0` so the `w_flow=0.80` weight contributes nothing — exactly what CLAUDE.md documents. The validation problem was that an operator had no dashboard-side way to see what flow values the feed would produce **before** flipping the live flag.

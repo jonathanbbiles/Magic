@@ -41,6 +41,7 @@ const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
 const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
+const marketRegimeDetector = require('./modules/marketRegimeDetector');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
@@ -382,6 +383,35 @@ const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
 // operator can validate the trades feed before flipping the live flag.
 // Default on so validation data accumulates automatically.
 const MICRO_TRADES_SHADOW_ENABLED = readBoolean('MICRO_TRADES_SHADOW_ENABLED', true);
+
+// Market regime detector (Phase 1, 2026-05-20). Observational classifier
+// over recent BTC closes — labels current regime (adverse/benign/flat/
+// quiet/wild) and surfaces the simulator's expected per-trade bps for
+// that regime. NO entry decision reads this in Phase 1; the dashboard
+// is the only consumer. Phase 2 (separate PR) wires a regime veto on
+// adverse so the bot stops trading when the simulator says expectancy
+// is −1382 bps/trade. See backend/modules/marketRegimeDetector.js.
+const MARKET_REGIME_DETECTOR_ENABLED = readBoolean('MARKET_REGIME_DETECTOR_ENABLED', true);
+const MARKET_REGIME_LOOKBACK_BARS = Math.max(
+  2,
+  Math.floor(readNumber('MARKET_REGIME_LOOKBACK_BARS', marketRegimeDetector.DEFAULT_LOOKBACK_BARS)),
+);
+const MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN = readNumber(
+  'MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN',
+  marketRegimeDetector.DEFAULT_THRESHOLDS.benignDriftBpsPerMin,
+);
+const MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN = readNumber(
+  'MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN',
+  marketRegimeDetector.DEFAULT_THRESHOLDS.adverseDriftBpsPerMin,
+);
+const MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN = readNumber(
+  'MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN',
+  marketRegimeDetector.DEFAULT_THRESHOLDS.quietSigmaBpsPerMin,
+);
+const MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN = readNumber(
+  'MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN',
+  marketRegimeDetector.DEFAULT_THRESHOLDS.wildSigmaBpsPerMin,
+);
 // Stop = max(stopFloorBps, sigma · MICRO_STOP_VOL_MULT). stopFloorBps
 // comes from per-horizon HORIZON_DEFAULTS; this multiplier is shared
 // across horizons. Previously hardcoded; wired here so the README claim
@@ -1963,6 +1993,7 @@ const lastQuoteUpdateBySymbol = new Map();
 const BTC_LEAD_LAG_SYMBOL = 'BTC/USD';
 const BTC_LEAD_LAG_MAX_AGE_MS = 5 * 60 * 1000;
 let btcLeadLagSnapshot = null;
+let marketRegimeSnapshot = null;
 function recordBtcLeadLagSnapshot(sig) {
   if (!sig || !sig.ok) return;
   const closes = Array.isArray(sig.closes) ? sig.closes : [];
@@ -1981,12 +2012,37 @@ function recordBtcLeadLagSnapshot(sig) {
     volumeRatio: Number.isFinite(sig.volumeRatio) ? sig.volumeRatio : null,
     capturedAt: Date.now(),
   };
+  // Market regime classifier piggybacks on the BTC scan — same closes
+  // already in memory, no extra Alpaca call. Stored separately because
+  // the regime label is conceptually distinct from BTC lead-lag (which
+  // is alt-specific). Observational only; nothing reads this for gating.
+  if (MARKET_REGIME_DETECTOR_ENABLED && closes.length >= 2) {
+    try {
+      const summary = marketRegimeDetector.summarizeRegime({
+        closes,
+        lookbackBars: MARKET_REGIME_LOOKBACK_BARS,
+        thresholds: {
+          benignDriftBpsPerMin: MARKET_REGIME_BENIGN_DRIFT_BPS_PER_MIN,
+          adverseDriftBpsPerMin: MARKET_REGIME_ADVERSE_DRIFT_BPS_PER_MIN,
+          quietSigmaBpsPerMin: MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN,
+          wildSigmaBpsPerMin: MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN,
+        },
+      });
+      marketRegimeSnapshot = { ...summary, capturedAt: Date.now() };
+    } catch (_) { /* observational; never fatal */ }
+  }
 }
 function getBtcLeadLagSnapshot() {
   if (!btcLeadLagSnapshot) return null;
   const ageMs = Date.now() - btcLeadLagSnapshot.capturedAt;
   if (ageMs > BTC_LEAD_LAG_MAX_AGE_MS) return null;
   return { ...btcLeadLagSnapshot, ageMs };
+}
+function getMarketRegimeSnapshot() {
+  if (!marketRegimeSnapshot) return null;
+  const ageMs = Date.now() - marketRegimeSnapshot.capturedAt;
+  if (ageMs > BTC_LEAD_LAG_MAX_AGE_MS) return null;
+  return { ...marketRegimeSnapshot, ageMs };
 }
 
 let entryManagerRunning = false;
@@ -3963,6 +4019,7 @@ module.exports = {
   computeOrderbookImbalance,
   recordBtcLeadLagSnapshot,
   getBtcLeadLagSnapshot,
+  getMarketRegimeSnapshot,
   fetchCryptoBars,
   fetchStockQuotes,
   fetchStockTrades,

@@ -179,6 +179,7 @@ const {
   getActiveSignalVersion,
   getSignalSelectorDecision,
   getMicroFlowShadowTrackerSnapshot,
+  getMarketRegimeSnapshot,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -1760,6 +1761,22 @@ app.get('/dashboard', async (req, res) => {
         // keeps the live scoring path at flow=0. The dashboard surfaces
         // the rolling per-symbol distribution so operators can validate
         // the trades feed before flipping MICRO_TRADES_ENABLED live.
+        // Market regime classifier (Phase 1, observational). Reads the
+        // most recent BTC snapshot from trade.js and labels current
+        // drift × σ as one of the simulator's five regime buckets,
+        // alongside the simulator's expected per-trade bps for that
+        // regime. Lets operators see at a glance which row of the
+        // simulator table they're currently inside. No gate or signal
+        // reads this in Phase 1.
+        marketRegime: (() => {
+          try {
+            const snap = typeof getMarketRegimeSnapshot === 'function'
+              ? getMarketRegimeSnapshot() : null;
+            return snap || null;
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), regime: 'detector_failed', error: err?.message };
+          }
+        })(),
         microstructureFlowShadow: MICRO_TRADES_SHADOW_ENABLED ? (() => {
           try {
             const snapshot = typeof getMicroFlowShadowTrackerSnapshot === 'function'
