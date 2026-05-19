@@ -38,8 +38,9 @@ const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
-const { evaluateMicrostructureSignal } = require('./modules/microstructureSignal');
+const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
 const { fetchRecentTrades } = require('./modules/cryptoTrades');
+const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
@@ -373,6 +374,14 @@ const MICRO_EV_MIN_BPS = readNumber('MICRO_EV_MIN_BPS', 2);
 const MICRO_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('MICRO_TARGET_NET_BPS_FLOOR', 8));
 const MICRO_SIGNAL_TARGET_MAX_NET_BPS = Math.max(MICRO_TARGET_NET_BPS_FLOOR, readNumber('MICRO_SIGNAL_TARGET_MAX_NET_BPS', 150));
 const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
+// Shadow mode (2026-05-20): when true, recent trades are fetched and
+// flowImbalance is computed even when MICRO_TRADES_ENABLED=false, but
+// the value is observed-only — the live signal scoring path remains
+// flow=0 until MICRO_TRADES_ENABLED is flipped explicitly. The shadow
+// observations roll into the microstructureFlowShadow tracker so the
+// operator can validate the trades feed before flipping the live flag.
+// Default on so validation data accumulates automatically.
+const MICRO_TRADES_SHADOW_ENABLED = readBoolean('MICRO_TRADES_SHADOW_ENABLED', true);
 // Stop = max(stopFloorBps, sigma · MICRO_STOP_VOL_MULT). stopFloorBps
 // comes from per-horizon HORIZON_DEFAULTS; this multiplier is shared
 // across horizons. Previously hardcoded; wired here so the README claim
@@ -1834,22 +1843,35 @@ async function getBarrierSignalForPair(pair, quote = null) {
   }
 }
 
+// Shadow tracker for the trades-feed validation surface. Even when
+// MICRO_TRADES_ENABLED=false, MICRO_TRADES_SHADOW_ENABLED (default true)
+// causes recent trades to be fetched + flowImbalance observed so the
+// operator can validate the trades feed before flipping the live flag.
+// The tracker capacity intentionally exceeds the typical scan rate × 5
+// minutes so the dashboard window is meaningful across short outages.
+const microFlowShadowTracker = createMicroFlowShadowTracker({ windowSize: 500 });
+function getMicroFlowShadowTrackerSnapshot() {
+  return microFlowShadowTracker.snapshot();
+}
+
 // Microstructure signal wrapper. The signal needs 60 1m bars (RSI(14) +
 // 60-bar spread/sigma windows) plus the live quote (for spread + microprice)
 // and (optionally) the orderbook for the bookImbalance term. Pattern matches
 // the barrier wrapper — orderbook fetch is non-fatal, signal degrades to
-// neutral when missing. recentTrades stays null until Phase 2 wires a
-// /v1beta3/crypto/us/latest/trades consumer; the signal's tradesEnabled
-// config flag is gated by MICRO_TRADES_ENABLED env and silently returns
-// flowImbalance=0 in Phase 1 so the contribution is zero.
+// neutral when missing. When MICRO_TRADES_ENABLED=true the signal's
+// computeFlowImbalance uses real Lee-Ready aggressor data; when false the
+// scoring path uses flowImbalance=0 (Phase 1 behaviour). Independently,
+// MICRO_TRADES_SHADOW_ENABLED (default true) still fetches trades and logs
+// the flow value observationally — feeding the microFlowShadowTracker so
+// the dashboard surfaces it without touching live scoring.
 async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
   try {
-    // Phase 2 (2026-05-19): when MICRO_TRADES_ENABLED=true the recent
-    // trades fetch piggybacks on the existing bars+orderbook fan-out so
-    // there's no added scan latency vs the Phase 1 path. When disabled
-    // (the default), we skip the fetch entirely and the signal's
-    // computeFlowImbalance returns 0 — identical to the prior behavior.
-    const tradesFetch = MICRO_TRADES_ENABLED
+    // Fetch trades when EITHER live scoring or shadow observation is on.
+    // Shadow mode is default-on so validation data accumulates automatically;
+    // an operator who wants to skip the trades fetch entirely flips
+    // MICRO_TRADES_SHADOW_ENABLED=false in Render env.
+    const shouldFetchTrades = MICRO_TRADES_ENABLED || MICRO_TRADES_SHADOW_ENABLED;
+    const tradesFetch = shouldFetchTrades
       ? fetchRecentTrades({
           request: (args) => alpacaRequest({ base: 'data', ...args }),
           symbols: [pair],
@@ -1896,6 +1918,25 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
       },
     });
     if (sig && typeof sig === 'object') sig.featureBars = { bars1m, orderbook };
+    // Shadow observation: when trades were fetched but the live scoring
+    // path used flow=0 (i.e. shadow on, live off), still compute the flow
+    // value and record it so the dashboard tracker can show what the live
+    // signal "would have seen" if MICRO_TRADES_ENABLED were flipped.
+    // The recorded value is also exposed on sig.shadowFlowImbalance for
+    // any downstream telemetry that wants the per-decision number.
+    if (MICRO_TRADES_SHADOW_ENABLED && !MICRO_TRADES_ENABLED && Array.isArray(recentTrades)) {
+      try {
+        const shadowFlow = computeFlowImbalance(recentTrades, true);
+        microFlowShadowTracker.record({
+          ts: Date.now(),
+          symbol: pair,
+          horizonMinutes,
+          flowImbalance: shadowFlow,
+          tradesCount: recentTrades.length,
+        });
+        if (sig && typeof sig === 'object') sig.shadowFlowImbalance = shadowFlow;
+      } catch (_) { /* observational; never fatal */ }
+    }
     return sig;
   } catch (err) {
     return { ok: false, reason: 'microstructure_signal_failed', error: err?.message };
@@ -3893,6 +3934,7 @@ async function runDustCleanup() {
 module.exports = {
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getMicroFlowShadowTrackerSnapshot,
   resolveAlpacaAuth,
   getAlpacaAuthStatus,
   getAlpacaBaseStatus,

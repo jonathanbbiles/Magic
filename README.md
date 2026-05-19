@@ -1,5 +1,24 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: microstructure trades-feed shadow observer
+
+The microstructure signal's `flowImbalance` feature requires Alpaca's `/v1beta3/crypto/{loc}/trades` feed. Until `MICRO_TRADES_ENABLED=true`, the live signal scores `flowImbalance=0` so the `w_flow=0.80` weight contributes nothing — exactly what CLAUDE.md documents. The validation problem was that an operator had no dashboard-side way to see what flow values the feed would produce **before** flipping the live flag.
+
+This PR adds a shadow observer. With `MICRO_TRADES_SHADOW_ENABLED=true` (the default), every microstructure scan now also fetches recent trades and computes `computeFlowImbalance(trades, true)` — but the result is **observed-only**, written to `sig.shadowFlowImbalance` and rolled into a 500-entry tracker. The dashboard surfaces the rolling per-symbol distribution at `meta.microstructureFlowShadow` (mean, abs-mean, stddev, non-zero fraction) so operators can answer:
+
+1. **Is flow data actually arriving for the symbols I trade?** If `nonZeroFraction` is near 0, Alpaca's trades endpoint is silent and flipping `MICRO_TRADES_ENABLED=true` would do nothing — flag stays off.
+2. **When flow is non-zero, what's its directional distribution?** Mean/stddev tells whether flow is a signal worth wiring into scoring or noise centred on zero.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `MICRO_TRADES_SHADOW_ENABLED` | `true` | Master kill — when false, no trades fetch, no shadow tracker. |
+
+The live scoring path is unchanged: `MICRO_TRADES_ENABLED=false` still produces `flowImbalance=0` in `evaluateMicrostructureSignal`. The shadow value never feeds the score. Once an operator confirms via the dashboard that the feed is healthy and flow values look directional, the existing `MICRO_TRADES_ENABLED=true` flip becomes evidence-backed instead of a leap-of-faith Phase 2 transition.
+
+**Hard Rule #4 compliance**: the shadow value is consumed by the rolling tracker + `meta.microstructureFlowShadow`. No gate, signal, or sizing decision reads it. The fetch piggybacks on the existing `Promise.all` in `getMicrostructureSignalForPair`, so there's no added scan latency vs the pre-PR path when shadow is on.
+
+---
+
 ## 2026-05-20 add: microstructure calibration status diagnostic
 
 Phase 2 weight-fitting (`build_microstructure_weights.js`) refuses to fit below the `--min-samples=500` safety floor, but operators previously had no dashboard-side way to know how close the sample count was. This PR adds `meta.microstructureCalibration` with `samplesAvailable`, `samplesNeeded`, `ready`, and (when present) the on-disk weights file's metadata (sampleCount, accuracy, logLoss). Observational only — does NOT run the fit; operator action stays explicit by design.

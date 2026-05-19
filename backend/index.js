@@ -115,6 +115,7 @@ const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
+const microFlowShadow = require('./modules/microstructureFlowShadow');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -177,6 +178,7 @@ const {
   getEntryRegimeStaleThresholdMs,
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getMicroFlowShadowTrackerSnapshot,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -774,6 +776,13 @@ const MICRO_CALIBRATION_MIN_SAMPLES = Math.max(
 const MICRO_WEIGHTS_FILE_PATH = String(
   process.env.MICRO_WEIGHTS_FILE || './data/microstructure_weights.json',
 ).trim() || './data/microstructure_weights.json';
+
+// Microstructure trades-feed shadow tracker (2026-05-20). Mirrors trade.js's
+// MICRO_TRADES_SHADOW_ENABLED gate — when off, the meta field becomes null
+// to avoid surfacing a stale tracker that isn't being fed.
+const MICRO_TRADES_SHADOW_ENABLED = String(
+  process.env.MICRO_TRADES_SHADOW_ENABLED || 'true',
+).toLowerCase() !== 'false';
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1740,6 +1749,28 @@ app.get('/dashboard', async (req, res) => {
               samplesAvailable: 0,
               minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
               ready: false,
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Microstructure trades-feed shadow observer. When
+        // MICRO_TRADES_SHADOW_ENABLED=true (default), recent trades are
+        // fetched on every microstructure scan and flowImbalance is
+        // computed observationally — even when MICRO_TRADES_ENABLED=false
+        // keeps the live scoring path at flow=0. The dashboard surfaces
+        // the rolling per-symbol distribution so operators can validate
+        // the trades feed before flipping MICRO_TRADES_ENABLED live.
+        microstructureFlowShadow: MICRO_TRADES_SHADOW_ENABLED ? (() => {
+          try {
+            const snapshot = typeof getMicroFlowShadowTrackerSnapshot === 'function'
+              ? getMicroFlowShadowTrackerSnapshot() : [];
+            return microFlowShadow.buildShadowMeta({ snapshot });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              observedSamples: 0,
+              bySymbol: [],
+              overall: null,
               error: err?.message,
             };
           }
