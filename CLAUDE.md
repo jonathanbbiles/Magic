@@ -77,6 +77,32 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Gate-rejection per-symbol slice + trend warning + trade-feasibility audit (2026-05-20)
+
+Three observational additions surfacing intelligence latent in data the bot already collects.
+
+1. **`gateRejectionAudit.buildAudit().bySymbolAndReason`** — same data as `byReason`, bucketed by (symbol, reason). Surfaces per-symbol asymmetry that aggregate verdicts hide. Use to find e.g. "BCH alone is gate_costly for spread_too_wide while the aggregate is noise."
+
+2. **`gateRejectionAudit.buildAudit().trendingReasons`** — half-over-half trend classifier on each reason's avgForwardBps. Flags `trending_costly` / `trending_justified` before the aggregate avg crosses the verdict threshold, so an operator gets an early warning. Tunable via `DEFAULT_CONFIG.trendMinEntries / trendDeltaBps / trendNearBps` (not env-overridable; pinned in code).
+
+3. **`backend/modules/tradeFeasibilityAudit.js`** — pure aggregator over `rollingSkipByReasonAndSymbol` (already populated by `rejectTrade`). Surfaces per-symbol `feasibilityPct`, `topBlocker`, and `chronicallyInfeasible`. **Inferred scan count = max(rejections per symbol)** — correct as long as entries are rare (≤ 1/day today); add `entryHintCount` if a future high-frequency signal makes that assumption tight.
+
+   When extending: pass `universe: runtimeConfig.configuredPrimarySymbols` so symbols with zero rejection events still appear (they either traded or didn't get scanned — both worth surfacing distinctly from "no data").
+
+   Env vars: `TRADE_FEASIBILITY_AUDIT_ENABLED` (master kill), `TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT` (default 20), `TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS` (default 5).
+
+## Diagnostics-driven fixes (2026-05-20)
+
+Four targeted fixes from the 2026-05-19 live dashboard snapshot. Full rationale in `README.md`. Quick reference:
+
+1. **Stale-quote single-symbol retry** (`STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED`, default `true`). When prefetched quote is stale, retry once via single-symbol endpoint. Tracker at `meta.staleQuoteRetry`. Per-symbol recoveryRate < 10% means feed-wide staleness — blocklist that symbol or contact Alpaca.
+
+2. **Microstructure per-horizon blocklists** (`MICRO_SYMBOL_BLOCKLIST_{5M,15M,30M,45M}`). 30m default seeded with `UNI/USD,DOT/USD,LTC/USD,BCH/USD,LINK/USD` per 2026-05-19 per-symbol decomposition. Wired into both live signal getter and `runBacktestAndStore` so the selector sees the same universe. **Do NOT add symbols to the 5m/15m blocklist without per-symbol backtest evidence** — sample sizes there are still too small (≤2 trades/symbol).
+
+3. **`marketRegime` decoupled from `recordBtcLeadLagSnapshot`**. New helper `maybeUpdateMarketRegimeFromBars(pair, bars1m)` called from each signal wrapper after the bars fetch — fires regardless of which signal is active or whether the signal returned `ok=true`. Previously the regime detector was silently null whenever MR was active because MR returns `ok=false` for `mr_no_drop`. **When adding a new signal wrapper, call `maybeUpdateMarketRegimeFromBars` immediately after the bars fetch** — same wiring discipline as the feature library snapshot.
+
+4. **MR-15m stop-loss widening is empirically exhausted.** 2026-05-19 sweep settled the curve at `[80, 120, 160, 200] → [-31.2, -27.9, -22.6, -22.5]` bps. The 160 → 200 step moved expectancy by 0.12 bps — converged. **Do not tune `MR_STOP_LOSS_BPS_15M` further as a path to flipping MR-15m positive.** The asymptote at −22.5 bps means more stop room won't fix it. Per-symbol blocklist (BCH-on-MR-1m-style) is the only remaining lever to try; sweep retries are wasted compute.
+
 ## Per-timeframe MR stop caps (2026-05-17 Stage 3)
 
 The `deriveStopLossBps` function in `backend/trade.js` dispatches the MR stop cap by `signalVersion` (`mean_reversion`, `mean_reversion_5m`, `mean_reversion_15m`). Each timeframe has its own tier-1/2 + tier-3 cap pair:

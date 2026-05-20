@@ -254,9 +254,108 @@ function makeBars(startTsMs, count, priceFn = (i) => 100 + i) {
     assert.strictEqual(audit.sampleSize, 0);
     assert.deepStrictEqual(audit.byReason, []);
     assert.deepStrictEqual(audit.costliestGates, []);
+    assert.deepStrictEqual(audit.bySymbolAndReason, []);
+    assert.deepStrictEqual(audit.trendingReasons, []);
   }
 
-  console.log('gateRejectionAudit.test ok', { tests: 15 });
+  // 16. buildAudit: per-(reason × symbol) slice surfaces per-symbol asymmetry.
+  //     2026-05-20 spread_too_wide hypothesis: aggregated noise verdict can
+  //     hide a single symbol that's actually gate_costly. This test pins it.
+  clearForTests();
+  // 11 BCH spread_too_wide rejects + 11 BTC spread_too_wide rejects, but
+  // BCH's forward bps is much more positive (gate is costly for BCH only).
+  for (let i = 0; i < 11; i += 1) {
+    capture({ symbol: 'BCH/USD', reason: 'spread_too_wide', midPx: 100, signalVersion: 'mean_reversion', ts: new Date(NOW).toISOString() });
+  }
+  for (let i = 0; i < 11; i += 1) {
+    capture({ symbol: 'BTC/USD', reason: 'spread_too_wide', midPx: 100, signalVersion: 'mean_reversion', ts: new Date(NOW).toISOString() });
+  }
+  {
+    const fetchBars = async ({ symbols }) => {
+      const sym = symbols[0];
+      // BCH forward = +50 bps (clearly costly); BTC forward = -5 bps (noise band).
+      const c = sym === 'BCH/USD' ? 100.5 : 99.95;
+      return { bars: { [sym]: makeBars(NOW, 30, () => c) } };
+    };
+    await gradePending({ fetchBars, nowMs: NOW + 25 * 60_000, forwardHorizonMs: 20 * 60_000, maxPerCycle: 100 });
+    const audit = buildAudit({ nowMs: NOW + 25 * 60_000 });
+    const bchSlice = audit.bySymbolAndReason.find((r) => r.reason === 'spread_too_wide' && r.symbol === 'BCH/USD');
+    const btcSlice = audit.bySymbolAndReason.find((r) => r.reason === 'spread_too_wide' && r.symbol === 'BTC/USD');
+    assert.ok(bchSlice, 'BCH slice present');
+    assert.ok(btcSlice, 'BTC slice present');
+    assert.strictEqual(bchSlice.verdict, 'gate_costly', 'BCH alone is gate_costly');
+    assert.strictEqual(btcSlice.verdict, 'noise', 'BTC alone is noise');
+    // Aggregate byReason hides the asymmetry — verdict averaged across.
+    const agg = audit.byReason.find((r) => r.reason === 'spread_too_wide');
+    assert.ok(agg.entries === 22, 'aggregate has both');
+  }
+
+  // 17. classifyTrend: flags trending_costly when newer half is moving
+  //     toward the costly threshold and is close enough to it. This is the
+  //     early-warning surface — spread_too_wide at 4.6 bps trending up
+  //     should fire BEFORE it crosses +10.
+  {
+    const { classifyTrend, DEFAULT_CONFIG: CFG } = require('./gateRejectionAudit');
+    const cfg = { ...CFG };
+    // Build 80 records: 40 older at +2 bps avg, 40 newer at +6 bps avg.
+    // Delta = +4 bps (above trendDeltaBps=1.5).
+    // newerAvg = +6 bps, distance to costlyThresholdBps=10 is 4 (≤ trendNearBps=6).
+    const records = [];
+    for (let i = 0; i < 40; i += 1) {
+      records.push({ capturedTsMs: NOW + i * 1000, forwardBps: 2 + (i % 2 === 0 ? 0.1 : -0.1) });
+    }
+    for (let i = 0; i < 40; i += 1) {
+      records.push({ capturedTsMs: NOW + 1_000_000 + i * 1000, forwardBps: 6 + (i % 2 === 0 ? 0.1 : -0.1) });
+    }
+    const t = classifyTrend(records, cfg);
+    assert.ok(t, 'classifier returns result');
+    assert.strictEqual(t.trend, 'trending_costly');
+    assert.ok(t.delta > 3 && t.delta < 5, `delta in range, got ${t.delta}`);
+    assert.ok(t.distanceToCostlyBps > 3 && t.distanceToCostlyBps < 5, `distance computed, got ${t.distanceToCostlyBps}`);
+  }
+
+  // 18. classifyTrend: flags trending_justified when moving toward justified.
+  {
+    const { classifyTrend, DEFAULT_CONFIG: CFG } = require('./gateRejectionAudit');
+    const cfg = { ...CFG };
+    const records = [];
+    for (let i = 0; i < 40; i += 1) records.push({ capturedTsMs: NOW + i, forwardBps: -2 });
+    for (let i = 0; i < 40; i += 1) records.push({ capturedTsMs: NOW + 1_000_000 + i, forwardBps: -7 });
+    const t = classifyTrend(records, cfg);
+    assert.strictEqual(t.trend, 'trending_justified');
+  }
+
+  // 19. classifyTrend: returns null below sample size; returns 'stable'
+  //     when delta is too small to be meaningful.
+  {
+    const { classifyTrend, DEFAULT_CONFIG: CFG } = require('./gateRejectionAudit');
+    const cfg = { ...CFG };
+    assert.strictEqual(classifyTrend([], cfg), null, 'empty input');
+    assert.strictEqual(
+      classifyTrend(Array.from({ length: 10 }, () => ({ capturedTsMs: NOW, forwardBps: 5 })), cfg),
+      null,
+      'below sample size',
+    );
+    const flat = Array.from({ length: 100 }, (_, i) => ({ capturedTsMs: NOW + i, forwardBps: 5 + (i % 2) * 0.2 }));
+    const tFlat = classifyTrend(flat, cfg);
+    assert.strictEqual(tFlat.trend, 'stable', 'small delta → stable');
+  }
+
+  // 20. classifyTrend: trending NOT fired when newer half is far from the
+  //     threshold (avoid spurious flags on already-stable noise).
+  {
+    const { classifyTrend, DEFAULT_CONFIG: CFG } = require('./gateRejectionAudit');
+    const cfg = { ...CFG };
+    const records = [];
+    // Older -30, newer -20: delta +10, but newer is +30 bps away from
+    // costlyThresholdBps=10 (not within trendNearBps=6).
+    for (let i = 0; i < 40; i += 1) records.push({ capturedTsMs: NOW + i, forwardBps: -30 });
+    for (let i = 0; i < 40; i += 1) records.push({ capturedTsMs: NOW + 1_000_000 + i, forwardBps: -20 });
+    const t = classifyTrend(records, cfg);
+    assert.strictEqual(t.trend, 'stable', 'far from threshold → stable');
+  }
+
+  console.log('gateRejectionAudit.test ok', { tests: 20 });
 })().catch((err) => {
   console.error('gateRejectionAudit.test failed', err);
   process.exit(1);
