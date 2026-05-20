@@ -33,6 +33,19 @@
 // - Captures with no valid quote (no_quote, stale_quote,
 //   pruned_stale_quotes, invalid_*) are EXCLUDED because there's no
 //   trustworthy mid-price to grade against.
+// - SPREAD-BASED GATES (spread_too_wide and any spread_too_wide_tier*)
+//   are uniquely meaningless under this audit. The rejection reason IS
+//   the spread cost itself, but forwardBps is computed mid-to-mid and
+//   does NOT subtract the round-trip spread cost the rejection avoided.
+//   Example: a 60-bps spread at rejection costs ~30 bps round-trip; a
+//   +10 bps forward mid move still nets ~-20 bps after the actual entry
+//   cost. These reasons will frequently surface as "gate_costly" and
+//   propagate to operatorRecommendations.gate_costly_verdict — do NOT
+//   tune spread caps based on this audit. Use the live scorecard's
+//   avgEntrySpreadBps or a backtest with realistic spread-cost modelling
+//   instead. First observed 2026-05-20: spread_too_wide flagged
+//   gate_costly at +10.4 bps over 1758 rejections (driven by AVAX +
+//   BCH at 60-bps spreads).
 
 const fs = require('fs');
 const path = require('path');
