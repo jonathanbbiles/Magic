@@ -47,6 +47,14 @@ const DEFAULT_CONFIG = Object.freeze({
   // tightened independently of the alert thresholds.
   costlyThresholdBps: 10,    // avgForwardBps > this → gate_costly (gate refused a winner-on-average)
   justifiedThresholdBps: -10, // avgForwardBps < this → gate_justified (gate refused a loser-on-average)
+  // Trend detection (2026-05-20). For each reason with ≥ trendMinEntries
+  // graded records, split into older half + newer half by capturedAt.
+  // Flag `trending_costly` when newer.avgForwardBps − older.avgForwardBps
+  // exceeds trendDeltaBps AND newer.avgForwardBps is within trendNearBps
+  // of the costlyThresholdBps. Mirror for trending_justified.
+  trendMinEntries: 40,        // smaller halves than the verdict floor; trend is movement, not magnitude
+  trendDeltaBps: 1.5,         // minimum half-over-half movement to be a "trend" vs noise
+  trendNearBps: 6,            // newer half must be within this many bps of the costly/justified threshold
 });
 
 // Reasons EXCLUDED from audit. These represent data-quality / capital
@@ -348,10 +356,53 @@ function verdictFor(avgForwardBps, entries, cfg) {
   return 'noise';
 }
 
-// Build the dashboard payload. Aggregates graded records into per-reason
-// and per-(reason × signalVersion) summaries. Sort order: most-costly
-// first (highest avgForwardBps), so the dashboard top row is the single
-// most-actionable gate to investigate.
+// Per-reason trend classifier (2026-05-20). Splits a reason's graded
+// records into older / newer halves by capturedAt and flags movement
+// toward the costly / justified verdicts BEFORE the aggregate avgForwardBps
+// crosses the threshold. This is the early-warning surface — operator sees
+// "spread_too_wide is at +4.6 bps avg and the newer half is +1.8 bps
+// higher than the older half" before it crosses +10 and becomes
+// gate_costly. Returns null when sample is too small to be meaningful.
+function classifyTrend(records, cfg) {
+  if (!Array.isArray(records) || records.length < cfg.trendMinEntries * 2) return null;
+  const sorted = [...records]
+    .filter((r) => Number.isFinite(Number(r?.capturedTsMs)) && Number.isFinite(Number(r?.forwardBps)))
+    .sort((a, b) => Number(a.capturedTsMs) - Number(b.capturedTsMs));
+  if (sorted.length < cfg.trendMinEntries * 2) return null;
+  const half = Math.floor(sorted.length / 2);
+  const olderNets = sorted.slice(0, half).map((r) => Number(r.forwardBps));
+  const newerNets = sorted.slice(half).map((r) => Number(r.forwardBps));
+  const olderSummary = summarizeBucket(olderNets);
+  const newerSummary = summarizeBucket(newerNets);
+  if (!Number.isFinite(olderSummary.avgForwardBps) || !Number.isFinite(newerSummary.avgForwardBps)) {
+    return null;
+  }
+  const delta = newerSummary.avgForwardBps - olderSummary.avgForwardBps;
+  const distToCostly = cfg.costlyThresholdBps - newerSummary.avgForwardBps;
+  const distToJustified = newerSummary.avgForwardBps - cfg.justifiedThresholdBps;
+  let trend = 'stable';
+  if (delta >= cfg.trendDeltaBps && distToCostly <= cfg.trendNearBps && distToCostly > 0) {
+    trend = 'trending_costly';
+  } else if (delta <= -cfg.trendDeltaBps && distToJustified <= cfg.trendNearBps && distToJustified > 0) {
+    trend = 'trending_justified';
+  }
+  return {
+    trend,
+    delta,
+    olderAvgBps: olderSummary.avgForwardBps,
+    newerAvgBps: newerSummary.avgForwardBps,
+    olderEntries: olderSummary.entries,
+    newerEntries: newerSummary.entries,
+    distanceToCostlyBps: distToCostly,
+    distanceToJustifiedBps: distToJustified,
+  };
+}
+
+// Build the dashboard payload. Aggregates graded records into per-reason,
+// per-(reason × signalVersion), and per-(reason × symbol) summaries plus
+// the trend classifier. Sort order: most-costly first (highest
+// avgForwardBps), so the dashboard top row is the single most-actionable
+// gate to investigate.
 //
 // Returns:
 //   ranAt:            ISO timestamp
@@ -361,29 +412,41 @@ function verdictFor(avgForwardBps, entries, cfg) {
 //   config:           the effective verdict-threshold config
 //   byReason:         [{reason, entries, avgForwardBps, medianForwardBps, winRate, verdict}]
 //   bySignalAndReason:[{reason, signalVersion, entries, avgForwardBps, ..., verdict}]
+//   bySymbolAndReason:[{reason, symbol, entries, avgForwardBps, ..., verdict}] (2026-05-20)
 //   costliestGates:   subset of byReason where verdict === 'gate_costly',
 //                     sorted by avgForwardBps DESC (worst false-positive first)
+//   trendingReasons:  per-reason trend classifier output (2026-05-20)
 function buildAudit({ records, config = {}, nowMs = Date.now() } = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...(config || {}) };
   const rows = Array.isArray(records) ? records : graded;
   const byReasonBucket = new Map();
   const bySignalReasonBucket = new Map();
+  const bySymbolReasonBucket = new Map();
+  const byReasonRecords = new Map(); // for trend classifier: full record refs (need capturedTsMs)
   let horizon = null;
   for (const r of rows) {
     if (!r) continue;
     const reason = String(r.reason || 'unknown');
     const sig = r.signalVersion ? String(r.signalVersion) : '<unknown>';
+    const symbol = r.symbol ? String(r.symbol) : '<unknown>';
     const fwd = Number(r.forwardBps);
     if (!Number.isFinite(fwd)) continue;
     const h = Number(r.forwardHorizonMs);
     if (Number.isFinite(h)) horizon = h;
     if (!byReasonBucket.has(reason)) byReasonBucket.set(reason, []);
     byReasonBucket.get(reason).push(fwd);
+    if (!byReasonRecords.has(reason)) byReasonRecords.set(reason, []);
+    byReasonRecords.get(reason).push(r);
     const key2 = `${reason}|${sig}`;
     if (!bySignalReasonBucket.has(key2)) {
       bySignalReasonBucket.set(key2, { reason, signalVersion: sig, nets: [] });
     }
     bySignalReasonBucket.get(key2).nets.push(fwd);
+    const key3 = `${reason}|${symbol}`;
+    if (!bySymbolReasonBucket.has(key3)) {
+      bySymbolReasonBucket.set(key3, { reason, symbol, nets: [] });
+    }
+    bySymbolReasonBucket.get(key3).nets.push(fwd);
   }
 
   const byReason = [];
@@ -413,7 +476,40 @@ function buildAudit({ records, config = {}, nowMs = Date.now() } = {}) {
     return bb - aa;
   });
 
+  // Per-(reason × symbol) slice (2026-05-20). Surfaces per-symbol asymmetry
+  // hidden by the by-reason aggregate. The 2026-05-19 snapshot suggested
+  // spread_too_wide rejections were dominated by BCH + LTC; this slice
+  // proves or disproves that hypothesis without log-grepping.
+  const bySymbolAndReason = [];
+  for (const bucket of bySymbolReasonBucket.values()) {
+    const s = summarizeBucket(bucket.nets);
+    bySymbolAndReason.push({
+      reason: bucket.reason,
+      symbol: bucket.symbol,
+      ...s,
+      verdict: verdictFor(s.avgForwardBps, s.entries, cfg),
+    });
+  }
+  bySymbolAndReason.sort((a, b) => {
+    const aa = a.avgForwardBps == null ? -Infinity : a.avgForwardBps;
+    const bb = b.avgForwardBps == null ? -Infinity : b.avgForwardBps;
+    return bb - aa;
+  });
+
   const costliestGates = byReason.filter((r) => r.verdict === 'gate_costly');
+
+  // Per-reason trend detection (2026-05-20). Early warning surface — flags
+  // when a reason's avgForwardBps is moving toward the costly/justified
+  // threshold before it crosses, so the operator can intervene preemptively
+  // instead of waiting for the verdict to flip.
+  const trendingReasons = [];
+  for (const [reason, recs] of byReasonRecords.entries()) {
+    const t = classifyTrend(recs, cfg);
+    if (t && t.trend !== 'stable') {
+      trendingReasons.push({ reason, ...t });
+    }
+  }
+  trendingReasons.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
 
   return {
     ranAt: new Date(nowMs).toISOString(),
@@ -423,7 +519,9 @@ function buildAudit({ records, config = {}, nowMs = Date.now() } = {}) {
     config: { ...cfg },
     byReason,
     bySignalAndReason,
+    bySymbolAndReason,
     costliestGates,
+    trendingReasons,
   };
 }
 
@@ -448,5 +546,6 @@ module.exports = {
   findBarAtOrAfter,
   summarizeBucket,
   verdictFor,
+  classifyTrend,
   clearForTests,
 };

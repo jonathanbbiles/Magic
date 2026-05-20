@@ -2178,6 +2178,17 @@ function rejectTrade(pair, reason, details = {}) {
   }
 }
 
+// Snapshot of the rolling per-(symbol, reason) rejection buffer for
+// downstream aggregators (tradeFeasibilityAudit consumes this). Trims
+// expired entries first so the consumer always sees a current view.
+function getRollingSkipSnapshot() {
+  const cutoff = Date.now() - REJECTION_WINDOW_MS;
+  while (rollingSkipByReasonAndSymbol.length > 0 && rollingSkipByReasonAndSymbol[0].ts < cutoff) {
+    rollingSkipByReasonAndSymbol.shift();
+  }
+  return rollingSkipByReasonAndSymbol.slice();
+}
+
 function getRejectionWindowStats() {
   const cutoff = Date.now() - REJECTION_WINDOW_MS;
   while (rollingSkipByReasonAndSymbol.length > 0 && rollingSkipByReasonAndSymbol[0].ts < cutoff) rollingSkipByReasonAndSymbol.shift();
@@ -4094,6 +4105,7 @@ module.exports = {
   getSignalSelectorDecision,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
+  getRollingSkipSnapshot,
   resolveAlpacaAuth,
   getAlpacaAuthStatus,
   getAlpacaBaseStatus,

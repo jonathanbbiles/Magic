@@ -117,6 +117,7 @@ const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
 const microFlowShadow = require('./modules/microstructureFlowShadow');
 const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
+const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -182,6 +183,7 @@ const {
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
+  getRollingSkipSnapshot,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -786,6 +788,21 @@ const MICRO_WEIGHTS_FILE_PATH = String(
 const MICRO_TRADES_SHADOW_ENABLED = String(
   process.env.MICRO_TRADES_SHADOW_ENABLED || 'true',
 ).toLowerCase() !== 'false';
+
+// Trade-feasibility audit (2026-05-20). Per-symbol view of the
+// rolling rejection buffer — surfaces which symbols are chronically
+// blocked from reaching signal evaluation and what's blocking each.
+// Master kill flips meta.tradeFeasibility to null.
+const TRADE_FEASIBILITY_AUDIT_ENABLED = String(
+  process.env.TRADE_FEASIBILITY_AUDIT_ENABLED || 'true',
+).toLowerCase() !== 'false';
+const TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT = Number.isFinite(Number(process.env.TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT))
+  ? Number(process.env.TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT)
+  : tradeFeasibilityAudit.DEFAULT_CHRONIC_THRESHOLD_PCT;
+const TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS = Math.max(
+  1,
+  Number(process.env.TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS) || tradeFeasibilityAudit.DEFAULT_MIN_SYMBOL_REJECTIONS,
+);
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1779,6 +1796,31 @@ app.get('/dashboard', async (req, res) => {
             return { ranAt: new Date().toISOString(), regime: 'detector_failed', error: err?.message };
           }
         })(),
+        // Per-symbol trade feasibility audit (2026-05-20). Decomposes the
+        // "the bot isn't trading" question into per-symbol intelligence —
+        // for each symbol in the universe, what % of recent scans reached
+        // signal evaluation, what's the most common blocker, and is the
+        // symbol chronically infeasible (operator should consider universe
+        // blocklist / tier change / Alpaca support).
+        tradeFeasibility: TRADE_FEASIBILITY_AUDIT_ENABLED ? (() => {
+          try {
+            const snapshot = typeof getRollingSkipSnapshot === 'function'
+              ? getRollingSkipSnapshot() : [];
+            return tradeFeasibilityAudit.buildFeasibilityAudit({
+              rejections: snapshot,
+              chronicThresholdPct: TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT,
+              minSymbolRejections: TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS,
+              universe: runtimeConfig.configuredPrimarySymbols || null,
+            });
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              symbols: [],
+              chronicallyInfeasible: [],
+              error: err?.message,
+            };
+          }
+        })() : null,
         // Stale-quote single-symbol retry diagnostic (2026-05-20). Per-symbol
         // recoveryRate is the actionable number — < 10% means the retry isn't
         // helping for that symbol and the operator should consider blocklisting

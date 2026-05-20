@@ -77,6 +77,20 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Gate-rejection per-symbol slice + trend warning + trade-feasibility audit (2026-05-20)
+
+Three observational additions surfacing intelligence latent in data the bot already collects.
+
+1. **`gateRejectionAudit.buildAudit().bySymbolAndReason`** — same data as `byReason`, bucketed by (symbol, reason). Surfaces per-symbol asymmetry that aggregate verdicts hide. Use to find e.g. "BCH alone is gate_costly for spread_too_wide while the aggregate is noise."
+
+2. **`gateRejectionAudit.buildAudit().trendingReasons`** — half-over-half trend classifier on each reason's avgForwardBps. Flags `trending_costly` / `trending_justified` before the aggregate avg crosses the verdict threshold, so an operator gets an early warning. Tunable via `DEFAULT_CONFIG.trendMinEntries / trendDeltaBps / trendNearBps` (not env-overridable; pinned in code).
+
+3. **`backend/modules/tradeFeasibilityAudit.js`** — pure aggregator over `rollingSkipByReasonAndSymbol` (already populated by `rejectTrade`). Surfaces per-symbol `feasibilityPct`, `topBlocker`, and `chronicallyInfeasible`. **Inferred scan count = max(rejections per symbol)** — correct as long as entries are rare (≤ 1/day today); add `entryHintCount` if a future high-frequency signal makes that assumption tight.
+
+   When extending: pass `universe: runtimeConfig.configuredPrimarySymbols` so symbols with zero rejection events still appear (they either traded or didn't get scanned — both worth surfacing distinctly from "no data").
+
+   Env vars: `TRADE_FEASIBILITY_AUDIT_ENABLED` (master kill), `TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT` (default 20), `TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS` (default 5).
+
 ## Diagnostics-driven fixes (2026-05-20)
 
 Four targeted fixes from the 2026-05-19 live dashboard snapshot. Full rationale in `README.md`. Quick reference:
