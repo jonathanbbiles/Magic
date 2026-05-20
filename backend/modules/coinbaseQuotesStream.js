@@ -96,7 +96,10 @@ function createStream({
   let symbols = [];
   let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
   let reconnectTimer = null;
-  let perProductLastSeq = new Map();
+  // Coinbase's `sequence_num` increments per CHANNEL, not per product. Track
+  // a single value so gap detection reflects actual dropped messages on the
+  // ticker channel rather than the natural per-product interleaving.
+  let lastTickerSeqNum = null;
 
   function resolveWsFactory() {
     if (typeof wsFactory === 'function') return wsFactory;
@@ -127,6 +130,19 @@ function createStream({
 
   function handleTickerMessage(msg) {
     const seqNum = Number(msg.sequence_num);
+    // Gap detection runs ONCE per message (the channel-level sequence
+    // number jumped by more than 1), not per-ticker. The previous
+    // per-product check generated spurious "gaps" every time the channel
+    // emitted ticker events for different products consecutively — Coinbase
+    // emits ~5-30 ticker events per second across the universe, so any
+    // per-product previous-seq was almost always stale relative to the
+    // channel's monotonic counter.
+    if (Number.isFinite(seqNum)) {
+      if (Number.isFinite(lastTickerSeqNum) && seqNum > lastTickerSeqNum + 1) {
+        stats.sequenceGaps += 1;
+      }
+      lastTickerSeqNum = seqNum;
+    }
     const events = Array.isArray(msg.events) ? msg.events : [];
     for (const ev of events) {
       const tickers = Array.isArray(ev?.tickers) ? ev.tickers : [];
@@ -134,13 +150,6 @@ function createStream({
         const parsed = parseTicker(t);
         if (!parsed) continue;
         stats.tickerEventsReceived += 1;
-        const prevSeq = perProductLastSeq.get(parsed.alpacaSym);
-        if (Number.isFinite(seqNum) && Number.isFinite(prevSeq) && seqNum > prevSeq + 1) {
-          stats.sequenceGaps += 1;
-        }
-        if (Number.isFinite(seqNum)) {
-          perProductLastSeq.set(parsed.alpacaSym, seqNum);
-        }
         cache.set(parsed.alpacaSym, {
           bidPx: parsed.bidPx,
           askPx: parsed.askPx,

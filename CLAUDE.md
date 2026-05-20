@@ -380,13 +380,46 @@ The headline metric is `meta.secondaryFeedShadow.overall.symbolsWhereAlpacaStale
 
 **Extension discipline**: when adding more venues (Kraken, Binance.US, etc.) as tertiary feeds, follow the same singleton pattern — one stream module per venue, one shadow aggregator that consumes all of them. Do NOT modify `secondaryFeedShadow.js` to be venue-aware; keep the aggregator agnostic and let callers pass whichever venue's quote is canonical for their use case.
 
+## Cross-venue divergence gate (Phase B — 2026-05-20)
+
+The Phase A shadow proved (in ~23 minutes of live data) that Coinbase is fresh 100% of observations across every symbol while Alpaca's freshness ranges from 23.8% (XRP) to 96.8% (BTC), with median divergence ≤ 6 bps per symbol. Phase B uses that signal to catch a failure mode the stale-quote gate can't: **Alpaca's quote LOOKS fresh by timestamp but the price has drifted between the upstream tick and Alpaca's cache update**.
+
+Module: `backend/modules/crossVenueGate.js`. Pure decision function + singleton tracker.
+
+**Decision tree** (`evaluateCrossVenueGate`):
+- Coinbase quote unavailable → bypass (don't penalize Alpaca for our second-feed problems).
+- Coinbase quote older than `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS` → bypass (Coinbase has its own staleness this scan; cross-check is meaningless).
+- Alpaca quote unavailable/invalid → bypass (existing `stale_quote` / `pruned_stale_quotes` upstream handles it; don't fire twice).
+- Both fresh, `|divergenceBps|` within `CROSS_VENUE_MAX_DIVERGENCE_BPS` → pass.
+- Both fresh, divergence exceeds tolerance → reject with reason `cross_venue_divergence`.
+
+**Wiring**: `trade.js` calls `crossVenueGate.evaluateCrossVenueGate()` per symbol after the bid/ask validation passes and before signal evaluation. `crossVenueGate.record()` updates the singleton tracker regardless of whether the gate is enabled — that's how shadow stats accumulate. When `CROSS_VENUE_GATE_ENABLED=true`, `rejectTrade()` is called with reason `cross_venue_divergence`; that flows through `gateRejectionAudit` (the new reason is NOT in `EXCLUDED_REASONS`, so it gets forward-graded).
+
+**Shadow mode is the default**. The merge ships with `CROSS_VENUE_GATE_ENABLED=false`. The gate code path runs (so `meta.crossVenueGate.overall.wouldHaveRejected` accumulates) but `rejectTrade` is NOT called. Operator flips to `true` only after ≥ 50 wouldHaveRejected events have been graded by `gateRejectionAudit.byReason.cross_venue_divergence` — same operator workflow as the Phase 2 regime-aware veto.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `CROSS_VENUE_GATE_ENABLED` | `false` | Master kill. When false, gate runs in shadow mode (records stats, no rejections). When true, also calls `rejectTrade('cross_venue_divergence', ...)`. |
+| `CROSS_VENUE_MAX_DIVERGENCE_BPS` | `25` | Absolute mid-to-mid divergence threshold. Phase A median divergence per-symbol was 0.3-6 bps; 25 bps is ~4x the typical noise floor — protective without firing on natural cross-venue drift. |
+| `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS` | `10000` | Coinbase quote must be at most this old for the cross-check to evaluate. 10s matches Coinbase's typical Phase A age (sub-second to a few seconds). |
+
+**Operator workflow to flip live**:
+1. After PR merge, leave `CROSS_VENUE_GATE_ENABLED=false`. The gate code runs; `meta.crossVenueGate.overall.wouldHaveRejected` accumulates.
+2. After ≥ 50 wouldHaveRejected events, check `meta.gateRejectionAudit.byReason` for `cross_venue_divergence`:
+   - `avgForwardBps < -10` → gate would have refused losers → `gate_justified` → flip `CROSS_VENUE_GATE_ENABLED=true`.
+   - `avgForwardBps > +10` → gate would have refused winners → `gate_costly` → don't flip; tighten `CROSS_VENUE_MAX_DIVERGENCE_BPS` or abandon the gate.
+   - Noise band → keep collecting.
+3. Once live, monitor `meta.crossVenueGate.overall.actuallyRejected` and the gate's forward-grade verdict for drift.
+
+**When extending**: the decision function is pure — never mock the Coinbase stream; just construct synthetic `{alpacaQuote, coinbaseQuote}` inputs. See `crossVenueGate.test.js` for 12 worked examples covering both-fresh / Coinbase-stale / Alpaca-unavailable / shape-tolerance / direction-symmetry / tracker bookkeeping.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
-- Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS)
+- Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default)
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`

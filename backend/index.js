@@ -121,6 +121,7 @@ const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
 const operatorRecommendations = require('./modules/operatorRecommendations');
 const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
+const crossVenueGate = require('./modules/crossVenueGate');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -803,6 +804,14 @@ const SECONDARY_FEED_FRESH_THRESHOLD_MS = Math.max(
   1000,
   Number(process.env.SECONDARY_FEED_FRESH_THRESHOLD_MS) || 30000,
 );
+// Phase B: cross-venue divergence gate. Default OFF (shadow mode only).
+// Meta surface always renders when SECONDARY_FEED_ENABLED is true so the
+// operator can observe `wouldHaveRejected` stats before flipping the gate
+// live. When SECONDARY_FEED_ENABLED is false, the gate is structurally
+// inert (trade.js doesn't call it) so the meta surface is null.
+const CROSS_VENUE_GATE_ENABLED = String(
+  process.env.CROSS_VENUE_GATE_ENABLED || 'false',
+).toLowerCase() === 'true';
 
 // Trade-feasibility audit (2026-05-20). Per-symbol view of the
 // rolling rejection buffer — surfaces which symbols are chronically
@@ -1929,6 +1938,26 @@ app.get('/dashboard', async (req, res) => {
               overall: null,
               bySymbol: [],
               streamStats: null,
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Cross-venue divergence gate (Phase B — 2026-05-20). Shadow stats
+        // when CROSS_VENUE_GATE_ENABLED=false, live stats when true. Null
+        // when SECONDARY_FEED_ENABLED is off (gate code path doesn't run).
+        crossVenueGate: SECONDARY_FEED_ENABLED ? (() => {
+          try {
+            const summary = crossVenueGate.buildSummary();
+            return {
+              ...summary,
+              gateEnabled: CROSS_VENUE_GATE_ENABLED,
+            };
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              overall: null,
+              bySymbol: [],
+              gateEnabled: CROSS_VENUE_GATE_ENABLED,
               error: err?.message,
             };
           }

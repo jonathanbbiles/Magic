@@ -143,31 +143,44 @@ function makeFakeWs() {
   delete process.env.SECONDARY_FEED_ENABLED;
 }
 
-// 8. Sequence-gap detection increments the counter.
+// 8. Sequence-gap detection increments per-channel (not per-product).
+//    Regression: the previous per-product check generated false gaps every
+//    time consecutive ticker events were for different products. Coinbase's
+//    sequence_num is per-channel; gaps mean dropped messages on the ticker
+//    channel itself, which can affect any/all products.
 {
   process.env.SECONDARY_FEED_ENABLED = 'true';
   const fakeWs = makeFakeWs();
   const stream = createStream({ wsFactory: () => fakeWs });
-  stream.start({ symbols: ['BTC/USD'] });
+  stream.start({ symbols: ['BTC/USD', 'ETH/USD'] });
   fakeWs._fire('open');
 
-  // First message: seq=1, establishes baseline
+  // Three contiguous messages across two products → 0 gaps.
   fakeWs._fire('message', JSON.stringify({
     channel: 'ticker', sequence_num: 1,
     events: [{ tickers: [{ product_id: 'BTC-USD', best_bid: '60000', best_ask: '60010' }] }],
   }));
-  assert.strictEqual(stream.getStats().sequenceGaps, 0);
-
-  // Second message: seq=2, contiguous, no gap
   fakeWs._fire('message', JSON.stringify({
     channel: 'ticker', sequence_num: 2,
+    events: [{ tickers: [{ product_id: 'ETH-USD', best_bid: '3000', best_ask: '3001' }] }],
+  }));
+  fakeWs._fire('message', JSON.stringify({
+    channel: 'ticker', sequence_num: 3,
     events: [{ tickers: [{ product_id: 'BTC-USD', best_bid: '60001', best_ask: '60011' }] }],
   }));
-  assert.strictEqual(stream.getStats().sequenceGaps, 0);
+  assert.strictEqual(stream.getStats().sequenceGaps, 0,
+    'contiguous channel-level seqs across different products should NOT count as gaps');
 
-  // Third message: seq=10, gap of 8
+  // Fourth message at seq=10 → channel-level gap of 6.
   fakeWs._fire('message', JSON.stringify({
     channel: 'ticker', sequence_num: 10,
+    events: [{ tickers: [{ product_id: 'ETH-USD', best_bid: '3002', best_ask: '3003' }] }],
+  }));
+  assert.strictEqual(stream.getStats().sequenceGaps, 1);
+
+  // Fifth message at seq=11 → contiguous, no new gap.
+  fakeWs._fire('message', JSON.stringify({
+    channel: 'ticker', sequence_num: 11,
     events: [{ tickers: [{ product_id: 'BTC-USD', best_bid: '60002', best_ask: '60012' }] }],
   }));
   assert.strictEqual(stream.getStats().sequenceGaps, 1);
