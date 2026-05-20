@@ -118,6 +118,7 @@ const microCalibrationStatus = require('./modules/microstructureCalibrationStatu
 const microFlowShadow = require('./modules/microstructureFlowShadow');
 const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
 const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
+const operatorRecommendations = require('./modules/operatorRecommendations');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -804,6 +805,13 @@ const TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS = Math.max(
   1,
   Number(process.env.TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS) || tradeFeasibilityAudit.DEFAULT_MIN_SYMBOL_REJECTIONS,
 );
+
+// Operator recommendations synthesizer (2026-05-20 PM). Reads from the
+// other meta diagnostics and produces a prioritised "today's action list".
+// Pure presentation layer — no live trading decision reads from this.
+const OPERATOR_RECOMMENDATIONS_ENABLED = String(
+  process.env.OPERATOR_RECOMMENDATIONS_ENABLED || 'true',
+).toLowerCase() !== 'false';
 
 // 2026-05-17 Stage 3 sweep: at each restart, run the MR-5m and MR-15m
 // backtest at three stop-loss caps so the dashboard can show the
@@ -1869,6 +1877,60 @@ app.get('/dashboard', async (req, res) => {
               overall: null,
               error: err?.message,
             };
+          }
+        })() : null,
+        // Operator recommendations synthesizer (2026-05-20 PM). Pure
+        // aggregator over the other diagnostic fields — generates a
+        // prioritised "today's action list" for phone-first operators.
+        // Re-computes the source diagnostics so it sees the freshest
+        // state at this exact dashboard build moment; the per-builder
+        // cost is bounded (all pure aggregators over small data).
+        operatorRecommendations: OPERATOR_RECOMMENDATIONS_ENABLED ? (() => {
+          try {
+            const buildSafe = (fn, fallback) => {
+              try { return fn(); } catch (_) { return fallback; }
+            };
+            const recsMarketRegime = buildSafe(() => (typeof getMarketRegimeSnapshot === 'function' ? getMarketRegimeSnapshot() : null), null);
+            const recsMarketRegimeVeto = buildSafe(() => (typeof getRegimeVetoState === 'function' ? getRegimeVetoState() : null), null);
+            const recsTradeFeasibility = TRADE_FEASIBILITY_AUDIT_ENABLED ? buildSafe(() => {
+              const snap = typeof getRollingSkipSnapshot === 'function' ? getRollingSkipSnapshot() : [];
+              return tradeFeasibilityAudit.buildFeasibilityAudit({
+                rejections: snap,
+                chronicThresholdPct: TRADE_FEASIBILITY_CHRONIC_THRESHOLD_PCT,
+                minSymbolRejections: TRADE_FEASIBILITY_MIN_SYMBOL_REJECTIONS,
+                universe: runtimeConfig.configuredPrimarySymbols || null,
+              });
+            }, null) : null;
+            const recsStaleQuoteRetry = buildSafe(() => {
+              const snap = typeof getStaleQuoteRetryTrackerSnapshot === 'function' ? getStaleQuoteRetryTrackerSnapshot() : [];
+              return staleQuoteRetryStats.buildRetryStats({ snapshot: snap });
+            }, null);
+            const recsGateRejectionAudit = GATE_REJECTION_AUDIT_ENABLED ? buildSafe(() => gateRejectionAudit.buildAudit({
+              config: {
+                minEntries: GATE_REJECTION_AUDIT_MIN_ENTRIES,
+                costlyThresholdBps: GATE_REJECTION_AUDIT_COSTLY_BPS,
+                justifiedThresholdBps: GATE_REJECTION_AUDIT_JUSTIFIED_BPS,
+              },
+            }), null) : null;
+            const recsSignalSelector = buildSafe(() => {
+              if (typeof getSignalSelectorDecision !== 'function') return null;
+              const d = getSignalSelectorDecision();
+              return d ? {
+                signalVersion: d.signalVersion,
+                tradingVeto: d.tradingVeto,
+                activeNetBps: d.activeNetBps,
+              } : null;
+            }, null);
+            return operatorRecommendations.buildRecommendations({
+              marketRegime: recsMarketRegime,
+              marketRegimeVeto: recsMarketRegimeVeto,
+              tradeFeasibility: recsTradeFeasibility,
+              staleQuoteRetry: recsStaleQuoteRetry,
+              gateRejectionAudit: recsGateRejectionAudit,
+              signalSelector: recsSignalSelector,
+            });
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), count: 0, bySeverity: {}, recommendations: [], error: err?.message };
           }
         })() : null,
         connectionState: {
