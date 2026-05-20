@@ -77,6 +77,25 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Phase 2 regime-aware veto (2026-05-20 PM)
+
+The observational regime classifier (shipped 2026-05-20 AM, `backend/modules/marketRegimeDetector.js`) is now wired as an opt-in entry gate via `backend/modules/regimeVetoEvaluator.js`. Quick reference:
+
+- **Default-OFF.** `MARKET_REGIME_VETO_ENABLED=false` means the veto path runs but does NOT reject — `regimeVetoState.wouldHaveVetoed` increments instead. The operator flips on once `meta.marketRegimeVeto.wouldHaveVetoed` has accumulated evidence + the `gateRejectionAudit.byReason` for `regime_veto_adverse` shows the gate would be `gate_justified` (rejected losers).
+- **Placement: post-signal.** Veto check fires AFTER `if (!sig.ok)` in `scanAndEnter` so only would-be entries get vetoed. Pre-signal placement would clog the audit with rejections that `mr_no_drop` would have caught anyway.
+- **Consecutive-duration requirement.** `MARKET_REGIME_VETO_CONSECUTIVE_MS` (default 5 min) prevents single-flicker churn. Tracked via `marketRegimeSnapshot.consecutiveStartedAt`, refreshed only when the regime label changes (`regimeVetoEvaluator.trackConsecutiveStart`).
+- **Snapshot freshness guard.** `MARKET_REGIME_VETO_MAX_AGE_MS` (default 60s) refuses to veto on a stale label (e.g. BTC scan failed). When the snapshot is stale, the veto path returns `{ shouldVeto: false }` regardless of label.
+- **Reason captured for forward-grading.** `regime_veto_<label>` is NOT in `gateRejectionAudit.EXCLUDED_REASONS`, so vetoed candidates get forward-graded. The `bySymbolAndReason` slice will surface per-symbol effectiveness once enough vetoes have accumulated.
+
+**Operator workflow to validate then flip live:**
+1. Leave `MARKET_REGIME_VETO_ENABLED=false` and watch `meta.marketRegimeVeto.wouldHaveVetoed` for a week.
+2. After 50+ wouldHaveVetoed events, check `meta.gateRejectionAudit.byReason` for `regime_veto_adverse`:
+   - If `avgForwardBps < -10` → `gate_justified` → flip `MARKET_REGIME_VETO_ENABLED=true`.
+   - If `avgForwardBps > +10` → `gate_costly` → don't flip; regime thresholds need tuning.
+   - If noise band → keep collecting data.
+
+**When extending:** the evaluator is a pure function — never mock the regime detector; just construct synthetic `{ regime, snapshotAgeMs, consecutiveStartedAt }` inputs. See `regimeVetoEvaluator.test.js` for examples.
+
 ## Gate-rejection per-symbol slice + trend warning + trade-feasibility audit (2026-05-20)
 
 Three observational additions surfacing intelligence latent in data the bot already collects.

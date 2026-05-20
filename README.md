@@ -1,5 +1,64 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: Phase 2 regime-aware entry veto (opt-in)
+
+Wires the existing observational `marketRegimeDetector` (shipped 2026-05-20 morning) as an actual entry gate. **Default OFF** — opt-in by env so behavior is unchanged until an operator flips it on with evidence. When OFF, the live engine still tracks a `wouldHaveVetoed` counter so the operator gets continuous evidence of how often the veto path would have fired.
+
+### Why this matters
+
+The 2026-05-20 03:00 live snapshot showed `meta.marketRegime: "adverse"` with `expectancyEstimate.bpsPerTrade: -1382` — the simulator's catastrophic regime. Pre-PR, the bot's entry gates had no awareness of this label: the selector still admitted MR-1m entries based on a 30-day average that mixed all regime types. The Phase 2 veto closes that gap by refusing entries whose current regime is one the operator has designated unsafe — but only after the regime has held that label for ≥ `MARKET_REGIME_VETO_CONSECUTIVE_MS` (default 5 min) so a single-snapshot flicker doesn't cause veto-on/off churn.
+
+### How the gate fires
+
+Placement is **after signal evaluation passes** (`sig.ok === true`). Reason behind this placement:
+- `mr_no_drop` and other signal-internal rejections already filter ~99% of scans. Vetoing pre-signal would clog the `gateRejectionAudit` with rejections the signal would have rejected anyway.
+- Placing the veto post-signal means the rejection captures **would-be entries** specifically — the gate-rejection audit forward-grades each veto-rejected candidate against its 20-min realised return, giving us empirical evidence of whether the veto is `gate_justified` (rejected losers) or `gate_costly` (rejected winners).
+
+The reason is `regime_veto_<label>` (e.g. `regime_veto_adverse`). The reason is NOT in `gateRejectionAudit.EXCLUDED_REASONS`, so it gets graded automatically.
+
+### Default-off "dark mode"
+
+When `MARKET_REGIME_VETO_ENABLED=false` (the default), the veto path runs but does NOT reject the entry. Instead, `regimeVetoState.wouldHaveVetoed` increments. Over time this counter accumulates the evidence:
+
+- If `wouldHaveVetoed` stays at 0 after weeks: regime never spends ≥ 5 min in `adverse` while an entry is otherwise eligible → veto is a no-op, don't bother flipping.
+- If `wouldHaveVetoed` grows steadily AND those candidates' forward returns (via `gateRejectionAudit.byReason` filtered to `regime_veto_*`) are net-negative: veto would have saved losses → flip to ON.
+- If `wouldHaveVetoed` grows AND forward returns are net-positive: veto would have rejected winners → don't flip, refine the regime thresholds.
+
+This is the same Phase 1 → Phase 2 validation pattern used for microstructure and the feature library.
+
+### Env vars
+
+| Env | Default | Purpose |
+|---|---|---|
+| `MARKET_REGIME_VETO_ENABLED` | `false` | Master switch. When `false`, only `wouldHaveVetoed` increments. |
+| `MARKET_REGIME_VETO_REGIMES` | `adverse` | Comma-separated regime labels that trigger veto. Valid labels: `adverse`, `benign`, `flat`, `quiet`, `wild` (`benign` would be perverse; included for completeness). |
+| `MARKET_REGIME_VETO_CONSECUTIVE_MS` | `300000` (5 min) | Regime must hold its veto label continuously for at least this long before veto fires. |
+| `MARKET_REGIME_VETO_MAX_AGE_MS` | `60000` | Regime snapshot must be fresher than this — refuses to veto on a stale label (e.g. BTC scan failing). |
+
+### Dashboard surface
+
+`meta.marketRegimeVeto`:
+```json
+{
+  "enabled": false,
+  "config": { "vetoRegimes": ["adverse"], "consecutiveMs": 300000, "maxSnapshotAgeMs": 60000 },
+  "vetoed": 0,
+  "wouldHaveVetoed": 0,
+  "lastDecision": null
+}
+```
+
+`wouldHaveVetoed` is the actionable counter when the veto is off; `vetoed` is the actionable counter when on. `lastDecision` exposes the most recent veto-trigger event for log correlation.
+
+### Hard Rule #4 compliance
+
+The module wiring is real, not a stub:
+- `regimeVetoEvaluator.js` is pure; tested in isolation.
+- `scanAndEnter` calls the evaluator after `sig.ok` check; when veto enabled, `rejectTrade(pair, decision.reason, ...)` is invoked with the regime label and consecutive duration in the details payload. The `gateRejectionAudit` captures these rejections for forward-grading because `regime_veto_*` is not in `EXCLUDED_REASONS`.
+- When veto disabled, the same evaluator runs and `wouldHaveVetoed` increments — no rejection, no audit capture, but the evidence trail accumulates in the counter.
+
+---
+
 ## 2026-05-20 add: gate-rejection per-symbol slice + trend warning + trade-feasibility audit
 
 A 3-piece diagnostic improvement targeting "the bot isn't trading" intelligence the dashboard couldn't surface before. All observational; no entry-decision changes.

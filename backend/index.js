@@ -184,6 +184,7 @@ const {
   getMarketRegimeSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
   getRollingSkipSnapshot,
+  getRegimeVetoState,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -1821,6 +1822,20 @@ app.get('/dashboard', async (req, res) => {
             };
           }
         })() : null,
+        // Regime-aware veto state (2026-05-20 Phase 2). Surfaces whether
+        // the veto is enabled, how many entries it has actually vetoed,
+        // and how many it WOULD have vetoed when disabled — operator
+        // reads `wouldHaveVetoed` over time to decide whether to flip
+        // MARKET_REGIME_VETO_ENABLED=true with evidence.
+        marketRegimeVeto: (() => {
+          try {
+            return typeof getRegimeVetoState === 'function'
+              ? getRegimeVetoState()
+              : null;
+          } catch (err) {
+            return { enabled: false, error: err?.message };
+          }
+        })(),
         // Stale-quote single-symbol retry diagnostic (2026-05-20). Per-symbol
         // recoveryRate is the actionable number — < 10% means the retry isn't
         // helping for that symbol and the operator should consider blocklisting
