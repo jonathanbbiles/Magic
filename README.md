@@ -1,5 +1,38 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: Phase B cross-venue divergence gate (shadow-mode by default) + sequence-gap fix
+
+Phase A's 23 minutes of live data was decisive: Coinbase is fresh 100% of observations across every symbol while Alpaca freshness ranges from 23.8% (XRP) to 96.8% (BTC), with median divergence ≤ 6 bps per symbol. The architectural premise is empirically confirmed.
+
+Phase B operationalizes that signal as an entry gate. When both Alpaca and Coinbase quotes are fresh but their mid-prices diverge by more than `CROSS_VENUE_MAX_DIVERGENCE_BPS` (default 25), the Alpaca quote is suspect — its timestamp passed the staleness check, but the price has drifted between the upstream tick and Alpaca's cache update. The gate refuses entry on this condition.
+
+**Default-OFF / shadow mode**: the merge ships with `CROSS_VENUE_GATE_ENABLED=false`. The gate code path runs (so `meta.crossVenueGate.overall.wouldHaveRejected` accumulates) but `rejectTrade` is NOT called. Operator validates the threshold via `gateRejectionAudit.byReason.cross_venue_divergence` verdict before flipping the gate live.
+
+### Files
+
+- `backend/modules/crossVenueGate.js` — pure decision function (`evaluateCrossVenueGate`) + singleton tracker (`record`, `buildSummary`). Symmetric divergence check (rejects in either direction). Bypasses gracefully when Coinbase is unavailable or stale.
+- `backend/trade.js` — calls the gate per symbol after bid/ask validation, before signal evaluation. Records the decision regardless of `CROSS_VENUE_GATE_ENABLED`. Only calls `rejectTrade` when enabled.
+- `backend/index.js` — surfaces `meta.crossVenueGate` alongside the existing `meta.secondaryFeedShadow`.
+
+### Env vars
+
+| Env var | Default | Notes |
+|---|---|---|
+| `CROSS_VENUE_GATE_ENABLED` | `false` | Master kill. False = shadow mode (records stats, no rejections). |
+| `CROSS_VENUE_MAX_DIVERGENCE_BPS` | `25` | Absolute mid-to-mid divergence threshold. ~4× Phase A's typical per-symbol median divergence (0.3-6 bps). |
+| `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS` | `10000` | Coinbase quote must be at most this old for cross-check to evaluate. |
+
+### Operator workflow
+
+1. Merge ships with `CROSS_VENUE_GATE_ENABLED=false`. Watch `meta.crossVenueGate.overall.wouldHaveRejected` accumulate.
+2. After ≥ 50 wouldHaveRejected events: check `meta.gateRejectionAudit.byReason` for `cross_venue_divergence`. Verdict `gate_justified` (refused losers, avg forward bps < -10) → flip live by setting `CROSS_VENUE_GATE_ENABLED=true` in Render env. Verdict `gate_costly` → don't flip; tighten the divergence threshold or abandon the gate.
+
+### Also in this PR: sequence-gap detection fix
+
+The Phase A diagnostics surfaced `streamStats.sequenceGaps: 28862 / 31614 ticker events` — an absurdly high gap rate that didn't match Coinbase's actual reliability. Root cause: my counter was tracking `sequence_num` per-product, but Coinbase's `sequence_num` increments per-channel globally. Every time the ticker channel emitted events for different products consecutively, the per-product check saw a "gap" that wasn't really a gap.
+
+Fixed to track the single channel-level sequence number. Now `sequenceGaps` reflects actual dropped messages on the ticker channel. Cosmetic-only; cache contents and divergence stats were always correct.
+
 ## 2026-05-20 add: Phase A secondary-feed shadow (Coinbase WebSocket)
 
 Live diagnostics across multiple days of 2026-05-20 showed Alpaca's crypto quote feed cycling between healthy and broken on the long-tail-alt tier (LTC, BCH, LINK, ADA, XRP, DOT, DOGE — quote ages stretching to 200-290 seconds during degraded windows; retry recovery rate collapsing to 3%). The bot's gates correctly refused trades on stale data, but that effectively gates the bot out of half its trading hours.

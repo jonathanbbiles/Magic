@@ -52,9 +52,24 @@ const closedTradeStats = require('./modules/closedTradeStats');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
+const crossVenueGate = require('./modules/crossVenueGate');
 const SECONDARY_FEED_ENABLED_TRADE = String(
   process.env.SECONDARY_FEED_ENABLED || 'false',
 ).toLowerCase() === 'true';
+// Phase B gate. Default-OFF — shadow-mode observation only. Operator flips
+// CROSS_VENUE_GATE_ENABLED=true in Render env after `meta.crossVenueGate`
+// accumulates enough wouldHaveRejected events to validate the threshold.
+const CROSS_VENUE_GATE_ENABLED = String(
+  process.env.CROSS_VENUE_GATE_ENABLED || 'false',
+).toLowerCase() === 'true';
+const CROSS_VENUE_MAX_DIVERGENCE_BPS = Math.max(
+  0,
+  Number(process.env.CROSS_VENUE_MAX_DIVERGENCE_BPS) || 25,
+);
+const CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS = Math.max(
+  0,
+  Number(process.env.CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS) || 10000,
+);
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
 const runtimeConfig = getRuntimeConfig(process.env);
@@ -2905,6 +2920,35 @@ async function scanAndEnter() {
       if (!Number.isFinite(ask) || ask <= 0) { rejectTrade(pair, 'invalid_ask'); continue; }
       if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
       const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
+
+      // Phase B: cross-venue divergence gate. When SECONDARY_FEED_ENABLED is
+      // on, consult Coinbase's latest quote for the same symbol. If both are
+      // fresh but disagree beyond tolerance, the Alpaca quote is suspect
+      // even though its timestamp passed the staleness check. Shadow mode
+      // (CROSS_VENUE_GATE_ENABLED=false) records `wouldHaveRejected` for
+      // operator validation but does NOT reject.
+      if (SECONDARY_FEED_ENABLED_TRADE) {
+        try {
+          const coinbaseQuote = coinbaseQuotesStream.getLatestQuote(pair);
+          const decision = crossVenueGate.evaluateCrossVenueGate({
+            alpacaQuote: quote,
+            coinbaseQuote,
+            maxDivergenceBps: CROSS_VENUE_MAX_DIVERGENCE_BPS,
+            minCoinbaseFreshnessMs: CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS,
+          });
+          crossVenueGate.record({
+            symbol: pair,
+            decision,
+            gateEnabled: CROSS_VENUE_GATE_ENABLED,
+          });
+          if (CROSS_VENUE_GATE_ENABLED && decision.shouldReject) {
+            rejectTrade(pair, decision.reason, decision.evidence);
+            continue;
+          }
+        } catch (_) {
+          // Gate evaluation must never break the scan. Fall through.
+        }
+      }
 
       let sig;
       if (ACTIVE_SIGNAL_VERSION === 'multi_factor') {
