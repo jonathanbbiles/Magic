@@ -309,6 +309,7 @@ function buildReadiness({
   staleQuoteRetry,
   gateRejectionAudit,
   signalSelector,
+  secondaryFeed,
   cfg = DEFAULT_CONFIG,
   nowMs = Date.now(),
 } = {}) {
@@ -399,6 +400,38 @@ function buildReadiness({
     };
   }
 
+  // secondaryFeed: Phase A shadow surface. Only included when present (the
+  // feature is opt-in via SECONDARY_FEED_ENABLED; when off, the synthesizer
+  // sees secondaryFeed === undefined and skips the entry entirely so the
+  // warming-up rec doesn't over-count an unused diagnostic).
+  if (secondaryFeed !== undefined) {
+    if (secondaryFeed === null) {
+      // Feature is wired but feed disabled — report ready: true so it's
+      // not flagged as "warming up." Operator already knows it's off.
+      perDiagnostic.secondaryFeed = {
+        ready: true,
+        detail: 'Secondary feed disabled (SECONDARY_FEED_ENABLED=false)',
+        percentReady: 1,
+      };
+    } else {
+      const totalObs = asNumber(secondaryFeed?.overall?.totalObservations) || 0;
+      const minObs = 60; // ~12 symbols × 5 scans before per-symbol stats are meaningful
+      const streamConnected = Boolean(secondaryFeed?.streamStats?.connected);
+      const ready = streamConnected && totalObs >= minObs;
+      perDiagnostic.secondaryFeed = {
+        ready,
+        detail: !streamConnected
+          ? 'Coinbase WS not connected yet (reconnect in progress or feed unreachable)'
+          : ready
+            ? `${totalObs} cross-feed observations (≥ ${minObs} threshold; Phase A divergence stats meaningful)`
+            : `${totalObs} cross-feed observations (need ${minObs}+ before Phase A divergence stats are meaningful)`,
+        percentReady: streamConnected ? Math.min(1, totalObs / minObs) : 0,
+        count: totalObs,
+        threshold: minObs,
+      };
+    }
+  }
+
   const totalCount = Object.keys(perDiagnostic).length;
   const unreadyCount = Object.values(perDiagnostic).filter((d) => !d.ready).length;
 
@@ -448,6 +481,7 @@ function buildRecommendations({
   staleQuoteRetry = null,
   gateRejectionAudit = null,
   signalSelector = null,
+  secondaryFeed = undefined, // undefined = feature unused; null = enabled but feed off
   config = {},
   nowMs = Date.now(),
 } = {}) {
@@ -456,7 +490,7 @@ function buildRecommendations({
   try {
     readiness = buildReadiness({
       marketRegime, marketRegimeVeto, tradeFeasibility,
-      staleQuoteRetry, gateRejectionAudit, signalSelector, cfg, nowMs,
+      staleQuoteRetry, gateRejectionAudit, signalSelector, secondaryFeed, cfg, nowMs,
     });
   } catch (_) { /* never crash on readiness computation */ }
   const builders = [
