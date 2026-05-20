@@ -77,6 +77,23 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Operator recommendations: data-readiness surface (2026-05-20 evening)
+
+`buildReadiness` extension to `operatorRecommendations.js` reports per-input readiness state so an empty recommendation list is no longer ambiguous between "all good" and "synthesizer warming up." Each input has a sample-size floor:
+
+- `marketRegime`: captured within `readinessRegimeMaxAgeMs` (60s)
+- `tradeFeasibility`: `rejectionsObserved ≥ readinessRollingRejectionsMin` (60)
+- `staleQuoteRetry`: `attempts ≥ staleQuoteMinAttempts` (30)
+- `gateRejectionAudit`: `sampleSize ≥ readinessGateAuditMin` (50)
+- `signalSelector`: has a non-null `signalVersion`
+- `marketRegimeVeto`: always ready (counter that starts at 0)
+
+When `unreadyCount ≥ warmingUpUnreadyThreshold` (2), the synthesizer emits an info-level `synthesizer_warming_up` rec citing which inputs aren't ready. Surface lands at `meta.operatorRecommendations.dataReadiness`.
+
+**Tuning:** All readiness thresholds live in `DEFAULT_CONFIG`; not env-overridable by design — they're pinned to known sample-size statistics from earlier audit work.
+
+**When adding new recommendation builders:** if the builder depends on a sample-size accumulating input, add a corresponding entry to `buildReadiness` so the warming-up rec correctly reflects it. The pattern is `{ ready: bool, detail: string, percentReady: number, count?, threshold? }`.
+
 ## Operator recommendations synthesizer (2026-05-20 PM)
 
 `backend/modules/operatorRecommendations.js` is a pure aggregator that reads every other meta diagnostic (`marketRegime`, `marketRegimeVeto`, `tradeFeasibility`, `staleQuoteRetry`, `gateRejectionAudit`, `signalSelector`) and produces a prioritised list of structured recommendations. Surfaced at `meta.operatorRecommendations`. Default-on via `OPERATOR_RECOMMENDATIONS_ENABLED` (set to `false` to disable).
