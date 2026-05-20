@@ -349,12 +349,44 @@ Three diagnostic bugs were observed in deployed logs and fixed in `backend/modul
 
 All three are observational fixes — none changes the live entry decision. When adding a new candidate slot, make sure to add its `<slot>NetBps` field to ALL three response branches in `pickActiveSignal` (operator-override, no-candidates, winner-picked) so the dashboard log payload stays consistent.
 
+## Secondary-feed shadow (Phase A — 2026-05-20)
+
+Observational-only Coinbase Advanced Trade WebSocket subscription that mirrors the universe's prefetched Alpaca quotes. Surfaces per-symbol divergence + freshness stats at `meta.secondaryFeedShadow`. **No live decision reads from this** — Phase A is a 7-day validation experiment to answer "was Coinbase fresh during Alpaca's broken windows?" before committing to the full secondary-feed architecture (Phases B-D).
+
+The headline metric is `meta.secondaryFeedShadow.overall.symbolsWhereAlpacaStaleCoinbaseFresh`. Non-zero during multiple Alpaca-degraded windows justifies committing to Phase B (cross-venue gate). Zero across all observed degradations means both venues degrade together and the architecture doesn't help — project should stop.
+
+**Wiring** (Hard Rule #4-compliant; all knobs wire to real code paths):
+1. `backend/modules/coinbaseQuotesStream.js` is a singleton WS client. Subscribes to `ticker` + `heartbeats` channels (both anonymous — no CDP API key needed). Maintains a per-symbol cache of `{bidPx, askPx, midPx, spreadBps, ts, seqNum}`. Reconnect with exponential backoff capped at 30s.
+2. `backend/modules/secondaryFeedShadow.js` is a singleton aggregator. `observe({symbol, alpacaQuote, coinbaseQuote, nowMs})` appends to a per-symbol rolling buffer (default 500 obs/symbol). `buildSummary()` produces the meta-surface shape.
+3. `backend/index.js` starts the WS connection at boot when `SECONDARY_FEED_ENABLED=true`, using `runtimeConfig.configuredPrimarySymbols` as the universe. Surfaces `meta.secondaryFeedShadow` (null when the master kill is off). Calls `coinbaseQuotesStream.stop()` in `gracefulShutdown`.
+4. `backend/trade.js` calls `secondaryFeedShadow.observe()` once per symbol per scan, immediately after `prefetchQuotesForCandidates`. Wrapped in try/catch so shadow observation can never break the scan.
+5. `backend/modules/operatorRecommendations.js`'s `buildReadiness` accepts a `secondaryFeed` input. When `SECONDARY_FEED_ENABLED=false`, the readiness entry reports `ready: true` with detail "disabled" so the warming-up rec doesn't over-count. When enabled, readiness is gated on `streamStats.connected && totalObservations >= 60` (~5 scans × 12 symbols).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SECONDARY_FEED_ENABLED` | `false` | Master kill. False = no WS connection opened, `meta.secondaryFeedShadow` null. Operator flips to `true` in Render env after PR merges. |
+| `COINBASE_WS_URL` | `wss://advanced-trade-ws.coinbase.com` | Operator override (testing). |
+| `SECONDARY_FEED_FRESH_THRESHOLD_MS` | `30000` | What counts as "fresh" for cross-feed status categorization. Matches Alpaca's `ENTRY_QUOTE_MAX_AGE_MS` so cross-venue freshness is directly comparable. |
+
+**Phase A success criteria** (greenlight Phase B):
+- Coinbase WS uptime ≥ 99% over 7 days (visible via `coinbaseQuotesStream.getStats().reconnectCount`).
+- Median Alpaca-Coinbase divergence ≤ 10 bps per symbol over the rolling window.
+- `overall.symbolsWhereAlpacaStaleCoinbaseFresh > 0` during at least one observed Alpaca-degraded window.
+
+**Phase A failure criteria** (stop the project):
+- Coinbase WS is itself unstable (< 99% uptime) → no architectural win available.
+- Median divergence is huge (> 30 bps) → venues have structural drift that isn't a usable freshness signal.
+- `symbolsWhereAlpacaStaleCoinbaseFresh` stays at zero across all degradations → both venues degrade together.
+
+**Extension discipline**: when adding more venues (Kraken, Binance.US, etc.) as tertiary feeds, follow the same singleton pattern — one stream module per venue, one shadow aggregator that consumes all of them. Do NOT modify `secondaryFeedShadow.js` to be venue-aware; keep the aggregator agnostic and let callers pass whichever venue's quote is canonical for their use case.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
+- Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS)
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`

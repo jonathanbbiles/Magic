@@ -119,6 +119,8 @@ const microFlowShadow = require('./modules/microstructureFlowShadow');
 const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
 const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
 const operatorRecommendations = require('./modules/operatorRecommendations');
+const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
+const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -790,6 +792,17 @@ const MICRO_WEIGHTS_FILE_PATH = String(
 const MICRO_TRADES_SHADOW_ENABLED = String(
   process.env.MICRO_TRADES_SHADOW_ENABLED || 'true',
 ).toLowerCase() !== 'false';
+
+// Secondary feed shadow (Phase A — Coinbase Advanced Trade WS). Master kill.
+// When false (default), no WS connection is opened and the meta surface is
+// null. Flip via Render env to true to begin the 7-day observation window.
+const SECONDARY_FEED_ENABLED = String(
+  process.env.SECONDARY_FEED_ENABLED || 'false',
+).toLowerCase() === 'true';
+const SECONDARY_FEED_FRESH_THRESHOLD_MS = Math.max(
+  1000,
+  Number(process.env.SECONDARY_FEED_FRESH_THRESHOLD_MS) || 30000,
+);
 
 // Trade-feasibility audit (2026-05-20). Per-symbol view of the
 // rolling rejection buffer — surfaces which symbols are chronically
@@ -1896,6 +1909,30 @@ app.get('/dashboard', async (req, res) => {
             };
           }
         })() : null,
+        // Secondary-feed shadow (Phase A — 2026-05-20). Observational-only
+        // Coinbase Advanced Trade WS subscription that mirrors the
+        // prefetched Alpaca quotes. The headline metric is
+        // `overall.symbolsWhereAlpacaStaleCoinbaseFresh` — non-zero during
+        // Alpaca-degraded windows justifies committing to Phase B.
+        secondaryFeedShadow: SECONDARY_FEED_ENABLED ? (() => {
+          try {
+            const summary = secondaryFeedShadow.buildSummary({
+              freshThresholdMs: SECONDARY_FEED_FRESH_THRESHOLD_MS,
+            });
+            return {
+              ...summary,
+              streamStats: coinbaseQuotesStream.getStats(),
+            };
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              overall: null,
+              bySymbol: [],
+              streamStats: null,
+              error: err?.message,
+            };
+          }
+        })() : null,
         // Operator recommendations synthesizer (2026-05-20 PM). Pure
         // aggregator over the other diagnostic fields — generates a
         // prioritised "today's action list" for phone-first operators.
@@ -1938,6 +1975,15 @@ app.get('/dashboard', async (req, res) => {
                 activeNetBps: d.activeNetBps,
               } : null;
             }, null);
+            const recsSecondaryFeed = buildSafe(() => {
+              if (!SECONDARY_FEED_ENABLED) return null;
+              return {
+                overall: secondaryFeedShadow.buildSummary({
+                  freshThresholdMs: SECONDARY_FEED_FRESH_THRESHOLD_MS,
+                }).overall,
+                streamStats: coinbaseQuotesStream.getStats(),
+              };
+            }, undefined);
             return operatorRecommendations.buildRecommendations({
               marketRegime: recsMarketRegime,
               marketRegimeVeto: recsMarketRegimeVeto,
@@ -1945,6 +1991,7 @@ app.get('/dashboard', async (req, res) => {
               staleQuoteRetry: recsStaleQuoteRetry,
               gateRejectionAudit: recsGateRejectionAudit,
               signalSelector: recsSignalSelector,
+              secondaryFeed: recsSecondaryFeed,
             });
           } catch (err) {
             return { ranAt: new Date().toISOString(), count: 0, bySeverity: {}, recommendations: [], error: err?.message };
@@ -3034,6 +3081,26 @@ if (GATE_REJECTION_AUDIT_ENABLED) {
   });
 }
 
+// Phase A: start the Coinbase secondary-feed WS subscription if enabled.
+// Symbols come from the configured primary universe (matches the same set
+// trade.js scans, so the shadow observation has a complete cross-section).
+if (SECONDARY_FEED_ENABLED) {
+  try {
+    const universeSymbols = Array.isArray(runtimeConfig.configuredPrimarySymbols)
+      ? runtimeConfig.configuredPrimarySymbols.filter(Boolean)
+      : [];
+    const started = coinbaseQuotesStream.start({ symbols: universeSymbols });
+    console.log('secondary_feed_started', {
+      started,
+      symbols: universeSymbols,
+      wsUrl: process.env.COINBASE_WS_URL || 'wss://advanced-trade-ws.coinbase.com',
+      freshThresholdMs: SECONDARY_FEED_FRESH_THRESHOLD_MS,
+    });
+  } catch (err) {
+    console.warn('secondary_feed_start_failed', { error: err?.message || String(err) });
+  }
+}
+
 bootstrapTrading().catch((err) => {
   console.error('bootstrap_step_failed', {
     step: 'bootstrapTrading',
@@ -3047,6 +3114,7 @@ function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('shutdown_initiated', { signal });
+  try { coinbaseQuotesStream.stop(); } catch (_) {}
   server.close(() => {
     console.log('server_closed', { signal });
     recordEquitySnapshot();

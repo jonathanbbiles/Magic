@@ -50,6 +50,11 @@ const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
 const closedTradeStats = require('./modules/closedTradeStats');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
+const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
+const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
+const SECONDARY_FEED_ENABLED_TRADE = String(
+  process.env.SECONDARY_FEED_ENABLED || 'false',
+).toLowerCase() === 'true';
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
 const runtimeConfig = getRuntimeConfig(process.env);
@@ -2742,6 +2747,31 @@ async function scanAndEnter() {
   const prefetchedQuotes = runtimeConfig.entryPrefetchQuotes
     ? await prefetchQuotesForCandidates(candidates, runtimeConfig.entryPrefetchChunkSize)
     : null;
+
+  // Phase A: secondary-feed shadow observation. Per-scan, per-symbol record
+  // of the prefetched Alpaca quote alongside the latest Coinbase WS quote.
+  // Pure observation — no live decision reads from this. Master kill is
+  // SECONDARY_FEED_ENABLED; when off this block is a no-op.
+  if (SECONDARY_FEED_ENABLED_TRADE) {
+    const nowMs = Date.now();
+    for (const pair of candidates) {
+      try {
+        const alpacaQuote = prefetchedQuotes && typeof prefetchedQuotes.get === 'function'
+          ? prefetchedQuotes.get(pair) || null
+          : null;
+        const coinbaseQuote = coinbaseQuotesStream.getLatestQuote(pair);
+        secondaryFeedShadow.observe({
+          symbol: pair,
+          alpacaQuote,
+          coinbaseQuote,
+          nowMs,
+        });
+      } catch (_) {
+        // Shadow observation must never break the scan. Swallow errors;
+        // the next scan will try again.
+      }
+    }
+  }
 
   let placed = 0;
   for (const pair of candidates) {

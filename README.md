@@ -1,5 +1,37 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: Phase A secondary-feed shadow (Coinbase WebSocket)
+
+Live diagnostics across multiple days of 2026-05-20 showed Alpaca's crypto quote feed cycling between healthy and broken on the long-tail-alt tier (LTC, BCH, LINK, ADA, XRP, DOT, DOGE — quote ages stretching to 200-290 seconds during degraded windows; retry recovery rate collapsing to 3%). The bot's gates correctly refused trades on stale data, but that effectively gates the bot out of half its trading hours.
+
+This PR adds a free, US-regulated, no-auth secondary feed — Coinbase Advanced Trade WebSocket — for **observational use only**. Phase A is a 7-day validation experiment: subscribe to Coinbase's `ticker` channel for the 12 primary symbols, log per-symbol divergence + freshness alongside Alpaca's quote, and answer "was Coinbase fresh during Alpaca's broken windows?"
+
+If yes (`meta.secondaryFeedShadow.overall.symbolsWhereAlpacaStaleCoinbaseFresh > 0` during multiple Alpaca-degraded windows), Phase B (cross-venue gate) is justified. If no, the architecture doesn't help and the project stops.
+
+**No trading behavior changes at any default settings.** Master kill `SECONDARY_FEED_ENABLED=false` means no WS connection is opened and `meta.secondaryFeedShadow` is null. Operator flips to `true` in Render env after merge to begin observation.
+
+### Env vars
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SECONDARY_FEED_ENABLED` | `false` | Master kill. When false, no WS connection and `meta.secondaryFeedShadow` is null. Flip to `true` to begin the 7-day observation window. |
+| `COINBASE_WS_URL` | `wss://advanced-trade-ws.coinbase.com` | Coinbase Advanced Trade WS endpoint. Override for testing. |
+| `SECONDARY_FEED_FRESH_THRESHOLD_MS` | `30000` | What counts as "fresh" for cross-feed status categorization (matches Alpaca's `ENTRY_QUOTE_MAX_AGE_MS`). |
+
+### Headline metric
+
+`meta.secondaryFeedShadow.overall.symbolsWhereAlpacaStaleCoinbaseFresh` — count of symbols whose latest observation shows Alpaca beyond the freshness threshold AND Coinbase within it. Non-zero values prove Coinbase data is available when Alpaca's is not, which is the entire architectural premise.
+
+### Files
+
+- `backend/modules/coinbaseQuotesStream.js` — WS client, singleton, reconnect-with-backoff, anonymous subscriptions (no CDP API key needed for `ticker`/`heartbeats`).
+- `backend/modules/secondaryFeedShadow.js` — pure aggregator. Accepts Alpaca + Coinbase quote pairs per scan and tracks rolling per-symbol divergence stats.
+- Wiring in `backend/index.js` (boot start, meta surface, graceful shutdown) and `backend/trade.js` (per-scan observe call after `prefetchQuotesForCandidates`).
+
+### Hard Rule #4 compliance
+
+Every env var here wires to real code. Every module method has at least one live consumer. No dead knobs.
+
 ## 2026-05-20 PM add: per-symbol auto-suppress on stale-quote retry
 
 The single-symbol retry fallback (PR #416) issues an extra Alpaca API call whenever a prefetched quote is stale, hoping the single-symbol endpoint has fresher data. The 2026-05-20 evening dashboard caught 8 symbols (LTC/XRP/AVAX/SOL/ADA/BCH/UNI/DOT) at < 5% recovery rate over 38-67 attempts each — the feed is upstream-stale and those retry calls are pure waste.
