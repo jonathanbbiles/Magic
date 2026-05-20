@@ -43,7 +43,8 @@ const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
 const marketRegimeDetector = require('./modules/marketRegimeDetector');
 const regimeVetoEvaluator = require('./modules/regimeVetoEvaluator');
-const { createRetryTracker: createStaleQuoteRetryTracker } = require('./modules/staleQuoteRetryStats');
+const staleQuoteRetryStatsModule = require('./modules/staleQuoteRetryStats');
+const { createRetryTracker: createStaleQuoteRetryTracker } = staleQuoteRetryStatsModule;
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
 const { buildFeatureSnapshot } = require('./modules/featureLibrary');
@@ -396,6 +397,26 @@ const MICRO_TRADES_SHADOW_ENABLED = readBoolean('MICRO_TRADES_SHADOW_ENABLED', t
 // symbol per scan. Opt out via STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false.
 const STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED = readBoolean(
   'STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED', true);
+// Auto-suppress (2026-05-20 PM). When a symbol's per-symbol retry recovery
+// rate stays at or below STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE
+// over ≥ STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS in the rolling window,
+// short-circuit the retry for that symbol — the feed is upstream-stale and
+// the API call is wasted. The 2026-05-20 evening snapshot caught 8 symbols
+// at < 5% recovery over 38-67 attempts; suppression saves ~50 API calls per
+// scan cycle without changing any trade decision (stale_quote rejection still
+// fires; only the recovery probe is skipped). Self-healing: the FIFO ages out
+// suppressed-symbol entries naturally so feed-recovery is re-detected without
+// manual intervention.
+const STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED = readBoolean(
+  'STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED', true);
+const STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS = Math.max(1, Math.floor(readNumber(
+  'STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS',
+  staleQuoteRetryStatsModule.DEFAULT_SUPPRESS_MIN_ATTEMPTS,
+)));
+const STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE = readNumber(
+  'STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE',
+  staleQuoteRetryStatsModule.DEFAULT_SUPPRESS_MAX_RECOVERY_RATE,
+);
 
 // Market regime detector (Phase 1, 2026-05-20). Observational classifier
 // over recent BTC closes — labels current regime (adverse/benign/flat/
@@ -2765,7 +2786,16 @@ async function scanAndEnter() {
       // shows per-symbol recovery rate.
       const prefetchedStale = usedPrefetched
         && (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS));
-      if (prefetchedStale && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED) {
+      const retrySuppressedForPair = prefetchedStale
+        && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED
+        && STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED
+        && staleQuoteRetryStatsModule.shouldSuppressRetry({
+          snapshot: staleQuoteRetryTracker.snapshot(),
+          symbol: pair,
+          minAttempts: STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS,
+          maxRecoveryRate: STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE,
+        });
+      if (prefetchedStale && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED && !retrySuppressedForPair) {
         const prefetchedAgeMs = ageMs;
         let retryError = null;
         let retriedAgeMs = null;

@@ -5,7 +5,11 @@ const assert = require('node:assert/strict');
 const {
   createRetryTracker,
   buildRetryStats,
+  shouldSuppressRetry,
+  buildSuppressedSymbols,
   DEFAULT_WINDOW_SIZE,
+  DEFAULT_SUPPRESS_MIN_ATTEMPTS,
+  DEFAULT_SUPPRESS_MAX_RECOVERY_RATE,
 } = require('./staleQuoteRetryStats');
 
 // Capacity enforced via FIFO ring buffer.
@@ -102,6 +106,94 @@ const {
   assert.equal(DEFAULT_WINDOW_SIZE, 500);
   const tracker = createRetryTracker();
   assert.equal(tracker.capacity, 500);
+})();
+
+// Auto-suppress: below minAttempts → never suppressed even if all failed.
+(function autoSuppressBelowMinAttempts() {
+  const snapshot = [];
+  for (let i = 0; i < 5; i += 1) {
+    snapshot.push({ ts: i, symbol: 'LTC/USD', recovered: false });
+  }
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'LTC/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), false, 'sample too small to suppress');
+})();
+
+// Auto-suppress: at-or-below maxRecoveryRate with enough attempts → suppress.
+(function autoSuppressTriggers() {
+  const snapshot = [];
+  for (let i = 0; i < 25; i += 1) {
+    snapshot.push({ ts: i, symbol: 'LTC/USD', recovered: false });
+  }
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'LTC/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), true, 'zero recovery over 25 attempts → suppress');
+})();
+
+// Auto-suppress: above maxRecoveryRate → not suppressed (occasional success).
+(function autoSuppressLetsThroughWorking() {
+  const snapshot = [];
+  for (let i = 0; i < 25; i += 1) {
+    snapshot.push({ ts: i, symbol: 'LINK/USD', recovered: i < 5 });
+  }
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'LINK/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), false, '20% recovery rate is above threshold → keep retrying');
+})();
+
+// Auto-suppress: exactly at maxRecoveryRate → suppress (inclusive).
+(function autoSuppressInclusiveAtMax() {
+  const snapshot = [];
+  for (let i = 0; i < 20; i += 1) {
+    snapshot.push({ ts: i, symbol: 'X/USD', recovered: i === 0 }); // 1/20 = 5%
+  }
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'X/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), true, 'exactly 5% recovery → suppress (≤ threshold)');
+})();
+
+// Auto-suppress: defensive — no symbol, no snapshot, malformed inputs.
+(function autoSuppressDefensive() {
+  assert.equal(shouldSuppressRetry({ snapshot: [], symbol: 'LTC/USD' }), false);
+  assert.equal(shouldSuppressRetry({ snapshot: null, symbol: 'LTC/USD' }), false);
+  assert.equal(shouldSuppressRetry({ snapshot: [{}], symbol: '' }), false);
+  assert.equal(shouldSuppressRetry({}), false);
+})();
+
+// Auto-suppress: per-symbol — only the failing symbol gets suppressed.
+(function autoSuppressPerSymbol() {
+  const snapshot = [];
+  for (let i = 0; i < 25; i += 1) {
+    snapshot.push({ ts: i, symbol: 'LTC/USD', recovered: false });
+  }
+  for (let i = 0; i < 25; i += 1) {
+    snapshot.push({ ts: 25 + i, symbol: 'DOGE/USD', recovered: true });
+  }
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'LTC/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), true);
+  assert.equal(shouldSuppressRetry({
+    snapshot, symbol: 'DOGE/USD', minAttempts: 20, maxRecoveryRate: 0.05,
+  }), false);
+})();
+
+// buildSuppressedSymbols: surfaces the dashboard-visible list, sorted by attempts.
+(function suppressedSymbolsList() {
+  const snapshot = [];
+  for (let i = 0; i < 25; i += 1) snapshot.push({ ts: i, symbol: 'LTC/USD', recovered: false });
+  for (let i = 0; i < 30; i += 1) snapshot.push({ ts: 100 + i, symbol: 'BCH/USD', recovered: false });
+  for (let i = 0; i < 25; i += 1) snapshot.push({ ts: 200 + i, symbol: 'DOGE/USD', recovered: i < 10 });
+  const list = buildSuppressedSymbols({ snapshot, minAttempts: 20, maxRecoveryRate: 0.05 });
+  assert.equal(list.length, 2, 'LTC and BCH suppressed; DOGE above threshold');
+  assert.equal(list[0].symbol, 'BCH/USD', 'sorted attempts-descending');
+  assert.equal(list[1].symbol, 'LTC/USD');
+  assert.equal(list[0].recoveryRate, 0);
+})();
+
+// Default constants are exported and sensible.
+(function defaultConstants() {
+  assert.equal(DEFAULT_SUPPRESS_MIN_ATTEMPTS, 20);
+  assert.equal(DEFAULT_SUPPRESS_MAX_RECOVERY_RATE, 0.05);
 })();
 
 console.log('staleQuoteRetryStats.test.js ok');

@@ -1,5 +1,21 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 PM add: per-symbol auto-suppress on stale-quote retry
+
+The single-symbol retry fallback (PR #416) issues an extra Alpaca API call whenever a prefetched quote is stale, hoping the single-symbol endpoint has fresher data. The 2026-05-20 evening dashboard caught 8 symbols (LTC/XRP/AVAX/SOL/ADA/BCH/UNI/DOT) at < 5% recovery rate over 38-67 attempts each — the feed is upstream-stale and those retry calls are pure waste.
+
+The operator-recommendations synthesizer was correctly flagging this and suggesting `STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false`. That kills the retry globally and loses recoveries for symbols where it actually works (LINK 7.1%, DOGE 6.9%). The per-symbol auto-suppress is a sharper instrument:
+
+- `STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED` (default `true`) — master switch.
+- `STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS` (default `20`) — minimum sample size before suppression engages for a symbol.
+- `STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE` (default `0.05`) — suppress when per-symbol recoveryRate ≤ this value.
+
+When both conditions hold, the live engine short-circuits the retry for that symbol — saves the API call without changing any trade decision (the `stale_quote` rejection still fires; only the recovery probe is skipped).
+
+**Self-healing.** The 500-entry FIFO window naturally ages out the suppressed symbol's data as other symbols' retries push old entries out. Once a symbol drops below the min-attempts floor in the rolling window, suppression auto-lifts and the next stale prefetch re-probes feed health. No operator intervention needed.
+
+Surfaced at `meta.staleQuoteRetry.suppressedSymbols` so the dashboard shows which symbols are currently skipping the retry path.
+
 ## 2026-05-20 add: data-readiness surface on operator recommendations
 
 `meta.operatorRecommendations.dataReadiness` now reports per-diagnostic readiness state. Before this PR, an empty `recommendations: []` list was ambiguous between "all systems healthy" and "bot just restarted, give it time." The 2026-05-20 04:05 snapshot — taken ~3 minutes after a restart — surfaced exactly this issue: every individual diagnostic was warming up so every threshold check correctly returned no recommendation, but the operator pulling the dashboard would have read it as "nothing to do."
