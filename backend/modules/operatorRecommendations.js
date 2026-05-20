@@ -42,6 +42,17 @@ const DEFAULT_CONFIG = Object.freeze({
   // (currently set up to veto adverse only). When regime is benign for
   // a long time, no veto evidence accumulates — operator should know.
   regimeBenignReminderMs: 60 * 60 * 1000, // 1 hour
+  // Data readiness thresholds (2026-05-20 evening). Each diagnostic input
+  // has a minimum sample size before its recommendations are meaningful.
+  // The synthesizer's `dataReadiness` surface reports per-input state so
+  // a phone-first operator can distinguish "no recommendations because
+  // everything's fine" from "no recommendations because the bot just
+  // restarted and the rolling buffers are still filling."
+  readinessRollingRejectionsMin: 60,    // ~5 rejections × 12 symbols
+  readinessGateAuditMin: 50,            // half-of-windowed audit before trends/byReason are stable
+  readinessRegimeMaxAgeMs: 60 * 1000,   // mirrors marketRegime snapshot freshness
+  // Number of unready inputs that triggers the synthesizer_warming_up rec.
+  warmingUpUnreadyThreshold: 2,
 });
 
 function asNumber(v) {
@@ -283,6 +294,149 @@ function recTradingActivity({ tradeFeasibility, signalSelector }) {
   };
 }
 
+// Per-diagnostic readiness assessment (2026-05-20 evening). Each input
+// has a minimum sample size before its recommendations are statistically
+// meaningful. After a restart most diagnostics need 5-15 minutes for the
+// rolling buffers to refill; surfacing that explicitly lets the operator
+// tell "no problems" from "synthesizer warming up."
+//
+// Returns: { perDiagnostic: { name: { ready, detail, percentReady, count?, threshold? } },
+//            unreadyCount, totalCount }
+function buildReadiness({
+  marketRegime,
+  marketRegimeVeto,
+  tradeFeasibility,
+  staleQuoteRetry,
+  gateRejectionAudit,
+  signalSelector,
+  cfg = DEFAULT_CONFIG,
+  nowMs = Date.now(),
+} = {}) {
+  const perDiagnostic = {};
+
+  // marketRegime: needs a recent snapshot under maxSnapshotAgeMs.
+  {
+    const capturedAt = asNumber(marketRegime?.capturedAt);
+    const ageMs = capturedAt == null ? null : Math.max(0, nowMs - capturedAt);
+    const ready = ageMs != null && ageMs <= cfg.readinessRegimeMaxAgeMs;
+    perDiagnostic.marketRegime = {
+      ready,
+      detail: ready
+        ? `Snapshot fresh (age ${Math.floor((ageMs || 0) / 1000)}s, regime ${marketRegime?.regime || 'unknown'})`
+        : ageMs == null
+          ? 'No regime snapshot yet (BTC scan has not completed since boot)'
+          : `Snapshot stale (age ${Math.floor(ageMs / 1000)}s > threshold ${Math.floor(cfg.readinessRegimeMaxAgeMs / 1000)}s)`,
+      percentReady: ready ? 1 : 0,
+    };
+  }
+
+  // tradeFeasibility: needs enough rolling rejections for per-symbol stats.
+  {
+    const observed = asNumber(tradeFeasibility?.rejectionsObserved) || 0;
+    const ready = observed >= cfg.readinessRollingRejectionsMin;
+    perDiagnostic.tradeFeasibility = {
+      ready,
+      detail: ready
+        ? `${observed} rejections observed (≥ ${cfg.readinessRollingRejectionsMin} threshold)`
+        : `${observed} rejections observed (need ${cfg.readinessRollingRejectionsMin}+ for chronicallyInfeasible to fire)`,
+      percentReady: Math.min(1, observed / cfg.readinessRollingRejectionsMin),
+      count: observed,
+      threshold: cfg.readinessRollingRejectionsMin,
+    };
+  }
+
+  // staleQuoteRetry: needs minAttempts before per-symbol recovery is meaningful.
+  {
+    const attempts = asNumber(staleQuoteRetry?.attempts) || 0;
+    const ready = attempts >= cfg.staleQuoteMinAttempts;
+    perDiagnostic.staleQuoteRetry = {
+      ready,
+      detail: ready
+        ? `${attempts} retry attempts (≥ ${cfg.staleQuoteMinAttempts} threshold; recovery analysis meaningful)`
+        : `${attempts} retry attempts (need ${cfg.staleQuoteMinAttempts}+ before stale_quote_retry_failing can fire)`,
+      percentReady: Math.min(1, attempts / cfg.staleQuoteMinAttempts),
+      count: attempts,
+      threshold: cfg.staleQuoteMinAttempts,
+    };
+  }
+
+  // gateRejectionAudit: needs sampleSize for byReason / bySymbolAndReason verdicts.
+  {
+    const sampleSize = asNumber(gateRejectionAudit?.sampleSize) || 0;
+    const ready = sampleSize >= cfg.readinessGateAuditMin;
+    perDiagnostic.gateRejectionAudit = {
+      ready,
+      detail: ready
+        ? `${sampleSize} graded rejections (≥ ${cfg.readinessGateAuditMin} threshold)`
+        : `${sampleSize} graded rejections (need ${cfg.readinessGateAuditMin}+ before gate verdicts / trends are meaningful)`,
+      percentReady: Math.min(1, sampleSize / cfg.readinessGateAuditMin),
+      count: sampleSize,
+      threshold: cfg.readinessGateAuditMin,
+    };
+  }
+
+  // signalSelector: needs a non-null active signal (selector decision complete).
+  {
+    const hasSelection = Boolean(signalSelector && signalSelector.signalVersion);
+    perDiagnostic.signalSelector = {
+      ready: hasSelection,
+      detail: hasSelection
+        ? `Active signal: ${signalSelector.signalVersion}`
+        : 'Selector has not chosen a signal yet (backtest chain still completing or all signals vetoed)',
+      percentReady: hasSelection ? 1 : 0,
+    };
+  }
+
+  // marketRegimeVeto: always ready (it's a counter that starts at 0); no
+  // separate readiness check beyond the marketRegime snapshot itself.
+  {
+    perDiagnostic.marketRegimeVeto = {
+      ready: true,
+      detail: marketRegimeVeto
+        ? `Veto ${marketRegimeVeto.enabled ? 'enabled' : 'disabled'}; wouldHaveVetoed=${marketRegimeVeto.wouldHaveVetoed || 0}`
+        : 'No state available',
+      percentReady: 1,
+    };
+  }
+
+  const totalCount = Object.keys(perDiagnostic).length;
+  const unreadyCount = Object.values(perDiagnostic).filter((d) => !d.ready).length;
+
+  return { perDiagnostic, unreadyCount, totalCount };
+}
+
+// Synthesizer-warming-up rec. Fires when >= warmingUpUnreadyThreshold of
+// the diagnostic inputs are below their sample-size floor. This is the
+// "the bot just restarted, give it time" signal — without it, the absence
+// of recommendations is ambiguous between "all good" and "no data yet."
+function recSynthesizerWarmingUp({ readiness, cfg }) {
+  if (!readiness) return null;
+  const { perDiagnostic, unreadyCount, totalCount } = readiness;
+  if (unreadyCount < cfg.warmingUpUnreadyThreshold) return null;
+  const unreadyDetails = Object.entries(perDiagnostic)
+    .filter(([, d]) => !d.ready)
+    .map(([name, d]) => ({ name, detail: d.detail, percentReady: d.percentReady }));
+  return {
+    id: 'synthesizer_warming_up',
+    severity: 'info',
+    title: `Synthesizer warming up — ${unreadyCount} of ${totalCount} diagnostic inputs below readiness threshold`,
+    detail: 'Diagnostic inputs are still accumulating samples — likely a recent restart. '
+      + 'Treat the absence of higher-severity recommendations as "not yet evaluated" rather '
+      + 'than "everything is fine." Re-check after the rolling buffers fill (typically 10-30 min).',
+    evidence: {
+      unreadyCount,
+      totalCount,
+      unreadyInputs: unreadyDetails,
+      overallReadinessPct: Number(((totalCount - unreadyCount) / totalCount * 100).toFixed(1)),
+    },
+    suggestedActions: [
+      'Wait 10-30 minutes for the rolling rejection buffer and staleQuoteRetry counter to refill.',
+      'If inputs remain unready after 30 min, investigate the scan rate (`meta.lastEntryScanAt`) and bot uptime.',
+    ],
+    sourceFields: ['meta.operatorRecommendations.dataReadiness'],
+  };
+}
+
 // Build the full recommendation set. All builders are pure functions over
 // the meta-pieces they need; failures inside any builder return null and
 // don't break the rest of the synthesis (defensive — recommendations are
@@ -298,6 +452,13 @@ function buildRecommendations({
   nowMs = Date.now(),
 } = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...(config || {}) };
+  let readiness = null;
+  try {
+    readiness = buildReadiness({
+      marketRegime, marketRegimeVeto, tradeFeasibility,
+      staleQuoteRetry, gateRejectionAudit, signalSelector, cfg, nowMs,
+    });
+  } catch (_) { /* never crash on readiness computation */ }
   const builders = [
     () => recStaleQuoteRetryHealth({ staleQuoteRetry, cfg }),
     () => recChronicallyInfeasibleSymbols({ tradeFeasibility, cfg }),
@@ -305,6 +466,7 @@ function buildRecommendations({
     () => recCostlyGates({ gateRejectionAudit }),
     () => recTrendingGates({ gateRejectionAudit }),
     () => recMarketRegimeVetoDarkMode({ marketRegime, marketRegimeVeto, cfg, nowMs }),
+    () => recSynthesizerWarmingUp({ readiness, cfg }),
   ];
   const recommendations = [];
   for (const b of builders) {
@@ -321,6 +483,14 @@ function buildRecommendations({
     count: recommendations.length,
     bySeverity: recommendations.reduce((acc, r) => { acc[r.severity] = (acc[r.severity] || 0) + 1; return acc; }, {}),
     recommendations,
+    dataReadiness: readiness ? {
+      perDiagnostic: readiness.perDiagnostic,
+      unreadyCount: readiness.unreadyCount,
+      totalCount: readiness.totalCount,
+      overallReadinessPct: readiness.totalCount > 0
+        ? Number((((readiness.totalCount - readiness.unreadyCount) / readiness.totalCount) * 100).toFixed(1))
+        : 0,
+    } : null,
   };
 }
 
@@ -334,4 +504,6 @@ module.exports = {
   recCostlyGates,
   recTrendingGates,
   recTradingActivity,
+  recSynthesizerWarmingUp,
+  buildReadiness,
 };

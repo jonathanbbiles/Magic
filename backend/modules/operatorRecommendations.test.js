@@ -15,11 +15,15 @@ const {
 
 const NOW = 1779252000000;
 
-// Empty input → empty recommendations list, no crash.
+// Empty input → only the synthesizer_warming_up info rec fires (added
+// 2026-05-20 evening). No high/med/low recs from data builders.
 (function emptyInput() {
   const out = buildRecommendations({});
-  assert.equal(out.count, 0);
-  assert.deepEqual(out.recommendations, []);
+  assert.equal(out.bySeverity.high || 0, 0);
+  assert.equal(out.bySeverity.med || 0, 0);
+  assert.equal(out.bySeverity.low || 0, 0);
+  // warming_up info rec present.
+  assert.ok(out.recommendations.some((r) => r.id === 'synthesizer_warming_up'));
 })();
 
 // Stale-quote retry: when ALL symbols have very low recoveryRate over many
@@ -253,7 +257,98 @@ const NOW = 1779252000000;
     gateRejectionAudit: null,
     signalSelector: undefined,
   });
-  assert.equal(out.count, 0, 'no recs from bad input, no crash');
+  // Empty input → buildReadiness reports many unready inputs → warming_up
+  // rec may fire. That's fine. Assert no high/med/low recs.
+  assert.equal(out.bySeverity.high || 0, 0);
+  assert.equal(out.bySeverity.med || 0, 0);
+  assert.equal(out.bySeverity.low || 0, 0);
+})();
+
+// dataReadiness surface (2026-05-20 evening) — empty input → all 5
+// sample-size inputs unready (marketRegimeVeto is always-ready by design).
+(function dataReadinessEmptyInput() {
+  const { buildReadiness } = require('./operatorRecommendations');
+  const r = buildReadiness({});
+  assert.equal(r.totalCount, 6);
+  // marketRegimeVeto is always ready; the other 5 are unready in this case.
+  assert.equal(r.unreadyCount, 5);
+  assert.equal(r.perDiagnostic.marketRegime.ready, false);
+  assert.equal(r.perDiagnostic.tradeFeasibility.ready, false);
+  assert.equal(r.perDiagnostic.staleQuoteRetry.ready, false);
+  assert.equal(r.perDiagnostic.gateRejectionAudit.ready, false);
+  assert.equal(r.perDiagnostic.signalSelector.ready, false);
+  assert.equal(r.perDiagnostic.marketRegimeVeto.ready, true);
+})();
+
+// dataReadiness: fully-warmed inputs → all ready.
+(function dataReadinessFullyWarmed() {
+  const { buildReadiness } = require('./operatorRecommendations');
+  const r = buildReadiness({
+    marketRegime: { regime: 'benign', capturedAt: NOW - 5_000 }, // 5s old
+    marketRegimeVeto: { enabled: false, wouldHaveVetoed: 0 },
+    tradeFeasibility: { rejectionsObserved: 500, symbols: [], chronicallyInfeasible: [] },
+    staleQuoteRetry: { attempts: 100, recoveries: 5, bySymbol: [] },
+    gateRejectionAudit: { sampleSize: 10000, byReason: [], bySignalAndReason: [], bySymbolAndReason: [], costliestGates: [], trendingReasons: [] },
+    signalSelector: { signalVersion: 'mean_reversion', tradingVeto: false, activeNetBps: 20 },
+    nowMs: NOW,
+  });
+  assert.equal(r.unreadyCount, 0);
+  assert.equal(r.totalCount, 6);
+  for (const [, d] of Object.entries(r.perDiagnostic)) assert.equal(d.ready, true);
+})();
+
+// dataReadiness: marketRegime captured > 60s ago → unready.
+(function dataReadinessStaleRegime() {
+  const { buildReadiness } = require('./operatorRecommendations');
+  const r = buildReadiness({
+    marketRegime: { regime: 'benign', capturedAt: NOW - 120_000 },
+    nowMs: NOW,
+  });
+  assert.equal(r.perDiagnostic.marketRegime.ready, false);
+})();
+
+// recSynthesizerWarmingUp: fires when ≥ warmingUpUnreadyThreshold inputs unready.
+(function warmingUpFiresOnLowReadiness() {
+  const out = buildRecommendations({
+    // All inputs empty / fresh-restart state.
+    tradeFeasibility: { rejectionsObserved: 5, symbols: [], chronicallyInfeasible: [] },
+    staleQuoteRetry: { attempts: 3, recoveries: 0, bySymbol: [] },
+    nowMs: NOW,
+  });
+  const rec = out.recommendations.find((r) => r.id === 'synthesizer_warming_up');
+  assert.ok(rec, 'warming_up rec present');
+  assert.equal(rec.severity, 'info');
+  assert.ok(rec.evidence.unreadyCount >= 2);
+  assert.ok(Array.isArray(rec.evidence.unreadyInputs));
+  assert.ok(rec.evidence.unreadyInputs.some((u) => u.name === 'marketRegime'));
+  // dataReadiness surface populated.
+  assert.ok(out.dataReadiness);
+  assert.equal(out.dataReadiness.totalCount, 6);
+  assert.ok(out.dataReadiness.unreadyCount >= 2);
+})();
+
+// recSynthesizerWarmingUp: does NOT fire when only 1 input is unready.
+(function warmingUpSilentNearReady() {
+  const out = buildRecommendations({
+    marketRegime: { regime: 'benign', capturedAt: NOW - 5_000 },
+    marketRegimeVeto: { enabled: false, wouldHaveVetoed: 0 },
+    tradeFeasibility: { rejectionsObserved: 500, symbols: [{ symbol: 'BTC/USD', feasibilityPct: 99, topBlocker: 'mr_no_drop' }], chronicallyInfeasible: [] },
+    staleQuoteRetry: { attempts: 100, recoveries: 5, bySymbol: [] },
+    // Only gateRejectionAudit is unready.
+    gateRejectionAudit: { sampleSize: 5, byReason: [], bySignalAndReason: [], bySymbolAndReason: [], costliestGates: [], trendingReasons: [] },
+    signalSelector: { signalVersion: 'mean_reversion', tradingVeto: false, activeNetBps: 20 },
+    nowMs: NOW,
+  });
+  const rec = out.recommendations.find((r) => r.id === 'synthesizer_warming_up');
+  assert.equal(rec, undefined, 'warming_up does not fire below threshold');
+})();
+
+// dataReadiness surface present even when no recommendations fire.
+(function dataReadinessAlwaysPresent() {
+  const out = buildRecommendations({});
+  assert.ok(out.dataReadiness, 'dataReadiness always populated');
+  assert.equal(typeof out.dataReadiness.overallReadinessPct, 'number');
+  assert.ok(Object.keys(out.dataReadiness.perDiagnostic).length === 6);
 })();
 
 console.log('operatorRecommendations.test.js ok');

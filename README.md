@@ -1,5 +1,44 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: data-readiness surface on operator recommendations
+
+`meta.operatorRecommendations.dataReadiness` now reports per-diagnostic readiness state. Before this PR, an empty `recommendations: []` list was ambiguous between "all systems healthy" and "bot just restarted, give it time." The 2026-05-20 04:05 snapshot — taken ~3 minutes after a restart — surfaced exactly this issue: every individual diagnostic was warming up so every threshold check correctly returned no recommendation, but the operator pulling the dashboard would have read it as "nothing to do."
+
+The readiness surface decomposes "no recs" into a structured per-input view:
+
+```json
+"dataReadiness": {
+  "perDiagnostic": {
+    "marketRegime": { "ready": true, "detail": "Snapshot fresh (age 6s, regime quiet)", "percentReady": 1 },
+    "tradeFeasibility": { "ready": false, "detail": "21 rejections observed (need 60+ for chronicallyInfeasible to fire)", "percentReady": 0.35 },
+    "staleQuoteRetry": { "ready": false, "detail": "11 retry attempts (need 30+ before stale_quote_retry_failing can fire)", "percentReady": 0.37 },
+    "gateRejectionAudit": { "ready": true, "detail": "10000 graded rejections (≥ 50 threshold)", "percentReady": 1 },
+    "signalSelector": { "ready": true, "detail": "Active signal: mean_reversion", "percentReady": 1 },
+    "marketRegimeVeto": { "ready": true, "detail": "Veto disabled; wouldHaveVetoed=0", "percentReady": 1 }
+  },
+  "unreadyCount": 2,
+  "totalCount": 6,
+  "overallReadinessPct": 66.7
+}
+```
+
+When ≥ 2 inputs are below their sample-size floor, the synthesizer now emits an info-level `synthesizer_warming_up` rec that cites the unready inputs explicitly. The phone-first operator gets an unambiguous "still warming up" signal instead of misreading the empty list.
+
+### Sample-size floors
+
+| Input | Threshold | Rationale |
+|---|---|---|
+| `marketRegime` | snapshot age ≤ 60s | Mirrors the regime detector's own staleness guard |
+| `tradeFeasibility` | ≥ 60 rejections observed | ~5 per symbol × 12 symbols — minimum for `chronicallyInfeasible` to flag |
+| `staleQuoteRetry` | ≥ 30 attempts | Matches the `stale_quote_retry_failing` rec's own min-attempts threshold |
+| `gateRejectionAudit` | ≥ 50 graded rejections | Half of the verdict-floor sample size, used for trend classification |
+| `signalSelector` | non-null `signalVersion` | Selector decision complete (backtest chain finished) |
+| `marketRegimeVeto` | always ready | Counter that starts at 0; no sample-size dependency |
+
+All thresholds are pinned in `DEFAULT_CONFIG` (not env-overridable by design — they reflect known sample-size statistics from earlier audit work).
+
+---
+
 ## 2026-05-20 add: operator recommendations synthesizer
 
 `meta.operatorRecommendations` translates the diagnostic firehose into a prioritised "today's action list" for phone-first operators. Pure presentation layer over data the bot already collects — no entry-decision read path. Each recommendation has `severity` (high/med/low/info), `title`, `detail`, `evidence` (structured citations), `suggestedActions`, and `sourceFields` (meta paths the rec was derived from).
