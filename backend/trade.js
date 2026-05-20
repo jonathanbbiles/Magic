@@ -42,6 +42,7 @@ const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./module
 const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
 const marketRegimeDetector = require('./modules/marketRegimeDetector');
+const regimeVetoEvaluator = require('./modules/regimeVetoEvaluator');
 const { createRetryTracker: createStaleQuoteRetryTracker } = require('./modules/staleQuoteRetryStats');
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
@@ -423,6 +424,26 @@ const MARKET_REGIME_QUIET_SIGMA_BPS_PER_MIN = readNumber(
 const MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN = readNumber(
   'MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN',
   marketRegimeDetector.DEFAULT_THRESHOLDS.wildSigmaBpsPerMin,
+);
+
+// Phase 2 regime-aware entry veto (2026-05-20). Opt-in by env. When
+// enabled, the entry path refuses entries whose regime label is in
+// MARKET_REGIME_VETO_REGIMES and has held for ≥ MARKET_REGIME_VETO_CONSECUTIVE_MS.
+// When disabled (the default), the live engine still tracks a
+// "wouldHaveVetoed" counter so the operator gets evidence before
+// flipping the gate on. See backend/modules/regimeVetoEvaluator.js.
+const MARKET_REGIME_VETO_ENABLED = readBoolean('MARKET_REGIME_VETO_ENABLED', false);
+const MARKET_REGIME_VETO_REGIMES = String(process.env.MARKET_REGIME_VETO_REGIMES || 'adverse')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const MARKET_REGIME_VETO_CONSECUTIVE_MS = Math.max(
+  0,
+  readNumber('MARKET_REGIME_VETO_CONSECUTIVE_MS', regimeVetoEvaluator.DEFAULT_CONFIG.consecutiveMs),
+);
+const MARKET_REGIME_VETO_MAX_AGE_MS = Math.max(
+  1000,
+  readNumber('MARKET_REGIME_VETO_MAX_AGE_MS', regimeVetoEvaluator.DEFAULT_CONFIG.maxSnapshotAgeMs),
 );
 // Stop = max(stopFloorBps, sigma · MICRO_STOP_VOL_MULT). stopFloorBps
 // comes from per-horizon HORIZON_DEFAULTS; this multiplier is shared
@@ -1906,6 +1927,37 @@ function getMicroFlowShadowTrackerSnapshot() {
   return microFlowShadowTracker.snapshot();
 }
 
+// Regime-veto counters (2026-05-20 Phase 2). Tracks how often the
+// regime veto fires (vetoed) and how often it WOULD fire if enabled
+// (wouldHaveVetoed) — the second counter accumulates the evidence the
+// operator needs to flip MARKET_REGIME_VETO_ENABLED=true.
+const regimeVetoState = {
+  vetoed: 0,
+  wouldHaveVetoed: 0,
+  lastDecisionAt: null,
+  lastDecisionRegime: null,
+  lastDecisionReason: null,
+  lastDecisionShouldVeto: false,
+};
+function getRegimeVetoState() {
+  return {
+    enabled: MARKET_REGIME_VETO_ENABLED,
+    config: {
+      vetoRegimes: MARKET_REGIME_VETO_REGIMES.slice(),
+      consecutiveMs: MARKET_REGIME_VETO_CONSECUTIVE_MS,
+      maxSnapshotAgeMs: MARKET_REGIME_VETO_MAX_AGE_MS,
+    },
+    vetoed: regimeVetoState.vetoed,
+    wouldHaveVetoed: regimeVetoState.wouldHaveVetoed,
+    lastDecision: regimeVetoState.lastDecisionAt ? {
+      at: new Date(regimeVetoState.lastDecisionAt).toISOString(),
+      regime: regimeVetoState.lastDecisionRegime,
+      reason: regimeVetoState.lastDecisionReason,
+      shouldVeto: regimeVetoState.lastDecisionShouldVeto,
+    } : null,
+  };
+}
+
 // Stale-quote retry tracker (2026-05-20). Records every single-symbol
 // retry attempt + outcome for dashboard surface. Per-symbol recoveryRate
 // is the actionable number: < 10% means the fallback isn't helping and
@@ -2063,7 +2115,19 @@ function maybeUpdateMarketRegimeFromBars(pair, bars1m) {
         wildSigmaBpsPerMin: MARKET_REGIME_WILD_SIGMA_BPS_PER_MIN,
       },
     });
-    marketRegimeSnapshot = { ...summary, capturedAt: Date.now() };
+    const now = Date.now();
+    // Track when the current regime label began so the veto evaluator
+    // can require a minimum consecutive duration. Reset to `now` whenever
+    // the label changes; keep stable otherwise.
+    const previousRegime = marketRegimeSnapshot ? marketRegimeSnapshot.regime : null;
+    const previousStart = marketRegimeSnapshot ? marketRegimeSnapshot.consecutiveStartedAt : null;
+    const consecutiveStartedAt = regimeVetoEvaluator.trackConsecutiveStart({
+      previousRegime,
+      currentRegime: summary.regime,
+      previousStartedAt: previousStart,
+      nowMs: now,
+    });
+    marketRegimeSnapshot = { ...summary, capturedAt: now, consecutiveStartedAt };
   } catch (_) { /* observational; never fatal */ }
 }
 
@@ -2810,6 +2874,46 @@ async function scanAndEnter() {
       if (!sig.ok) {
         rejectTrade(pair, sig.reason || 'prediction_rejected');
         continue;
+      }
+
+      // Phase 2 regime-aware veto (2026-05-20). When the regime detector
+      // reports a label in MARKET_REGIME_VETO_REGIMES that has held for
+      // ≥ MARKET_REGIME_VETO_CONSECUTIVE_MS, refuse the entry. Placed
+      // after signal evaluation so only would-be entries (signal said
+      // ok=true) get vetoed and forward-graded; mr_no_drop etc. handle
+      // most rejections upstream and don't pollute the veto counter.
+      // When MARKET_REGIME_VETO_ENABLED=false the veto path is observed
+      // (wouldHaveVetoed++) but the entry is allowed through — Phase 2
+      // ships dark by default so the operator gets evidence before
+      // flipping live.
+      {
+        const snap = getMarketRegimeSnapshot();
+        const decision = regimeVetoEvaluator.evaluateRegimeVeto({
+          regime: snap ? snap.regime : null,
+          snapshotAgeMs: snap ? snap.ageMs : null,
+          consecutiveStartedAt: snap ? snap.consecutiveStartedAt : null,
+          nowMs: Date.now(),
+          config: {
+            vetoRegimes: MARKET_REGIME_VETO_REGIMES,
+            consecutiveMs: MARKET_REGIME_VETO_CONSECUTIVE_MS,
+            maxSnapshotAgeMs: MARKET_REGIME_VETO_MAX_AGE_MS,
+          },
+        });
+        if (decision.shouldVeto) {
+          regimeVetoState.lastDecisionAt = Date.now();
+          regimeVetoState.lastDecisionRegime = decision.regime;
+          regimeVetoState.lastDecisionReason = decision.reason;
+          regimeVetoState.lastDecisionShouldVeto = true;
+          if (MARKET_REGIME_VETO_ENABLED) {
+            regimeVetoState.vetoed += 1;
+            rejectTrade(pair, decision.reason, {
+              regime: decision.regime,
+              consecutiveDurationMs: decision.durationMs,
+            });
+            continue;
+          }
+          regimeVetoState.wouldHaveVetoed += 1;
+        }
       }
 
       // Recent-high proximity gate. Reject when the bid is within
@@ -4106,6 +4210,7 @@ module.exports = {
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
   getRollingSkipSnapshot,
+  getRegimeVetoState,
   resolveAlpacaAuth,
   getAlpacaAuthStatus,
   getAlpacaBaseStatus,
