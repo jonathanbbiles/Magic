@@ -1,5 +1,33 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: operator recommendations synthesizer
+
+`meta.operatorRecommendations` translates the diagnostic firehose into a prioritised "today's action list" for phone-first operators. Pure presentation layer over data the bot already collects — no entry-decision read path. Each recommendation has `severity` (high/med/low/info), `title`, `detail`, `evidence` (structured citations), `suggestedActions`, and `sourceFields` (meta paths the rec was derived from).
+
+### What the synthesizer can recommend today
+
+| Rec id | Trigger | Severity | Suggested action |
+|---|---|---|---|
+| `stale_quote_retry_failing` | Per-symbol `staleQuoteRetry.recoveryRate < 5%` over ≥ 30 attempts | `high` if ≥ 8 offenders, else `med` | Blocklist symbols / contact Alpaca / set `STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false`. |
+| `chronically_infeasible_symbols` | Symbols with `feasibilityPct < 20%` in `meta.tradeFeasibility.chronicallyInfeasible` | `high` ≥ 8, `med` ≥ 4, else `low` | Per-blocker actions: feed-side → blocklist; spread → re-tier; signal-side → wait. |
+| `bot_not_trading` | All universe symbols have 0% feasibility | `med` | Read `meta.tradeFeasibility` to identify the blocker pattern. |
+| `gate_costly_verdict` | `gateRejectionAudit.costliestGates` non-empty | `high` | Investigate the gate's threshold; remove or tune. |
+| `gate_trending_costly` | A reason is `trending_costly` in `trendingReasons` | `med` | Watch for verdict flip; no immediate action. |
+| `regime_veto_evidence_ready` | `marketRegimeVeto.enabled=false` AND `wouldHaveVetoed ≥ 50` | `med` | Check `gateRejectionAudit.byReason[regime_veto_*]` verdict, decide flip. |
+| `regime_benign_stable` | Regime `benign` for ≥ 1 hour AND veto disabled | `info` | Verify bot can actually trade during the good regime window. |
+
+The synthesizer is **defensive**: each builder runs inside a try/catch, so a single malformed input field can't crash the recommendation list. Each rec cites its source meta path so the operator can verify the evidence.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OPERATOR_RECOMMENDATIONS_ENABLED` | `true` | Master kill — `meta.operatorRecommendations` becomes `null`. |
+
+### Why this matters
+
+The 2026-05-20 03:51 snapshot showed the bot in `marketRegime: benign` (+1 bps/trade simulator expectancy) yet making zero trades — because 11/12 symbols are stale-feed-blocked and the validated MR-1m signal won't fire on the 1 fresh symbol (BTC) without a capitulation drop. The data to figure that out was spread across `tradeFeasibility`, `staleQuoteRetry`, `signalSelector`, `marketRegime`, and `quoteFreshness`. With the synthesizer, the operator sees the synthesis directly: a high-severity `stale_quote_retry_failing` rec + a med-severity `bot_not_trading` rec, each citing the underlying fields.
+
+---
+
 ## 2026-05-20 add: Phase 2 regime-aware entry veto (opt-in)
 
 Wires the existing observational `marketRegimeDetector` (shipped 2026-05-20 morning) as an actual entry gate. **Default OFF** — opt-in by env so behavior is unchanged until an operator flips it on with evidence. When OFF, the live engine still tracks a `wouldHaveVetoed` counter so the operator gets continuous evidence of how often the veto path would have fired.

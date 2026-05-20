@@ -77,6 +77,20 @@ The mean-reversion signal's internal thresholds were hard-coded in `DEFAULT_CONF
 
 Defaults mirror DEFAULT_CONFIG so wiring is zero-behavior-change until an operator sets one in Render env. Always validate a knob flip with `/debug/backtest?days=90&refresh=true&strategy=mean_reversion` before deploying it live.
 
+## Operator recommendations synthesizer (2026-05-20 PM)
+
+`backend/modules/operatorRecommendations.js` is a pure aggregator that reads every other meta diagnostic (`marketRegime`, `marketRegimeVeto`, `tradeFeasibility`, `staleQuoteRetry`, `gateRejectionAudit`, `signalSelector`) and produces a prioritised list of structured recommendations. Surfaced at `meta.operatorRecommendations`. Default-on via `OPERATOR_RECOMMENDATIONS_ENABLED` (set to `false` to disable).
+
+**Each recommendation has source-field citations.** When adding a new rec builder, follow the same shape: `{ id, severity, title, detail, evidence, suggestedActions, sourceFields }`. The `sourceFields` array must list every `meta.*` path the rec was derived from — that's the verification trail.
+
+**When adding new rec types:**
+1. Implement a pure `recXxx({ ...meta-pieces, cfg })` function returning either `null` (no rec) or the structured rec object.
+2. Add it to the `builders` array in `buildRecommendations`.
+3. Each builder runs inside a try/catch — return null defensively for malformed inputs rather than throwing.
+4. Add a test that drives the builder with synthetic inputs (no mocks needed; builders are pure functions).
+
+**Hard Rule #4 compliance:** the live consumer is the dashboard meta surface. No signal/gate/sizing decision reads from `operatorRecommendations`. Recs are advisory only — the operator still has to act on them via env var changes.
+
 ## Phase 2 regime-aware veto (2026-05-20 PM)
 
 The observational regime classifier (shipped 2026-05-20 AM, `backend/modules/marketRegimeDetector.js`) is now wired as an opt-in entry gate via `backend/modules/regimeVetoEvaluator.js`. Quick reference:
