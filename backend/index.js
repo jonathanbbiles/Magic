@@ -1852,7 +1852,23 @@ app.get('/dashboard', async (req, res) => {
           try {
             const snapshot = typeof getStaleQuoteRetryTrackerSnapshot === 'function'
               ? getStaleQuoteRetryTrackerSnapshot() : [];
-            return staleQuoteRetryStats.buildRetryStats({ snapshot });
+            const stats = staleQuoteRetryStats.buildRetryStats({ snapshot });
+            const autoSuppressEnabled = String(process.env.STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED
+              || 'true').toLowerCase() !== 'false';
+            if (autoSuppressEnabled) {
+              const minAttempts = Number(process.env.STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS)
+                || staleQuoteRetryStats.DEFAULT_SUPPRESS_MIN_ATTEMPTS;
+              const maxRate = Number(process.env.STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE)
+                || staleQuoteRetryStats.DEFAULT_SUPPRESS_MAX_RECOVERY_RATE;
+              stats.suppressedSymbols = staleQuoteRetryStats.buildSuppressedSymbols({
+                snapshot, minAttempts, maxRecoveryRate: maxRate,
+              });
+              stats.autoSuppressConfig = { minAttempts, maxRecoveryRate: maxRate };
+            } else {
+              stats.suppressedSymbols = [];
+              stats.autoSuppressConfig = { enabled: false };
+            }
+            return stats;
           } catch (err) {
             return {
               ranAt: new Date().toISOString(),
@@ -1860,6 +1876,7 @@ app.get('/dashboard', async (req, res) => {
               recoveries: 0,
               recoveryRate: null,
               bySymbol: [],
+              suppressedSymbols: [],
               error: err?.message,
             };
           }
