@@ -1287,6 +1287,16 @@ async function runBacktest(overrides = {}) {
     totalGateSkips.btc_leading_drop += symbolGateSkipped.btc_leading_drop || 0;
     totalGateSkips.projected_below_gross_target += symbolGateSkipped.projected_below_gross_target || 0;
     allTrades = allTrades.concat(trades);
+    // Release this symbol's bars now that replay is complete. BTC bars stay
+    // alive across iterations because non-BTC symbols need them for the
+    // lead-lag gate; everything else can be reclaimed immediately. 30 days
+    // of 1m bars per symbol is ~7 MB; freeing 11 of 12 caps the peak at
+    // ~15 MB instead of ~80 MB and prevents the boot-time backtest swarm
+    // from exhausting V8's old-space heap on a 512 MB Render instance.
+    if (symbol !== btcSymbol) {
+      delete barsBySymbol[symbol];
+      bars = null;
+    }
   }
   const overall = summarise(allTrades);
   const strategyName = String(opts.strategy || 'ols').toLowerCase();

@@ -6,13 +6,13 @@
     "node": "22.x"
   },
   "scripts": {
-    "start": "node index.js",
+    "start": "node --max-old-space-size=460 index.js",
     "test": "npm run check:no-secrets && npm run test:core && npm run test:modules && npm run test:config && npm run test:telemetry && npm run test:scripts",
     "smoke": "node smoke.test.js",
     "check:runtime-env": "node scripts/check_runtime_env.js",
     "check:no-secrets": "node scripts/check-no-secrets.js",
     "preflight": "CHECK_RUNTIME_ENV_TEMPLATE_ONLY=1 node scripts/check_runtime_env.js && node smoke.test.js",
-    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node index.js",
+    "start:production": "LOAD_LOCAL_PRODUCTION_DOTENV=true DOTENV_CONFIG_PATH=.env.production.local NODE_ENV=production node --max-old-space-size=460 index.js",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
