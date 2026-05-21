@@ -53,6 +53,7 @@ const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
+const staleQuoteRescue = require('./modules/staleQuoteRescue');
 const SECONDARY_FEED_ENABLED_TRADE = String(
   process.env.SECONDARY_FEED_ENABLED || 'false',
 ).toLowerCase() === 'true';
@@ -70,6 +71,43 @@ const CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS = Math.max(
   0,
   Number(process.env.CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS) || 10000,
 );
+// Stale-quote rescue (Phase B follow-up). Default-OFF — operator flips
+// STALE_QUOTE_RESCUE_ENABLED=true in Render env after `meta.staleQuoteRescue`
+// shows reasonable wouldHaveRescued counts. Reuses the cross-venue divergence
+// threshold (same physical concept: are the two venues agreeing on price?).
+const STALE_QUOTE_RESCUE_ENABLED = String(
+  process.env.STALE_QUOTE_RESCUE_ENABLED || 'false',
+).toLowerCase() === 'true';
+
+// Attempt to rescue a quote that would otherwise be rejected with stale_quote
+// or pruned_stale_quotes. Always records the would-have-rescued counter (so
+// operator can observe the rescue's potential impact in shadow mode); only
+// returns `{ rescued: true }` when STALE_QUOTE_RESCUE_ENABLED is on AND the
+// rescue decision is favourable. Caller wraps the existing rejectTrade call
+// with this check.
+function tryStaleQuoteRescue(pair, alpacaQuote, rejectionReason) {
+  if (!SECONDARY_FEED_ENABLED_TRADE) return { rescued: false };
+  let decision = null;
+  try {
+    const coinbaseQuote = coinbaseQuotesStream.getLatestQuote(pair);
+    decision = staleQuoteRescue.evaluateStaleQuoteRescue({
+      alpacaQuote,
+      coinbaseQuote,
+      rejectionReason,
+      maxDivergenceBps: CROSS_VENUE_MAX_DIVERGENCE_BPS,
+      minCoinbaseFreshnessMs: CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS,
+    });
+    staleQuoteRescue.record({
+      symbol: pair,
+      decision,
+      rescueEnabled: STALE_QUOTE_RESCUE_ENABLED,
+    });
+  } catch (_) {
+    // Rescue eval must never break the scan. Fall through to rejection.
+  }
+  if (!decision || !decision.rescued) return { rescued: false };
+  return { rescued: STALE_QUOTE_RESCUE_ENABLED, evidence: decision.evidence };
+}
 const { createQuoteFreshnessTracker } = require('./modules/quoteFreshnessTracker');
 
 const runtimeConfig = getRuntimeConfig(process.env);
@@ -2887,8 +2925,18 @@ async function scanAndEnter() {
         // Some venues occasionally publish delayed quote timestamps despite
         // updating bid/ask. If the quote moved since the previous scan, avoid
         // classifying it as stale solely due to provider timestamp lag.
-      } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
-      if (STALE_QUOTE_PRUNE_ENABLED && quoteFreshness.isPruned(pair)) { rejectTrade(pair, 'pruned_stale_quotes', { ageMs }); continue; }
+      } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) {
+        const rescue = tryStaleQuoteRescue(pair, quote, 'stale_quote');
+        if (!rescue.rescued) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
+        // Rescue admitted — emit a structured log so the bypass is auditable
+        // alongside the rejected counterfactual in gateRejectionAudit.
+        console.log('stale_quote_rescued', { symbol: pair, ageMs, ...rescue.evidence });
+      }
+      if (STALE_QUOTE_PRUNE_ENABLED && quoteFreshness.isPruned(pair)) {
+        const rescue = tryStaleQuoteRescue(pair, quote, 'pruned_stale_quotes');
+        if (!rescue.rescued) { rejectTrade(pair, 'pruned_stale_quotes', { ageMs }); continue; }
+        console.log('pruned_stale_quotes_rescued', { symbol: pair, ageMs, ...rescue.evidence });
+      }
 
       // Bind the gate-audit context now that we have a freshness-passing
       // quote. All subsequent rejects (spread_too_wide, prediction_rejected,

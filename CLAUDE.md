@@ -413,13 +413,48 @@ Module: `backend/modules/crossVenueGate.js`. Pure decision function + singleton 
 
 **When extending**: the decision function is pure — never mock the Coinbase stream; just construct synthetic `{alpacaQuote, coinbaseQuote}` inputs. See `crossVenueGate.test.js` for 12 worked examples covering both-fresh / Coinbase-stale / Alpaca-unavailable / shape-tolerance / direction-symmetry / tracker bookkeeping.
 
+## Stale-quote rescue (Phase B follow-up — 2026-05-20)
+
+The inverse of `crossVenueGate`. When Alpaca's quote is stale (would normally fire `stale_quote` or `pruned_stale_quotes`) but Coinbase has a fresh quote that confirms the price hasn't moved (divergence within `CROSS_VENUE_MAX_DIVERGENCE_BPS`), the rescue admits the entry. Alpaca's stale quote is "old but still accurate" — Coinbase's fresh tick confirms it.
+
+Module: `backend/modules/staleQuoteRescue.js`. Pure decision function + singleton tracker.
+
+**Why this matters**: during sustained Alpaca-feed degradation (observed multiple times this week — `staleQuoteRetry.recoveryRate` collapsing to ~3-4%, 11/12 symbols hitting `stale_quote` or `pruned_stale_quotes`), the bot is completely blocked from trading. Phase A established Coinbase has fresh quotes during these windows; this rescue lets that signal unblock entries.
+
+**Decision tree** (`evaluateStaleQuoteRescue`, symmetric with cross-venue gate):
+- Coinbase unavailable → no rescue.
+- Coinbase older than `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS` → no rescue.
+- Alpaca quote invalid (zero/negative bid or ask) → no rescue.
+- Both fresh on the cross-feed side, `|divergence|` within `CROSS_VENUE_MAX_DIVERGENCE_BPS` → rescue (price hasn't moved during Alpaca's staleness window).
+- `|divergence|` exceeds tolerance → no rescue (price HAS moved; the stale Alpaca quote is genuinely wrong).
+
+**Wiring**: `trade.js` calls `tryStaleQuoteRescue(pair, quote, rejectionReason)` at the two stale-quote rejection points (`stale_quote` at the freshness check, `pruned_stale_quotes` at the pruner check). The helper:
+1. Always evaluates the rescue + records the would-have-rescued counter (shadow stats accumulate regardless of `STALE_QUOTE_RESCUE_ENABLED`).
+2. Only returns `{ rescued: true }` when `STALE_QUOTE_RESCUE_ENABLED=true` AND the evaluation says rescue is OK.
+3. When live and rescued, the existing rejection is bypassed and the scan continues with Alpaca's (stale-but-cross-confirmed) quote. A `stale_quote_rescued` or `pruned_stale_quotes_rescued` log line is emitted so the bypass is auditable in retrospect.
+
+**Shadow mode is the default**. Operator workflow:
+1. After PR merges with `STALE_QUOTE_RESCUE_ENABLED=false`, watch `meta.staleQuoteRescue.overall.wouldHaveRescued` accumulate during Alpaca-degraded windows.
+2. After ≥ 50 wouldHaveRescued events, flip `STALE_QUOTE_RESCUE_ENABLED=true` in Render env.
+3. Once live, the rescued entries flow through the existing `bid_plus_tick` limit-order path. Whether they fill is the next observable: limit at stale-Alpaca-bid + 1 tick will only execute if Alpaca's order book is close enough. Cross-venue confirmation says the *price* is approximately right, but execution still depends on Alpaca's local order book — expect a higher `entry_unfilled` rate on rescued entries than on naturally-fresh ones.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `STALE_QUOTE_RESCUE_ENABLED` | `false` | Master kill. When false, rescue runs in shadow mode (records stats, no behavior change). When true, also bypasses `stale_quote` / `pruned_stale_quotes` rejections. |
+
+**Reuses** `CROSS_VENUE_MAX_DIVERGENCE_BPS` and `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS` from Phase B. The two gates are physically opposed but logically share the divergence threshold — "are the two venues agreeing on price?" — so the same number governs both.
+
+**Hard Rule #4 compliance**: the rescue path is wired into trade.js (the master-kill check is at the rejection site; the tracker singleton records every evaluation). When `STALE_QUOTE_RESCUE_ENABLED=false`, the wouldHaveRescued counter is the active consumer of the data; when true, the live rejection bypass is. No dead branches.
+
+**When extending**: the decision function is pure — see `staleQuoteRescue.test.js` for 12 worked examples. The rescue is logically the inverse of `crossVenueGate.evaluateCrossVenueGate`, and intentionally shares the `normalizeQuote` helper from `crossVenueGate.js`. Do NOT duplicate the normalization logic; if quote-shape handling needs to change, change `crossVenueGate.normalizeQuote` and both modules benefit.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
 - Signals: `backend/modules/multiFactorSignal.js`, `meanReversionSignal.js`, `rangeMeanReversionSignal.js`, `barrierSignal.js` (restored original signal from fbdb924), `microstructureSignal.js` (2026-05-18 — microstructure-weighted logistic, 4 horizons)
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
-- Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default)
+- Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default), `staleQuoteRescue.js` (Phase B follow-up — inverse rescue gate, shadow-mode by default)
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
