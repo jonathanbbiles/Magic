@@ -27,6 +27,8 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 5. **Don't add stop-loss, max-hold, or force-exit logic without explicit user instruction.** The "walk away after placing the GTC sell" behavior is intentional design, not a missing feature.
 
+6. **Ship-and-merge is the default workflow.** When a change is complete and tests pass, push the branch, open the PR via the GitHub MCP, and merge it (squash, into `main`) without waiting for explicit confirmation each time. This is a standing instruction from the repo owner (2026-05-21). Exceptions: if tests fail, if the change touches anything the user flagged as risky in the same session, or if the user explicitly says "don't merge yet."
+
 ## Useful commands
 
 ```sh
