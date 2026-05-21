@@ -336,12 +336,53 @@ const COSTLY_VERDICT_EXCLUDED_REASONS = new Set([
   'spread_too_wide_tier1',
   'spread_too_wide_tier2',
   'spread_too_wide_tier3',
+  // Multi-factor's volume sub-gates (NOT the universal `volume_below_min`).
+  'volume_insufficient_bars',
+  'volume_lookback_zero',
+  // Multi-factor's orderbook sub-gates.
+  'orderbook_missing',
+  'orderbook_unusable',
+  'orderbook_zero_depth',
 ]);
+
+// Signal-internal rejection reasons. These mean the signal's own evaluator
+// returned ok=false — the signal would NOT have proposed an entry. The
+// audit's forward-bps measures price movement from random non-firing scan
+// points, which has zero relationship to what the signal would have entered
+// on (signals like MR enter AFTER a capitulation drop expecting reversal;
+// non-drop scan points are not entry candidates). Tuning these thresholds
+// requires per-signal backtest evidence, not forward-bps grading. Per
+// CLAUDE.md, several are also empirically locked (e.g. MR_DROP_TRIGGER_BPS
+// at 100 — lowering to 80 flipped expectancy +14.91 → −24 bps).
+const SIGNAL_INTERNAL_REASON_PREFIXES = [
+  'mr_',         // mean_reversion + mean_reversion_5m/15m
+  'range_mr_',   // range_mean_reversion
+  'barrier_',    // barrier signal
+  'micro_',      // microstructure_5m/15m/30m/45m
+  'mf_',         // multi_factor
+  'htf_',        // multi_factor higher-timeframe gate
+  'pullback_',   // multi_factor pullback gate
+  'turn_',       // multi_factor turn confirmation
+];
+
+function isSignalInternalReason(reason) {
+  const r = String(reason || '');
+  if (!r) return false;
+  return SIGNAL_INTERNAL_REASON_PREFIXES.some((p) => r.startsWith(p));
+}
+
+function isCostlyVerdictAuditable(reason) {
+  const r = String(reason || '');
+  if (!r) return false;
+  if (COSTLY_VERDICT_EXCLUDED_REASONS.has(r)) return false;
+  if (isSignalInternalReason(r)) return false;
+  return true;
+}
 
 function recCostlyGates({ gateRejectionAudit }) {
   if (!gateRejectionAudit) return null;
   const costly = Array.isArray(gateRejectionAudit.costliestGates) ? gateRejectionAudit.costliestGates : [];
-  const auditable = costly.filter((g) => !COSTLY_VERDICT_EXCLUDED_REASONS.has(String(g.reason || '')));
+  const auditable = costly.filter((g) => isCostlyVerdictAuditable(g.reason));
   if (auditable.length === 0) return null;
   return {
     id: 'gate_costly_verdict',
@@ -395,6 +436,20 @@ function recTradingActivity({ tradeFeasibility, signalSelector }) {
   if (!tradeFeasibility) return null;
   const symbols = Array.isArray(tradeFeasibility.symbols) ? tradeFeasibility.symbols : [];
   if (symbols.length === 0) return null;
+  // Require non-trivial rejection sample before claiming infeasibility.
+  // When `rejectionsObserved === 0` and `inferredScanCount === 0` the audit
+  // has no data — every symbol's feasibilityPct is null. Firing
+  // "all symbols infeasible" off zero evidence is a false positive that
+  // double-counts with the synthesizer_warming_up rec (which already
+  // surfaces "0 rejections observed; warming up"). Observed 2026-05-21
+  // when account equity was $0 mid-deposit: scans skipped at
+  // `sizing_unavailable` before any per-symbol gating ran, leaving the
+  // feasibility audit empty — the bot was idle for cash, not blocked by
+  // structural infeasibility, and the synthesizer warm-up rec was the
+  // honest signal to read.
+  const rejectionsObserved = asNumber(tradeFeasibility.rejectionsObserved) || 0;
+  const inferredScanCount = asNumber(tradeFeasibility.inferredScanCount) || 0;
+  if (rejectionsObserved <= 0 && inferredScanCount <= 0) return null;
   // Count symbols with > 0 feasibility.
   const anyFeasible = symbols.some((s) => (asNumber(s.feasibilityPct) || 0) > 0);
   if (anyFeasible) return null; // some trading possible — no rec
