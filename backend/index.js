@@ -122,6 +122,7 @@ const operatorRecommendations = require('./modules/operatorRecommendations');
 const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
+const staleQuoteRescue = require('./modules/staleQuoteRescue');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -811,6 +812,11 @@ const SECONDARY_FEED_FRESH_THRESHOLD_MS = Math.max(
 // inert (trade.js doesn't call it) so the meta surface is null.
 const CROSS_VENUE_GATE_ENABLED = String(
   process.env.CROSS_VENUE_GATE_ENABLED || 'false',
+).toLowerCase() === 'true';
+// Stale-quote rescue (Phase B follow-up). Default OFF — meta surface
+// renders shadow-mode stats so operator can validate before flipping live.
+const STALE_QUOTE_RESCUE_ENABLED = String(
+  process.env.STALE_QUOTE_RESCUE_ENABLED || 'false',
 ).toLowerCase() === 'true';
 
 // Trade-feasibility audit (2026-05-20). Per-symbol view of the
@@ -1958,6 +1964,29 @@ app.get('/dashboard', async (req, res) => {
               overall: null,
               bySymbol: [],
               gateEnabled: CROSS_VENUE_GATE_ENABLED,
+              error: err?.message,
+            };
+          }
+        })() : null,
+        // Stale-quote rescue (Phase B follow-up — 2026-05-20). Inverse of
+        // the divergence gate: when Alpaca's quote is stale but Coinbase
+        // confirms the price hasn't moved, admit the entry. Shadow stats
+        // when STALE_QUOTE_RESCUE_ENABLED=false; live rescues when true.
+        // Headline metric: `overall.wouldHaveRescued` — how often the
+        // rescue would have unblocked an otherwise-stalled entry.
+        staleQuoteRescue: SECONDARY_FEED_ENABLED ? (() => {
+          try {
+            const summary = staleQuoteRescue.buildSummary();
+            return {
+              ...summary,
+              rescueEnabled: STALE_QUOTE_RESCUE_ENABLED,
+            };
+          } catch (err) {
+            return {
+              ranAt: new Date().toISOString(),
+              overall: null,
+              bySymbol: [],
+              rescueEnabled: STALE_QUOTE_RESCUE_ENABLED,
               error: err?.message,
             };
           }

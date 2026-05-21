@@ -146,15 +146,53 @@ const NOW = 1779252000000;
 })();
 
 // Costly gates: when present, surface high severity with per-gate detail.
+// Use a non-spread reason because spread_too_wide* are filtered as
+// structurally un-audit-able (see PR #421 and the rec's COSTLY_VERDICT
+// _EXCLUDED_REASONS).
 (function costlyGatesHigh() {
   const rec = recCostlyGates({
     gateRejectionAudit: {
-      costliestGates: [{ reason: 'spread_too_wide', entries: 500, avgForwardBps: 15.7, winRate: 0.62 }],
+      costliestGates: [{ reason: 'near_recent_high', entries: 500, avgForwardBps: 15.7, winRate: 0.62 }],
     },
   });
   assert.ok(rec);
   assert.equal(rec.severity, 'high');
-  assert.equal(rec.evidence.costliestGates[0].reason, 'spread_too_wide');
+  assert.equal(rec.evidence.costliestGates[0].reason, 'near_recent_high');
+})();
+
+// Costly gates: spread-based reasons are filtered out (false positive per
+// PR #421 — forwardBps is mid-to-mid, doesn't subtract spread cost).
+(function costlyGatesSpreadFiltered() {
+  const onlySpread = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [{ reason: 'spread_too_wide', entries: 500, avgForwardBps: 15.7, winRate: 0.62 }],
+    },
+  });
+  assert.equal(onlySpread, null, 'spread_too_wide alone should NOT trigger the costly-gates rec');
+
+  const mixed = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [
+        { reason: 'spread_too_wide', entries: 500, avgForwardBps: 15.7, winRate: 0.62 },
+        { reason: 'near_recent_high', entries: 200, avgForwardBps: 12.3, winRate: 0.55 },
+      ],
+    },
+  });
+  assert.ok(mixed, 'mixed list with at least one auditable gate should still surface a rec');
+  assert.equal(mixed.evidence.costliestGates.length, 1);
+  assert.equal(mixed.evidence.costliestGates[0].reason, 'near_recent_high');
+
+  // Tier variants also filtered.
+  const tierVariants = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [
+        { reason: 'spread_too_wide_tier1', entries: 50, avgForwardBps: 11, winRate: 0.6 },
+        { reason: 'spread_too_wide_tier2', entries: 60, avgForwardBps: 12, winRate: 0.6 },
+        { reason: 'spread_too_wide_tier3', entries: 70, avgForwardBps: 13, winRate: 0.6 },
+      ],
+    },
+  });
+  assert.equal(tierVariants, null, 'all spread_too_wide_tier* should be filtered too');
 })();
 
 // Costly gates: empty → no rec.

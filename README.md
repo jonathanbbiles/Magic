@@ -1,5 +1,34 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-20 add: stale-quote rescue (Coinbase confirms Alpaca's stale price is still right) + costly-gates rec filter
+
+The 2026-05-20 23:49Z diagnostic snapshot showed the bot completely stalled: 11/12 symbols blocked by `stale_quote` despite Coinbase's WS feed having sub-2-second-old quotes on every one of them. Phase A built the cross-feed observation; Phase B used it to add MORE rejections when both feeds disagree. Neither phase USED Coinbase to UNBLOCK stale-Alpaca entries — that's the gap this PR closes.
+
+**Stale-quote rescue.** When the `stale_quote` or `pruned_stale_quotes` rejection would fire AND Coinbase has a fresh quote whose mid is within `CROSS_VENUE_MAX_DIVERGENCE_BPS` (default 25) of Alpaca's stale mid, the rescue admits the entry. The reasoning: Coinbase confirms the price hasn't actually moved during Alpaca's staleness window, so Alpaca's stale quote — while old — is still approximately accurate for the bid+tick limit-order construction.
+
+Symmetric design with Phase B's `crossVenueGate`: that module REJECTS when both fresh feeds disagree; this module ADMITS when one feed is stale but the other confirms the price is still right. Same divergence threshold (`CROSS_VENUE_MAX_DIVERGENCE_BPS`) governs both — "are the venues agreeing on price?" is the same physical question.
+
+**Default-OFF / shadow mode**. `STALE_QUOTE_RESCUE_ENABLED=false` ships the rescue path observational-only. `meta.staleQuoteRescue.overall.wouldHaveRescued` accumulates; no actual rescue happens. Operator flips to true after validating the counter looks reasonable.
+
+### Env vars
+
+| Env var | Default | Notes |
+|---|---|---|
+| `STALE_QUOTE_RESCUE_ENABLED` | `false` | Master kill. When true, the rescue actually bypasses `stale_quote` / `pruned_stale_quotes` when cross-feed confirms price hasn't moved. |
+
+Reuses `CROSS_VENUE_MAX_DIVERGENCE_BPS=25` and `CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS=10000` from Phase B by design — same physical question.
+
+### Operator workflow
+
+1. Merge ships with `STALE_QUOTE_RESCUE_ENABLED=false`. Watch `meta.staleQuoteRescue.overall.wouldHaveRescued` climb during Alpaca-degraded windows (where the rescue would have helped).
+2. After ≥ 50 wouldHaveRescued events: flip `STALE_QUOTE_RESCUE_ENABLED=true` in Render env. Existing `bid_plus_tick` execution path handles the actual order; expect a higher `entry_unfilled` rate on rescued entries because execution still depends on Alpaca's local order book matching the (stale-but-confirmed) price.
+
+### Also in this PR: `gate_costly_verdict` rec filters spread-based gates
+
+PR #421 documented the structural false positive — `spread_too_wide` always shows `gate_costly` in `gateRejectionAudit` because `forwardBps` is mid-to-mid and doesn't subtract the round-trip spread cost the rejection avoided. The rec was still flagging it as a high-severity action item every snapshot.
+
+`recCostlyGates` in `operatorRecommendations.js` now filters `spread_too_wide` and `spread_too_wide_tier{1,2,3}` from the costly-gates list. When the costliestGates list contains ONLY spread-based reasons, the rec is null (silent). When it's mixed, only the auditable reasons surface. The structural exclusion is documented inline with a pointer to the PR #421 explanation.
+
 ## 2026-05-20 add: Phase B cross-venue divergence gate (shadow-mode by default) + sequence-gap fix
 
 Phase A's 23 minutes of live data was decisive: Coinbase is fresh 100% of observations across every symbol while Alpaca freshness ranges from 23.8% (XRP) to 96.8% (BTC), with median divergence ≤ 6 bps per symbol. The architectural premise is empirically confirmed.

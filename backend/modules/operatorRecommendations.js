@@ -209,26 +209,41 @@ function recMarketRegimeVetoDarkMode({ marketRegime, marketRegimeVeto, cfg, nowM
   return null;
 }
 
+// Reasons whose `gate_costly` verdict is structurally meaningless and
+// should NOT be surfaced as a high-severity recommendation. See the
+// gateRejectionAudit.js module header and CLAUDE.md's gate-rejection-audit
+// section for the full rationale: forwardBps is mid-to-mid, so it does
+// not subtract the round-trip spread cost the rejection avoided. For
+// spread-based gates the rejection cost IS the spread, so the audit
+// always over-attributes profitability and the rec mis-signals action.
+const COSTLY_VERDICT_EXCLUDED_REASONS = new Set([
+  'spread_too_wide',
+  'spread_too_wide_tier1',
+  'spread_too_wide_tier2',
+  'spread_too_wide_tier3',
+]);
+
 function recCostlyGates({ gateRejectionAudit }) {
   if (!gateRejectionAudit) return null;
   const costly = Array.isArray(gateRejectionAudit.costliestGates) ? gateRejectionAudit.costliestGates : [];
-  if (costly.length === 0) return null;
+  const auditable = costly.filter((g) => !COSTLY_VERDICT_EXCLUDED_REASONS.has(String(g.reason || '')));
+  if (auditable.length === 0) return null;
   return {
     id: 'gate_costly_verdict',
     severity: 'high',
-    title: `${costly.length} gate${costly.length === 1 ? '' : 's'} verdict gate_costly — refusing profitable entries`,
+    title: `${auditable.length} gate${auditable.length === 1 ? '' : 's'} verdict gate_costly — refusing profitable entries`,
     detail: 'These gates have rejected candidates whose 20-minute forward '
       + 'return averaged > +10 bps. The gate is structurally rejecting '
       + 'winners. Investigate threshold or remove if not justified.',
     evidence: {
-      costliestGates: costly.map((g) => ({
+      costliestGates: auditable.map((g) => ({
         reason: g.reason,
         entries: g.entries,
         avgForwardBps: Number(g.avgForwardBps?.toFixed(2) || 0),
         winRate: Number((g.winRate || 0).toFixed(3)),
       })),
     },
-    suggestedActions: costly.map((g) => `Investigate gate '${g.reason}' (avg forward bps +${g.avgForwardBps?.toFixed(1)} over ${g.entries} rejections). Consider tuning the threshold or removing.`),
+    suggestedActions: auditable.map((g) => `Investigate gate '${g.reason}' (avg forward bps +${g.avgForwardBps?.toFixed(1)} over ${g.entries} rejections). Consider tuning the threshold or removing.`),
     sourceFields: ['meta.gateRejectionAudit.costliestGates'],
   };
 }
