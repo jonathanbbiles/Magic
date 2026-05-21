@@ -69,6 +69,77 @@ const NOW = 1779252000000;
   assert.equal(rec, null, 'healthy recoveryRate → no rec');
 })();
 
+// Stale-quote retry: ALL offenders already auto-suppressed → no rec
+// (auto-suppress is already preventing the wasted API calls; the rec was
+// firing as a stale "what should I do" item).
+(function staleQuoteRetryAllAutoSuppressed() {
+  const bySymbol = [];
+  for (const sym of ['ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'UNI/USD', 'DOT/USD', 'ADA/USD', 'XRP/USD']) {
+    bySymbol.push({ symbol: sym, attempts: 50, recoveries: 0, recoveryRate: 0 });
+  }
+  const suppressedSymbols = bySymbol.map((b) => ({
+    symbol: b.symbol, attempts: b.attempts, recoveries: b.recoveries, recoveryRate: b.recoveryRate,
+  }));
+  const rec = recStaleQuoteRetryHealth({
+    staleQuoteRetry: {
+      bySymbol, suppressedSymbols, attempts: 400, recoveries: 0, recoveryRate: 0,
+    },
+    cfg: DEFAULT_CONFIG,
+  });
+  assert.equal(rec, null, 'all offenders auto-suppressed → no rec');
+})();
+
+// Stale-quote retry: SOME offenders auto-suppressed, some still probing →
+// rec fires only on the still-probing set with a note about how many
+// are already auto-handled.
+(function staleQuoteRetryPartiallySuppressed() {
+  const bySymbol = [];
+  const suppressedNames = ['ETH/USD', 'SOL/USD', 'AVAX/USD'];
+  const stillProbingNames = ['LINK/USD', 'UNI/USD'];
+  for (const sym of [...suppressedNames, ...stillProbingNames]) {
+    bySymbol.push({ symbol: sym, attempts: 50, recoveries: 0, recoveryRate: 0 });
+  }
+  const suppressedSymbols = suppressedNames.map((symbol) => ({ symbol, attempts: 50, recoveries: 0, recoveryRate: 0 }));
+  const rec = recStaleQuoteRetryHealth({
+    staleQuoteRetry: {
+      bySymbol, suppressedSymbols, attempts: 250, recoveries: 0, recoveryRate: 0,
+    },
+    cfg: DEFAULT_CONFIG,
+  });
+  assert.ok(rec, 'still-probing offenders → rec fires');
+  assert.equal(rec.severity, 'med', '2 still-probing → med (< 8)');
+  assert.equal(rec.evidence.offenderSymbols.length, 2);
+  assert.deepEqual(rec.evidence.offenderSymbols.sort(), stillProbingNames.sort());
+  assert.equal(rec.evidence.autoSuppressedCount, 3);
+  assert.ok(rec.title.includes('3 additional'));
+  assert.ok(rec.sourceFields.includes('meta.staleQuoteRetry.suppressedSymbols'));
+  // Suggested actions reference auto-suppress instead of the global kill switch.
+  assert.ok(rec.suggestedActions.some((a) => a.includes('Auto-suppress')));
+  assert.equal(
+    rec.suggestedActions.some((a) => a.includes('STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false to stop')),
+    false,
+    'old "kill globally" suggestion removed in favour of pointing at auto-suppress',
+  );
+})();
+
+// Stale-quote retry: snapshot reproduction (2026-05-21 diagnostics where all
+// 12 symbols were in suppressedSymbols). Exercises the actual production
+// data shape end-to-end via buildRecommendations.
+(function staleQuoteRetrySnapshotReplay() {
+  const symbols = ['XRP/USD', 'DOGE/USD', 'BCH/USD', 'LTC/USD', 'DOT/USD', 'SOL/USD', 'ADA/USD', 'UNI/USD', 'AVAX/USD', 'ETH/USD', 'LINK/USD', 'BTC/USD'];
+  const bySymbol = symbols.map((symbol, i) => ({
+    symbol, attempts: 96 - i * 6, recoveries: i === 0 ? 4 : 0, recoveryRate: i === 0 ? 0.0417 : 0,
+  }));
+  const suppressedSymbols = bySymbol.map((b) => ({ ...b }));
+  const out = buildRecommendations({
+    staleQuoteRetry: {
+      bySymbol, suppressedSymbols, attempts: 500, recoveries: 6, recoveryRate: 0.012,
+    },
+  });
+  const rec = out.recommendations.find((r) => r.id === 'stale_quote_retry_failing');
+  assert.equal(rec, undefined, 'when every offender is already auto-suppressed, no rec fires (was high-severity false positive in the 2026-05-21 snapshot)');
+})();
+
 // Chronically infeasible symbols: groups by topBlocker; severity scales
 // with count.
 (function chronicallyInfeasibleByBlocker() {
@@ -91,7 +162,8 @@ const NOW = 1779252000000;
   assert.equal(rec.evidence.byBlocker[0].symbolCount, 4);
 })();
 
-// Chronically infeasible: severity HIGH at 8+.
+// Chronically infeasible: severity HIGH at 8+ when blockers are
+// structurally concerning (feed-side here).
 (function chronicallyInfeasibleHigh() {
   const chronic = Array.from({ length: 10 }, (_, i) => ({ symbol: `S${i}`, topBlocker: 'stale_quote' }));
   const rec = recChronicallyInfeasibleSymbols({
@@ -99,6 +171,81 @@ const NOW = 1779252000000;
     cfg: DEFAULT_CONFIG,
   });
   assert.equal(rec.severity, 'high');
+  assert.equal(rec.evidence.structurallyConcerningCount, 10);
+  assert.equal(rec.evidence.signalInternalNoOpportunityCount, 0);
+})();
+
+// Chronically infeasible: when the ONLY blockers are signal-internal
+// "no opportunity" reasons, severity collapses to info (not high) — the
+// signal hasn't seen a setup, which is expected behaviour not an action item.
+(function chronicallyInfeasibleSignalInternalOnly() {
+  const chronic = Array.from({ length: 10 }, (_, i) => ({ symbol: `S${i}`, topBlocker: 'mr_no_drop' }));
+  const rec = recChronicallyInfeasibleSymbols({
+    tradeFeasibility: { chronicallyInfeasible: chronic, symbols: chronic, inferredScanCount: 50, config: { chronicThresholdPct: 20 } },
+    cfg: DEFAULT_CONFIG,
+  });
+  assert.ok(rec);
+  assert.equal(rec.severity, 'info', '10 mr_no_drop chronic → info (signal-internal only, not a real problem)');
+  assert.equal(rec.evidence.structurallyConcerningCount, 0);
+  assert.equal(rec.evidence.signalInternalNoOpportunityCount, 10);
+  assert.ok(rec.title.includes('not actionable'));
+})();
+
+// Chronically infeasible: 2026-05-21 snapshot reproduction — 10 symbols
+// blocked by mr_no_drop + 2 by spread_too_wide. concerningCount=2 → low,
+// not high. The full 12-symbol "chronically infeasible" count would have
+// flagged this high under the old logic, but it's really just "wait for
+// the signal to fire + spread cap on 2 illiquid pairs".
+(function chronicallyInfeasibleSnapshotReplay() {
+  const chronic = [
+    ...['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD', 'UNI/USD', 'DOT/USD', 'ADA/USD', 'XRP/USD', 'DOGE/USD']
+      .map((symbol) => ({ symbol, topBlocker: 'mr_no_drop', feasibilityPct: 0 })),
+    { symbol: 'LTC/USD', topBlocker: 'spread_too_wide', feasibilityPct: 2.32 },
+    { symbol: 'BCH/USD', topBlocker: 'spread_too_wide', feasibilityPct: 2.32 },
+  ];
+  const out = buildRecommendations({
+    tradeFeasibility: {
+      chronicallyInfeasible: chronic, symbols: chronic, inferredScanCount: 43,
+      rejectionsObserved: 510, config: { chronicThresholdPct: 20 },
+    },
+  });
+  const rec = out.recommendations.find((r) => r.id === 'chronically_infeasible_symbols');
+  assert.ok(rec);
+  assert.equal(rec.severity, 'low', '2 structurally concerning → low (was high pre-fix)');
+  assert.equal(rec.evidence.signalInternalNoOpportunityCount, 10);
+  assert.equal(rec.evidence.structurallyConcerningCount, 2);
+})();
+
+// Chronically infeasible: feed_side OR gate_side count drives severity.
+// 4 stale_quote + 4 spread_too_wide + 2 mr_no_drop → concerningCount=8 → high.
+(function chronicallyInfeasibleMixedReachesHigh() {
+  const chronic = [
+    ...Array.from({ length: 4 }, (_, i) => ({ symbol: `F${i}`, topBlocker: 'stale_quote' })),
+    ...Array.from({ length: 4 }, (_, i) => ({ symbol: `G${i}`, topBlocker: 'spread_too_wide' })),
+    ...Array.from({ length: 2 }, (_, i) => ({ symbol: `S${i}`, topBlocker: 'mr_no_drop' })),
+  ];
+  const rec = recChronicallyInfeasibleSymbols({
+    tradeFeasibility: { chronicallyInfeasible: chronic, symbols: chronic, inferredScanCount: 50 },
+    cfg: DEFAULT_CONFIG,
+  });
+  assert.equal(rec.severity, 'high');
+  assert.equal(rec.evidence.structurallyConcerningCount, 8);
+  assert.equal(rec.evidence.signalInternalNoOpportunityCount, 2);
+})();
+
+// Blocker classification helper: spot-check the public classifier.
+(function blockerClassification() {
+  const { classifyBlocker } = require('./operatorRecommendations');
+  assert.equal(classifyBlocker('mr_no_drop'), 'signal_internal');
+  assert.equal(classifyBlocker('micro_prob_below_min'), 'signal_internal');
+  assert.equal(classifyBlocker('htf_below_ema'), 'signal_internal');
+  assert.equal(classifyBlocker('stale_quote'), 'feed_side');
+  assert.equal(classifyBlocker('pruned_stale_quotes'), 'feed_side');
+  assert.equal(classifyBlocker('spread_too_wide'), 'gate_side');
+  assert.equal(classifyBlocker('spread_too_wide_tier2'), 'gate_side');
+  assert.equal(classifyBlocker('near_recent_high'), 'gate_side');
+  assert.equal(classifyBlocker('something_unrecognized'), 'unknown');
+  assert.equal(classifyBlocker(null), 'unknown');
 })();
 
 // Regime veto dark-mode: fires med when wouldHaveVetoed >= 50.

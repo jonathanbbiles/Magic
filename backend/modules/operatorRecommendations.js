@@ -62,23 +62,43 @@ function asNumber(v) {
 
 function recStaleQuoteRetryHealth({ staleQuoteRetry, cfg }) {
   if (!staleQuoteRetry || !Array.isArray(staleQuoteRetry.bySymbol)) return null;
-  const offenders = staleQuoteRetry.bySymbol.filter((entry) => {
+  // Per-symbol auto-suppress (PR #420, default on) short-circuits the retry
+  // probe once a symbol's recoveryRate stays ≤ STALE_QUOTE_RETRY_AUTO_SUPPRESS
+  // _MAX_RECOVERY_RATE over ≥ MIN_ATTEMPTS. Already-suppressed offenders no
+  // longer cost an API call per scan, so the "wasted API calls" framing
+  // doesn't apply to them — they should not drive the rec's severity or
+  // suggestedActions. The remaining offenders (still being probed each
+  // scan) are the ones an operator can usefully act on.
+  const suppressedSet = new Set(
+    Array.isArray(staleQuoteRetry.suppressedSymbols)
+      ? staleQuoteRetry.suppressedSymbols.map((s) => s?.symbol).filter(Boolean)
+      : [],
+  );
+  const allOffenders = staleQuoteRetry.bySymbol.filter((entry) => {
     const attempts = asNumber(entry?.attempts) || 0;
     const recoveryRate = asNumber(entry?.recoveryRate);
     if (attempts < cfg.staleQuoteMinAttempts) return false;
     if (recoveryRate == null) return false;
     return recoveryRate * 100 < cfg.staleQuoteRecoveryThresholdPct;
   });
+  const offenders = allOffenders.filter((o) => !suppressedSet.has(o.symbol));
+  const suppressedOffenders = allOffenders.filter((o) => suppressedSet.has(o.symbol));
   if (offenders.length === 0) return null;
   const symbols = offenders.map((o) => o.symbol);
   const overallRate = asNumber(staleQuoteRetry.recoveryRate);
+  const suppressedNote = suppressedOffenders.length > 0
+    ? ` (${suppressedOffenders.length} additional symbol${suppressedOffenders.length === 1 ? '' : 's'} already auto-suppressed — no API-call waste)`
+    : '';
   return {
     id: 'stale_quote_retry_failing',
     severity: offenders.length >= 8 ? 'high' : 'med',
-    title: `Stale-quote retry recovering < ${cfg.staleQuoteRecoveryThresholdPct}% for ${offenders.length} symbol${offenders.length === 1 ? '' : 's'}`,
+    title: `Stale-quote retry recovering < ${cfg.staleQuoteRecoveryThresholdPct}% for ${offenders.length} symbol${offenders.length === 1 ? '' : 's'}${suppressedNote}`,
     detail: 'The single-symbol retry fallback (PR #416) is not recovering '
       + 'usable quotes for these symbols. The feed itself is likely broken '
-      + 'upstream. Each retry costs an Alpaca API call with negligible payoff.',
+      + 'upstream. Each retry costs an Alpaca API call with negligible payoff. '
+      + 'Already-auto-suppressed symbols (meta.staleQuoteRetry.suppressedSymbols) '
+      + 'are excluded — auto-suppress is already preventing their wasted retry '
+      + 'calls; the rec only surfaces symbols still being probed.',
     evidence: {
       overallRecoveryRate: overallRate == null ? null : Number((overallRate * 100).toFixed(2)),
       totalAttempts: asNumber(staleQuoteRetry.attempts),
@@ -88,14 +108,73 @@ function recStaleQuoteRetryHealth({ staleQuoteRetry, cfg }) {
         attempts: o.attempts,
         recoveryRate: o.recoveryRate == null ? null : Number((o.recoveryRate * 100).toFixed(2)),
       })),
+      autoSuppressedCount: suppressedOffenders.length,
+      autoSuppressedSymbols: suppressedOffenders.map((o) => o.symbol),
     },
     suggestedActions: [
       `Add affected symbols to a universe blocklist (operator-side env var) until Alpaca's feed recovers: ${symbols.join(', ')}`,
       'Contact Alpaca support with the per-symbol prunedSinceMs timestamps from meta.quoteFreshness.perSymbol.',
-      'Consider setting STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false to stop wasting API calls on the failing retry path.',
+      'Auto-suppress (STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED=true, default) already short-circuits the retry probe per symbol — no need to set STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false globally.',
     ],
-    sourceFields: ['meta.staleQuoteRetry.bySymbol', 'meta.staleQuoteRetry.recoveryRate'],
+    sourceFields: ['meta.staleQuoteRetry.bySymbol', 'meta.staleQuoteRetry.recoveryRate', 'meta.staleQuoteRetry.suppressedSymbols'],
   };
+}
+
+// Blocker classification for severity weighting (added 2026-05-21). The
+// previous severity was a pure count (8+ → high), which over-flagged
+// "signal didn't fire this scan" cases where every other safeguard is
+// already correctly handling things. Now severity scales with the count
+// of *structurally concerning* blockers, not the total chronic count:
+//
+//   - signal_internal: the signal evaluator returned ok=false because no
+//     opportunity matched its criteria. Expected behaviour — these
+//     symbols are "feasible" in principle; they just had no setup in
+//     the rolling window. Examples: mr_no_drop, range_mr_no_drop,
+//     micro_prob_below_min, htf_below_ema, turn_no_confirmation,
+//     pullback_above_ema, ob_depth_insufficient, mf_insufficient_history.
+//   - feed_side: Alpaca's quote feed is the structural problem.
+//     stale_quote, pruned_stale_quotes, no_quote, invalid_quote,
+//     invalid_bid, invalid_ask. ACTIONABLE: blocklist or contact Alpaca.
+//   - gate_side: a price-aware gate rejected the candidate. spread_too_wide
+//     (the gate is correctly protecting against high-friction entries),
+//     near_recent_high, projected_below_min/gross_target, etc.
+//     POTENTIALLY actionable: review tier / threshold but the gate is
+//     usually doing its job.
+const BLOCKER_CLASS = {
+  signal_internal: new Set([
+    'mr_no_drop', 'mr_insufficient_history', 'mr_drop_not_significant',
+    'mr_volume_insufficient', 'mr_volume_unknown', 'mr_btc_correlated_drop',
+    'mr_rsi_unknown', 'mr_not_oversold', 'mr_deep_downtrend', 'mr_vol_unknown',
+    'range_mr_no_drop', 'range_mr_insufficient_history', 'range_mr_unknown_range',
+    'range_mr_not_range_bound', 'range_mr_not_near_low', 'range_mr_below_range_low',
+    'range_mr_volume_unknown', 'range_mr_volume_insufficient', 'range_mr_not_oversold',
+    'micro_insufficient_bars', 'micro_invalid_bars', 'micro_sigma_unavailable',
+    'micro_invalid_horizon', 'micro_prob_below_min', 'micro_ev_below_min',
+    'micro_spread_regime_wide', 'micro_insufficient_history',
+    'mf_insufficient_history', 'turn_no_confirmation', 'pullback_above_ema',
+    'pullback_oversold', 'htf_below_ema', 'htf_ema_not_rising',
+    'ob_depth_insufficient', 'barrier_ev_below_min',
+    'prediction_rejected', 'slope_not_positive',
+  ]),
+  feed_side: new Set([
+    'stale_quote', 'pruned_stale_quotes', 'no_quote', 'invalid_quote',
+    'invalid_bid', 'invalid_ask',
+  ]),
+  gate_side: new Set([
+    'spread_too_wide', 'spread_too_wide_tier1', 'spread_too_wide_tier2', 'spread_too_wide_tier3',
+    'near_recent_high', 'projected_below_min', 'projected_below_gross_target',
+    'net_edge_below_min', 'honest_ev_below_min', 'gross_target_below_friction_floor',
+    'alpha_below_execution_cost', 'btc_leading_drop', 'volume_below_min',
+    'htf_rejected', 'concurrent_position_cap',
+  ]),
+};
+
+function classifyBlocker(reason) {
+  if (!reason) return 'unknown';
+  if (BLOCKER_CLASS.feed_side.has(reason)) return 'feed_side';
+  if (BLOCKER_CLASS.gate_side.has(reason)) return 'gate_side';
+  if (BLOCKER_CLASS.signal_internal.has(reason)) return 'signal_internal';
+  return 'unknown';
 }
 
 function recChronicallyInfeasibleSymbols({ tradeFeasibility, cfg }) {
@@ -111,37 +190,73 @@ function recChronicallyInfeasibleSymbols({ tradeFeasibility, cfg }) {
   }
   const blockerSummary = [];
   for (const [blocker, symbols] of byBlocker.entries()) {
-    blockerSummary.push({ blocker, symbolCount: symbols.length, symbols });
+    blockerSummary.push({
+      blocker, blockerClass: classifyBlocker(blocker), symbolCount: symbols.length, symbols,
+    });
   }
   blockerSummary.sort((a, b) => b.symbolCount - a.symbolCount);
 
-  let severity = 'low';
-  if (chronic.length >= cfg.feasibilityChronicCountForHigh) severity = 'high';
-  else if (chronic.length >= cfg.feasibilityChronicCountForMed) severity = 'med';
+  // Count chronic symbols by class. Signal-internal "no opportunity" symbols
+  // are not a real problem — they're the bot waiting for a setup. Severity
+  // scales with how many symbols are blocked by structurally concerning
+  // reasons (feed-side or gate-side), not the raw chronic count.
+  const concerningCount = blockerSummary
+    .filter((b) => b.blockerClass === 'feed_side' || b.blockerClass === 'gate_side' || b.blockerClass === 'unknown')
+    .reduce((sum, b) => sum + b.symbolCount, 0);
+  const signalInternalCount = blockerSummary
+    .filter((b) => b.blockerClass === 'signal_internal')
+    .reduce((sum, b) => sum + b.symbolCount, 0);
+
+  let severity = 'info';
+  if (concerningCount >= cfg.feasibilityChronicCountForHigh) severity = 'high';
+  else if (concerningCount >= cfg.feasibilityChronicCountForMed) severity = 'med';
+  else if (concerningCount > 0) severity = 'low';
+  // When the only chronic blockers are signal-internal "no opportunity"
+  // reasons, downgrade further: the rec is informational, not an action item.
+
+  const concerningNote = signalInternalCount > 0 && concerningCount === 0
+    ? ` — all ${signalInternalCount} blocked by signal-internal "no opportunity" reasons (not actionable)`
+    : signalInternalCount > 0
+      ? ` (${concerningCount} blocked by feed/gate-side, ${signalInternalCount} by signal-internal "no opportunity")`
+      : '';
 
   return {
     id: 'chronically_infeasible_symbols',
     severity,
-    title: `${chronic.length} symbol${chronic.length === 1 ? '' : 's'} chronically infeasible (< ${tradeFeasibility?.config?.chronicThresholdPct ?? 20}% feasibility)`,
+    title: `${chronic.length} symbol${chronic.length === 1 ? '' : 's'} chronically infeasible (< ${tradeFeasibility?.config?.chronicThresholdPct ?? 20}% feasibility)${concerningNote}`,
     detail: 'These symbols are not reaching signal evaluation in recent scans. '
       + 'Grouped by what is blocking each — different blockers warrant '
-      + 'different operator actions.',
+      + 'different operator actions. Severity scales with the count of '
+      + 'structurally concerning blockers (feed-side or gate-side); '
+      + 'signal-internal "no opportunity" rejections are expected behaviour '
+      + 'and do not raise severity.',
     evidence: {
       chronicCount: chronic.length,
+      structurallyConcerningCount: concerningCount,
+      signalInternalNoOpportunityCount: signalInternalCount,
       inferredScanCount: tradeFeasibility.inferredScanCount,
       byBlocker: blockerSummary,
     },
     suggestedActions: blockerSummary.map((b) => {
+      const cls = b.blockerClass;
+      const sym = b.symbols.join(', ');
+      const count = `${b.symbolCount} symbol${b.symbolCount === 1 ? '' : 's'}`;
       if (b.blocker === 'stale_quote' || b.blocker === 'pruned_stale_quotes') {
-        return `${b.symbolCount} symbol${b.symbolCount === 1 ? '' : 's'} blocked by '${b.blocker}' (feed-side): ${b.symbols.join(', ')} — consider universe blocklist.`;
+        return `${count} blocked by '${b.blocker}' (feed-side): ${sym} — consider universe blocklist. Note: meta.staleQuoteRescue may already be admitting these via Coinbase cross-confirmation.`;
       }
-      if (b.blocker === 'spread_too_wide') {
-        return `${b.symbolCount} symbol${b.symbolCount === 1 ? '' : 's'} blocked by 'spread_too_wide': ${b.symbols.join(', ')} — review tier assignment or accept that the current spread cap is correctly protecting against costly entries.`;
+      if (b.blocker === 'spread_too_wide' || b.blocker.startsWith('spread_too_wide')) {
+        return `${count} blocked by '${b.blocker}': ${sym} — review tier assignment or accept that the current spread cap is correctly protecting against costly entries.`;
       }
-      if (b.blocker === 'mr_no_drop') {
-        return `${b.symbolCount} symbol${b.symbolCount === 1 ? '' : 's'} blocked by 'mr_no_drop' (signal-internal): ${b.symbols.join(', ')} — this is expected when no capitulation drop has occurred; not actionable unless the bot has been quiet for a long stretch.`;
+      if (cls === 'signal_internal') {
+        return `${count} blocked by '${b.blocker}' (signal-internal "no opportunity"): ${sym} — expected when the signal didn't see a matching setup; not actionable unless the bot has been quiet for a long stretch.`;
       }
-      return `${b.symbolCount} symbol${b.symbolCount === 1 ? '' : 's'} blocked by '${b.blocker}': ${b.symbols.join(', ')}.`;
+      if (cls === 'feed_side') {
+        return `${count} blocked by '${b.blocker}' (feed-side): ${sym} — investigate quote feed health for these symbols.`;
+      }
+      if (cls === 'gate_side') {
+        return `${count} blocked by '${b.blocker}' (gate-side): ${sym} — review gate threshold or accept that the gate is doing its job.`;
+      }
+      return `${count} blocked by '${b.blocker}': ${sym}.`;
     }),
     sourceFields: ['meta.tradeFeasibility.chronicallyInfeasible', 'meta.tradeFeasibility.symbols'],
   };
@@ -555,4 +670,6 @@ module.exports = {
   recTradingActivity,
   recSynthesizerWarmingUp,
   buildReadiness,
+  BLOCKER_CLASS,
+  classifyBlocker,
 };
