@@ -10,6 +10,45 @@ const dirPath = filePath ? path.dirname(filePath) : null;
 
 const recentRecords = [];
 
+// Tail-read the JSONL file into memory at module load so the dashboard
+// scorecard, drift alerter, and per-symbol expectancy auditor are non-empty
+// immediately after restart. Without this, the in-memory buffer starts at []
+// on every deploy and meta.scorecard.totalClosedTrades reports 0 even when
+// the persistent file has hundreds of records — which made the live-vs-
+// predicted comparison structurally broken across deploys.
+function hydrateFromDisk() {
+  if (!filePath) return 0;
+  try {
+    if (!fs.existsSync(filePath)) return 0;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw) return 0;
+    const lines = raw.split('\n').filter(Boolean);
+    const tail = lines.slice(-RECENT_LIMIT);
+    let loaded = 0;
+    for (const line of tail) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj && obj.type === 'closed_trade') {
+          recentRecords.push(obj);
+          loaded += 1;
+        }
+      } catch (_) { /* skip corrupt line */ }
+    }
+    return loaded;
+  } catch (err) {
+    logOnce('warn', 'closed_trade_stats_hydrate_failed', 'closed_trade_stats_hydrate_failed', {
+      filePath,
+      error: err?.message || err,
+    });
+    return 0;
+  }
+}
+
+const HYDRATE_AT_BOOT = String(process.env.CLOSED_TRADE_STATS_HYDRATE_AT_BOOT || 'true').toLowerCase() !== 'false';
+if (HYDRATE_AT_BOOT) {
+  hydrateFromDisk();
+}
+
 function ensureFileReady() {
   if (!filePath || !dirPath) return false;
   fs.mkdirSync(dirPath, { recursive: true });
@@ -114,4 +153,5 @@ module.exports = {
   append,
   getRecent,
   buildScorecard,
+  hydrateFromDisk,
 };
