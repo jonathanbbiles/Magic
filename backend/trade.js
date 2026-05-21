@@ -1334,15 +1334,36 @@ async function fetchAccount() {
 }
 
 async function fetchPortfolioHistory(query = {}) {
+  // Phase 2 (venue=binance_us): Binance.US has no equity-history endpoint
+  // analogous to Alpaca's `/v2/account/portfolio/history`. Dashboard
+  // consumers receive empty arrays and surface "history unavailable" —
+  // safer than 401-ing on every fetch.
+  if (IS_BINANCE_EXECUTION) {
+    return { timestamp: [], equity: [], profit_loss: [], profit_loss_pct: [], base_value: 0, timeframe: query?.timeframe || '1H' };
+  }
   return alpacaRequest({ base: 'trade', path: '/v2/account/portfolio/history', query, label: 'portfolio_history' });
 }
 
 async function fetchActivities(query = {}) {
+  // Phase 2 (venue=binance_us): Alpaca-only activities feed. Binance.US
+  // has `/api/v3/myTrades` per-symbol — different shape, more granular —
+  // so a faithful translation would have to fan out per held symbol. The
+  // only live consumer is the dashboard's `getRecentBuyFillLookup` cache
+  // (display-only, not in the trade decision path), so empty is the
+  // honest answer until a Binance fills translator ships.
+  if (IS_BINANCE_EXECUTION) return { items: [], nextPageToken: null };
   const items = await alpacaRequest({ base: 'trade', path: '/v2/account/activities', query, label: 'activities' });
   return { items: Array.isArray(items) ? items : [], nextPageToken: null };
 }
 
 async function fetchClock() {
+  // Phase 2 (venue=binance_us): crypto trades 24/7 on Binance.US — there's
+  // no concept of "market closed." Returning a synthetic clock keeps any
+  // existing consumer of `fetchClock` venue-agnostic without an Alpaca call.
+  if (IS_BINANCE_EXECUTION) {
+    const nowIso = new Date().toISOString();
+    return { is_open: true, timestamp: nowIso, next_open: nowIso, next_close: nowIso };
+  }
   return alpacaRequest({ base: 'trade', path: '/v2/clock', label: 'clock' });
 }
 
@@ -1375,6 +1396,27 @@ async function fetchPosition(symbol) {
 }
 
 async function fetchAsset(symbol) {
+  // Phase 2 (venue=binance_us): Alpaca's `/v2/assets/{symbol}` returns
+  // an Asset object (tradable flag, class, fractionable). The Binance
+  // equivalent — `binanceSymbols.resolveBinanceSymbol` — exposes
+  // tradability via the LOT_SIZE / status fields. Synthesise an
+  // Alpaca-shape asset record so existing consumers stay venue-agnostic.
+  if (IS_BINANCE_EXECUTION) {
+    const resolution = binanceSymbols.resolveBinanceSymbol(symbol);
+    if (!resolution) return null;
+    return {
+      symbol,
+      name: symbol,
+      class: 'crypto',
+      exchange: 'BINANCEUS',
+      status: resolution.status === 'TRADING' ? 'active' : 'inactive',
+      tradable: resolution.status === 'TRADING',
+      fractionable: true,
+      min_order_size: resolution.minQty != null ? String(resolution.minQty) : '0',
+      min_trade_increment: resolution.stepSize || '0',
+      price_increment: resolution.tickSize || '0',
+    };
+  }
   const apiSym = toAlpacaSymbol(symbol) || symbol;
   try {
     return await alpacaRequest({ base: 'trade', path: `/v2/assets/${encodeURIComponent(apiSym)}`, label: 'asset' });

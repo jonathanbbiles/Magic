@@ -2867,11 +2867,20 @@ const server = app.listen(port, () => {
 });
 
 // Kick off the auto-backtest a short while after the server starts. Skipped
-// during tests, when the env flag is off, or when Alpaca creds aren't set.
+// during tests, when the env flag is off, or when Alpaca creds aren't set
+// AND the venue is alpaca (Binance data path doesn't need Alpaca creds —
+// 2026-05-21 PM Phase 2). When venue=binance_us the auto-backtest fetches
+// bars from `binanceMarketData.fetchAllKlinesForSymbol` instead, and the
+// runBacktest dispatcher inside `backtest_strategy.js` handles the
+// per-venue cred check internally.
 const backtestSkipReason = (() => {
   if (!BACKTEST_AUTORUN_ENABLED) return 'autorun_disabled';
   if (process.env.NODE_ENV === 'test') return 'test_env';
-  if (!(process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY)) return 'no_alpaca_creds';
+  const venueForBacktest = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  if (venueForBacktest !== 'binance_us'
+      && !(process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY)) {
+    return 'no_alpaca_creds';
+  }
   return null;
 })();
 if (backtestSkipReason) {
