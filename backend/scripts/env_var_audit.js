@@ -47,6 +47,9 @@ const NON_ENV_ALLOWLIST = new Set([
   'SCHEMA_VERSION',
   'TIMEFRAMES',
   'EXCLUDED_REASONS',
+  'COSTLY_VERDICT_EXCLUDED_REASONS',
+  'SIGNAL_INTERNAL_REASON_PREFIXES',
+  'TIMEFRAME_MAP',
   // Binance.US adapter constants (2026-05-21). Module-level exports
   // referenced by name in docs, not runtime-configurable env vars.
   'DEFAULT_SYMBOL_MAP',

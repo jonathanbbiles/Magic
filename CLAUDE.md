@@ -2,9 +2,9 @@
 
 ## What this repo is
 
-Live crypto trading bot. As of 2026-05-21 the bot supports two execution venues, controlled by `EXECUTION_VENUE` env var:
-- `EXECUTION_VENUE=alpaca` (default): all order placement + account queries route through Alpaca crypto. Historical posture; what every prior CLAUDE.md entry assumes.
-- `EXECUTION_VENUE=binance_us`: order placement + balance queries route through Binance.US (0% maker / 0.0095% taker as of April 2026). Historical bar data + signal selector backtests STILL flow through Alpaca regardless of venue — only execution moves.
+Live crypto trading bot. As of 2026-05-21 the bot supports two venues, controlled by `EXECUTION_VENUE` env var:
+- `EXECUTION_VENUE=alpaca` (default): all order placement, account queries, bars, and quotes route through Alpaca crypto. Historical posture.
+- `EXECUTION_VENUE=binance_us`: order placement, balance queries, **bars, AND quotes** route through Binance.US (0% maker / 0.0095% taker as of April 2026; public REST endpoints for market data — no auth needed). Phase 2 (2026-05-21 PM) extended dispatch to the data path; **Alpaca credentials are no longer required on this venue**. Phase 3 (deferred): Binance.US WebSocket feed module as a third shadow feed at `meta.binanceFeedShadow`.
 
 The full strategy is documented in `README.md` (top level). Read it before making changes — older doc fragments in `backend/README.md` describe features that are documented but not implemented (stops, Kelly sizing, drawdown guard, correlation guard, TWAP, engine v2). Treat any env var not listed in the top-level `README.md` as not-wired until confirmed by `grep` in `backend/`.
 
@@ -474,7 +474,7 @@ Modules:
 1. When `EXECUTION_VENUE=binance_us`, both `BINANCE_US_API_KEY` and `BINANCE_US_API_SECRET` are required.
 2. `BINANCE_US_REST_URL` must resolve to `api.binance.us` (testnet hosts rejected; mirrors the live-only `TRADE_BASE` gate for Alpaca).
 3. `EXECUTION_VENUE` must be `alpaca` or `binance_us` — any other value fails boot.
-4. **Alpaca credentials remain REQUIRED** when `EXECUTION_VENUE=binance_us` because historical bars + signal-selector backtests still flow through `data.alpaca.markets`. The validator surfaces this via a trailing `(still required for Alpaca data API ...)` note on each missing-cred error so the failure mode is unambiguous (this caught a real Render deploy on 2026-05-21 where the operator added Binance creds but dropped Alpaca creds, expecting full venue cutover — the data API still 401s without them). The live-tier check (`Expected a live AK* key`) is SKIPPED when venue=binance_us — Alpaca's data API accepts paper-tier (`PK*`) and unknown-tier keys; the live-tier guarantee is only relevant when Alpaca is also the execution venue.
+4. **Phase 2 (2026-05-21 PM): Alpaca credentials are OPTIONAL when `EXECUTION_VENUE=binance_us`.** Bars and quotes route through `binanceMarketData.js` (`/api/v3/klines` + `/api/v3/ticker/bookTicker` — both public, no auth). The validator emits a warning if Alpaca creds are set under `binance_us` (operator paying for unused seat) but does not block boot. The Alpaca live-tier check (`Expected a live AK* key`) is also skipped on this venue. Earlier (2026-05-21 AM) validator iterations required Alpaca creds with a "still required for Alpaca data API" suffix — Phase 2 removed that requirement when it shipped the Binance data path.
 
 **Env vars** added in `liveDefaults.js`:
 
@@ -490,7 +490,9 @@ Modules:
 
 **When extending the symbol map**: add new canonical entries to `DEFAULT_SYMBOL_MAP` in `binanceSymbols.js` as ordered preference arrays (USD first, USDT fallback). Update `TIER1_CANONICAL` / `TIER2_CANONICAL` exports. The `binanceSymbols.test.js` length assertions will fail until those are kept in sync.
 
-**Phase 2 (deferred, separate PR)**: a Binance.US WebSocket feed module modeled on `coinbaseQuotesStream.js`, as a third shadow feed alongside Alpaca + Coinbase. Observational at `meta.binanceFeedShadow`. Phase 3 (only after data) optionally flips quote prefetch to Binance primary. The WS-URL env var will be added in Phase 2 alongside its consumer to stay Hard-Rule-#4-clean.
+**Phase 2 SHIPPED 2026-05-21 PM**: data path now venue-aware. `backend/modules/binanceMarketData.js` fetches bars + bid/ask via Binance.US public REST endpoints when `EXECUTION_VENUE=binance_us`. `fetchCryptoBars` + `fetchCryptoQuotes` in `trade.js` dispatch at the top of each function; the Alpaca path stays intact below the branch. `backend/scripts/backtest_strategy.js`'s `runBacktest` accepts an `executionVenue` override (or reads `process.env.EXECUTION_VENUE`) and routes its bar fetch via `binanceMarketData.fetchAllKlinesForSymbol` (paginated, ms-cursor advance). `loadSupportedCryptoPairs` in `trade.js` skips the Alpaca `/v2/assets` call on `binance_us` and uses `binanceSymbols.getCanonicalResolution()` instead. `bootstrap()` in `index.js` no longer requires `alpacaAuthOk` on `binance_us`. **Operator workflow**: deposit to Binance.US, set `EXECUTION_VENUE=binance_us` + `BINANCE_US_API_KEY/SECRET`, remove Alpaca creds (optional — they're just ignored). Boot proceeds without any Alpaca dependency.
+
+**Phase 3 (deferred, separate PR)**: a Binance.US WebSocket feed module modeled on `coinbaseQuotesStream.js`, as a third shadow feed alongside Alpaca + Coinbase. Observational at `meta.binanceFeedShadow`. Optionally flips Binance from REST polling to WS for lower-latency quotes.
 
 **Hard Rule #4 compliance**: every new env var has a live consumer. `EXECUTION_VENUE` → dispatch in trade.js. `BINANCE_US_API_KEY/SECRET` → `resolveCredentials` in binanceAuth.js. `BINANCE_US_REST_URL` → `resolveRestUrl` in binanceAuth.js + validateEnv assertion. `BINANCE_US_RECV_WINDOW_MS` → `resolveRecvWindowMs` in binanceAuth.js. `BINANCE_SYMBOL_MAP` → `readOperatorSymbolMap` in binanceSymbols.js.
 
@@ -501,7 +503,7 @@ Modules:
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
 - Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default), `staleQuoteRescue.js` (Phase B follow-up — inverse rescue gate, shadow-mode by default)
-- Binance.US execution (2026-05-21): `backend/modules/binanceAuth.js`, `binanceSymbols.js`, `binanceExecution.js` (dormant when `EXECUTION_VENUE=alpaca`, default; activates when operator flips to `binance_us`)
+- Binance.US execution + data (2026-05-21): `backend/modules/binanceAuth.js`, `binanceSymbols.js`, `binanceExecution.js`, `binanceMarketData.js` (dormant when `EXECUTION_VENUE=alpaca`, default; activates when operator flips to `binance_us`). The market-data module is Phase 2 (2026-05-21 PM) — public REST endpoints for klines + bookTicker, no auth needed.
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
