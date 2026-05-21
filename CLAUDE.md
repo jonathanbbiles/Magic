@@ -27,6 +27,8 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 5. **Don't add stop-loss, max-hold, or force-exit logic without explicit user instruction.** The "walk away after placing the GTC sell" behavior is intentional design, not a missing feature.
 
+6. **Ship-and-merge is the default workflow.** When a change is complete and tests pass, push the branch, open the PR via the GitHub MCP, and merge it (squash, into `main`) without waiting for explicit confirmation each time. This is a standing instruction from the repo owner (2026-05-21). Exceptions: if tests fail, if the change touches anything the user flagged as risky in the same session, or if the user explicitly says "don't merge yet."
+
 ## Useful commands
 
 ```sh
@@ -471,6 +473,7 @@ Modules:
 1. When `EXECUTION_VENUE=binance_us`, both `BINANCE_US_API_KEY` and `BINANCE_US_API_SECRET` are required.
 2. `BINANCE_US_REST_URL` must resolve to `api.binance.us` (testnet hosts rejected; mirrors the live-only `TRADE_BASE` gate for Alpaca).
 3. `EXECUTION_VENUE` must be `alpaca` or `binance_us` — any other value fails boot.
+4. **Alpaca credentials remain REQUIRED** when `EXECUTION_VENUE=binance_us` because historical bars + signal-selector backtests still flow through `data.alpaca.markets`. The validator surfaces this via a trailing `(still required for Alpaca data API ...)` note on each missing-cred error so the failure mode is unambiguous (this caught a real Render deploy on 2026-05-21 where the operator added Binance creds but dropped Alpaca creds, expecting full venue cutover — the data API still 401s without them). The live-tier check (`Expected a live AK* key`) is SKIPPED when venue=binance_us — Alpaca's data API accepts paper-tier (`PK*`) and unknown-tier keys; the live-tier guarantee is only relevant when Alpaca is also the execution venue.
 
 **Env vars** added in `liveDefaults.js`:
 

@@ -44,8 +44,9 @@ Binance.US enforces `NOTIONAL.minNotional` (typically $10) per pair. At $84 × 1
 
 1. Deposit to bring Binance.US equity above $105.
 2. Add Render env vars: `EXECUTION_VENUE=binance_us`, `BINANCE_US_API_KEY=<key>`, `BINANCE_US_API_SECRET=<secret>`. Update `ENTRY_SYMBOLS_PRIMARY` to the comma-separated 30-symbol list.
-3. Bot boots, hydrates `/api/v3/exchangeInfo`, logs `binance_symbol_hydrate_ok`.
-4. First scan submits an order via Binance.US REST. Watch `meta.scorecard.totalClosedTrades` for the first close.
+3. **Keep `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` set.** Alpaca data API still serves bars/quotes/signal-selector backtests regardless of execution venue. Paper-tier (`PK*`) Alpaca keys are accepted when `EXECUTION_VENUE=binance_us` — the live-tier requirement only applies when Alpaca is also the execution venue. Boot fails fast with a `still required for Alpaca data API` message if these are missing.
+4. Bot boots, hydrates `/api/v3/exchangeInfo`, logs `binance_symbol_hydrate_ok`.
+5. First scan submits an order via Binance.US REST. Watch `meta.scorecard.totalClosedTrades` for the first close.
 
 ### Phase boundaries
 

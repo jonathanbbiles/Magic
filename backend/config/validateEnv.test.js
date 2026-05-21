@@ -287,4 +287,66 @@ withEnv({
   assert.equal(findEntryUniverseModeWarning(warnings), undefined);
 });
 
+// EXECUTION_VENUE=binance_us with valid Binance creds + missing Alpaca creds:
+// the validator should still fail (Alpaca data API needs creds) but with the
+// data-API-context note in the error message.
+withEnv({
+  NODE_ENV: 'production',
+  EXECUTION_VENUE: 'binance_us',
+  BINANCE_US_API_KEY: 'bk_live_realistic_key_123456',
+  BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
+  APCA_API_KEY_ID: '',
+  APCA_API_SECRET_KEY: '',
+  API_TOKEN: 'prod_token_1234567890',
+}, () => {
+  assert.throws(
+    () => validateEnv(),
+    /still required for Alpaca data API/
+  );
+});
+
+// EXECUTION_VENUE=binance_us with paper-tier (PK*) Alpaca creds for data:
+// the live-tier requirement should be relaxed because Alpaca is data-only.
+withEnv({
+  NODE_ENV: 'production',
+  EXECUTION_VENUE: 'binance_us',
+  BINANCE_US_API_KEY: 'bk_live_realistic_key_123456',
+  BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
+  APCA_API_KEY_ID: `P${'K'}_paper_realistic_key_123456`,
+  APCA_API_SECRET_KEY: `s${'k'}_paper_realistic_secret_abcdef123456`,
+  API_TOKEN: 'prod_token_1234567890',
+}, () => {
+  assert.doesNotThrow(() => validateEnv());
+});
+
+// EXECUTION_VENUE=binance_us with completely unrecognized key prefix
+// (tier=unknown) is also accepted because the tier check is only for
+// execution-on-Alpaca paths.
+withEnv({
+  NODE_ENV: 'production',
+  EXECUTION_VENUE: 'binance_us',
+  BINANCE_US_API_KEY: 'bk_live_realistic_key_123456',
+  BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
+  APCA_API_KEY_ID: 'unknown_prefix_key_realistic_123456',
+  APCA_API_SECRET_KEY: 'unknown_prefix_secret_realistic_abcdef',
+  API_TOKEN: 'prod_token_1234567890',
+}, () => {
+  assert.doesNotThrow(() => validateEnv());
+});
+
+// EXECUTION_VENUE=alpaca (default) with unknown-tier Alpaca creds still fails
+// in production. Regression guard so the binance_us bypass doesn't leak.
+withEnv({
+  NODE_ENV: 'production',
+  EXECUTION_VENUE: 'alpaca',
+  APCA_API_KEY_ID: 'unknown_prefix_key_realistic_123456',
+  APCA_API_SECRET_KEY: 'unknown_prefix_secret_realistic_abcdef',
+  API_TOKEN: 'prod_token_1234567890',
+}, () => {
+  assert.throws(
+    () => validateEnv(),
+    /Unable to verify Alpaca credential tier from key format/
+  );
+});
+
 console.log('validate env tests passed');
