@@ -348,6 +348,57 @@ const NOW = 1779252000000;
   assert.equal(rec, null);
 })();
 
+// Costly gates: signal-internal reasons (mr_*, range_mr_*, barrier_*,
+// micro_*, mf_*, htf_*, pullback_*, turn_*) are filtered. These mean the
+// signal didn't fire — the audit's forward-bps grades random non-firing
+// scan points, which has zero relationship to what the signal would have
+// entered on. Tuning these via the rec is misleading (and for
+// MR_DROP_TRIGGER_BPS, actively harmful per CLAUDE.md's empirical lock).
+// Observed 2026-05-21: mr_no_drop flagged gate_costly at +19.5 bps over
+// 7532 rejections — structurally invalid verdict; rec suppressed.
+(function costlyGatesSignalInternalFiltered() {
+  const onlyMr = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [{ reason: 'mr_no_drop', entries: 7532, avgForwardBps: 19.5, winRate: 0.59 }],
+    },
+  });
+  assert.equal(onlyMr, null, 'mr_no_drop alone should not trigger costly-gates rec');
+
+  const onlyBarrier = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [{ reason: 'barrier_ev_below_min', entries: 100, avgForwardBps: 12, winRate: 0.6 }],
+    },
+  });
+  assert.equal(onlyBarrier, null, 'barrier_* signal-internal reasons filtered');
+
+  const onlyMicro = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [{ reason: 'micro_prob_below_min', entries: 100, avgForwardBps: 14, winRate: 0.6 }],
+    },
+  });
+  assert.equal(onlyMicro, null, 'micro_* signal-internal reasons filtered');
+
+  const onlyMfHtf = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [{ reason: 'htf_below_ema', entries: 100, avgForwardBps: 14, winRate: 0.6 }],
+    },
+  });
+  assert.equal(onlyMfHtf, null, 'htf_* multi-factor sub-gates filtered');
+
+  // Mixed: signal-internal filtered, universal gate kept.
+  const mixed = recCostlyGates({
+    gateRejectionAudit: {
+      costliestGates: [
+        { reason: 'mr_no_drop', entries: 7532, avgForwardBps: 19.5, winRate: 0.59 },
+        { reason: 'near_recent_high', entries: 200, avgForwardBps: 12.3, winRate: 0.55 },
+      ],
+    },
+  });
+  assert.ok(mixed, 'mixed list with universal gate should still surface');
+  assert.equal(mixed.evidence.costliestGates.length, 1);
+  assert.equal(mixed.evidence.costliestGates[0].reason, 'near_recent_high');
+})();
+
 // Trending gates: filter to trending_costly only.
 (function trendingGatesCostlyOnly() {
   const rec = recTrendingGates({
@@ -377,7 +428,7 @@ const NOW = 1779252000000;
 (function tradingNotPossible() {
   const symbols = Array.from({ length: 12 }, (_, i) => ({ symbol: `S${i}`, feasibilityPct: 0, topBlocker: 'stale_quote' }));
   const rec = recTradingActivity({
-    tradeFeasibility: { symbols, chronicallyInfeasible: symbols, inferredScanCount: 50 },
+    tradeFeasibility: { symbols, chronicallyInfeasible: symbols, inferredScanCount: 50, rejectionsObserved: 600 },
     signalSelector: { signalVersion: 'mean_reversion', tradingVeto: false, activeNetBps: 19.9 },
   });
   assert.ok(rec);
@@ -392,10 +443,32 @@ const NOW = 1779252000000;
     { symbol: 'ETH/USD', feasibilityPct: 0, topBlocker: 'stale_quote' },
   ];
   const rec = recTradingActivity({
-    tradeFeasibility: { symbols },
+    tradeFeasibility: { symbols, rejectionsObserved: 200, inferredScanCount: 50 },
     signalSelector: { signalVersion: 'mean_reversion' },
   });
   assert.equal(rec, null);
+})();
+
+// Trading-activity: zero-data audit → no rec (synthesizer_warming_up rec
+// handles this case; firing bot_not_trading off zero evidence is a false
+// positive). Observed 2026-05-21 when equity was $0 mid-deposit.
+(function tradingZeroDataNoRec() {
+  const symbols = Array.from({ length: 12 }, (_, i) => ({
+    symbol: `S${i}`,
+    feasibilityPct: null,
+    rejections: 0,
+    topBlocker: null,
+  }));
+  const rec = recTradingActivity({
+    tradeFeasibility: {
+      symbols,
+      chronicallyInfeasible: [],
+      inferredScanCount: 0,
+      rejectionsObserved: 0,
+    },
+    signalSelector: { signalVersion: 'mean_reversion', tradingVeto: false, activeNetBps: 19.9 },
+  });
+  assert.equal(rec, null, 'zero-data audit must not fire bot_not_trading');
 })();
 
 // End-to-end synthesis: full recommendation set sorted by severity.
