@@ -287,9 +287,9 @@ withEnv({
   assert.equal(findEntryUniverseModeWarning(warnings), undefined);
 });
 
-// EXECUTION_VENUE=binance_us with valid Binance creds + missing Alpaca creds:
-// the validator should still fail (Alpaca data API needs creds) but with the
-// data-API-context note in the error message.
+// Phase 2 (2026-05-21 PM): EXECUTION_VENUE=binance_us with valid Binance
+// creds and NO Alpaca creds boots successfully. Bars + quotes route through
+// Binance.US public REST endpoints; Alpaca is fully optional on this path.
 withEnv({
   NODE_ENV: 'production',
   EXECUTION_VENUE: 'binance_us',
@@ -299,14 +299,26 @@ withEnv({
   APCA_API_SECRET_KEY: '',
   API_TOKEN: 'prod_token_1234567890',
 }, () => {
-  assert.throws(
-    () => validateEnv(),
-    /still required for Alpaca data API/
-  );
+  assert.doesNotThrow(() => validateEnv(), 'binance_us venue with NO Alpaca creds must boot');
 });
 
-// EXECUTION_VENUE=binance_us with paper-tier (PK*) Alpaca creds for data:
-// the live-tier requirement should be relaxed because Alpaca is data-only.
+// Phase 2: Alpaca creds set under venue=binance_us → still boots, but
+// emits a warning that the creds are unused. Operator may have forgotten
+// to clean Render env after cutover.
+withEnv({
+  NODE_ENV: 'production',
+  EXECUTION_VENUE: 'binance_us',
+  BINANCE_US_API_KEY: 'bk_live_realistic_key_123456',
+  BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
+  APCA_API_KEY_ID: `A${'K'}_live_realistic_key_123456`,
+  APCA_API_SECRET_KEY: `s${'k'}_live_realistic_secret_abcdef123456`,
+  API_TOKEN: 'prod_token_1234567890',
+}, () => {
+  assert.doesNotThrow(() => validateEnv());
+});
+
+// Phase 2: paper-tier (PK*) Alpaca creds under venue=binance_us → boots
+// (tier check is skipped — Alpaca not in use at all).
 withEnv({
   NODE_ENV: 'production',
   EXECUTION_VENUE: 'binance_us',
@@ -314,21 +326,6 @@ withEnv({
   BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
   APCA_API_KEY_ID: `P${'K'}_paper_realistic_key_123456`,
   APCA_API_SECRET_KEY: `s${'k'}_paper_realistic_secret_abcdef123456`,
-  API_TOKEN: 'prod_token_1234567890',
-}, () => {
-  assert.doesNotThrow(() => validateEnv());
-});
-
-// EXECUTION_VENUE=binance_us with completely unrecognized key prefix
-// (tier=unknown) is also accepted because the tier check is only for
-// execution-on-Alpaca paths.
-withEnv({
-  NODE_ENV: 'production',
-  EXECUTION_VENUE: 'binance_us',
-  BINANCE_US_API_KEY: 'bk_live_realistic_key_123456',
-  BINANCE_US_API_SECRET: 'bs_live_realistic_secret_abcdef123456',
-  APCA_API_KEY_ID: 'unknown_prefix_key_realistic_123456',
-  APCA_API_SECRET_KEY: 'unknown_prefix_secret_realistic_abcdef',
   API_TOKEN: 'prod_token_1234567890',
 }, () => {
   assert.doesNotThrow(() => validateEnv());

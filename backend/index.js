@@ -2771,6 +2771,12 @@ async function bootstrapTrading() {
   console.log('bootstrap_start');
   logMarketDataUrlSelfCheck();
   const authStatus = resolveAlpacaAuth();
+  // Phase 2 venue dispatch (2026-05-21 PM): when EXECUTION_VENUE=binance_us,
+  // Alpaca creds are no longer required. Bootstrap proceeds via Binance
+  // execution + data paths. The old `startup_blocked_missing_alpaca_auth`
+  // bail-out only applies when Alpaca is actually in use.
+  const executionVenue = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  const alpacaAuthRequired = executionVenue !== 'binance_us';
   const emitStartupTruthSummaryOnce = () => {
     if (startupTruthLogged) return;
     const baseStatus = getAlpacaBaseStatus();
@@ -2787,7 +2793,7 @@ async function bootstrapTrading() {
     });
     startupTruthLogged = true;
   };
-  if (!authStatus.alpacaAuthOk) {
+  if (alpacaAuthRequired && !authStatus.alpacaAuthOk) {
     emitStartupTruthSummaryOnce();
     console.warn('startup_blocked_missing_alpaca_auth', {
       missing: authStatus.missing,

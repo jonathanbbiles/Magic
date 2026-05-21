@@ -1193,17 +1193,59 @@ async function runBacktest(overrides = {}) {
   );
   const symbols = rawSymbols.filter((s) => !blockedSet.has(String(s).toUpperCase()));
   const blockedSymbolsApplied = rawSymbols.filter((s) => blockedSet.has(String(s).toUpperCase()));
+
+  // Phase 2 venue dispatch (2026-05-21 PM). When EXECUTION_VENUE=binance_us
+  // the auto-backtester fetches historical 1m bars from Binance.US's
+  // /api/v3/klines instead of Alpaca's /v1beta3/crypto endpoint. Alpaca
+  // credentials are not required on this path; binanceMarketData uses
+  // public (unsigned) endpoints. Keeping both paths in one runBacktest
+  // means the dispatcher in index.js doesn't need a venue branch — the
+  // bars come back in identical shape regardless of source.
+  const venue = String(opts.executionVenue || process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  const isBinanceVenue = venue === 'binance_us';
   const dataBase = (opts.dataBase || process.env.DATA_BASE || 'https://data.alpaca.markets').replace(/\/+$/, '');
-  const keyId = opts.apiKey || process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY;
-  const secret = opts.apiSecret || process.env.APCA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY || process.env.ALPACA_API_SECRET_KEY;
-  if (!keyId || !secret) throw new Error('missing_alpaca_credentials');
-  const headers = { 'APCA-API-KEY-ID': keyId, 'APCA-API-SECRET-KEY': secret };
+  let headers = null;
+  let binanceMarketData = null;
+  if (isBinanceVenue) {
+    binanceMarketData = require('../modules/binanceMarketData');
+    const binanceSymbols = require('../modules/binanceSymbols');
+    // Ensure symbol map is hydrated — required for canonical→Binance
+    // resolution inside fetchAllKlinesForSymbol. Idempotent; safe to call
+    // even if the live engine already hydrated.
+    const hydration = binanceSymbols.getHydrationStatus();
+    if (!hydration.lastHydratedAtMs) {
+      try {
+        await binanceSymbols.hydrate({
+          universe: binanceSymbols.TIER1_CANONICAL.concat(binanceSymbols.TIER2_CANONICAL),
+        });
+      } catch (_) { /* surface as empty bars per symbol */ }
+    }
+  } else {
+    const keyId = opts.apiKey || process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY;
+    const secret = opts.apiSecret || process.env.APCA_API_SECRET_KEY || process.env.ALPACA_SECRET_KEY || process.env.ALPACA_API_SECRET_KEY;
+    if (!keyId || !secret) throw new Error('missing_alpaca_credentials');
+    headers = { 'APCA-API-KEY-ID': keyId, 'APCA-API-SECRET-KEY': secret };
+  }
 
   if (!opts.start) {
     const days = Number.isFinite(opts.windowDays) ? opts.windowDays : 30;
     opts.start = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   }
   if (!opts.end) opts.end = new Date().toISOString();
+
+  // Single-symbol bar fetch with venue dispatch. Returns bars in the same
+  // oldest-first shape regardless of source so downstream replay logic
+  // is venue-agnostic.
+  const fetchBarsForSymbol = async (symbol) => {
+    if (isBinanceVenue) {
+      return binanceMarketData.fetchAllKlinesForSymbol(symbol, {
+        interval: '1m',
+        startMs: Date.parse(opts.start),
+        endMs: Date.parse(opts.end),
+      });
+    }
+    return fetchAllBars({ symbol, start: opts.start, end: opts.end, dataBase, headers });
+  };
 
   // Fetch BTC bars first so non-BTC symbols can use them for the lead-lag
   // gate. If BTC is in the test universe we'll reuse the same bars; if not,
@@ -1213,7 +1255,7 @@ async function runBacktest(overrides = {}) {
   const barsBySymbol = {};
   if (btcLeadLagActive && !symbols.includes(btcSymbol)) {
     try {
-      barsBySymbol[btcSymbol] = await fetchAllBars({ symbol: btcSymbol, start: opts.start, end: opts.end, dataBase, headers });
+      barsBySymbol[btcSymbol] = await fetchBarsForSymbol(btcSymbol);
     } catch (err) {
       // Non-fatal — gate just becomes a no-op for this run.
       barsBySymbol[btcSymbol] = [];
@@ -1226,7 +1268,7 @@ async function runBacktest(overrides = {}) {
   for (const symbol of symbols) {
     let bars = [];
     try {
-      bars = barsBySymbol[symbol] || await fetchAllBars({ symbol, start: opts.start, end: opts.end, dataBase, headers });
+      bars = barsBySymbol[symbol] || await fetchBarsForSymbol(symbol);
       barsBySymbol[symbol] = bars;
     } catch (err) {
       perSymbol[symbol] = { error: err?.message || String(err) };

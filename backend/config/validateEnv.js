@@ -127,17 +127,15 @@ const validateEnv = () => {
   const nodeEnv = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
   const strictSecretsMode = nodeEnv === 'production' || isTrueLike(process.env.LIVE) || isTrueLike(process.env.LIVE_MODE) || isTrueLike(process.env.LIVE_TRADING);
   // Resolved early so downstream Alpaca-credential checks can soften when the
-  // operator has flipped execution to Binance.US. Per the architecture note in
-  // CLAUDE.md (2026-05-21), historical bars + signal-selector backtests STILL
-  // flow through Alpaca regardless of venue — only order placement moves. So
-  // Alpaca credentials remain REQUIRED for data access even when venue is
-  // binance_us, but Alpaca's live-vs-paper tier no longer matters (data API
-  // accepts any tier; the operator is not trading on Alpaca anymore).
+  // operator has flipped execution to Binance.US. With Phase 2 (2026-05-21 PM)
+  // shipped, Binance.US is now BOTH the execution and data venue — bars and
+  // quotes route through `/api/v3/klines` + `/api/v3/ticker/bookTicker`
+  // (public endpoints, no auth required). Alpaca credentials are therefore
+  // not required at all when venue=binance_us; the validator just warns if
+  // they're set (operator is paying for an Alpaca seat they don't use).
   const executionVenueResolved = String(process.env.EXECUTION_VENUE || 'alpaca').trim().toLowerCase();
   const alpacaUsedForExecution = executionVenueResolved !== 'binance_us';
-  const alpacaDataOnlyContext = alpacaUsedForExecution
-    ? ''
-    : ' (still required for Alpaca data API — bars/quotes/signal-backtests flow through Alpaca even when EXECUTION_VENUE=binance_us)';
+  const alpacaNeeded = alpacaUsedForExecution; // Phase 2: data path also moves with venue.
   const placeholderSecretPatterns = [
     /<[^>]+>/i,
     /^changeme$/i,
@@ -227,29 +225,40 @@ const validateEnv = () => {
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
   const alpacaSecretProvided = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY']
     .some((key) => Object.prototype.hasOwnProperty.call(process.env, key));
-  if (strictSecretsMode) {
-    if (!String(alpacaKeyRaw || '').trim()) {
-      validationErrors.push(`APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty.${alpacaDataOnlyContext}`);
+  if (alpacaNeeded) {
+    if (strictSecretsMode) {
+      if (!String(alpacaKeyRaw || '').trim()) {
+        validationErrors.push('APCA_API_KEY_ID/ALPACA_KEY_ID is required and cannot be empty.');
+      }
+      if (!String(alpacaSecretRaw || '').trim()) {
+        validationErrors.push('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY is required and cannot be empty.');
+      }
+    } else if (!String(alpacaKeyRaw || '').trim() || !String(alpacaSecretRaw || '').trim()) {
+      console.warn('config_warning', {
+        field: 'APCA_API_*',
+        message: 'Alpaca credentials are missing. Startup may continue outside production/live mode, but trading endpoints require credentials.',
+      });
     }
-    if (!String(alpacaSecretRaw || '').trim()) {
-      validationErrors.push(`APCA_API_SECRET_KEY/ALPACA_SECRET_KEY is required and cannot be empty.${alpacaDataOnlyContext}`);
+    assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: strictSecretsMode, provided: alpacaKeyProvided });
+    assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: strictSecretsMode, provided: alpacaSecretProvided });
+    const alpacaTier = String(tradeBaseResolution.credentialTier || 'unknown');
+    if (nodeEnv === 'production') {
+      if (alpacaTier === 'paper') {
+        validationErrors.push('Live trading in production cannot use paper-tier Alpaca credentials (PK* key detected).');
+      }
+      if (alpacaTier === 'unknown') {
+        validationErrors.push('Unable to verify Alpaca credential tier from key format. Expected a live AK* key in production.');
+      }
     }
-  } else if (!String(alpacaKeyRaw || '').trim() || !String(alpacaSecretRaw || '').trim()) {
+  } else if (alpacaKeyProvided || alpacaSecretProvided) {
+    // venue=binance_us with Alpaca creds set: operator is paying for an
+    // Alpaca seat they don't use. Surface as a warning so it's visible
+    // without blocking boot (creds may be intentional for a future flip
+    // back to venue=alpaca).
     console.warn('config_warning', {
       field: 'APCA_API_*',
-      message: 'Alpaca credentials are missing. Startup may continue outside production/live mode, but trading endpoints require credentials.',
+      message: 'Alpaca credentials set but EXECUTION_VENUE=binance_us — Phase 2 routes bars/quotes through Binance.US. The Alpaca creds will go unused; consider removing them from Render env.',
     });
-  }
-  assertNonPlaceholderSecret('APCA_API_KEY_ID/ALPACA_KEY_ID', alpacaKeyRaw, { required: strictSecretsMode, provided: alpacaKeyProvided, context: alpacaDataOnlyContext });
-  assertNonPlaceholderSecret('APCA_API_SECRET_KEY/ALPACA_SECRET_KEY', alpacaSecretRaw, { required: strictSecretsMode, provided: alpacaSecretProvided, context: alpacaDataOnlyContext });
-  const alpacaTier = String(tradeBaseResolution.credentialTier || 'unknown');
-  if (nodeEnv === 'production' && alpacaUsedForExecution) {
-    if (alpacaTier === 'paper') {
-      validationErrors.push('Live trading in production cannot use paper-tier Alpaca credentials (PK* key detected).');
-    }
-    if (alpacaTier === 'unknown') {
-      validationErrors.push('Unable to verify Alpaca credential tier from key format. Expected a live AK* key in production.');
-    }
   }
 
   corsAllowedOrigins.forEach((origin) => {

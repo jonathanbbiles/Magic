@@ -57,9 +57,16 @@ const staleQuoteRescue = require('./modules/staleQuoteRescue');
 // Binance.US execution adapter (2026-05-21). Dormant when EXECUTION_VENUE='alpaca'
 // (the code default). When operator flips EXECUTION_VENUE='binance_us' in Render
 // env, the venue dispatcher routes order primitives through binanceExecution
-// instead of the inline Alpaca calls. Data path (bars/quotes) stays Alpaca.
+// instead of the inline Alpaca calls. Phase 2 (2026-05-21 PM) extends the
+// dispatch to the data path: fetchCryptoBars + fetchCryptoQuotes route to
+// binanceMarketData when venue=binance_us, so Alpaca credentials become
+// optional (validateEnv enforces this). Phase 2 ships with Binance.US's
+// public REST endpoints (/api/v3/klines, /api/v3/ticker/bookTicker — no
+// auth needed) so an operator running on Binance.US can boot with only
+// BINANCE_US_API_KEY/SECRET and zero Alpaca env vars.
 const binanceExecution = require('./modules/binanceExecution');
 const binanceSymbols = require('./modules/binanceSymbols');
+const binanceMarketData = require('./modules/binanceMarketData');
 const EXECUTION_VENUE = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
 const IS_BINANCE_EXECUTION = EXECUTION_VENUE === 'binance_us';
 const SECONDARY_FEED_ENABLED_TRADE = String(
@@ -1500,6 +1507,16 @@ function normalizeSymbolsParam(raw) {
 async function fetchCryptoQuotes({ symbols, location = 'us' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { quotes: {} };
+  if (IS_BINANCE_EXECUTION) {
+    // Phase 2 data dispatch: Binance.US bookTicker. Response shape
+    // matches Alpaca's `{ quotes: { 'BTC/USD': { ap, as, bp, bs, t } } }`
+    // so downstream callers (entry-quote prefetch, staleness check,
+    // signal evaluators) see identical inputs.
+    const payload = await binanceMarketData.fetchBookTickers({ symbols: list });
+    lastQuoteAt = Date.now();
+    lastQuoteSymbol = list[0] || null;
+    return payload || { quotes: {} };
+  }
   const payload = await alpacaRequest({
     base: 'data',
     path: `/v1beta3/crypto/${encodeURIComponent(location)}/latest/quotes`,
@@ -1543,6 +1560,13 @@ async function prefetchQuotesForCandidates(candidates, chunkSize) {
 async function fetchCryptoTrades({ symbols, location = 'us' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { trades: {} };
+  // Phase 2 (venue=binance_us): trades feed is only consumed by the
+  // microstructure signal's flow-imbalance feature (MICRO_TRADES_ENABLED,
+  // default off). Return empty until the Binance trades feed is wired
+  // (Phase 3 follow-up). With the default flag off this branch is
+  // observational; downstream `computeFlowImbalance` returns 0 when the
+  // trades array is empty, which matches the Phase 1 default behaviour.
+  if (IS_BINANCE_EXECUTION) return { trades: {} };
   return alpacaRequest({
     base: 'data',
     path: `/v1beta3/crypto/${encodeURIComponent(location)}/latest/trades`,
@@ -1558,6 +1582,12 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
 async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { orderbooks: {} };
+  // Phase 2 (venue=binance_us): L2 orderbook is consumed only when
+  // ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true (default off). Return empty
+  // until the Binance.US depth feed is wired (Phase 3 follow-up).
+  // multi_factor's `orderbook_missing` reason fires for that signal when
+  // the feature flag is on, which is the documented fallback path.
+  if (IS_BINANCE_EXECUTION) return { orderbooks: {} };
   return alpacaRequest({
     base: 'data',
     path: `/v1beta3/crypto/${encodeURIComponent(location)}/latest/orderbooks`,
@@ -1594,6 +1624,23 @@ async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe 
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { bars: {} };
   const cacheKey = `${location}:${timeframe}:${limit}:${list.join(',')}`;
+  if (IS_BINANCE_EXECUTION) {
+    // Phase 2 data dispatch: Binance.US klines. Returns oldest-first
+    // bars matching the post-reverse Alpaca shape. The cache and the
+    // engine's `bars.slice(0, -1)` (drop in-progress bar) semantics
+    // work unchanged.
+    try {
+      const payload = await binanceMarketData.fetchKlines({
+        symbols: list, timeframe, limit,
+      });
+      barsCache.set(cacheKey, { at: Date.now(), payload });
+      return payload;
+    } catch (err) {
+      const cached = barsCache.get(cacheKey);
+      if (cached && (Date.now() - cached.at) <= BARS_CACHE_TTL_MS) return cached.payload;
+      return { bars: {} };
+    }
+  }
   // Without an explicit `start`, /v1beta3/crypto/{loc}/bars has been observed
   // in production to return 200 OK with empty `bars:{}` for every requested
   // symbol — which the predictor surfaces as `insufficient_bars` for every
@@ -1680,6 +1727,19 @@ const STABLECOIN_BASES = new Set([
 
 async function loadSupportedCryptoPairs() {
   if (supportedPairsLoading) return supportedPairsLoading;
+  // Phase 2 (venue=binance_us): the bot's universe is `configured` by
+  // default (post-2026-05-16 flip), so the dynamic universe filter that
+  // consumes this snapshot is dormant. Skip the Alpaca call cleanly
+  // rather than warning with `load_supported_crypto_pairs_failed`.
+  // Binance.US equivalent (resolvedSymbols from binanceSymbols.hydrate)
+  // is already populated separately at boot for the configured universe.
+  if (IS_BINANCE_EXECUTION) {
+    supportedPairsSnapshot = {
+      pairs: Object.keys(binanceSymbols.getCanonicalResolution()),
+      lastUpdated: new Date().toISOString(),
+    };
+    return supportedPairsSnapshot;
+  }
   supportedPairsLoading = (async () => {
     try {
       const assets = await alpacaRequest({

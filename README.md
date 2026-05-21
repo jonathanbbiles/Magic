@@ -44,15 +44,15 @@ Binance.US enforces `NOTIONAL.minNotional` (typically $10) per pair. At $84 × 1
 
 1. Deposit to bring Binance.US equity above $105.
 2. Add Render env vars: `EXECUTION_VENUE=binance_us`, `BINANCE_US_API_KEY=<key>`, `BINANCE_US_API_SECRET=<secret>`. Update `ENTRY_SYMBOLS_PRIMARY` to the comma-separated 30-symbol list.
-3. **Keep `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` set.** Alpaca data API still serves bars/quotes/signal-selector backtests regardless of execution venue. Paper-tier (`PK*`) Alpaca keys are accepted when `EXECUTION_VENUE=binance_us` — the live-tier requirement only applies when Alpaca is also the execution venue. Boot fails fast with a `still required for Alpaca data API` message if these are missing.
+3. **Alpaca creds are no longer required (Phase 2, 2026-05-21 PM).** Bars + quotes route through Binance.US's public REST endpoints (`/api/v3/klines`, `/api/v3/ticker/bookTicker` — no auth). You may remove `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` from Render env if you no longer use Alpaca. If you leave them set, the validator emits a warning that they're unused.
 4. Bot boots, hydrates `/api/v3/exchangeInfo`, logs `binance_symbol_hydrate_ok`.
 5. First scan submits an order via Binance.US REST. Watch `meta.scorecard.totalClosedTrades` for the first close.
 
 ### Phase boundaries
 
-- **Phase 1 (this PR)**: execution adapter dormant by default, ready to flip. **Shipped.**
-- **Phase 2 (separate PR, deferred)**: `binanceQuotesStream.js` — Binance.US WS as a third shadow feed. Observational only.
-- **Phase 3 (after Phase 2 validation)**: optionally flip primary quote source.
+- **Phase 1 (2026-05-21 AM)**: execution adapter dormant by default, ready to flip. **Shipped.**
+- **Phase 2 (2026-05-21 PM)**: data path also dispatched. Bars + quotes route through Binance.US public REST when venue=binance_us. Alpaca creds become optional. **Shipped.**
+- **Phase 3 (deferred, separate PR)**: `binanceQuotesStream.js` — Binance.US WS as a third shadow feed alongside Alpaca + Coinbase. Observational only.
 
 ### Hard Rule #4 compliance
 
