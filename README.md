@@ -1,5 +1,30 @@
 # Magic — Alpaca Crypto Trading Bot
 
+## 2026-05-21 add: operator recommendations follow through on auto-suppress + classify chronic blockers
+
+The 2026-05-21 11:58Z diagnostic snapshot surfaced two HIGH-severity recs (`stale_quote_retry_failing` + `chronically_infeasible_symbols`) that were both stale-recommendation artefacts — every concern they raised was already being correctly handled by existing safeguards:
+
+- All 12 stale-quote offenders were in `meta.staleQuoteRetry.suppressedSymbols` (auto-suppress shipped 2026-05-20 PM). No API calls were being wasted. The rec was still suggesting `STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false` as if auto-suppress didn't exist.
+- 10 of the 12 "chronically infeasible" symbols were blocked by `mr_no_drop` (signal-internal "no capitulation yet"). The rec's own action message said this was "not actionable" but the severity was still HIGH because the count crossed 8. The remaining 2 (LTC/BCH) were blocked by `spread_too_wide` — the gate correctly protecting against high-friction entries on those illiquid pairs.
+
+### What changed
+
+**`recStaleQuoteRetryHealth` is now auto-suppress-aware.** Offenders that already appear in `meta.staleQuoteRetry.suppressedSymbols` are excluded from the rec — auto-suppress is already preventing their wasted API calls. When all offenders are auto-suppressed, the rec returns `null` (silent). When some are auto-suppressed and some still being probed, the title carries a note (`"3 additional symbols already auto-suppressed — no API-call waste"`) and the still-probing list drives severity. The third suggested action no longer points at the global kill switch; it points at the auto-suppress feature that supersedes it.
+
+**`recChronicallyInfeasibleSymbols` now classifies blockers by structural concern.** Every blocker reason is bucketed into one of three classes:
+
+- `signal_internal` (`mr_no_drop`, `range_mr_no_drop`, `micro_prob_below_min`, `htf_below_ema`, `turn_no_confirmation`, etc.) — the signal evaluator returned "no setup matched its criteria." Expected behaviour, not an action item.
+- `feed_side` (`stale_quote`, `pruned_stale_quotes`, `no_quote`, `invalid_quote`, `invalid_bid`, `invalid_ask`) — Alpaca's quote feed is the structural problem. Actionable: blocklist or contact Alpaca.
+- `gate_side` (`spread_too_wide{,_tier1,_tier2,_tier3}`, `near_recent_high`, `projected_below_*`, `net_edge_below_min`, `volume_below_min`, `btc_leading_drop`, etc.) — a price-aware gate rejected the candidate. Potentially actionable: review the threshold.
+
+Severity now scales with the count of `feed_side + gate_side + unknown` blockers, not the raw chronic count. The same 2026-05-21 snapshot now produces ONE `low`-severity rec instead of TWO `high`-severity ones, and the title carries the breakdown: `"12 symbols chronically infeasible (2 blocked by feed/gate-side, 10 by signal-internal "no opportunity")"`.
+
+**Hard Rule #4 compliance**: both fixes are purely presentation-layer adjustments inside `operatorRecommendations.js`. No live trading decision reads from this module; signal selection, gate evaluation, and order placement are unchanged. The classification helper (`classifyBlocker`) is exported for tests + future rec builders.
+
+### Operator workflow
+
+No env var changes. The same dashboard surface now reflects the reality that auto-suppress + cross-venue rescue + spread cap are already correctly handling the stale-quote / infeasibility patterns. When real structural problems return (e.g. a new symbol class hits `pruned_stale_quotes` that auto-suppress hasn't yet caught, or `near_recent_high` starts rejecting winners), severity will rise accordingly.
+
 ## 2026-05-20 add: stale-quote rescue (Coinbase confirms Alpaca's stale price is still right) + costly-gates rec filter
 
 The 2026-05-20 23:49Z diagnostic snapshot showed the bot completely stalled: 11/12 symbols blocked by `stale_quote` despite Coinbase's WS feed having sub-2-second-old quotes on every one of them. Phase A built the cross-feed observation; Phase B used it to add MORE rejections when both feeds disagree. Neither phase USED Coinbase to UNBLOCK stale-Alpaca entries — that's the gap this PR closes.
@@ -157,8 +182,8 @@ All thresholds are pinned in `DEFAULT_CONFIG` (not env-overridable by design —
 
 | Rec id | Trigger | Severity | Suggested action |
 |---|---|---|---|
-| `stale_quote_retry_failing` | Per-symbol `staleQuoteRetry.recoveryRate < 5%` over ≥ 30 attempts | `high` if ≥ 8 offenders, else `med` | Blocklist symbols / contact Alpaca / set `STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED=false`. |
-| `chronically_infeasible_symbols` | Symbols with `feasibilityPct < 20%` in `meta.tradeFeasibility.chronicallyInfeasible` | `high` ≥ 8, `med` ≥ 4, else `low` | Per-blocker actions: feed-side → blocklist; spread → re-tier; signal-side → wait. |
+| `stale_quote_retry_failing` | Per-symbol `staleQuoteRetry.recoveryRate < 5%` over ≥ 30 attempts, AFTER excluding any symbol already in `staleQuoteRetry.suppressedSymbols` (auto-suppress neutralises the wasted-API-calls concern, so already-suppressed offenders don't drive severity) | `high` if ≥ 8 still-probing offenders, else `med`. Silent when every offender is already auto-suppressed. | Blocklist still-probing symbols / contact Alpaca / rely on per-symbol auto-suppress (default on) rather than the global kill switch. |
+| `chronically_infeasible_symbols` | Symbols with `feasibilityPct < 20%` in `meta.tradeFeasibility.chronicallyInfeasible` | Driven by count of structurally concerning blockers (feed-side + gate-side), NOT raw chronic count: `high` ≥ 8, `med` ≥ 4, `low` ≥ 1, else `info`. Pure signal-internal "no opportunity" chronics collapse to `info`. | Per-blocker actions: feed-side → blocklist or check Coinbase rescue; gate-side → review threshold or accept the gate is protecting; signal-internal → wait for setup. |
 | `bot_not_trading` | All universe symbols have 0% feasibility | `med` | Read `meta.tradeFeasibility` to identify the blocker pattern. |
 | `gate_costly_verdict` | `gateRejectionAudit.costliestGates` non-empty | `high` | Investigate the gate's threshold; remove or tune. |
 | `gate_trending_costly` | A reason is `trending_costly` in `trendingReasons` | `med` | Watch for verdict flip; no immediate action. |
