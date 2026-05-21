@@ -623,6 +623,37 @@ const validateEnv = () => {
       process.env.ALPACA_API_SECRET_KEY
   );
 
+  // Binance.US execution credentials check (2026-05-21). When operator flips
+  // EXECUTION_VENUE=binance_us, both BINANCE_US_API_KEY and BINANCE_US_API_SECRET
+  // MUST be set. Without them, every signed call would throw at request time;
+  // failing fast at boot is the safer pattern.
+  const executionVenue = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  const binanceKeyPresent = Boolean(String(process.env.BINANCE_US_API_KEY || '').trim());
+  const binanceSecretPresent = Boolean(String(process.env.BINANCE_US_API_SECRET || '').trim());
+  if (executionVenue === 'binance_us') {
+    if (!binanceKeyPresent) {
+      validationErrors.push('BINANCE_US_API_KEY is required when EXECUTION_VENUE=binance_us.');
+    }
+    if (!binanceSecretPresent) {
+      validationErrors.push('BINANCE_US_API_SECRET is required when EXECUTION_VENUE=binance_us.');
+    }
+    if (binanceKeyPresent) {
+      assertNonPlaceholderSecret('BINANCE_US_API_KEY', process.env.BINANCE_US_API_KEY, { required: true, provided: true });
+    }
+    if (binanceSecretPresent) {
+      assertNonPlaceholderSecret('BINANCE_US_API_SECRET', process.env.BINANCE_US_API_SECRET, { required: true, provided: true });
+    }
+    // Confirm REST URL points at production Binance.US (not a typo or testnet)
+    const binanceRestUrl = String(process.env.BINANCE_US_REST_URL || 'https://api.binance.us').trim();
+    const parsedBinanceUrl = parseUrl('BINANCE_US_REST_URL', binanceRestUrl);
+    const expectedBinanceHost = 'api.binance.us';
+    if (parsedBinanceUrl && String(parsedBinanceUrl.hostname || '').toLowerCase() !== expectedBinanceHost) {
+      validationErrors.push(`BINANCE_US_REST_URL must resolve to "${expectedBinanceHost}". Received host "${parsedBinanceUrl.hostname}".`);
+    }
+  } else if (executionVenue !== 'alpaca') {
+    validationErrors.push(`EXECUTION_VENUE must be 'alpaca' or 'binance_us'. Received: "${process.env.EXECUTION_VENUE}".`);
+  }
+
   console.log('config_summary', {
     version:
       process.env.VERSION ||
@@ -643,6 +674,9 @@ const validateEnv = () => {
     corsAllowLan,
     alpacaKeyPresent,
     alpacaSecretPresent,
+    executionVenue,
+    binanceKeyPresent,
+    binanceSecretPresent,
     datasetDir,
     datasetPath,
     datasetDirAbsolute,

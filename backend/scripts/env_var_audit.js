@@ -47,6 +47,12 @@ const NON_ENV_ALLOWLIST = new Set([
   'SCHEMA_VERSION',
   'TIMEFRAMES',
   'EXCLUDED_REASONS',
+  // Binance.US adapter constants (2026-05-21). Module-level exports
+  // referenced by name in docs, not runtime-configurable env vars.
+  'DEFAULT_SYMBOL_MAP',
+  'TIER1_CANONICAL',
+  'TIER2_CANONICAL',
+  'IS_BINANCE_EXECUTION',
   // Internal JS local-variable names referenced by name in module headers
   'ACTIVE_SIGNAL_VERSION',
   'CALIBRATION_RELOAD_MS',
