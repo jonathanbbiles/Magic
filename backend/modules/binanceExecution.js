@@ -1,0 +1,544 @@
+// Binance.US execution adapter (2026-05-21).
+//
+// Provides Alpaca-shape-compatible primitives so the existing trade.js
+// dispatch logic doesn't have to branch on venue at every call site.
+// Each function returns the same fields the Alpaca path returns; missing
+// Binance concepts (e.g. there's no native "positions" endpoint) are
+// synthesized from the closest equivalent.
+//
+// Alpaca shape compatibility map:
+//   Alpaca order field          → Binance order field
+//   --------------------------    ------------------------
+//   id (UUID)                   → clientOrderId (we use this as the canonical
+//                                  external id since it's what the bot generates)
+//   symbol (BTC/USD)            → canonicalSymbol stored alongside binanceSymbol
+//   side (buy/sell)             → side (BUY/SELL); we lowercase on the way out
+//   type (limit)                → type (LIMIT); we lowercase on the way out
+//   time_in_force (gtc/ioc)     → timeInForce (GTC/IOC); we lowercase on the way out
+//   qty (string)                → executedQty / origQty (string)
+//   filled_qty                  → executedQty
+//   filled_avg_price            → cummulativeQuoteQty / executedQty
+//   limit_price                 → price (string)
+//   status                      → status (NEW/PARTIALLY_FILLED/FILLED/CANCELED/EXPIRED) →
+//                                  mapped to Alpaca's (new/partially_filled/filled/canceled/expired)
+//   client_order_id             → clientOrderId
+//   created_at (ISO)            → transactTime (epoch ms) → ISO
+//
+// Hard Rule #4: every export is consumed by the trade.js dispatcher.
+// No dead knobs.
+
+const { signedRequest } = require('./binanceAuth');
+const symbols = require('./binanceSymbols');
+
+const SUPPORTED_QUOTES = new Set(['USD', 'USDT', 'BUSD', 'USDC']);
+
+function mapStatus(binanceStatus) {
+  const s = String(binanceStatus || '').toUpperCase();
+  switch (s) {
+    case 'NEW': return 'new';
+    case 'PARTIALLY_FILLED': return 'partially_filled';
+    case 'FILLED': return 'filled';
+    case 'CANCELED': return 'canceled';
+    case 'PENDING_CANCEL': return 'pending_cancel';
+    case 'REJECTED': return 'rejected';
+    case 'EXPIRED': return 'expired';
+    case 'EXPIRED_IN_MATCH': return 'expired';
+    default: return s.toLowerCase();
+  }
+}
+
+function mapSide(binanceSide) {
+  return String(binanceSide || '').toLowerCase();
+}
+
+function mapType(binanceType) {
+  return String(binanceType || '').toLowerCase();
+}
+
+function mapTif(binanceTif) {
+  return String(binanceTif || '').toLowerCase();
+}
+
+// Compute avg fill price from cummulativeQuoteQty / executedQty.
+// Returns null if no fills yet (zero-divide guard).
+function computeAvgFillPrice(order) {
+  const executedQty = Number(order?.executedQty);
+  const cummQuote = Number(order?.cummulativeQuoteQty);
+  if (!Number.isFinite(executedQty) || executedQty <= 0) return null;
+  if (!Number.isFinite(cummQuote) || cummQuote <= 0) return null;
+  return cummQuote / executedQty;
+}
+
+// Convert a Binance order response into the Alpaca-shaped object the
+// trade.js engine expects. Stores the canonical symbol on the object so
+// downstream lookups (which expect "BTC/USD") work without re-translation.
+function toAlpacaShapedOrder(binanceOrder, { canonicalSymbol } = {}) {
+  if (!binanceOrder || typeof binanceOrder !== 'object') return null;
+  const status = mapStatus(binanceOrder.status);
+  const side = mapSide(binanceOrder.side);
+  const type = mapType(binanceOrder.type);
+  const tif = mapTif(binanceOrder.timeInForce);
+  const avgPrice = computeAvgFillPrice(binanceOrder);
+  // Prefer clientOrderId as the canonical id (the bot generates it; it
+  // survives across the cancel-and-replace dance Binance requires for
+  // replaceOrder). Fall back to the numeric orderId when clientOrderId
+  // is absent.
+  const id = binanceOrder.clientOrderId || (binanceOrder.orderId != null ? String(binanceOrder.orderId) : null);
+  const createdAtMs = Number(binanceOrder.transactTime || binanceOrder.time || binanceOrder.updateTime);
+  const createdAt = Number.isFinite(createdAtMs) && createdAtMs > 0
+    ? new Date(createdAtMs).toISOString()
+    : null;
+  return {
+    id,
+    client_order_id: binanceOrder.clientOrderId || null,
+    binance_order_id: binanceOrder.orderId != null ? String(binanceOrder.orderId) : null,
+    symbol: canonicalSymbol || binanceOrder.symbol || null,
+    binance_symbol: binanceOrder.symbol || null,
+    side,
+    type,
+    time_in_force: tif,
+    qty: binanceOrder.origQty != null ? String(binanceOrder.origQty) : null,
+    filled_qty: binanceOrder.executedQty != null ? String(binanceOrder.executedQty) : '0',
+    filled_avg_price: avgPrice != null ? String(avgPrice) : null,
+    limit_price: binanceOrder.price != null ? String(binanceOrder.price) : null,
+    status,
+    created_at: createdAt,
+    updated_at: createdAt,
+    raw_venue: 'binance_us',
+    raw_response: binanceOrder,
+  };
+}
+
+// --- account / portfolio ----------------------------------------------------
+
+// Returns the Alpaca-shaped account object the trade.js engine reads.
+// Equity = sum(asset.free * mid_price) + cash where asset is one of the
+// 12-symbol bases. Cash = quote-currency free balance summed across
+// USD, USDT, BUSD, USDC (a Binance.US account holds USD natively but
+// the spot pair quote may be USDT depending on what's listed).
+async function fetchAccount({ midPriceLookup, signedRequestOverride } = {}) {
+  const call = signedRequestOverride || signedRequest;
+  const account = await call({ path: '/api/v3/account', method: 'GET' });
+  const balances = Array.isArray(account?.balances) ? account.balances : [];
+  let cashUsd = 0;
+  let nonCashEquity = 0;
+  for (const b of balances) {
+    const asset = String(b?.asset || '').toUpperCase();
+    const free = Number(b?.free);
+    const locked = Number(b?.locked);
+    const total = (Number.isFinite(free) ? free : 0) + (Number.isFinite(locked) ? locked : 0);
+    if (total <= 0) continue;
+    if (SUPPORTED_QUOTES.has(asset)) {
+      cashUsd += total; // USDT/USDC/BUSD treated as ~$1 (Binance.US quote currencies)
+    } else {
+      // Mark non-quote assets to USD via midPriceLookup callback. The
+      // caller (trade.js) injects a function that consults the quote cache.
+      let usdValue = 0;
+      if (typeof midPriceLookup === 'function') {
+        try {
+          const px = midPriceLookup(asset);
+          if (Number.isFinite(px) && px > 0) usdValue = total * px;
+        } catch (_) { usdValue = 0; }
+      }
+      nonCashEquity += usdValue;
+    }
+  }
+  const equity = cashUsd + nonCashEquity;
+  return {
+    id: account?.accountType || 'binance_us',
+    account_number: 'binance_us',
+    status: account?.canTrade ? 'ACTIVE' : 'RESTRICTED',
+    crypto_status: account?.canTrade ? 'ACTIVE' : 'RESTRICTED',
+    currency: 'USD',
+    cash: String(cashUsd),
+    buying_power: String(cashUsd),
+    regt_buying_power: String(cashUsd),
+    daytrading_buying_power: '0',
+    effective_buying_power: String(cashUsd),
+    non_marginable_buying_power: String(cashUsd),
+    portfolio_value: String(equity),
+    equity: String(equity),
+    last_equity: String(equity),
+    long_market_value: String(nonCashEquity),
+    short_market_value: '0',
+    initial_margin: '0',
+    maintenance_margin: '0',
+    sma: String(cashUsd),
+    daytrade_count: 0,
+    pattern_day_trader: false,
+    trading_blocked: !account?.canTrade,
+    transfers_blocked: !account?.canDeposit,
+    account_blocked: false,
+    multiplier: '1',
+    shorting_enabled: false,
+    raw_venue: 'binance_us',
+    raw_response: account,
+  };
+}
+
+// Synthesize Alpaca-shape positions[] from Binance account balances.
+// Binance has no native "open positions" concept — every non-quote asset
+// holding is a long position. The bot only cares about the 12-symbol
+// universe; balances of unrelated assets (BNB held for fee discount,
+// stale holdings from manual trades) are filtered out via the universe
+// argument.
+async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPriceLookup, signedRequestOverride } = {}) {
+  const call = signedRequestOverride || signedRequest;
+  const account = await call({ path: '/api/v3/account', method: 'GET' });
+  const balances = Array.isArray(account?.balances) ? account.balances : [];
+  // Build a base-asset → canonical-symbol map from the resolved universe.
+  const baseToCanonical = new Map();
+  for (const canonical of universe) {
+    const resolved = symbols.resolveBinanceSymbol(canonical);
+    if (!resolved) continue;
+    const baseAsset = canonical.split('/')[0].toUpperCase();
+    baseToCanonical.set(baseAsset, canonical);
+  }
+  const positions = [];
+  for (const b of balances) {
+    const asset = String(b?.asset || '').toUpperCase();
+    if (!baseToCanonical.has(asset)) continue;
+    const free = Number(b?.free);
+    const locked = Number(b?.locked);
+    const total = (Number.isFinite(free) ? free : 0) + (Number.isFinite(locked) ? locked : 0);
+    if (total <= 0) continue;
+    const canonical = baseToCanonical.get(asset);
+    let marketPrice = 0;
+    if (typeof midPriceLookup === 'function') {
+      try {
+        const px = midPriceLookup(asset);
+        if (Number.isFinite(px) && px > 0) marketPrice = px;
+      } catch (_) { marketPrice = 0; }
+    }
+    const marketValue = total * marketPrice;
+    positions.push({
+      symbol: canonical,
+      asset_id: canonical,
+      exchange: 'binance_us',
+      asset_class: 'crypto',
+      qty: String(total),
+      qty_available: String(Number.isFinite(free) ? free : 0),
+      avg_entry_price: null, // Binance doesn't track average entry; the bot's
+                              // tradePredictions Map holds this when the bot
+                              // placed the order.
+      side: 'long',
+      market_value: String(marketValue),
+      cost_basis: null,
+      unrealized_pl: null,
+      unrealized_plpc: null,
+      current_price: String(marketPrice),
+      lastday_price: null,
+      change_today: null,
+      raw_venue: 'binance_us',
+    });
+  }
+  return positions;
+}
+
+async function fetchPosition(symbolCanonical, opts = {}) {
+  const list = await fetchPositions({
+    ...opts,
+    universe: [symbolCanonical],
+  });
+  return list.find((p) => p.symbol === symbolCanonical) || null;
+}
+
+// --- orders -----------------------------------------------------------------
+
+async function fetchOrders({
+  status = 'open',
+  symbol = null, // optional canonical symbol to scope the query
+  limit = 500,
+  signedRequestOverride,
+} = {}) {
+  const call = signedRequestOverride || signedRequest;
+  // Binance has TWO order-listing endpoints:
+  //   /api/v3/openOrders     → returns OPEN orders (across all symbols, OR a single symbol if specified)
+  //   /api/v3/allOrders      → returns historical orders for a SINGLE symbol (required)
+  // For the bot's "all open orders across the universe" need, openOrders
+  // with no symbol filter is the right call.
+  if (String(status).toLowerCase() === 'open') {
+    const params = symbol ? { symbol: requireBinanceSymbol(symbol) } : {};
+    const result = await call({ path: '/api/v3/openOrders', method: 'GET', params });
+    return (Array.isArray(result) ? result : [])
+      .map((o) => toAlpacaShapedOrder(o, { canonicalSymbol: canonicalForBinance(o.symbol) }))
+      .filter(Boolean);
+  }
+  // Closed/all-status query — requires a symbol. Iterate across the universe
+  // if the caller didn't specify one. (At 12 symbols this is bounded.)
+  const universe = symbol ? [symbol] : symbols.listCanonicalSymbols();
+  const aggregated = [];
+  for (const canonical of universe) {
+    const bs = requireBinanceSymbol(canonical, { silent: true });
+    if (!bs) continue;
+    try {
+      const result = await call({
+        path: '/api/v3/allOrders',
+        method: 'GET',
+        params: { symbol: bs, limit: Math.min(1000, Math.max(1, Math.floor(Number(limit) || 500))) },
+      });
+      for (const o of (Array.isArray(result) ? result : [])) {
+        const shaped = toAlpacaShapedOrder(o, { canonicalSymbol: canonical });
+        if (shaped) aggregated.push(shaped);
+      }
+    } catch (err) {
+      // One symbol failing must not break the whole fetch.
+      // Caller can inspect raw_venue errors via logs.
+    }
+  }
+  return aggregated;
+}
+
+async function fetchOrderById(id, { symbol = null, signedRequestOverride } = {}) {
+  const call = signedRequestOverride || signedRequest;
+  // Binance requires symbol on order lookup. The bot stores the canonical
+  // symbol alongside the order id at submission (in `tradePredictions`),
+  // so the caller is expected to pass it. If not, we iterate the universe
+  // until we find a hit (bounded at 12 symbols).
+  const universe = symbol ? [symbol] : symbols.listCanonicalSymbols();
+  for (const canonical of universe) {
+    const bs = requireBinanceSymbol(canonical, { silent: true });
+    if (!bs) continue;
+    try {
+      const result = await call({
+        path: '/api/v3/order',
+        method: 'GET',
+        params: { symbol: bs, origClientOrderId: id },
+      });
+      if (result && (result.orderId || result.clientOrderId)) {
+        return toAlpacaShapedOrder(result, { canonicalSymbol: canonical });
+      }
+    } catch (err) {
+      // -2013 ORDER_NOT_FOUND → continue to next symbol
+      if (err?.binanceErrorCode === -2013) continue;
+      // Other errors: only continue if iterating (no symbol hint provided).
+      if (symbol) throw err;
+    }
+  }
+  return null;
+}
+
+async function cancelOrder(id, { symbol = null, signedRequestOverride } = {}) {
+  const call = signedRequestOverride || signedRequest;
+  const universe = symbol ? [symbol] : symbols.listCanonicalSymbols();
+  for (const canonical of universe) {
+    const bs = requireBinanceSymbol(canonical, { silent: true });
+    if (!bs) continue;
+    try {
+      await call({
+        path: '/api/v3/order',
+        method: 'DELETE',
+        params: { symbol: bs, origClientOrderId: id },
+      });
+      return { canceled: true, id };
+    } catch (err) {
+      // -2011 UNKNOWN_ORDER / -2013 ORDER_NOT_FOUND → continue iteration
+      if (err?.binanceErrorCode === -2011 || err?.binanceErrorCode === -2013) continue;
+      // Other errors when caller passed an explicit symbol: surface them
+      if (symbol) {
+        return { canceled: false, id, status: err?.status || null, reason: err?.binanceErrorMessage || err?.message || null };
+      }
+    }
+  }
+  return { canceled: false, id, status: 404, reason: 'order_not_found' };
+}
+
+// Binance has no atomic replace. The Alpaca caller expects to call
+// replaceOrder(id, body) and get a new order. We implement it as
+// cancel-then-resubmit, preserving the bot's clientOrderId pattern. If
+// cancel fails (e.g. already filled) we DO NOT resubmit — that would
+// double-fill.
+async function replaceOrder(id, body, { symbol = null, signedRequestOverride } = {}) {
+  const cancelResult = await cancelOrder(id, { symbol, signedRequestOverride });
+  if (!cancelResult.canceled) {
+    const err = new Error('binance_replace_cancel_failed');
+    err.cancelResult = cancelResult;
+    throw err;
+  }
+  // The caller's body uses Alpaca naming (limit_price, qty); pass through
+  // to submitOrder which handles the translation.
+  return submitOrder({
+    ...body,
+    symbol: symbol || body.symbol,
+    // Reuse the same clientOrderId so the bot's tradePredictions Map
+    // continues to track this as the "same" order across replace.
+    client_order_id: id,
+    signedRequestOverride,
+  });
+}
+
+// Submit a new order. Translates the Alpaca-shape payload to Binance:
+//   payload.symbol (BTC/USD)        → resolved to BTCUSD via binanceSymbols
+//   payload.side ('buy'/'sell')     → 'BUY' / 'SELL'
+//   payload.type ('limit')          → 'LIMIT'
+//   payload.time_in_force ('gtc')   → 'GTC'
+//   payload.qty                     → quantity (quantized to stepSize)
+//   payload.notional                → quantity via midPriceLookup
+//   payload.limit_price             → price (quantized to tickSize)
+//   payload.client_order_id         → newClientOrderId
+//
+// Returns the Alpaca-shape order. For BUY: { ok: true, buy: order, sell: null }
+// For SELL: the order directly.
+async function submitOrder(payload = {}) {
+  const {
+    symbol: canonicalSymbol,
+    side: sideRaw,
+    type: typeRaw,
+    time_in_force: tifRaw,
+    qty,
+    notional,
+    limit_price,
+    client_order_id,
+    midPriceLookup, // injected by caller to convert notional → quantity
+    signedRequestOverride,
+  } = payload;
+
+  if (!canonicalSymbol) throw new Error('binance_submit_missing_symbol');
+  const resolved = symbols.resolveBinanceSymbol(canonicalSymbol);
+  if (!resolved) {
+    const err = new Error('binance_submit_unresolved_symbol');
+    err.canonicalSymbol = canonicalSymbol;
+    throw err;
+  }
+  const binanceSymbol = resolved.binanceSymbol;
+  const side = String(sideRaw || 'buy').toUpperCase();
+  const type = String(typeRaw || 'limit').toUpperCase();
+  const timeInForce = String(tifRaw || 'gtc').toUpperCase();
+
+  if (type !== 'LIMIT') {
+    // The bot uses LIMIT for entries+TPs and IOC for stop exits. The IOC
+    // variant in this codebase still places a LIMIT order, just with
+    // timeInForce=IOC — not a MARKET order. Reject any other type rather
+    // than silently coerce.
+    if (type !== 'MARKET') {
+      throw new Error(`binance_submit_unsupported_type:${type}`);
+    }
+  }
+
+  // Translate qty / notional → Binance quantity
+  let quantity;
+  if (qty != null && qty !== '') {
+    quantity = symbols.quantizeQty(canonicalSymbol, Number(qty));
+  } else if (notional != null && notional !== '') {
+    const notionalNum = Number(notional);
+    if (!Number.isFinite(notionalNum) || notionalNum <= 0) {
+      throw new Error('binance_submit_invalid_notional');
+    }
+    let midPx = null;
+    if (typeof midPriceLookup === 'function') {
+      try { midPx = Number(midPriceLookup(canonicalSymbol)); } catch (_) { midPx = null; }
+    }
+    // Fall back to limit_price as the reference if midPriceLookup gave nothing.
+    if ((!Number.isFinite(midPx) || midPx <= 0) && limit_price != null) {
+      midPx = Number(limit_price);
+    }
+    if (!Number.isFinite(midPx) || midPx <= 0) {
+      throw new Error('binance_submit_notional_needs_price_reference');
+    }
+    quantity = symbols.quantizeQty(canonicalSymbol, notionalNum / midPx);
+  } else {
+    throw new Error('binance_submit_missing_qty_or_notional');
+  }
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    const err = new Error('binance_submit_quantity_too_small_after_quantization');
+    err.binanceErrorCode = 'qty_too_small';
+    throw err;
+  }
+
+  // Translate limit_price → price (LIMIT orders only; MARKET orders skip)
+  let price = null;
+  if (type === 'LIMIT') {
+    if (limit_price == null) {
+      throw new Error('binance_submit_limit_needs_price');
+    }
+    price = symbols.quantizePrice(canonicalSymbol, Number(limit_price));
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error('binance_submit_invalid_price_after_quantization');
+    }
+  }
+
+  // MIN_NOTIONAL pre-flight check. Binance would reject with -1013 anyway,
+  // but we catch it here so the rejection includes the canonical symbol +
+  // the actual notional we tried to send — the operator-facing forensics
+  // are clearer than the bare -1013 from the API.
+  const refPrice = price != null ? price : (typeof midPriceLookup === 'function' ? Number(midPriceLookup(canonicalSymbol)) : null);
+  if (Number.isFinite(refPrice) && refPrice > 0) {
+    if (!symbols.meetsMinNotional(canonicalSymbol, quantity, refPrice)) {
+      const err = new Error('binance_submit_min_notional_too_small');
+      err.binanceErrorCode = 'min_notional_too_small';
+      err.notional = quantity * refPrice;
+      err.minNotional = symbols.minNotional(canonicalSymbol);
+      err.canonicalSymbol = canonicalSymbol;
+      throw err;
+    }
+  }
+
+  const params = {
+    symbol: binanceSymbol,
+    side,
+    type,
+    quantity: String(quantity),
+  };
+  if (type === 'LIMIT') {
+    params.timeInForce = timeInForce;
+    params.price = String(price);
+  }
+  if (client_order_id) {
+    params.newClientOrderId = client_order_id;
+  }
+  // newOrderRespType=RESULT gives us executedQty + cummulativeQuoteQty in the
+  // response (so the caller can immediately see if an IOC filled). FULL would
+  // also include the individual fill events but bloats the payload — RESULT
+  // is the sweet spot.
+  params.newOrderRespType = 'RESULT';
+
+  const call = signedRequestOverride || signedRequest;
+  const order = await call({
+    path: '/api/v3/order',
+    method: 'POST',
+    params,
+  });
+  const shaped = toAlpacaShapedOrder(order, { canonicalSymbol });
+  if (side === 'BUY') return { ok: true, buy: shaped, sell: null };
+  return shaped;
+}
+
+// --- helpers ---------------------------------------------------------------
+
+function requireBinanceSymbol(canonical, { silent = false } = {}) {
+  const resolved = symbols.resolveBinanceSymbol(canonical);
+  if (!resolved) {
+    if (silent) return null;
+    const err = new Error(`binance_symbol_unresolved:${canonical}`);
+    err.canonicalSymbol = canonical;
+    throw err;
+  }
+  return resolved.binanceSymbol;
+}
+
+// Reverse lookup: Binance symbol → canonical. Used when parsing order
+// responses that only carry the Binance symbol.
+function canonicalForBinance(binanceSymbol) {
+  if (!binanceSymbol) return null;
+  const res = symbols.getCanonicalResolution();
+  for (const [canonical, info] of Object.entries(res)) {
+    if (info.binanceSymbol === binanceSymbol) return canonical;
+  }
+  return null;
+}
+
+module.exports = {
+  fetchAccount,
+  fetchPositions,
+  fetchPosition,
+  fetchOrders,
+  fetchOrderById,
+  cancelOrder,
+  replaceOrder,
+  submitOrder,
+  // exported for tests + dispatcher diagnostics
+  toAlpacaShapedOrder,
+  mapStatus,
+  computeAvgFillPrice,
+  canonicalForBinance,
+};

@@ -1,4 +1,22 @@
 const LIVE_CRITICAL_DEFAULTS = Object.freeze({
+  // Execution venue dispatch (2026-05-21). Default 'alpaca' keeps the bot
+  // on Alpaca for both data + execution; the PR adds the Binance.US
+  // adapter dormant. Operator flips to 'binance_us' in Render env on
+  // cutover. When 'binance_us': BINANCE_US_API_KEY + BINANCE_US_API_SECRET
+  // MUST be present (validateEnv.js enforces this). The Alpaca data path
+  // (historical bars + signal selector backtests) keeps running regardless
+  // of the execution venue — only ORDER PLACEMENT moves to Binance.US.
+  EXECUTION_VENUE: 'alpaca',
+  BINANCE_US_API_KEY: '',
+  BINANCE_US_API_SECRET: '',
+  BINANCE_US_REST_URL: 'https://api.binance.us',
+  BINANCE_US_RECV_WINDOW_MS: '5000',
+  // BINANCE_US_WS_URL deferred to Phase 2 (WS quote/order stream shadow).
+  // Operator sets BINANCE_SYMBOL_MAP in Render env if they need to override
+  // the static USD→USDT fallback map in backend/modules/binanceSymbols.js
+  // (e.g. forcing UNI to USDT pair if USD is delisted). JSON value, e.g.
+  // {"UNI/USD":["UNIUSDT"]}. Default empty = use the static map.
+  BINANCE_SYMBOL_MAP: '',
   TRADE_BASE: 'https://api.alpaca.markets',
   DATA_BASE: 'https://data.alpaca.markets',
   // 2026-05-16: was 'dynamic'. Alpaca's quote feed is chronically stale on

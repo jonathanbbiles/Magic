@@ -1,4 +1,61 @@
-# Magic — Alpaca Crypto Trading Bot
+# Magic — Crypto Trading Bot (Alpaca + Binance.US)
+
+## 2026-05-21 add: Binance.US execution adapter (Phase 1) + 30-symbol universe
+
+The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ships dormant — default value `alpaca` means zero behavior change at merge. Operator flips to `binance_us` in Render env to cut over.
+
+**Why migrate.** Binance.US slashed spot trading fees in April 2026 to **0% maker / 0.0095% taker** on every pair, every user, regardless of volume. The bot's order shape (bid+tick limit entry + GTC sell limit at TP) is maker-on-both-sides, so clean wins cost **0 bps round-trip**. Stops fire as IOC (taker) → 0.95 bps on Tier 0 pairs, 1.9 bps on Tier I. Alpaca crypto charges 30 bps. The migration converts a stalled bot into one where every signal validates at positive expectancy.
+
+**Architecture.** Dispatcher pattern at the seven order-primitive call sites in `backend/trade.js`. When `EXECUTION_VENUE=binance_us`, calls route through `backend/modules/binanceExecution.js`. When `alpaca` (default), original inline calls run unchanged. Historical bar data + signal selector backtests STILL flow through Alpaca regardless of venue — only **order placement** moves.
+
+### Files
+
+- `backend/modules/binanceAuth.js` — HMAC-SHA256 query-string signer + REST helpers (12 tests).
+- `backend/modules/binanceSymbols.js` — 30-symbol map, `/api/v3/exchangeInfo` boot-time cache, quantize helpers, MIN_NOTIONAL guard (12 tests).
+- `backend/modules/binanceExecution.js` — order primitives in Alpaca-shape: `fetchAccount`, `fetchPositions`, `fetchPosition`, `fetchOrders`, `fetchOrderById`, `cancelOrder`, `replaceOrder`, `submitOrder` (14 tests).
+- `backend/trade.js` — venue dispatcher at each call site; `FEE_BPS_ROUND_TRIP` default is venue-aware (2 bps for binance_us, 30 bps for alpaca).
+- `backend/config/liveDefaults.js` + `validateEnv.js` — new env-var defaults + credentials/host check.
+
+### Env vars
+
+| Env var | Default | Notes |
+|---|---|---|
+| `EXECUTION_VENUE` | `alpaca` | Master dispatch. Flip to `binance_us` to cut over. |
+| `BINANCE_US_API_KEY` | empty | Required when venue=binance_us. |
+| `BINANCE_US_API_SECRET` | empty | Required when venue=binance_us. |
+| `BINANCE_US_REST_URL` | `https://api.binance.us` | Operator override (testing). validateEnv requires `api.binance.us`. |
+| `BINANCE_US_RECV_WINDOW_MS` | `5000` | Signed-request recv window. |
+| `BINANCE_SYMBOL_MAP` | empty (use static map) | JSON override of the 30-symbol USD→USDT fallback map. |
+| `FEE_BPS_ROUND_TRIP` | venue-derived | Override the venue default if observed economics drift. |
+
+### Universe expansion: 12 → 30 symbols
+
+`binanceSymbols.js` ships a 30-symbol static map:
+- **Tier 1 (20 large-caps)**: BTC, ETH, SOL, AVAX, LINK, UNI, DOT, ADA, XRP, DOGE, LTC, BCH, ATOM, NEAR, ETC, ALGO, ICP, TRX, XLM, BNB
+- **Tier 2 (10 mid-caps)**: AAVE, OP, SUI, SAND, GRT, FET, GALA, CRV, HBAR, RENDER
+
+All 30 have native USD pairs on Binance.US with USDT fallback if delisted at boot.
+
+### The blocking constraint: MIN_NOTIONAL
+
+Binance.US enforces `NOTIONAL.minNotional` (typically $10) per pair. At $84 × 10% sizing = $8.40 — below the $10 floor. **Operator must deposit to ≥ $105 equity before cutover.** The adapter pre-flight-checks MIN_NOTIONAL in `submitOrder` and throws `binance_submit_min_notional_too_small` with full forensics if the order would reject, BEFORE the API call.
+
+### Operator workflow for cutover
+
+1. Deposit to bring Binance.US equity above $105.
+2. Add Render env vars: `EXECUTION_VENUE=binance_us`, `BINANCE_US_API_KEY=<key>`, `BINANCE_US_API_SECRET=<secret>`. Update `ENTRY_SYMBOLS_PRIMARY` to the comma-separated 30-symbol list.
+3. Bot boots, hydrates `/api/v3/exchangeInfo`, logs `binance_symbol_hydrate_ok`.
+4. First scan submits an order via Binance.US REST. Watch `meta.scorecard.totalClosedTrades` for the first close.
+
+### Phase boundaries
+
+- **Phase 1 (this PR)**: execution adapter dormant by default, ready to flip. **Shipped.**
+- **Phase 2 (separate PR, deferred)**: `binanceQuotesStream.js` — Binance.US WS as a third shadow feed. Observational only.
+- **Phase 3 (after Phase 2 validation)**: optionally flip primary quote source.
+
+### Hard Rule #4 compliance
+
+Every new env var has a live consumer wired in code. The Phase 2 WS-feed env vars are deferred until Phase 2 ships their reader.
 
 ## 2026-05-21 add: operator recommendations follow through on auto-suppress + classify chronic blockers
 

@@ -54,6 +54,14 @@ const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
 const staleQuoteRescue = require('./modules/staleQuoteRescue');
+// Binance.US execution adapter (2026-05-21). Dormant when EXECUTION_VENUE='alpaca'
+// (the code default). When operator flips EXECUTION_VENUE='binance_us' in Render
+// env, the venue dispatcher routes order primitives through binanceExecution
+// instead of the inline Alpaca calls. Data path (bars/quotes) stays Alpaca.
+const binanceExecution = require('./modules/binanceExecution');
+const binanceSymbols = require('./modules/binanceSymbols');
+const EXECUTION_VENUE = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+const IS_BINANCE_EXECUTION = EXECUTION_VENUE === 'binance_us';
 const SECONDARY_FEED_ENABLED_TRADE = String(
   process.env.SECONDARY_FEED_ENABLED || 'false',
 ).toLowerCase() === 'true';
@@ -168,19 +176,21 @@ const ENFORCE_PROJECTED_COVERS_GROSS = readBoolean('ENFORCE_PROJECTED_COVERS_GRO
 // deriveSignalTargetNetBps below) actually has room to bite for typical
 // projections; with the old 15-bps floor the fractional formula was a no-op.
 const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(5, readNumber('TARGET_NET_PROFIT_BPS', 8)));
-// Round-trip Alpaca crypto fees, in basis points. Default lowered from 40 →
-// 30 to match the maker-maker fill path that the live engine actually uses:
-// ENTRY_LIMIT_PRICE_MODE='mid' rests our buy as a maker bid; the GTC sell
-// limit rests as a maker ask. Maker fees on Alpaca crypto are ~10-15 bps per
-// side at the lowest tier (~$84 account → lowest tier), so round-trip ≈ 20-30.
-// 30 is the conservative end of that range. The May 2026 mean-reversion
-// backtest's gross expectancy was +15.83 bps (loose) and +54.91 bps (strict)
-// — both blocked from net positive at 40 fee bps, both clear with 30. The
-// 40-bps assumption assumed taker entry (BUY crosses to ask), which hasn't
-// matched live execution since the May-14 mid-mode flip. This is a model
-// correctness fix; doesn't change the win path math, just removes a 10-bps
-// over-charge that was suppressing valid trades.
-const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', 30));
+// Round-trip crypto trading fees, in basis points. Default depends on the
+// execution venue:
+//   - alpaca (default): 30 bps round-trip. Alpaca crypto maker-maker is
+//     ~10-15 bps per side at the lowest tier (~$84 account → lowest tier).
+//   - binance_us: 2 bps round-trip. Binance.US slashed fees in April 2026
+//     to 0% maker / 0.0095% taker. Bot is maker on both legs at TP exit
+//     (entry: bid+tick rest, exit: GTC sell at TP) = 0 bps round-trip on
+//     clean wins. Stops fire as IOC (taker) → 0.95 bps on Tier 0 pairs
+//     or 1.9 bps on Tier I. Default 2 is the conservative "stops occasionally
+//     fire on a Tier I pair" assumption. Tighten to 1 if dashboard shows
+//     mostly-maker fills; widen if Tier I pairs dominate stops.
+// Operator can override via FEE_BPS_ROUND_TRIP env var at any time.
+const EXECUTION_VENUE_FOR_FEE_DEFAULT = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+const FEE_BPS_DEFAULT = EXECUTION_VENUE_FOR_FEE_DEFAULT === 'binance_us' ? 2 : 30;
+const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', FEE_BPS_DEFAULT));
 // Gross upward move the sell limit requires above entry.
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
 // Safety buffer, in basis points. Used only for the entry edge gate.
@@ -1292,7 +1302,27 @@ async function getAlpacaConnectivityStatus() {
 
 // --- account / portfolio / clock ----------------------------------------
 
+// Binance adapter helper: snapshot the latest mid-price for a base asset
+// (e.g. 'BTC') from the quote cache. The Binance adapter needs this to
+// (a) value non-quote balances when computing equity, (b) convert notional
+// → quantity at submit time. Returns 0 when unknown — callers handle that
+// case (skip equity, throw on submit).
+function binanceMidPriceLookup(baseAsset) {
+  if (!baseAsset) return 0;
+  const canonical = `${String(baseAsset).toUpperCase()}/USD`;
+  const lastQuote = lastQuoteFingerprintBySymbol.get(canonical);
+  if (!lastQuote) return 0;
+  const parts = String(lastQuote).split(':');
+  const bid = Number(parts[0]);
+  const ask = Number(parts[1]);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0) return 0;
+  return (bid + ask) / 2;
+}
+
 async function fetchAccount() {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.fetchAccount({ midPriceLookup: binanceMidPriceLookup });
+  }
   return alpacaRequest({ base: 'trade', path: '/v2/account', label: 'account' });
 }
 
@@ -1312,11 +1342,22 @@ async function fetchClock() {
 // --- positions / assets --------------------------------------------------
 
 async function fetchPositions() {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.fetchPositions({
+      universe: binanceSymbols.listCanonicalSymbols(),
+      midPriceLookup: binanceMidPriceLookup,
+    });
+  }
   const list = await alpacaRequest({ base: 'trade', path: '/v2/positions', label: 'positions' });
   return Array.isArray(list) ? list : [];
 }
 
 async function fetchPosition(symbol) {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.fetchPosition(symbol, {
+      midPriceLookup: binanceMidPriceLookup,
+    });
+  }
   const apiSym = toAlpacaSymbol(symbol) || symbol;
   try {
     return await alpacaRequest({ base: 'trade', path: `/v2/positions/${encodeURIComponent(apiSym)}`, label: 'position' });
@@ -1359,6 +1400,13 @@ function expandNestedOrders(orders) {
 }
 
 async function fetchOrders(query = {}) {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.fetchOrders({
+      status: query.status || 'open',
+      symbol: query.symbol || null,
+      limit: query.limit,
+    });
+  }
   const q = { ...query };
   if (q.nested === true) q.nested = 'true';
   if (q.nested === false) delete q.nested;
@@ -1366,7 +1414,10 @@ async function fetchOrders(query = {}) {
   return Array.isArray(list) ? list : [];
 }
 
-async function fetchOrderById(id) {
+async function fetchOrderById(id, opts = {}) {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.fetchOrderById(id, { symbol: opts.symbol || null });
+  }
   try {
     return await alpacaRequest({ base: 'trade', path: `/v2/orders/${encodeURIComponent(id)}`, label: 'order_by_id' });
   } catch (err) {
@@ -1376,10 +1427,16 @@ async function fetchOrderById(id) {
 }
 
 async function replaceOrder(id, body) {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.replaceOrder(id, body, { symbol: body?.symbol || null });
+  }
   return alpacaRequest({ base: 'trade', path: `/v2/orders/${encodeURIComponent(id)}`, method: 'PATCH', body: body || {}, label: 'replace_order' });
 }
 
-async function cancelOrder(id) {
+async function cancelOrder(id, opts = {}) {
+  if (IS_BINANCE_EXECUTION) {
+    return binanceExecution.cancelOrder(id, { symbol: opts.symbol || null });
+  }
   try {
     await alpacaRequest({ base: 'trade', path: `/v2/orders/${encodeURIComponent(id)}`, method: 'DELETE', label: 'cancel_order' });
     return { canceled: true, id };
@@ -1394,6 +1451,18 @@ async function cancelOrder(id) {
 // `submitOrder` handles /buy, /orders, and /trade POSTs. For a BUY it returns
 // { ok, buy, sell } (sell attaches later via the exit manager once filled).
 async function submitOrder(payload = {}) {
+  if (IS_BINANCE_EXECUTION) {
+    // Inject midPriceLookup so the adapter can convert notional→quantity
+    // and run the MIN_NOTIONAL pre-flight. limit_price is also used as
+    // a fallback reference (see binanceExecution.js submitOrder).
+    return withOrderSubmitQueue(() => binanceExecution.submitOrder({
+      ...payload,
+      midPriceLookup: (canonical) => {
+        const base = String(canonical).split('/')[0];
+        return binanceMidPriceLookup(base);
+      },
+    }));
+  }
   const symbol = payload.symbol;
   const side = String(payload.side || 'buy').toLowerCase();
   const apiSym = toAlpacaSymbol(symbol) || symbol;
@@ -4356,9 +4425,43 @@ async function runDustCleanup() {
   return { ran: true, cleaned: 0 };
 }
 
+// --- Binance execution boot --------------------------------------------
+// At boot, when EXECUTION_VENUE=binance_us, hydrate the symbol map from
+// Binance.US's /api/v3/exchangeInfo so the adapter knows tickSize, stepSize,
+// and MIN_NOTIONAL for each pair before any order is submitted. This is
+// fire-and-forget — failures log but don't crash the boot (the operator can
+// see the error in meta.binanceSymbolMap and react). When EXECUTION_VENUE
+// is anything other than 'binance_us', the hydrate is skipped entirely.
+function getBinanceExecutionStatus() {
+  return {
+    venue: EXECUTION_VENUE,
+    isBinance: IS_BINANCE_EXECUTION,
+    symbolHydration: binanceSymbols.getHydrationStatus(),
+    resolvedSymbols: IS_BINANCE_EXECUTION ? binanceSymbols.getCanonicalResolution() : {},
+  };
+}
+
+if (IS_BINANCE_EXECUTION) {
+  binanceSymbols.hydrate({
+    universe: binanceSymbols.TIER1_CANONICAL.concat(binanceSymbols.TIER2_CANONICAL),
+  }).then((result) => {
+    if (result.ok) {
+      console.log('binance_symbol_hydrate_ok', {
+        resolved: Object.keys(result.resolved).length,
+        unresolved: result.unresolved,
+      });
+    } else {
+      console.warn('binance_symbol_hydrate_failed', { error: result.error });
+    }
+  }).catch((err) => {
+    console.warn('binance_symbol_hydrate_threw', { error: err?.message || String(err) });
+  });
+}
+
 module.exports = {
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
   getRollingSkipSnapshot,

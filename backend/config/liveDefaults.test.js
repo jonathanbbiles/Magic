@@ -72,6 +72,17 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 
+// 2026-05-21: Binance.US execution adapter shipped dormant. Default venue
+// is 'alpaca' so the merge is zero-behavior-change. Operator flips
+// EXECUTION_VENUE='binance_us' in Render env to cut over. validateEnv.js
+// requires BINANCE_US_API_KEY + _SECRET when venue=binance_us.
+assert.equal(LIVE_CRITICAL_DEFAULTS.EXECUTION_VENUE, 'alpaca');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BINANCE_US_API_KEY, '');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BINANCE_US_API_SECRET, '');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BINANCE_US_REST_URL, 'https://api.binance.us');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BINANCE_US_RECV_WINDOW_MS, '5000');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BINANCE_SYMBOL_MAP, '');
+
 // 2026-05-17: Phase 1 master switch re-enabled. With MR-1m as the only
 // validated signal firing ~6/30 days (~$0.005/day expectancy on $84
 // equity), Phase 1's expanded trigger surface (MR-5m, MR-15m, range-MR)

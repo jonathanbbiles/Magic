@@ -2,7 +2,11 @@
 
 ## What this repo is
 
-Live Alpaca crypto trading bot. The full strategy is documented in `README.md` (top level). Read it before making changes — older doc fragments in `backend/README.md` describe features that are documented but not implemented (stops, Kelly sizing, drawdown guard, correlation guard, TWAP, engine v2). Treat any env var not listed in the top-level `README.md` as not-wired until confirmed by `grep` in `backend/`.
+Live crypto trading bot. As of 2026-05-21 the bot supports two execution venues, controlled by `EXECUTION_VENUE` env var:
+- `EXECUTION_VENUE=alpaca` (default): all order placement + account queries route through Alpaca crypto. Historical posture; what every prior CLAUDE.md entry assumes.
+- `EXECUTION_VENUE=binance_us`: order placement + balance queries route through Binance.US (0% maker / 0.0095% taker as of April 2026). Historical bar data + signal selector backtests STILL flow through Alpaca regardless of venue — only execution moves.
+
+The full strategy is documented in `README.md` (top level). Read it before making changes — older doc fragments in `backend/README.md` describe features that are documented but not implemented (stops, Kelly sizing, drawdown guard, correlation guard, TWAP, engine v2). Treat any env var not listed in the top-level `README.md` as not-wired until confirmed by `grep` in `backend/`.
 
 ## Hard rules
 
@@ -17,7 +21,7 @@ Live Alpaca crypto trading bot. The full strategy is documented in `README.md` (
 
 2. **Never commit Alpaca credentials or `API_TOKEN` values.** A pre-commit hook in `.git-hooks/pre-commit` blocks the obvious cases, but never bypass it with `--no-verify`.
 
-3. **Live trading only.** `TRADE_BASE` must point at `https://api.alpaca.markets` in production; paper endpoints are explicitly rejected. Don't add fallbacks that re-allow paper.
+3. **Live trading only.** `TRADE_BASE` must point at `https://api.alpaca.markets` in production; paper endpoints are explicitly rejected. Same for Binance.US: `BINANCE_US_REST_URL` must resolve to `api.binance.us` — testnet hosts are rejected by `validateEnv.js`. Don't add fallbacks that re-allow paper or testnet.
 
 4. **Don't re-introduce dead knobs as if they're real.** If you add documentation for a feature, the feature must actually be wired. The current backend has substantial doc-vs-code drift; do not make it worse.
 
@@ -448,6 +452,44 @@ Module: `backend/modules/staleQuoteRescue.js`. Pure decision function + singleto
 
 **When extending**: the decision function is pure — see `staleQuoteRescue.test.js` for 12 worked examples. The rescue is logically the inverse of `crossVenueGate.evaluateCrossVenueGate`, and intentionally shares the `normalizeQuote` helper from `crossVenueGate.js`. Do NOT duplicate the normalization logic; if quote-shape handling needs to change, change `crossVenueGate.normalizeQuote` and both modules benefit.
 
+## Binance.US execution adapter — Phase 1 (2026-05-21)
+
+Multi-venue execution path. The bot's ENTIRE Alpaca codebase is untouched at default settings (`EXECUTION_VENUE=alpaca`); the Binance.US adapter is dormant until the operator flips the venue env var in Render. The motivation: Alpaca crypto charges 30 bps round-trip, while Binance.US slashed fees in April 2026 to **0% maker / 0.0095% taker on every pair, every tier**. The bot's order shape (bid+tick limit + GTC sell limit) is maker-on-both-sides, so clean wins now cost 0 bps round-trip. Only stop-loss exits (IOC) pay the ~1 bp taker fee. The cost of trading is essentially eliminated.
+
+**Architecture**: a venue-dispatch pattern at the seven order-primitive call sites in `backend/trade.js` (`fetchAccount`, `fetchPositions`, `fetchPosition`, `fetchOrders`, `fetchOrderById`, `replaceOrder`, `cancelOrder`, `submitOrder`). Each function branches at the top: `if (IS_BINANCE_EXECUTION) return binanceExecution.X(...)`. The Alpaca path is unchanged below the branch. Historical bar data + signal selector backtests still use the Alpaca data path regardless of venue — only **order placement** moves.
+
+Modules:
+- `backend/modules/binanceAuth.js` — HMAC-SHA256 query-string signer + public/signed request helpers. Reuses node:https (no new deps).
+- `backend/modules/binanceSymbols.js` — 30-symbol map (Tier 1: 20 large-caps; Tier 2: 10 mid-caps). Hydrates `/api/v3/exchangeInfo` at boot to populate per-symbol `LOT_SIZE`, `PRICE_FILTER`, `NOTIONAL` filters. Exposes `quantizeQty` (rounds DOWN to stepSize — never over-sizes), `quantizePrice` (rounds to tickSize), `meetsMinNotional`.
+- `backend/modules/binanceExecution.js` — order primitives that return Alpaca-shape-compatible responses so the trade.js engine doesn't have to branch downstream. Translates Binance status codes (`NEW`/`PARTIALLY_FILLED`/`FILLED`/...) to Alpaca's (`new`/`partially_filled`/`filled`/...). Synthesizes Alpaca-shape `positions[]` from Binance's `balances[]` (Binance has no native positions concept).
+
+**Fee constant**: `FEE_BPS_ROUND_TRIP` default is now venue-aware in `trade.js`: 30 bps for Alpaca, 2 bps for Binance.US. The 2-bps default is conservative — assumes stops occasionally fire on Tier I pairs (0.95 bps + 0.95 bps taker would be 1.9 bps round-trip if both legs took). Operator can override.
+
+**The critical risk: MIN_NOTIONAL.** Binance.US enforces `NOTIONAL.minNotional` (typically $10) per pair. At $84 equity × 10% sizing = $8.40 per trade — BELOW the floor. Every order would reject with `-1013 LOT_SIZE`. **The adapter pre-flight-checks this** in `binanceExecution.submitOrder` and throws `binance_submit_min_notional_too_small` BEFORE hitting the API; the error includes `notional`, `minNotional`, `canonicalSymbol` for forensics. Operator workflow: deposit to ≥$105 equity before cutover so 10% sizing clears the $10 floor naturally.
+
+**Validation gates** in `backend/config/validateEnv.js`:
+1. When `EXECUTION_VENUE=binance_us`, both `BINANCE_US_API_KEY` and `BINANCE_US_API_SECRET` are required.
+2. `BINANCE_US_REST_URL` must resolve to `api.binance.us` (testnet hosts rejected; mirrors the live-only `TRADE_BASE` gate for Alpaca).
+3. `EXECUTION_VENUE` must be `alpaca` or `binance_us` — any other value fails boot.
+
+**Env vars** added in `liveDefaults.js`:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `EXECUTION_VENUE` | `alpaca` | Master dispatch. Flip to `binance_us` to cut over. |
+| `BINANCE_US_API_KEY` | empty | Required when venue=binance_us. |
+| `BINANCE_US_API_SECRET` | empty | Required when venue=binance_us. |
+| `BINANCE_US_REST_URL` | `https://api.binance.us` | Override for testing. |
+| `BINANCE_US_RECV_WINDOW_MS` | `5000` | Signed-request recv window. |
+| `BINANCE_SYMBOL_MAP` | empty | JSON override of the static USD→USDT fallback map. |
+| `FEE_BPS_ROUND_TRIP` | venue-derived | Operator override of the 2-bps Binance default if observed economics drift. |
+
+**When extending the symbol map**: add new canonical entries to `DEFAULT_SYMBOL_MAP` in `binanceSymbols.js` as ordered preference arrays (USD first, USDT fallback). Update `TIER1_CANONICAL` / `TIER2_CANONICAL` exports. The `binanceSymbols.test.js` length assertions will fail until those are kept in sync.
+
+**Phase 2 (deferred, separate PR)**: a Binance.US WebSocket feed module modeled on `coinbaseQuotesStream.js`, as a third shadow feed alongside Alpaca + Coinbase. Observational at `meta.binanceFeedShadow`. Phase 3 (only after data) optionally flips quote prefetch to Binance primary. The WS-URL env var will be added in Phase 2 alongside its consumer to stay Hard-Rule-#4-clean.
+
+**Hard Rule #4 compliance**: every new env var has a live consumer. `EXECUTION_VENUE` → dispatch in trade.js. `BINANCE_US_API_KEY/SECRET` → `resolveCredentials` in binanceAuth.js. `BINANCE_US_REST_URL` → `resolveRestUrl` in binanceAuth.js + validateEnv assertion. `BINANCE_US_RECV_WINDOW_MS` → `resolveRecvWindowMs` in binanceAuth.js. `BINANCE_SYMBOL_MAP` → `readOperatorSymbolMap` in binanceSymbols.js.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
@@ -455,6 +497,7 @@ Module: `backend/modules/staleQuoteRescue.js`. Pure decision function + singleto
 - Math: `backend/modules/entryProbability.js`, `tradeGuards.js`, `orderbookMetrics.js` (now includes `computeMicroprice` + `computeSpreadZScore`), `indicators.js` (now includes `stochastic`, `bollingerBands`, `candleBodyWickRatio`, `macdHistogramSlope`, `macdSignalDivergence`, `rsiPriceDivergence`, `emaAlignmentScore`, `obvSlope`, `chaikinMoneyFlow`)
 - Feature library: `backend/modules/featureLibrary.js` (2026-05-18 — rolling Sharpe/Sortino/skew/kurtosis/Ljung-Box/R²/maxDD/VaR/CVaR + S/R proximity + snapshot orchestrator)
 - Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default), `staleQuoteRescue.js` (Phase B follow-up — inverse rescue gate, shadow-mode by default)
+- Binance.US execution (2026-05-21): `backend/modules/binanceAuth.js`, `binanceSymbols.js`, `binanceExecution.js` (dormant when `EXECUTION_VENUE=alpaca`, default; activates when operator flips to `binance_us`)
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
