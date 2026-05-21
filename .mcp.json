@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "magic-diagnostics": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./mcp/magic-diagnostics/server.js"],
+      "env": {
+        "MAGIC_BACKEND_URL": "${MAGIC_BACKEND_URL}",
+        "MAGIC_API_TOKEN": "${MAGIC_API_TOKEN}"
+      }
+    }
+  }
+}

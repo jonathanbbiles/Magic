@@ -171,6 +171,7 @@ function auditEnvVars({
   readmePath = path.join(REPO_ROOT, 'README.md'),
   claudeMdPath = path.join(REPO_ROOT, 'CLAUDE.md'),
   backendDir = BACKEND_DIR,
+  extraSourceDirs = [path.join(REPO_ROOT, 'mcp')],
   extraAllowlist = [],
 } = {}) {
   const docs = [
@@ -187,7 +188,16 @@ function auditEnvVars({
     }
   }
 
+  // Scan backend/ + any extra source dirs (default: repo-root mcp/) for
+  // env reads. Without this, env vars consumed by repo-root tooling
+  // outside backend/ (e.g. MCP servers in mcp/) would be flagged as
+  // "documented but never read" — a false positive.
   const sourceFiles = listSourceFiles(backendDir);
+  for (const extraDir of extraSourceDirs) {
+    if (fs.existsSync(extraDir)) {
+      listSourceFiles(extraDir, sourceFiles);
+    }
+  }
   const allRead = new Set();
   for (const file of sourceFiles) {
     const text = readFileSafe(file);

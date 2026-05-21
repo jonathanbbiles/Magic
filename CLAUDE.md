@@ -40,7 +40,42 @@ npm run check:complexity                          # line budget for trade.js
 npm run reconcile                                 # offline predicted vs realized analysis
 node scripts/backtest_strategy.js --strategy=multi_factor   # multi-factor on real Alpaca bars
 node scripts/simulate_strategy.js --strategy=multi_factor   # multi-factor across regimes
+
+# Live diagnostics (MCP) — zero-dep stdio server in mcp/magic-diagnostics/.
+# Pulls /dashboard, /debug/logs, /debug/runtime-config, /dashboard/scorecard
+# from the running bot. Auto-registered via repo-root .mcp.json. Requires
+# MAGIC_BACKEND_URL + MAGIC_API_TOKEN env vars. Test:
+node ../mcp/magic-diagnostics/server.test.js     # 8 tests, no network
 ```
+
+## Live diagnostics via MCP (2026-05-21 PM)
+
+The `mcp/magic-diagnostics/` server lets a Claude Code session pull
+live bot state on demand — no copy-paste of dashboard JSON, no waiting
+for the operator to grab logs.
+
+**Tools exposed:**
+- `get_diagnostics()` → full `/dashboard` blob (account, positions, meta)
+- `get_logs({level?, limit?, sinceMs?})` → `/debug/logs` filtered ring
+- `get_runtime_config()` → git commit + effective env values
+- `get_scorecard()` → closed-trade summary (cheaper than full diagnostics)
+
+**Wiring:** repo-root `.mcp.json` registers the stdio server; Claude
+Code prompts for approval on first use per project. Two env vars must
+be set in the session's environment: `MAGIC_BACKEND_URL` (Render URL)
+and `MAGIC_API_TOKEN` (matches the backend's `API_TOKEN` env, used in
+the `Authorization: Bearer` header by `backend/auth.js`).
+
+**Adding a new tool:** implement `async toolFoo(args)` in
+`mcp/magic-diagnostics/server.js`, register it in the `TOOLS` array
+with `name + description + inputSchema`, add unit tests in
+`server.test.js`. The server is zero-dep (raw stdio + node:https) so
+no `npm install` step. If a new tool needs a backend endpoint that
+doesn't exist yet, add the Express route in `backend/index.js` first —
+the MCP server is a thin shim over what's already exposed.
+
+**Hard Rule #4 compliance:** every tool maps to a real backend route.
+No stubs; no "available but unimplemented" entries.
 
 ## Entry signal flag
 
