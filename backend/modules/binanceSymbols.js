@@ -1,9 +1,12 @@
 // Binance.US symbol resolution + exchangeInfo cache (2026-05-21).
 //
 // Responsibilities:
-//   1. Map the bot's canonical "BTC/USD" form → Binance's "BTCUSD" form.
-//      Includes a USDT fallback for symbols Binance.US periodically delists
-//      from USD pairs (LINK, UNI, DOT have all had USDT-only windows).
+//   1. Map the bot's canonical "BTC/USD" form → Binance's "BTCUSDT" form.
+//      USDT-quoted pairs are the deep/liquid books on Binance.US; the
+//      native-USD alt books are chronically thin (observed 100-1442 bps
+//      bid/ask spreads on 2026-05-26, which the spread gate correctly
+//      refuses). We quote USDT for every symbol so the whole universe sees
+//      tight, consistent spreads. USD is kept only as a delisting fallback.
 //   2. At boot, fetch GET /api/v3/exchangeInfo once and cache:
 //      - status (TRADING vs HALT/BREAK)
 //      - LOT_SIZE filter (stepSize, minQty)
@@ -22,13 +25,16 @@
 const { publicRequest } = require('./binanceAuth');
 
 // Default canonical→Binance map. Each value is an ordered preference list:
-// the first that's TRADING in exchangeInfo wins; USDT is the fallback.
+// the first that's TRADING in exchangeInfo wins. USDT is listed FIRST
+// (2026-05-26) because the USDT-quoted books are the liquid ones on
+// Binance.US — native-USD alt books are too thin to trade (1-14% spreads).
+// USD is the delisting fallback. NOTE: USDT pairs settle in USDT, so the
+// account must hold USDT, not USD (operator converts on Binance.US once).
 // Operator-overridable via BINANCE_SYMBOL_MAP env var (JSON).
 //
 // Tiering (used to seed ENTRY_SYMBOLS_PRIMARY at cutover):
-//   Tier 1 — original 12 + 8 large-cap additions. All have native USD pairs
-//            on Binance.US and deep order books. Default universe at venue
-//            cutover. (20 symbols.)
+//   Tier 1 — original 12 + 8 large-cap additions. All have deep USDT order
+//            books on Binance.US. Default universe at venue cutover. (20.)
 //   Tier 2 — 10 mid-cap symbols with reasonable liquidity. Available in the
 //            map so the adapter handles them when the operator opts in via
 //            ENTRY_SYMBOLS_PRIMARY env var. (Brings the total to 30.)
@@ -39,38 +45,38 @@ const { publicRequest } = require('./binanceAuth');
 //   assumes liquid-major economics.)
 const DEFAULT_SYMBOL_MAP = Object.freeze({
   // Tier 1 (12 original)
-  'BTC/USD':    ['BTCUSD',    'BTCUSDT'],
-  'ETH/USD':    ['ETHUSD',    'ETHUSDT'],
-  'SOL/USD':    ['SOLUSD',    'SOLUSDT'],
-  'AVAX/USD':   ['AVAXUSD',   'AVAXUSDT'],
-  'LINK/USD':   ['LINKUSD',   'LINKUSDT'],
-  'UNI/USD':    ['UNIUSD',    'UNIUSDT'],
-  'DOT/USD':    ['DOTUSD',    'DOTUSDT'],
-  'ADA/USD':    ['ADAUSD',    'ADAUSDT'],
-  'XRP/USD':    ['XRPUSD',    'XRPUSDT'],
-  'DOGE/USD':   ['DOGEUSD',   'DOGEUSDT'],
-  'LTC/USD':    ['LTCUSD',    'LTCUSDT'],
-  'BCH/USD':    ['BCHUSD',    'BCHUSDT'],
+  'BTC/USD':    ['BTCUSDT',    'BTCUSD'],
+  'ETH/USD':    ['ETHUSDT',    'ETHUSD'],
+  'SOL/USD':    ['SOLUSDT',    'SOLUSD'],
+  'AVAX/USD':   ['AVAXUSDT',   'AVAXUSD'],
+  'LINK/USD':   ['LINKUSDT',   'LINKUSD'],
+  'UNI/USD':    ['UNIUSDT',    'UNIUSD'],
+  'DOT/USD':    ['DOTUSDT',    'DOTUSD'],
+  'ADA/USD':    ['ADAUSDT',    'ADAUSD'],
+  'XRP/USD':    ['XRPUSDT',    'XRPUSD'],
+  'DOGE/USD':   ['DOGEUSDT',   'DOGEUSD'],
+  'LTC/USD':    ['LTCUSDT',    'LTCUSD'],
+  'BCH/USD':    ['BCHUSDT',    'BCHUSD'],
   // Tier 1 (8 large-cap additions, 2026-05-21)
-  'ATOM/USD':   ['ATOMUSD',   'ATOMUSDT'],
-  'NEAR/USD':   ['NEARUSD',   'NEARUSDT'],
-  'ETC/USD':    ['ETCUSD',    'ETCUSDT'],
-  'ALGO/USD':   ['ALGOUSD',   'ALGOUSDT'],
-  'ICP/USD':    ['ICPUSD',    'ICPUSDT'],
-  'TRX/USD':    ['TRXUSD',    'TRXUSDT'],
-  'XLM/USD':    ['XLMUSD',    'XLMUSDT'],
-  'BNB/USD':    ['BNBUSD',    'BNBUSDT'],
+  'ATOM/USD':   ['ATOMUSDT',   'ATOMUSD'],
+  'NEAR/USD':   ['NEARUSDT',   'NEARUSD'],
+  'ETC/USD':    ['ETCUSDT',    'ETCUSD'],
+  'ALGO/USD':   ['ALGOUSDT',   'ALGOUSD'],
+  'ICP/USD':    ['ICPUSDT',    'ICPUSD'],
+  'TRX/USD':    ['TRXUSDT',    'TRXUSD'],
+  'XLM/USD':    ['XLMUSDT',    'XLMUSD'],
+  'BNB/USD':    ['BNBUSDT',    'BNBUSD'],
   // Tier 2 (10 mid-cap additions, 2026-05-21)
-  'AAVE/USD':   ['AAVEUSD',   'AAVEUSDT'],
-  'OP/USD':     ['OPUSD',     'OPUSDT'],
-  'SUI/USD':    ['SUIUSD',    'SUIUSDT'],
-  'SAND/USD':   ['SANDUSD',   'SANDUSDT'],
-  'GRT/USD':    ['GRTUSD',    'GRTUSDT'],
-  'FET/USD':    ['FETUSD',    'FETUSDT'],
-  'GALA/USD':   ['GALAUSD',   'GALAUSDT'],
-  'CRV/USD':    ['CRVUSD',    'CRVUSDT'],
-  'HBAR/USD':   ['HBARUSD',   'HBARUSDT'],
-  'RENDER/USD': ['RENDERUSD', 'RENDERUSDT'],
+  'AAVE/USD':   ['AAVEUSDT',   'AAVEUSD'],
+  'OP/USD':     ['OPUSDT',     'OPUSD'],
+  'SUI/USD':    ['SUIUSDT',    'SUIUSD'],
+  'SAND/USD':   ['SANDUSDT',   'SANDUSD'],
+  'GRT/USD':    ['GRTUSDT',    'GRTUSD'],
+  'FET/USD':    ['FETUSDT',    'FETUSD'],
+  'GALA/USD':   ['GALAUSDT',   'GALAUSD'],
+  'CRV/USD':    ['CRVUSDT',    'CRVUSD'],
+  'HBAR/USD':   ['HBARUSDT',   'HBARUSD'],
+  'RENDER/USD': ['RENDERUSDT', 'RENDERUSD'],
 });
 
 // Tier classification for the venue-cutover seed lists. Exported so the
