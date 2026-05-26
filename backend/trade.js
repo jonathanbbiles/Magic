@@ -2242,7 +2242,15 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
     // Shadow mode is default-on so validation data accumulates automatically;
     // an operator who wants to skip the trades fetch entirely flips
     // MICRO_TRADES_SHADOW_ENABLED=false in Render env.
-    const shouldFetchTrades = MICRO_TRADES_ENABLED || MICRO_TRADES_SHADOW_ENABLED;
+    //
+    // The trades feed is Alpaca-only (/v1beta3/crypto/{loc}/trades). On
+    // binance_us — or any venue without Alpaca creds — the fetch can only
+    // throw alpaca_auth_missing, which previously logged a per-symbol
+    // crypto_trades_fetch_failed warning every scan. Gate on Alpaca auth so
+    // the venue silently keeps Phase-1 flowImbalance=0 behaviour instead of
+    // hammering an endpoint that cannot succeed.
+    const alpacaDataAvailable = resolveAlpacaAuth().alpacaAuthOk;
+    const shouldFetchTrades = (MICRO_TRADES_ENABLED || MICRO_TRADES_SHADOW_ENABLED) && alpacaDataAvailable;
     const tradesFetch = shouldFetchTrades
       ? fetchRecentTrades({
           request: (args) => alpacaRequest({ base: 'data', ...args }),
@@ -3779,8 +3787,21 @@ async function scanAndEnter() {
         rejectTrade(pair, 'buy_rejected');
       }
     } catch (err) {
-      lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'buy_failed', message: err?.errorMessage || err?.message || String(err) };
-      rejectTrade(pair, 'buy_error', { message: err?.message || String(err) });
+      // Surface the venue's own error code + message when present (Binance.US
+      // signed errors carry binanceErrorCode/binanceErrorMessage). Without
+      // this the operator only sees the opaque HTTP wrapper (e.g.
+      // "binance_signed_401") and cannot tell a key-permission/IP problem
+      // (-2015) apart from a signature problem (-1022) or insufficient
+      // balance (-2010). Account reads can succeed while order POSTs fail,
+      // so the distinction is the whole diagnosis.
+      const binanceErrorCode = err?.binanceErrorCode ?? null;
+      const binanceErrorMessage = err?.binanceErrorMessage ?? null;
+      const baseMessage = err?.errorMessage || err?.message || String(err);
+      const message = binanceErrorCode != null
+        ? `${baseMessage} (binance ${binanceErrorCode}: ${binanceErrorMessage || 'no detail'})`
+        : baseMessage;
+      lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'buy_failed', message, binanceErrorCode, binanceErrorMessage };
+      rejectTrade(pair, 'buy_error', { message, binanceErrorCode, binanceErrorMessage });
     }
   }
 
