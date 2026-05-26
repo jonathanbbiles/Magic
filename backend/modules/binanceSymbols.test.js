@@ -38,11 +38,11 @@ function info(symbol, { status = 'TRADING', stepSize = '0.001', tickSize = '0.01
   for (const s of TIER1_CANONICAL) assert.ok(s in DEFAULT_SYMBOL_MAP, `Tier1 missing ${s}`);
   for (const s of TIER2_CANONICAL) assert.ok(s in DEFAULT_SYMBOL_MAP, `Tier2 missing ${s}`);
   assert.strictEqual(Object.keys(DEFAULT_SYMBOL_MAP).length, 30, 'map size = 30');
-  // Each entry must list USD first, USDT fallback second.
+  // Each entry must list USDT first (liquid book), USD fallback second.
   for (const [canonical, prefs] of Object.entries(DEFAULT_SYMBOL_MAP)) {
     assert.ok(prefs.length >= 1, `${canonical} has no preferences`);
-    assert.ok(prefs[0].endsWith('USD') && !prefs[0].endsWith('USDT'), `${canonical} USD pair must be first preference`);
-    assert.ok(prefs[1] && prefs[1].endsWith('USDT'), `${canonical} must have USDT fallback`);
+    assert.ok(prefs[0].endsWith('USDT'), `${canonical} USDT pair must be first preference (liquid book)`);
+    assert.ok(prefs[1] && prefs[1].endsWith('USD') && !prefs[1].endsWith('USDT'), `${canonical} must have USD fallback`);
   }
   // The original 12 must remain — never silently dropped.
   for (const s of ['BTC/USD','ETH/USD','SOL/USD','AVAX/USD','LINK/USD','UNI/USD','DOT/USD','ADA/USD','XRP/USD','DOGE/USD','LTC/USD','BCH/USD']) {
@@ -59,7 +59,8 @@ function info(symbol, { status = 'TRADING', stepSize = '0.001', tickSize = '0.01
   assert.strictEqual(precisionFromStep('0.00000001'), 8);
 }
 
-// 3. hydrate via _testInjectExchangeInfo resolves USD pairs preferentially.
+// 3. hydrate resolves the USD pair when only USD is listed (USDT is the
+//    first preference but absent from this fixture, so USD wins as fallback).
 {
   _testReset();
   _testInjectExchangeInfo({
@@ -82,7 +83,7 @@ function info(symbol, { status = 'TRADING', stepSize = '0.001', tickSize = '0.01
   assert.strictEqual(r.status, 'TRADING');
 }
 
-// 4. Hydrate falls back to USDT when USD pair is not TRADING.
+// 4. Hydrate prefers the USDT pair (liquid book) over the USD pair.
 {
   _testReset();
   _testInjectExchangeInfo({
@@ -96,7 +97,7 @@ function info(symbol, { status = 'TRADING', stepSize = '0.001', tickSize = '0.01
     universe: ['BTC/USD', 'LINK/USD'],
   });
   const r = resolveBinanceSymbol('LINK/USD');
-  assert.strictEqual(r.binanceSymbol, 'LINKUSDT', 'should fall back to USDT pair when USD is BREAK');
+  assert.strictEqual(r.binanceSymbol, 'LINKUSDT', 'should prefer the liquid USDT pair');
   assert.strictEqual(r.quote, 'USDT');
 }
 

@@ -35,7 +35,7 @@ The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ship
 | `BINANCE_US_API_SECRET` | empty | Required when venue=binance_us. |
 | `BINANCE_US_REST_URL` | `https://api.binance.us` | Operator override (testing). validateEnv requires `api.binance.us`. |
 | `BINANCE_US_RECV_WINDOW_MS` | `5000` | Signed-request recv window. |
-| `BINANCE_SYMBOL_MAP` | empty (use static map) | JSON override of the 30-symbol USD→USDT fallback map. |
+| `BINANCE_SYMBOL_MAP` | empty (use static map) | JSON override of the 30-symbol USDT→USD preference map (USDT-first as of 2026-05-26). |
 | `FEE_BPS_ROUND_TRIP` | venue-derived | Override the venue default if observed economics drift. |
 
 ### Universe expansion: 12 → 30 symbols
@@ -44,7 +44,9 @@ The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ship
 - **Tier 1 (20 large-caps)**: BTC, ETH, SOL, AVAX, LINK, UNI, DOT, ADA, XRP, DOGE, LTC, BCH, ATOM, NEAR, ETC, ALGO, ICP, TRX, XLM, BNB
 - **Tier 2 (10 mid-caps)**: AAVE, OP, SUI, SAND, GRT, FET, GALA, CRV, HBAR, RENDER
 
-All 30 have native USD pairs on Binance.US with USDT fallback if delisted at boot.
+Each symbol resolves to its **USDT** pair first, with the USD pair as a delisting fallback (flipped from USD-first on 2026-05-26). The USDT-quoted books are the deep/liquid ones on Binance.US; the native-USD alt books are chronically thin (100–1442 bps spreads observed 2026-05-26) and the `spread_too_wide` gate correctly refuses them, which left the whole alt universe unable to trade. Quoting USDT books gives every symbol tight, consistent spreads so a sub-1% target clears the gate at Binance.US's ~0% maker fee.
+
+**USDT pairs settle in USDT, not USD.** The account must hold a USDT balance — the operator converts USD → USDT once on Binance.US (instant, ~1:1, near-zero cost) before the bot can fill. Sizing/economics are unchanged since USDT ≈ USD.
 
 ### The blocking constraint: MIN_NOTIONAL
 
@@ -52,8 +54,8 @@ Binance.US enforces `NOTIONAL.minNotional` (typically $10) per pair. At $84 × 1
 
 ### Operator workflow for cutover
 
-1. Deposit to bring Binance.US equity above $105.
-2. Add Render env vars: `EXECUTION_VENUE=binance_us`, `BINANCE_US_API_KEY=<key>`, `BINANCE_US_API_SECRET=<secret>`. Update `ENTRY_SYMBOLS_PRIMARY` to the comma-separated 30-symbol list.
+1. Deposit to bring Binance.US equity above $105, then **convert the USD balance to USDT** (the universe quotes USDT pairs — see "Universe expansion" above). USDT pairs cannot be bought with a USD-only balance.
+2. Add Render env vars: `EXECUTION_VENUE=binance_us`, `BINANCE_US_API_KEY=<key>`, `BINANCE_US_API_SECRET=<secret>`. The API key needs **spot trading permission** and either no IP restriction or Render's egress IP allow-listed (a read-only or IP-locked key fails every order with Binance `-2015`). Update `ENTRY_SYMBOLS_PRIMARY` to the comma-separated 30-symbol list.
 3. **Alpaca creds are no longer required (Phase 2, 2026-05-21 PM).** Bars + quotes route through Binance.US's public REST endpoints (`/api/v3/klines`, `/api/v3/ticker/bookTicker` — no auth). You may remove `APCA_API_KEY_ID` + `APCA_API_SECRET_KEY` from Render env if you no longer use Alpaca. If you leave them set, the validator emits a warning that they're unused.
 4. Bot boots, hydrates `/api/v3/exchangeInfo`, logs `binance_symbol_hydrate_ok`.
 5. First scan submits an order via Binance.US REST. Watch `meta.scorecard.totalClosedTrades` for the first close.
