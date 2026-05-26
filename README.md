@@ -1,5 +1,15 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-26 fix: auto-backtest now prices the venue fee (lifts the Binance.US veto)
+
+**Symptom.** After the Binance.US cutover the bot deposited capital but never traded — every scan logged `entry_scan_skipped_backtest_veto` / `no_signal_passed_backtest_threshold`. The signal selector saw OLS at −26.9 bps, multi_factor −45.9, mean_reversion −31.1, barrier −36.9, so it vetoed all entries.
+
+**Root cause.** The live engine's `FEE_BPS_ROUND_TRIP` is venue-aware (2 bps on `binance_us`, 30 bps on `alpaca`), but the auto-backtest in `runBacktestAndStore` never passed a fee — it fell through to `backtest_strategy.js`'s hardcoded `DEFAULTS.feeBpsRoundTrip = 30` (Alpaca). So on Binance.US every signal was graded ~28 bps too harshly. OLS's gross expectancy is **+3.14 bps**; subtracting a 30-bps fee that no longer applies produced −26.9 net and tripped the veto. This is the exact failure mode the env-fallback resolver exists to prevent — a live-engine value (the venue-derived fee) not bridged into the auto-backtest — just for the fee constant instead of an env-only knob.
+
+**Fix.** `backend/modules/backtestEnvFallbacks.js` gains `resolveBacktestFeeBps(overrides, env)` mirroring `trade.js` exactly: explicit override → `FEE_BPS_ROUND_TRIP` env → venue default (`binance_us`=2, else 30). `runBacktestAndStore` resolves it once and passes `feeBpsRoundTrip` into `runBacktest`, so all slots (primary/alt/mf/mean_rev/range_mr/barrier/micro) stay in sync with the live engine. `/debug/backtest?feeBpsRoundTrip=N` lets an operator A/B a fee (e.g. `0` to model pure-maker round-trips). Default `alpaca` venue is unchanged (still 30).
+
+**Effect.** At 2 bps, OLS flips to **+1.14 net** and clears the selector's 0-bps threshold; micro30m (gross +5.40 → +3.40) and micro15m (gross +3.61 → +1.61) also clear. The selector picks the highest validated net and the veto lifts. Multi_factor / barrier / range_mr remain negative even after the fee correction, so they stay vetoed (correctly).
+
 ## 2026-05-21 add: Binance.US execution adapter (Phase 1) + 30-symbol universe
 
 The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ships dormant — default value `alpaca` means zero behavior change at merge. Operator flips to `binance_us` in Render env to cut over.

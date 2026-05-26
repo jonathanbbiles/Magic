@@ -5,7 +5,7 @@
 // The priority chain must be: explicit override > env > undefined.
 
 const assert = require('assert/strict');
-const { resolveLiveEngineFallbacks } = require('./backtestEnvFallbacks');
+const { resolveLiveEngineFallbacks, resolveBacktestFeeBps } = require('./backtestEnvFallbacks');
 
 // 1. Empty overrides + empty env → empty result (let backtester apply its own
 // defaults).
@@ -220,6 +220,47 @@ const { resolveLiveEngineFallbacks } = require('./backtestEnvFallbacks');
     { ENFORCE_PROJECTED_COVERS_GROSS: 'false' },
   );
   assert.equal(r.enforceProjectedCoversGross, false);
+}
+
+// --- 2026-05-26 venue-aware backtest fee: resolveBacktestFeeBps ---
+// Regression guard for the post-Binance.US-cutover veto bug: the auto-backtest
+// must price the same round-trip fee the live engine uses, not the backtester's
+// hardcoded 30-bps Alpaca default.
+
+// 19. Default venue (alpaca) → 30 bps.
+{
+  assert.equal(resolveBacktestFeeBps({}, {}), 30, 'no venue → alpaca 30 bps default');
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'alpaca' }), 30);
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'ALPACA' }), 30, 'case-insensitive');
+}
+
+// 20. Binance.US venue → 2 bps (the bug fix: ~0 maker round-trip).
+{
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'binance_us' }), 2);
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'BINANCE_US' }), 2, 'case-insensitive');
+}
+
+// 21. FEE_BPS_ROUND_TRIP env overrides the venue default (operator control).
+{
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'binance_us', FEE_BPS_ROUND_TRIP: '1' }), 1);
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'alpaca', FEE_BPS_ROUND_TRIP: '40' }), 40);
+}
+
+// 22. Explicit override (e.g. /debug/backtest?feeBpsRoundTrip=) wins over env + venue.
+{
+  assert.equal(
+    resolveBacktestFeeBps({ feeBpsRoundTrip: 5 }, { EXECUTION_VENUE: 'binance_us', FEE_BPS_ROUND_TRIP: '2' }),
+    5,
+    'explicit override beats env and venue',
+  );
+  assert.equal(resolveBacktestFeeBps({ feeBpsRoundTrip: '7' }, {}), 7, 'string override coerces');
+}
+
+// 23. Negative / garbage values clamp or fall through (mirrors trade.js Math.max(0,...)).
+{
+  assert.equal(resolveBacktestFeeBps({ feeBpsRoundTrip: -5 }, { EXECUTION_VENUE: 'binance_us' }), 0, 'negative clamps to 0');
+  assert.equal(resolveBacktestFeeBps({ feeBpsRoundTrip: 'abc' }, { EXECUTION_VENUE: 'binance_us' }), 2, 'garbage override falls through to venue default');
+  assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'binance_us', FEE_BPS_ROUND_TRIP: '' }), 2, 'empty env falls through to venue default');
 }
 
 console.log('backtestEnvFallbacks.test ok');

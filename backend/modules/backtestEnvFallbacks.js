@@ -68,6 +68,30 @@ function parseEnvBoolean(raw) {
   return undefined;
 }
 
+// Venue-aware round-trip fee for the auto-backtest. This is NOT a simple
+// env→param mapping like the others: the *default* depends on EXECUTION_VENUE,
+// exactly mirroring trade.js's FEE_BPS_ROUND_TRIP derivation.
+//
+// The bug this fixes (2026-05-26): after the Binance.US cutover the live engine
+// trades at ~2 bps round-trip (0% maker both legs), but the auto-backtest kept
+// falling through to backtest_strategy.js's hardcoded DEFAULTS.feeBpsRoundTrip
+// = 30 (Alpaca). The signal selector therefore graded every signal at Alpaca
+// fee economics and vetoed all entries — OLS net was -26.86 bps (gross +3.14
+// minus a 30-bps fee that no longer applies). At 2 bps the same gross flips to
+// +1.14 net and the veto lifts. Same failure mode the resolver exists for, just
+// for the venue-derived fee constant instead of an env-only knob.
+//
+// Priority: explicit override → FEE_BPS_ROUND_TRIP env → venue default
+// (binance_us = 2, else 30). Always returns a finite number (>= 0).
+function resolveBacktestFeeBps(overrides = {}, env = process.env) {
+  const explicit = parseEnvNumber(overrides.feeBpsRoundTrip);
+  if (explicit !== undefined) return Math.max(0, explicit);
+  const fromEnv = parseEnvNumber(env.FEE_BPS_ROUND_TRIP);
+  if (fromEnv !== undefined) return Math.max(0, fromEnv);
+  const venue = String(env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  return venue === 'binance_us' ? 2 : 30;
+}
+
 function resolveLiveEngineFallbacks(overrides = {}, env = process.env) {
   const resolved = {};
   for (const [overrideKey, envKey] of Object.entries(ENV_NUMBER_FALLBACKS)) {
@@ -103,6 +127,7 @@ function resolveLiveEngineFallbacks(overrides = {}, env = process.env) {
 
 module.exports = {
   resolveLiveEngineFallbacks,
+  resolveBacktestFeeBps,
   ENV_NUMBER_FALLBACKS,
   ENV_BOOLEAN_FALLBACKS,
 };

@@ -103,7 +103,7 @@ const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
-const { resolveLiveEngineFallbacks } = require('./modules/backtestEnvFallbacks');
+const { resolveLiveEngineFallbacks, resolveBacktestFeeBps } = require('./modules/backtestEnvFallbacks');
 const {
   parseSweepCaps,
   summarizeCell,
@@ -994,9 +994,17 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       microSignalTargetMaxNetBps: microSignalTargetMaxNetBpsResolved,
       enforceProjectedCoversGross: enforceProjectedCoversGrossResolved,
     } = liveEngineFallbacks;
+    // Venue-aware round-trip fee. Without this the auto-backtest falls through
+    // to backtest_strategy.js's hardcoded 30-bps Alpaca default, which on the
+    // Binance.US venue (~2 bps) over-charges every signal by ~28 bps and makes
+    // the selector veto all entries despite positive gross expectancy. Applied
+    // once here so all slots (primary/alt/mf/mean_rev/.../micro) stay in sync
+    // with the live engine's FEE_BPS_ROUND_TRIP.
+    const feeBpsRoundTripResolved = resolveBacktestFeeBps(overrides, process.env);
     const result = await runBacktest({
       symbols: overrides.symbols || symbolsCsv,
       windowDays: days,
+      feeBpsRoundTrip: feeBpsRoundTripResolved,
       ...(overrides.predictBars ? { predictBars: Number(overrides.predictBars) } : {}),
       ...(overrides.minProjectedBps != null ? { minProjectedBps: Number(overrides.minProjectedBps) } : {}),
       ...(overrides.signalTargetFraction != null ? { signalTargetFraction: Number(overrides.signalTargetFraction) } : {}),
@@ -1142,6 +1150,10 @@ app.get('/debug/backtest', async (req, res) => {
     mrStopLossBps5mTier3: req.query.mrStopLossBps5mTier3,
     mrStopLossBps15m: req.query.mrStopLossBps15m,
     mrStopLossBps15mTier3: req.query.mrStopLossBps15mTier3,
+    // Venue-aware round-trip fee. Defaults follow EXECUTION_VENUE (binance_us=2,
+    // else 30) via resolveBacktestFeeBps; this lets an operator A/B a fee value
+    // directly, e.g. ?feeBpsRoundTrip=0 to model pure-maker round-trips.
+    feeBpsRoundTrip: req.query.feeBpsRoundTrip,
   };
   if (!wait) {
     runBacktestAndStore(overrides).catch(() => {});
