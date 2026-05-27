@@ -162,6 +162,38 @@ async function runAsyncTests() {
     assert.strictEqual(account.trading_blocked, false);
   }
 
+  // 5b. fetchAccount prices held positions via the bookTicker fallback when the
+  //     sync cache is cold — equity must include the position, not read as cash
+  //     only (the bug that made a $35 ALGO holding show long_market_value: 0).
+  {
+    injectUniverse();
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/account', respond: {
+        canTrade: true,
+        balances: [
+          { asset: 'USDT', free: '449.03', locked: '0' },     // cash
+          { asset: 'SOL', free: '0', locked: '324' },          // locked in a resting sell; cache cold
+        ],
+      }},
+    ]);
+    let bookTickerCalls = 0;
+    const account = await fetchAccount({
+      midPriceLookup: () => 0, // cold cache forces the fallback
+      bookTickerOverride: async ({ symbols: syms }) => {
+        bookTickerCalls += 1;
+        const quotes = {};
+        if (syms.includes('SOL/USD')) quotes['SOL/USD'] = { bp: 0.108, ap: 0.10826 }; // mid ~0.10813
+        return { quotes };
+      },
+      signedRequestOverride: fakeReq,
+    });
+    assert.strictEqual(account.cash, '449.03');
+    // equity = 449.03 + 324 * 0.10813 = 449.03 + 35.03412 = 484.06412
+    assert.ok(Math.abs(Number(account.equity) - 484.06412) < 1e-6, `equity includes the priced position, got ${account.equity}`);
+    assert.ok(Math.abs(Number(account.long_market_value) - 35.03412) < 1e-6, `long_market_value reflects the position, got ${account.long_market_value}`);
+    assert.strictEqual(bookTickerCalls, 1);
+  }
+
   // 6. fetchAccount handles restricted account.
   {
     const fakeReq = makeFakeSignedRequest([
@@ -518,7 +550,7 @@ async function runAsyncTests() {
     assert.strictEqual(positions[0].current_price, '0');
   }
 
-  console.log('binanceExecution.test ok', { tests: 19 });
+  console.log('binanceExecution.test ok', { tests: 20 });
 }
 
 runAsyncTests().catch((err) => { console.error(err); process.exit(1); });

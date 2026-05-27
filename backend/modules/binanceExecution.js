@@ -115,17 +115,53 @@ function toAlpacaShapedOrder(binanceOrder, { canonicalSymbol } = {}) {
 
 // --- account / portfolio ----------------------------------------------------
 
+// Resolve a USD reference price per base asset. Prefer the injected sync
+// lookup (the live quote cache); for any asset the cache doesn't cover, do a
+// single batched public bookTicker fetch. Shared by fetchAccount (equity) and
+// fetchPositions (dust filter) so a cold cache never under-values a held
+// balance — the failure mode that made a $35 ALGO position read as $0 in
+// equity (long_market_value: 0), looking like a $35 loss. `entries` is
+// [{ asset, canonical }]; a null canonical is skipped in the fallback (a
+// non-universe asset has no resolvable Binance pair to price against).
+async function resolveUsdPrices(entries, { midPriceLookup, bookTickerOverride } = {}) {
+  const priceByAsset = new Map();
+  const needPrice = [];
+  for (const e of entries) {
+    let px = 0;
+    if (typeof midPriceLookup === 'function') {
+      try { const v = Number(midPriceLookup(e.asset)); if (Number.isFinite(v) && v > 0) px = v; } catch (_) { px = 0; }
+    }
+    if (px > 0) priceByAsset.set(e.asset, px);
+    else if (e.canonical) needPrice.push(e);
+  }
+  if (needPrice.length > 0) {
+    try {
+      const fetchTickers = bookTickerOverride || marketData.fetchBookTickers;
+      const { quotes } = await fetchTickers({ symbols: needPrice.map((e) => e.canonical) });
+      for (const e of needPrice) {
+        const q = quotes ? quotes[e.canonical] : null;
+        const bid = Number(q?.bp);
+        const ask = Number(q?.ap);
+        if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+          priceByAsset.set(e.asset, (bid + ask) / 2);
+        }
+      }
+    } catch (_) { /* price unavailable: asset stays unpriced rather than breaking the call */ }
+  }
+  return priceByAsset;
+}
+
 // Returns the Alpaca-shaped account object the trade.js engine reads.
-// Equity = sum(asset.free * mid_price) + cash where asset is one of the
-// 12-symbol bases. Cash = quote-currency free balance summed across
+// Equity = sum(asset.total * mid_price) + cash where asset is one of the
+// universe bases. Cash = quote-currency free balance summed across
 // USD, USDT, BUSD, USDC (a Binance.US account holds USD natively but
 // the spot pair quote may be USDT depending on what's listed).
-async function fetchAccount({ midPriceLookup, signedRequestOverride } = {}) {
+async function fetchAccount({ midPriceLookup, signedRequestOverride, bookTickerOverride } = {}) {
   const call = signedRequestOverride || signedRequest;
   const account = await call({ path: '/api/v3/account', method: 'GET' });
   const balances = Array.isArray(account?.balances) ? account.balances : [];
   let cashUsd = 0;
-  let nonCashEquity = 0;
+  const nonCash = []; // { asset, canonical, total }
   for (const b of balances) {
     const asset = String(b?.asset || '').toUpperCase();
     const free = Number(b?.free);
@@ -135,17 +171,17 @@ async function fetchAccount({ midPriceLookup, signedRequestOverride } = {}) {
     if (SUPPORTED_QUOTES.has(asset)) {
       cashUsd += total; // USDT/USDC/BUSD treated as ~$1 (Binance.US quote currencies)
     } else {
-      // Mark non-quote assets to USD via midPriceLookup callback. The
-      // caller (trade.js) injects a function that consults the quote cache.
-      let usdValue = 0;
-      if (typeof midPriceLookup === 'function') {
-        try {
-          const px = midPriceLookup(asset);
-          if (Number.isFinite(px) && px > 0) usdValue = total * px;
-        } catch (_) { usdValue = 0; }
-      }
-      nonCashEquity += usdValue;
+      const canonical = `${asset}/USD`;
+      nonCash.push({ asset, canonical: symbols.resolveBinanceSymbol(canonical) ? canonical : null, total });
     }
+  }
+  // Price every non-quote holding (sync cache first, bookTicker fallback) so
+  // equity reflects positions even when the live quote cache is cold.
+  const priceByAsset = await resolveUsdPrices(nonCash, { midPriceLookup, bookTickerOverride });
+  let nonCashEquity = 0;
+  for (const e of nonCash) {
+    const px = priceByAsset.get(e.asset) || 0;
+    if (px > 0) nonCashEquity += e.total * px;
   }
   const equity = cashUsd + nonCashEquity;
   return {
@@ -226,35 +262,11 @@ async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPr
     candidates.push({ asset, canonical, total, free: Number.isFinite(free) ? free : 0, sellableQty });
   }
 
-  // Resolve a USD reference price per candidate. Prefer the injected sync
-  // lookup (the live quote cache); for any candidate it doesn't cover, do a
-  // single batched public bookTicker fetch so the MIN_NOTIONAL dust filter is
-  // robust on a cold cache (the state that left $0.21–$0.76 dust holdings
-  // spamming exit_sell_failed every scan).
-  const priceByAsset = new Map();
-  const needPrice = [];
-  for (const c of candidates) {
-    let px = 0;
-    if (typeof midPriceLookup === 'function') {
-      try { const v = Number(midPriceLookup(c.asset)); if (Number.isFinite(v) && v > 0) px = v; } catch (_) { px = 0; }
-    }
-    if (px > 0) priceByAsset.set(c.asset, px);
-    else needPrice.push(c);
-  }
-  if (needPrice.length > 0) {
-    try {
-      const fetchTickers = bookTickerOverride || marketData.fetchBookTickers;
-      const { quotes } = await fetchTickers({ symbols: needPrice.map((c) => c.canonical) });
-      for (const c of needPrice) {
-        const q = quotes ? quotes[c.canonical] : null;
-        const bid = Number(q?.bp);
-        const ask = Number(q?.ap);
-        if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
-          priceByAsset.set(c.asset, (bid + ask) / 2);
-        }
-      }
-    } catch (_) { /* price unavailable: keep the candidate rather than drop it on a transient fetch error */ }
-  }
+  // Resolve a USD reference price per candidate (sync cache first, batched
+  // bookTicker fallback) so the MIN_NOTIONAL dust filter is robust on a cold
+  // cache — the state that left $0.21–$0.76 dust holdings spamming
+  // exit_sell_failed every scan.
+  const priceByAsset = await resolveUsdPrices(candidates, { midPriceLookup, bookTickerOverride });
 
   const positions = [];
   for (const c of candidates) {
