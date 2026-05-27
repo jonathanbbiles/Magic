@@ -123,6 +123,7 @@ const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
 const staleQuoteRescue = require('./modules/staleQuoteRescue');
+const backtestSpreadRealism = require('./modules/backtestSpreadRealism');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
@@ -746,6 +747,7 @@ const PER_SYMBOL_AUDIT_LOOKBACK_TRADES = Math.max(
 // captures every gradeIntervalMs; expired pending (> staleMin minutes
 // old) are dropped without grading.
 const GATE_REJECTION_AUDIT_ENABLED = String(process.env.GATE_REJECTION_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
+const BACKTEST_SPREAD_REALISM_ENABLED = String(process.env.BACKTEST_SPREAD_REALISM_ENABLED || 'true').toLowerCase() !== 'false';
 const GATE_REJECTION_AUDIT_FORWARD_BARS = Math.max(
   1,
   Number(process.env.GATE_REJECTION_AUDIT_FORWARD_BARS) || 20,
@@ -1748,6 +1750,34 @@ app.get('/dashboard', async (req, res) => {
             });
           } catch (err) {
             return { overall: { ok: false, reason: 'drift_compute_failed', error: err?.message }, perSignal: {} };
+          }
+        })() : null,
+        // Backtest spread-realism diagnostic (observational). Explains a large
+        // part of the drift the alerter above flags: the auto-backtest charges
+        // a tier half-spread cost (8/18/35 bps) on entry, while the live engine
+        // pays the real book spread (60-1500 bps on thin Binance.US alt books).
+        // realismGapBps per symbol = median observed full spread minus the full
+        // spread the backtest implicitly assumed (2x the tier half-spread). A
+        // large positive gap means that symbol's backtest expectancy is
+        // optimistic by ~that many bps. Does NOT gate entries.
+        backtestSpreadRealism: BACKTEST_SPREAD_REALISM_ENABLED ? (() => {
+          try {
+            const params = lastBacktestResult?.params || {};
+            const decision = getSignalSelectorDecision();
+            return backtestSpreadRealism.buildSummary({
+              tierHalfSpreadCostBps: {
+                tier1: params.entrySpreadCostBpsTier1,
+                tier2: params.entrySpreadCostBpsTier2,
+                tier3: params.entrySpreadCostBpsTier3,
+              },
+              activeSignal: {
+                signalVersion: decision.signalVersion,
+                predictedNetBps: decision.activeNetBps,
+                backtestRanAt: decision.backtestRanAt,
+              },
+            });
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), overall: null, bySymbol: [], error: err?.message };
           }
         })() : null,
         // Per-symbol expectancy auditor — observational outlier detector

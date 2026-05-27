@@ -599,6 +599,30 @@ The aggregate ships an extra `bySignalAndReason` slice so the same reason (e.g. 
 
 ---
 
+## 2026-05-27 add: backtest spread-realism diagnostic (live-vs-backtest spread gap)
+
+Explains a large part of the live-vs-backtest divergence the drift alerter flags. The signal selector picks the live signal from 30-day auto-backtests, and those backtests charge a tier-aware **half-spread** cost on entry — `entrySpreadCostBpsTier1/2/3 = 8/18/35 bps` (applied as a half-spread at `scripts/backtest_strategy.js:~939`). On a thin venue — Binance.US alt USDT books — the real book spread is routinely 60–1500 bps, so the backtest's "+N bps" expectancy ignores most of the cost the live engine actually pays. Observed 2026-05-27: `microstructure_30m` backtest **+7.3 bps** vs live **−32.8 bps**, while 21/30 symbols were being rejected at 60–1553 bps spreads.
+
+Module: `backend/modules/backtestSpreadRealism.js` (singleton tracker + pure aggregator). `trade.js` calls `recordObservedSpread()` once per symbol per scan, right after the book spread is computed and **before** any spread gate, so the record captures the true spread regardless of whether the symbol passes. The dashboard surfaces `meta.backtestSpreadRealism`:
+
+- Per symbol: `medianObservedSpreadBps` (full book spread), `p90ObservedSpreadBps`, `tier`, `assumedHalfSpreadBps` (the tier cost the backtest charges), `impliedFullSpreadBps` (`2 × assumedHalfSpreadBps`), and `realismGapBps = medianObservedSpreadBps − impliedFullSpreadBps`. A large positive gap means that symbol's backtest expectancy is optimistic by roughly that many bps. `bySymbol` is sorted most-optimistic-first.
+- `overall`: median observed spread, median realism gap, `symbolsExceedingAssumed`, and `worstSymbol`.
+- `activeSignal`: passthrough of the selected signal version + its predicted net bps + backtest timestamp, so the gap reads next to the expectancy it undercuts.
+
+The recorded `tier` is the **live execution tier** (`resolveSymbolTier`); the assumed cost mirrors the backtest's tier→cost mapping (tier3/unclassified fall through to the tier3 cost). The comparison is full-spread vs `2×` half-spread because the backtest applies its tier cost as a half-spread.
+
+**Honest limitations**: this measures the spread the live engine *faces* in the book, not the spread it *pays* — the bot rests `bid_plus_tick` (maker), so a clean fill ideally pays near-zero spread. The gap is therefore an upper bound on the spread-cost portion of the drift, not an exact attribution. It does not capture adverse-selection, IOC stop-exit, or staircase-decay effects. Use it alongside `meta.drift` (the realized-vs-predicted ground truth), not as a replacement.
+
+**Hard Rule #4 compliance**: the consumer is the dashboard meta surface only. No entry/gate/sizing decision reads from this module — `recordObservedSpread()` runs after the spread is computed and never returns a decision; the scan ignores it.
+
+### Env vars added in this PR
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `BACKTEST_SPREAD_REALISM_ENABLED` | `true` | Master kill. When false, the scan skips the per-symbol spread record and `meta.backtestSpreadRealism` is null. |
+
+---
+
 ## 2026-05-18 cleanup: signal-aware universal gates + backtest fallback fix
 
 The gate analysis surfaced three universal entry gates in `scanAndEnter` that were OLS-shaped and either firing on the wrong signals or about to fire on signals where the gate's assumption no longer holds. Plus a doc-vs-code drift on the backtest side. This PR is the cleanup:

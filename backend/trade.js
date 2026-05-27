@@ -54,6 +54,7 @@ const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
 const staleQuoteRescue = require('./modules/staleQuoteRescue');
+const backtestSpreadRealism = require('./modules/backtestSpreadRealism');
 // Binance.US execution adapter (2026-05-21). Dormant when EXECUTION_VENUE='alpaca'
 // (the code default). When operator flips EXECUTION_VENUE='binance_us' in Render
 // env, the venue dispatcher routes order primitives through binanceExecution
@@ -72,6 +73,14 @@ const IS_BINANCE_EXECUTION = EXECUTION_VENUE === 'binance_us';
 const SECONDARY_FEED_ENABLED_TRADE = String(
   process.env.SECONDARY_FEED_ENABLED || 'false',
 ).toLowerCase() === 'true';
+// Backtest spread-realism diagnostic (observational). When on, the scan records
+// the real per-symbol book spread so the dashboard can compare it to the spread
+// the auto-backtest assumes for that symbol's tier. Pure observation — no entry
+// decision reads from it. Default-on; set BACKTEST_SPREAD_REALISM_ENABLED=false
+// to skip the per-symbol record.
+const BACKTEST_SPREAD_REALISM_ENABLED = String(
+  process.env.BACKTEST_SPREAD_REALISM_ENABLED || 'true',
+).toLowerCase() !== 'false';
 // Phase B gate. Default-OFF — shadow-mode observation only. Operator flips
 // CROSS_VENUE_GATE_ENABLED=true in Render env after `meta.crossVenueGate`
 // accumulates enough wouldHaveRejected events to validate the threshold.
@@ -3138,6 +3147,18 @@ async function scanAndEnter() {
 
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
+      // Observational: record the real book spread before any spread gate so
+      // the dashboard can quantify how far reality exceeds the spread the
+      // auto-backtest assumed for this symbol's tier. Never affects the scan.
+      if (BACKTEST_SPREAD_REALISM_ENABLED) {
+        try {
+          backtestSpreadRealism.recordObservedSpread({
+            symbol: pair,
+            spreadBps,
+            tier: resolveSymbolTier(pair),
+          });
+        } catch (_) { /* diagnostic must never break the scan */ }
+      }
       const spreadCapBps = resolveSpreadCapBps(pair) + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
       const spreadToleranceBps = SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS;
       if (spreadBps > (spreadCapBps + spreadToleranceBps)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }

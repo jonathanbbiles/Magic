@@ -539,6 +539,18 @@ Modules:
 
 **Hard Rule #4 compliance**: every new env var has a live consumer. `EXECUTION_VENUE` → dispatch in trade.js. `BINANCE_US_API_KEY/SECRET` → `resolveCredentials` in binanceAuth.js. `BINANCE_US_REST_URL` → `resolveRestUrl` in binanceAuth.js + validateEnv assertion. `BINANCE_US_RECV_WINDOW_MS` → `resolveRecvWindowMs` in binanceAuth.js. `BINANCE_SYMBOL_MAP` → `readOperatorSymbolMap` in binanceSymbols.js.
 
+## Backtest spread-realism diagnostic (2026-05-27)
+
+`backend/modules/backtestSpreadRealism.js` explains a large part of the live-vs-backtest divergence the drift alerter flags. The signal selector picks the live signal from 30-day auto-backtests, which charge a tier **half-spread** cost on entry (`entrySpreadCostBpsTier1/2/3 = 8/18/35`, applied as a half-spread at `backtest_strategy.js:~939`). On Binance.US alt USDT books the real spread is 60–1500 bps, so the backtest's "+N bps" ignores most of the cost the live engine pays — observed 2026-05-27: `microstructure_30m` backtest +7.3 bps vs live −32.8 bps, 21/30 symbols rejected at 60–1553 bps spreads.
+
+**Wiring** (Hard Rule #4-compliant — observational, no decision reads it):
+1. `trade.js` calls `backtestSpreadRealism.recordObservedSpread({ symbol, spreadBps, tier })` once per symbol per scan, right after `computeSpreadBps` and **before** any spread gate, so it captures the real book spread regardless of pass/fail. Wrapped in try/catch; never breaks the scan.
+2. `index.js` surfaces `meta.backtestSpreadRealism` via `buildSummary({ tierHalfSpreadCostBps, activeSignal })`, reading the tier costs from `lastBacktestResult.params` and the active signal from the selector decision.
+
+Per symbol: `medianObservedSpreadBps`, `p90ObservedSpreadBps`, `assumedHalfSpreadBps`, `impliedFullSpreadBps` (= `2×` half), `realismGapBps` (= median observed − implied full). `bySymbol` is sorted most-optimistic-first; `overall` carries `medianRealismGapBps`, `symbolsExceedingAssumed`, `worstSymbol`. The recorded `tier` is the live execution tier; the assumed cost mirrors the backtest's tier→cost map (tier3/unclassified → tier3 cost).
+
+**Limitation — it's an upper bound, not an attribution.** It measures the spread the engine *faces*, not what it *pays* (the bot rests `bid_plus_tick`, so a clean maker fill ideally pays ~0). Read it next to `meta.drift` (the realized-vs-predicted ground truth), not instead of it. Knob: `BACKTEST_SPREAD_REALISM_ENABLED` (default `true`, master kill → `meta.backtestSpreadRealism` null).
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`
@@ -548,6 +560,7 @@ Modules:
 - Secondary feed (2026-05-20): `backend/modules/coinbaseQuotesStream.js`, `secondaryFeedShadow.js` (Phase A observational subscription to Coinbase Advanced Trade WS), `crossVenueGate.js` (Phase B divergence gate — shadow-mode by default), `staleQuoteRescue.js` (Phase B follow-up — inverse rescue gate, shadow-mode by default)
 - Binance.US execution + data (2026-05-21): `backend/modules/binanceAuth.js`, `binanceSymbols.js`, `binanceExecution.js`, `binanceMarketData.js` (dormant when `EXECUTION_VENUE=alpaca`, default; activates when operator flips to `binance_us`). The market-data module is Phase 2 (2026-05-21 PM) — public REST endpoints for klines + bookTicker, no auth needed.
 - Diagnostics (2026-05-19): `backend/modules/driftAlerter.js`, `perSymbolExpectancyAudit.js`, `cryptoTrades.js`, `gateRejectionAudit.js` (shadow forward-test of rejected candidates)
+- Diagnostics (2026-05-27): `backend/modules/backtestSpreadRealism.js` (per-symbol live book spread vs the spread the auto-backtest assumes — explains live-vs-backtest drift on thin venues)
 - Calibration (2026-05-19): `backend/scripts/build_microstructure_weights.js`, `env_var_audit.js`, `audit_per_symbol_expectancy.js`
 - Config + env validation: `backend/config/`
 - HTTP routes + dashboard meta: `backend/index.js`
