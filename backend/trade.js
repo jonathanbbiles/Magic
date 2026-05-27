@@ -3895,6 +3895,40 @@ function getStopLossConfig() {
   };
 }
 
+// Resolved entry prices for Binance.US held positions, keyed by pair. Binance
+// has no native avg_entry_price (positions are synthesized from spot
+// balances), so reconcileExits resolves one and caches it here to avoid
+// re-querying trade history every cycle. Cleared when the position closes or a
+// pending buy times out (alongside positionFirstSeenAt / tradePredictions).
+const binanceEntryPriceCache = new Map();
+
+// Resolve the entry price of a held Binance.US position so reconcileExits can
+// attach the GTC sell. Priority: cached value → the maker buy-limit the bot
+// placed (a resting maker order fills at its limit, so this is exact and never
+// understates breakeven) → cost basis reconstructed from Binance trade history
+// (the only source that survives a restart that cleared the in-memory
+// prediction — including this fix's own deploy). Returns NaN when nothing
+// resolves, in which case the caller leaves the position untouched this cycle.
+async function resolveBinanceEntryPrice(pair) {
+  const cached = Number(binanceEntryPriceCache.get(pair));
+  if (Number.isFinite(cached) && cached > 0) return cached;
+  const pred = tradePredictions.get(pair);
+  const cachedFill = Number(pred?.actualEntryPrice);
+  if (Number.isFinite(cachedFill) && cachedFill > 0) return cachedFill;
+  const buyLimit = Number(pred?.prediction?.buyLimit);
+  if (Number.isFinite(buyLimit) && buyLimit > 0) return buyLimit;
+  try {
+    const fromTrades = await binanceExecution.getEntryPrice(pair);
+    if (Number.isFinite(fromTrades) && fromTrades > 0) {
+      binanceEntryPriceCache.set(pair, fromTrades);
+      return fromTrades;
+    }
+  } catch (err) {
+    console.warn('binance_entry_price_resolve_failed', { symbol: pair, error: err?.message });
+  }
+  return NaN;
+}
+
 async function reconcileExits() {
   const { byPair, openSellByPair } = await buildHeldAndOpenSellsIndex();
 
@@ -3936,13 +3970,26 @@ async function reconcileExits() {
       pendingBuys.delete(pair);
       tradePredictions.delete(pair);
       entryIntentState.delete(pair);
+      binanceEntryPriceCache.delete(pair);
     }
   }
 
   for (const [pair, pos] of byPair.entries()) {
     const qty = Number(pos?.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
-    const avg = Number(pos?.avg_entry_price);
+    let avg = Number(pos?.avg_entry_price);
+
+    // Binance.US synthesizes positions from spot balances and exposes no
+    // native avg_entry_price (binanceExecution.fetchPositions returns null).
+    // Without an entry price every branch below short-circuits, so the GTC
+    // sell is never attached and the position sits in `pending_fill` forever,
+    // permanently holding a concurrency slot — the failure mode that wedged
+    // the whole bot (8/8 slots stuck, every scan rejecting on
+    // concurrent_position_cap). Recover the entry price from the buy the bot
+    // placed, or from Binance trade history after a restart.
+    if (IS_BINANCE_EXECUTION && (!Number.isFinite(avg) || avg <= 0)) {
+      avg = await resolveBinanceEntryPrice(pair);
+    }
 
     // Stamp first-seen on first observation so age diagnostics start ticking.
     // Also re-stamp if a new buy cycle has clearly started since the previous
@@ -4474,6 +4521,7 @@ async function reconcileExits() {
     tradePredictions.delete(pair);
     positionFirstSeenAt.delete(pair);
     entryIntentState.delete(pair);
+    binanceEntryPriceCache.delete(pair);
   }
 }
 
