@@ -1,5 +1,13 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-27 fix: Binance.US dust balances spam `exit_sell_failed` every scan
+
+**Symptom.** On `binance_us` every reconcile cycle logged a burst of `exit_sell_failed` / `exit_stop_loss_failed` — `binance_submit_min_notional_too_small` for BTC + ETH, `binance_submit_quantity_too_small_after_quantization` for BNB + DOGE + GRT — and `meta.lastExecutionFailure` was permanently pinned to one of them. The dashboard showed 5 "positions" the bot could never exit, each falsely consuming a concurrency slot.
+
+**Root cause.** `binanceExecution.fetchPositions` synthesizes a position from *every* non-zero universe balance. The account held tiny leftover dust (BTC 0.00001 ≈ $0.76, ETH 0.0001 ≈ $0.21, BNB 0.000931 ≈ $0.61, DOGE 0.991 ≈ $0.10, GRT 0.76 ≈ $0.02), all far below Binance's ~$10 `MIN_NOTIONAL` (and some below `LOT_SIZE`). The exit reconciler dutifully tried to attach a GTC sell to each, Binance rejected every one, and the cycle repeated forever — the dust can never be sold, so the loop never terminates.
+
+**Fix.** `fetchPositions` now drops un-sellable dust before returning. A balance is dropped when its quantized sellable quantity rounds below `LOT_SIZE` (price-independent — catches the `quantity_too_small` class), or when its notional is below the pair's `MIN_NOTIONAL`. The notional check needs a price: it uses the live quote cache first and falls back to a single batched public `bookTicker` fetch when the cache is cold (the exact state that let the dust leak through). A balance with no resolvable price is kept (unknown ≠ dust), and a transient `bookTicker` error never drops a real holding. Dust still counts toward equity in `fetchAccount` — it's just not surfaced as a manageable position. Alpaca path unchanged (it has a native positions endpoint). With the dust gone, `exit_sell_failed` stops, slots free, and the dashboard shows only real positions.
+
 ## 2026-05-27 fix: Binance.US positions stuck in `pending_fill` (whole bot wedged)
 
 **Symptom.** On `binance_us` the bot opened 8 positions, then went dark — every scan logged `entry_rejected … reason: concurrent_position_cap` for all 22 remaining symbols. The 8 positions sat in `state: "pending_fill"` for 10+ hours with no GTC sell attached (`sell.activeLimit: null`), even though the buys had filled (the balances existed). With 8/8 concurrency slots permanently consumed by un-exitable positions, no new trade could ever start.

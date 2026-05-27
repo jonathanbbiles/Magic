@@ -451,7 +451,74 @@ async function runAsyncTests() {
     }), null);
   }
 
-  console.log('binanceExecution.test ok', { tests: 17 });
+  // 18. fetchPositions filters un-sellable dust (sub-LOT_SIZE without a price,
+  //     sub-MIN_NOTIONAL with one) while keeping real positions, and resolves a
+  //     price via the bookTicker fallback when the sync cache is cold.
+  {
+    injectUniverse();
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/account', respond: {
+        canTrade: true,
+        balances: [
+          { asset: 'BTC',  free: '0.001',   locked: '0' }, // 0.001 @ 50000 = $50 → KEEP (sync price)
+          { asset: 'ETH',  free: '0.0001',  locked: '0' }, // 0.0001 @ 3000 = $0.30 < $10 → DROP (bookTicker price)
+          { asset: 'SOL',  free: '0.00001', locked: '0' }, // < stepSize 0.001 → sub-LOT_SIZE → DROP (no price needed)
+          { asset: 'AVAX', free: '5',       locked: '0' }, // 5 @ 20 = $100 → KEEP (sync price)
+          { asset: 'LINK', free: '1',       locked: '0' }, // no price anywhere → unknown → KEEP
+        ],
+      }},
+    ]);
+    let bookTickerCalls = 0;
+    let bookTickerSyms = null;
+    const bookTickerOverride = async ({ symbols: syms }) => {
+      bookTickerCalls += 1;
+      bookTickerSyms = syms;
+      const quotes = {};
+      if (syms.includes('ETH/USD')) quotes['ETH/USD'] = { bp: 2999, ap: 3001 }; // mid 3000; LINK stays unpriced
+      return { quotes };
+    };
+    const positions = await fetchPositions({
+      universe: ['BTC/USD', 'ETH/USD', 'SOL/USD', 'AVAX/USD', 'LINK/USD'],
+      midPriceLookup: (asset) => ({ BTC: 50000, AVAX: 20 })[asset] || 0, // cache only knows BTC + AVAX
+      bookTickerOverride,
+      signedRequestOverride: fakeReq,
+    });
+    const byPair = Object.fromEntries(positions.map((p) => [p.symbol, p]));
+    assert.strictEqual(positions.length, 3);
+    assert.ok(byPair['BTC/USD'], 'real BTC position kept');
+    assert.ok(byPair['AVAX/USD'], 'real AVAX position kept');
+    assert.ok(byPair['LINK/USD'], 'unpriced holding kept (unknown != dust)');
+    assert.strictEqual(byPair['ETH/USD'], undefined, 'sub-MIN_NOTIONAL dust dropped (priced via bookTicker)');
+    assert.strictEqual(byPair['SOL/USD'], undefined, 'sub-LOT_SIZE dust dropped without a price');
+    assert.strictEqual(byPair['LINK/USD'].current_price, '0');
+    assert.strictEqual(bookTickerCalls, 1, 'one batched fallback fetch');
+    // SOL is dropped at the LOT_SIZE gate, before pricing — it must not be in the batch.
+    assert.deepStrictEqual(bookTickerSyms.slice().sort(), ['ETH/USD', 'LINK/USD']);
+  }
+
+  // 19. fetchPositions: a bookTicker fetch failure leaves candidates as
+  //     positions — a transient feed error must never silently drop a real
+  //     holding (the dust filter only drops when it has a confirmed price).
+  {
+    injectUniverse();
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/account', respond: {
+        canTrade: true,
+        balances: [{ asset: 'BTC', free: '0.001', locked: '0' }],
+      }},
+    ]);
+    const positions = await fetchPositions({
+      universe: ['BTC/USD'],
+      midPriceLookup: () => 0, // cold cache forces the fallback
+      bookTickerOverride: async () => { throw new Error('feed_down'); },
+      signedRequestOverride: fakeReq,
+    });
+    assert.strictEqual(positions.length, 1);
+    assert.strictEqual(positions[0].symbol, 'BTC/USD');
+    assert.strictEqual(positions[0].current_price, '0');
+  }
+
+  console.log('binanceExecution.test ok', { tests: 19 });
 }
 
 runAsyncTests().catch((err) => { console.error(err); process.exit(1); });
