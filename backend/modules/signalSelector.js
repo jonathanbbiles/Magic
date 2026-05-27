@@ -25,6 +25,8 @@
 //   choice wins. The veto still applies (negative backtest still blocks
 //   trading) unless `BACKTEST_VETO_ENABLED` is also set to false.
 
+const driftAlerter = require('./driftAlerter');
+
 const DEFAULTS = {
   // Minimum avgNetBpsPerEntry a signal must clear in its most recent
   // backtest to be considered "validated" for live use.
@@ -274,6 +276,74 @@ function pickActiveSignal({
   };
 }
 
+// Realized-expectancy circuit breaker.
+//
+// `pickActiveSignal` above is purely backtest-driven: it trusts the 30-day
+// auto-backtest's avgNetBpsPerEntry. But the backtest fill model does not
+// penalise passive-limit adverse selection, so it systematically over-states
+// every signal's edge. The 2026-05-27 live snapshot is the canonical failure:
+// microstructure_30m backtested **+7.8 bps/trade** yet realised **−31 bps/
+// trade** over 29 live fills (overall realised −55 bps). The selector kept
+// trading the loser because nothing fed realised results back into the gate.
+//
+// This evaluates the *active* signal's realised net bps over its most recent
+// closed trades and returns veto=true when it is losing beyond `floorBps`
+// with at least `minTrades` of sample. The caller (trade.js scanAndEnter)
+// halts NEW entries on veto — open positions are still managed/exited
+// normally. Pure: the caller supplies the closed-trade records (it owns the
+// I/O). Reuses driftAlerter.selectRealizedTrades so the trade set this veto
+// acts on is identical to the one meta.drift reports.
+const REALIZED_VETO_DEFAULTS = Object.freeze({
+  // Master kill. False → never vetoes (records nothing, returns reason
+  // 'disabled'). Operator reverts the whole feature with one env flag.
+  enabled: true,
+  // Minimum realised-trade sample for the active signal before the veto can
+  // fire. Mirrors driftAlerter.minTrades — below this the realised average is
+  // too noisy to act on.
+  minTrades: 10,
+  // Realised avgNetBps below this halts new entries. −10 bps sits well past
+  // the ~0-2 bps round-trip fee on Binance.US plus single-trade noise, so it
+  // only fires on a signal that is genuinely bleeding, not a marginal one.
+  floorBps: -10,
+  // Window of most-recent closed trades (for the active signal) the average
+  // is computed over. Recency-weighted so a signal that has turned can clear
+  // the veto without waiting for ancient losers to age out of the full file.
+  lookbackTrades: 50,
+});
+
+function evaluateRealizedVeto({ records = [], signalVersion = null, config = {} } = {}) {
+  const cfg = { ...REALIZED_VETO_DEFAULTS, ...(config || {}) };
+  const base = {
+    veto: false,
+    enabled: cfg.enabled !== false,
+    signalVersion: signalVersion || null,
+    sampleSize: 0,
+    realizedAvgNetBps: null,
+    floorBps: cfg.floorBps,
+    minTrades: cfg.minTrades,
+    lookbackTrades: cfg.lookbackTrades,
+  };
+  if (cfg.enabled === false) return { ...base, reason: 'disabled' };
+  if (!signalVersion) return { ...base, reason: 'no_active_signal' };
+
+  const filtered = driftAlerter.selectRealizedTrades(records, signalVersion);
+  const recent = cfg.lookbackTrades > 0 ? filtered.slice(-cfg.lookbackTrades) : filtered;
+  if (recent.length < cfg.minTrades) {
+    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length };
+  }
+  let sum = 0;
+  for (const t of recent) sum += t.realizedNetBps;
+  const avg = sum / recent.length;
+  const veto = avg < cfg.floorBps;
+  return {
+    ...base,
+    veto,
+    reason: veto ? 'realized_below_floor' : 'within_floor',
+    sampleSize: recent.length,
+    realizedAvgNetBps: avg,
+  };
+}
+
 // Stateful holder used by the live engine. The auto-backtester calls
 // `setLatestDecision()` whenever a backtest completes; the entry scanner
 // calls `getCurrentDecision()` on each scan. Until the first backtest
@@ -345,8 +415,10 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
 
 module.exports = {
   pickActiveSignal,
+  evaluateRealizedVeto,
   setLatestDecision,
   getCurrentDecision,
   bootstrapDecisionFromEnv,
   DEFAULTS,
+  REALIZED_VETO_DEFAULTS,
 };

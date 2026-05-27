@@ -185,6 +185,7 @@ const {
   getEntryRegimeStaleThresholdMs,
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getRealizedVetoState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
@@ -1715,6 +1716,17 @@ app.get('/dashboard', async (req, res) => {
             backtestRanAt: decision.backtestRanAt,
             minBpsToActivate: decision.config?.minBpsToActivate,
             vetoEnabled: decision.config?.vetoEnabled,
+            // Realized-expectancy circuit breaker state (evaluated each scan in
+            // trade.js). Shows whether the active signal is being halted because
+            // its LIVE realized net bps fell below the floor — the feedback the
+            // backtest-only selector above structurally lacks.
+            realizedVeto: (() => {
+              try {
+                return typeof getRealizedVetoState === 'function' ? getRealizedVetoState() : null;
+              } catch (_) {
+                return null;
+              }
+            })(),
           };
         })(),
         // Live-vs-predicted drift alerter. Observational-only — surfaces
