@@ -2,6 +2,7 @@ const assert = require('assert');
 const {
   fetchAccount,
   fetchPositions,
+  getEntryPrice,
   fetchOrders,
   fetchOrderById,
   cancelOrder,
@@ -389,7 +390,68 @@ async function runAsyncTests() {
     assert.ok(calls >= 3);
   }
 
-  console.log('binanceExecution.test ok', { tests: 14 });
+  // 15. getEntryPrice: weighted-average cost basis over multiple buys, and
+  //     resilient to out-of-order trade history (it sorts oldest→newest).
+  {
+    injectUniverse();
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/myTrades', method: 'GET', respond: [
+        // intentionally out of time order to exercise the sort
+        { price: '60000', qty: '0.001', time: 2000, isBuyer: true },
+        { price: '50000', qty: '0.001', time: 1000, isBuyer: true },
+      ]},
+    ]);
+    const px = await getEntryPrice('BTC/USD', { signedRequestOverride: fakeReq });
+    // (0.001*50000 + 0.001*60000) / 0.002 = 55000
+    assert.strictEqual(px, 55000);
+  }
+
+  // 16. getEntryPrice: partial sell leaves the basis intact; a sell-to-flat
+  //     resets it so a fresh buy reports the NEW position's basis.
+  {
+    injectUniverse();
+    const partialSellReq = makeFakeSignedRequest([
+      { path: '/api/v3/myTrades', method: 'GET', respond: [
+        { price: '100', qty: '2', time: 1000, isBuyer: true },
+        { price: '150', qty: '1', time: 2000, isBuyer: false }, // sell 1 of 2
+      ]},
+    ]);
+    assert.strictEqual(await getEntryPrice('SOL/USD', { signedRequestOverride: partialSellReq }), 100);
+
+    const resetReq = makeFakeSignedRequest([
+      { path: '/api/v3/myTrades', method: 'GET', respond: [
+        { price: '100', qty: '1', time: 1000, isBuyer: true },
+        { price: '110', qty: '1', time: 2000, isBuyer: false }, // sell to flat
+        { price: '200', qty: '2', time: 3000, isBuyer: true },  // re-open
+      ]},
+    ]);
+    assert.strictEqual(await getEntryPrice('SOL/USD', { signedRequestOverride: resetReq }), 200);
+  }
+
+  // 17. getEntryPrice: null when no usable basis (empty history, fully sold,
+  //     or an unresolved symbol).
+  {
+    injectUniverse();
+    const emptyReq = makeFakeSignedRequest([
+      { path: '/api/v3/myTrades', method: 'GET', respond: [] },
+    ]);
+    assert.strictEqual(await getEntryPrice('BTC/USD', { signedRequestOverride: emptyReq }), null);
+
+    const flatReq = makeFakeSignedRequest([
+      { path: '/api/v3/myTrades', method: 'GET', respond: [
+        { price: '100', qty: '1', time: 1000, isBuyer: true },
+        { price: '105', qty: '1', time: 2000, isBuyer: false },
+      ]},
+    ]);
+    assert.strictEqual(await getEntryPrice('BTC/USD', { signedRequestOverride: flatReq }), null);
+
+    // Unresolved symbol → null without touching the network.
+    assert.strictEqual(await getEntryPrice('NOPE/USD', {
+      signedRequestOverride: () => { throw new Error('should not reach Binance'); },
+    }), null);
+  }
+
+  console.log('binanceExecution.test ok', { tests: 17 });
 }
 
 runAsyncTests().catch((err) => { console.error(err); process.exit(1); });

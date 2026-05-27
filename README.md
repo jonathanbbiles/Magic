@@ -1,5 +1,13 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-27 fix: Binance.US positions stuck in `pending_fill` (whole bot wedged)
+
+**Symptom.** On `binance_us` the bot opened 8 positions, then went dark — every scan logged `entry_rejected … reason: concurrent_position_cap` for all 22 remaining symbols. The 8 positions sat in `state: "pending_fill"` for 10+ hours with no GTC sell attached (`sell.activeLimit: null`), even though the buys had filled (the balances existed). With 8/8 concurrency slots permanently consumed by un-exitable positions, no new trade could ever start.
+
+**Root cause.** The exit reconciler (`reconcileExits` in `backend/trade.js`) keys every branch off `pos.avg_entry_price`. Binance.US has no native average-entry concept, so `binanceExecution.fetchPositions` returns `avg_entry_price: null`. With `avg` non-finite, the buy-fill observation, the GTC-sell attach (`if (!Number.isFinite(avg) || avg <= 0) continue;`), and the staircase all short-circuit — the position never leaves `pending_fill` and never frees its slot. The intended entry-price source (the in-memory `tradePredictions` map) is wiped on every restart, so it couldn't recover already-open positions (and a fix's own deploy is a restart).
+
+**Fix.** A new `binanceExecution.getEntryPrice(symbol)` reconstructs the position's moving-average cost basis from `/api/v3/myTrades` (the only Binance-side source that survives a restart). `reconcileExits` resolves a Binance entry price when `avg_entry_price` is null — cached value → the maker buy-limit the bot placed (a resting maker order fills at its limit, so it's exact and never understates breakeven) → `getEntryPrice` from trade history — and caches the result (cleared on close / buy-timeout). With an entry price in hand the existing exit lifecycle attaches the GTC sell exactly as on Alpaca, positions exit, and slots free. Alpaca path unchanged (its `avg_entry_price` is always finite, so the resolver never runs).
+
 ## 2026-05-26 fix: auto-backtest now prices the venue fee (lifts the Binance.US veto)
 
 **Symptom.** After the Binance.US cutover the bot deposited capital but never traded — every scan logged `entry_scan_skipped_backtest_veto` / `no_signal_passed_backtest_threshold`. The signal selector saw OLS at −26.9 bps, multi_factor −45.9, mean_reversion −31.1, barrier −36.9, so it vetoed all entries.
@@ -22,7 +30,7 @@ The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ship
 
 - `backend/modules/binanceAuth.js` — HMAC-SHA256 query-string signer + REST helpers (12 tests).
 - `backend/modules/binanceSymbols.js` — 30-symbol map, `/api/v3/exchangeInfo` boot-time cache, quantize helpers, MIN_NOTIONAL guard (12 tests).
-- `backend/modules/binanceExecution.js` — order primitives in Alpaca-shape: `fetchAccount`, `fetchPositions`, `fetchPosition`, `fetchOrders`, `fetchOrderById`, `cancelOrder`, `replaceOrder`, `submitOrder` (14 tests).
+- `backend/modules/binanceExecution.js` — order primitives in Alpaca-shape: `fetchAccount`, `fetchPositions`, `fetchPosition`, `getEntryPrice` (cost-basis from trade history, since Binance has no native avg-entry), `fetchOrders`, `fetchOrderById`, `cancelOrder`, `replaceOrder`, `submitOrder` (17 tests).
 - `backend/trade.js` — venue dispatcher at each call site; `FEE_BPS_ROUND_TRIP` default is venue-aware (2 bps for binance_us, 30 bps for alpaca).
 - `backend/config/liveDefaults.js` + `validateEnv.js` — new env-var defaults + credentials/host check.
 

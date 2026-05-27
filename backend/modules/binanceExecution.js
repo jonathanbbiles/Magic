@@ -243,6 +243,54 @@ async function fetchPosition(symbolCanonical, opts = {}) {
   return list.find((p) => p.symbol === symbolCanonical) || null;
 }
 
+// Reconstruct the moving-average cost basis of the CURRENT spot holding from
+// trade history. Binance.US exposes no native avg_entry_price on
+// /api/v3/account (fetchPositions returns it as null), so this is how the exit
+// lifecycle recovers an entry price for a held position — including after a
+// restart that cleared the in-memory prediction (e.g. every redeploy). Without
+// it a Binance position can never have its GTC sell attached and sits in
+// `pending_fill` forever, permanently consuming a concurrency slot.
+//
+// Walks fills oldest→newest maintaining a running quantity + weighted-average
+// cost. Buys raise the basis; sells reduce the quantity but leave the basis
+// intact; a sell-to-flat resets it. The result is the cost basis of whatever
+// quantity remains — i.e. the entry price of the open position. Returns null
+// when there are no usable buy fills (e.g. a holding that arrived via deposit
+// with no trade, which the bot shouldn't manage anyway).
+async function getEntryPrice(canonicalSymbol, { limit = 200, signedRequestOverride } = {}) {
+  const bs = requireBinanceSymbol(canonicalSymbol, { silent: true });
+  if (!bs) return null;
+  const call = signedRequestOverride || signedRequest;
+  let trades;
+  try {
+    trades = await call({
+      path: '/api/v3/myTrades',
+      method: 'GET',
+      params: { symbol: bs, limit: Math.min(1000, Math.max(1, Math.floor(Number(limit) || 200))) },
+    });
+  } catch (_) {
+    return null;
+  }
+  if (!Array.isArray(trades) || trades.length === 0) return null;
+  const sorted = trades.slice().sort((a, b) => Number(a?.time) - Number(b?.time));
+  let qty = 0;
+  let avgCost = 0;
+  for (const t of sorted) {
+    const tQty = Number(t?.qty);
+    const tPrice = Number(t?.price);
+    if (!Number.isFinite(tQty) || tQty <= 0 || !Number.isFinite(tPrice) || tPrice <= 0) continue;
+    if (t?.isBuyer === true) {
+      const newQty = qty + tQty;
+      avgCost = newQty > 0 ? (qty * avgCost + tQty * tPrice) / newQty : tPrice;
+      qty = newQty;
+    } else {
+      qty -= tQty;
+      if (qty <= 1e-12) { qty = 0; avgCost = 0; }
+    }
+  }
+  return qty > 0 && avgCost > 0 ? avgCost : null;
+}
+
 // --- orders -----------------------------------------------------------------
 
 async function fetchOrders({
@@ -531,6 +579,7 @@ module.exports = {
   fetchAccount,
   fetchPositions,
   fetchPosition,
+  getEntryPrice,
   fetchOrders,
   fetchOrderById,
   cancelOrder,
