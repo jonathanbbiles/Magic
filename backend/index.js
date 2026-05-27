@@ -1724,6 +1724,16 @@ app.get('/dashboard', async (req, res) => {
         // disable the computation (the field becomes null on meta).
         drift: DRIFT_ALERT_ENABLED ? (() => {
           try {
+            // Anchor the overall drift baseline to whatever signal is
+            // actually live (the selector's activeNetBps), not the OLS/primary
+            // backtest. With a non-OLS signal selected, OLS's expectancy has
+            // no relationship to what the bot is trading, so the headline
+            // drift number was comparing realised P&L against a baseline that
+            // wasn't in play. Fall back to the primary backtest only when the
+            // selector has no active winner (trading veto / pre-backtest).
+            const activeDecision = getSignalSelectorDecision();
+            const activeNetBps = Number(activeDecision?.activeNetBps);
+            const haveActive = Number.isFinite(activeNetBps);
             return driftAlerter.buildDriftMeta({
               closedTrades: closedTradeStats.getRecent(DRIFT_ALERT_LOOKBACK_TRADES),
               backtestsBySignal: {
@@ -1739,8 +1749,12 @@ app.get('/dashboard', async (req, res) => {
                 microstructure_30m: lastBacktestMicro30m,
                 microstructure_45m: lastBacktestMicro45m,
               },
-              overallPredictedAvgNetBps: lastBacktestResult?.overall?.avgNetBpsPerEntry ?? null,
-              overallBacktestRanAt: lastBacktestResult?.ranAt ?? null,
+              overallPredictedAvgNetBps: haveActive
+                ? activeNetBps
+                : (lastBacktestResult?.overall?.avgNetBpsPerEntry ?? null),
+              overallBacktestRanAt: haveActive
+                ? (activeDecision?.backtestRanAt ?? lastBacktestResult?.ranAt ?? null)
+                : (lastBacktestResult?.ranAt ?? null),
               config: {
                 minTrades: DRIFT_ALERT_MIN_TRADES,
                 thresholdBps: DRIFT_ALERT_THRESHOLD_BPS,
