@@ -83,6 +83,23 @@ No stubs; no "available but unimplemented" entries.
 
 `SIGNAL_VERSION=barrier` (added 2026-05-17) is the **restored original signal** from commit `fbdb924` (the project's initial commit). Trade-construction signal using barrier-touch probability theory + EWMA-vol-scaled stops + EMA-based momentum + intra-spread micro-momentum + (optional) orderbook bias. Targets ~100 bps net per trade — NOT a tiny scalp; the math only works at this scale because retail Alpaca fees (~30 bps round-trip) eat any smaller target. Module at `backend/modules/barrierSignal.js`. `BARRIER_ENABLED=false` disables the auto-backtest entirely.
 
+## Realized-expectancy circuit breaker (2026-05-27)
+
+**The bug it fixes:** the signal selector (`pickActiveSignal`) was the *only* gate on which signal trades live, and it is purely backtest-driven. The backtest fill model never penalises passive-limit adverse selection (you only get filled on a `bid_plus_tick` rest when the market trades *down* through your price), so it systematically over-states every signal's edge. The 2026-05-27 live snapshot is the canonical failure: `microstructure_30m` backtested **+7.8 bps/trade**, the selector pinned it, and it realized **−31 bps/trade** over 29 live fills (overall realized **−55 bps**, scorecard 31% win / 0.27 profit factor). `meta.drift` *detected* the divergence — but the drift alerter is observational-only and cannot stop trades, so the bot bled until the operator intervened.
+
+**The fix:** `signalSelector.evaluateRealizedVeto({ records, signalVersion, config })` is a pure function that computes the *active* signal's realized `avgNetBps` over its most recent `lookbackTrades` closed trades and returns `veto=true` when it is below `floorBps` with at least `minTrades` of sample. It reuses `driftAlerter.selectRealizedTrades` so the trade set it acts on is **identical** to what `meta.drift` reports. `trade.js scanAndEnter` calls it every scan, immediately after `ACTIVE_SIGNAL_VERSION` is pinned and after the existing backtest-veto check; on veto it logs `entry_scan_skipped_realized_veto`, bumps the `realized_expectancy_veto` skip reason, and returns (halts NEW entries only — open positions are still managed/exited by the reconciler). Evaluated at scan time on purpose: `refreshSignalSelectorDecision` only runs when a backtest completes, and the auto-backtest is a one-shot at boot, so a backtest-time check would be stale for days.
+
+**Why a separate gate instead of disqualifying the candidate inside `pickActiveSignal`:** disqualifying the loser would just promote the next-best backtest candidate (e.g. `barrier`), which has no live edge either and only a tiny live sample — i.e. it would rotate through losing signals. Vetoing the *active* signal halts trading instead, which is the correct "stop the bleeding" behaviour when the live evidence contradicts the backtest. The bot resumes automatically once the signal's recent realized window clears the floor (recency-weighted) or a backtest re-selects a different signal.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SIGNAL_SELECTOR_REALIZED_VETO_ENABLED` | `true` | Master kill. `false` → backtest-only gating (the pre-2026-05-27 behaviour); the realized veto records nothing and never fires. |
+| `SIGNAL_SELECTOR_REALIZED_MIN_TRADES` | `10` | Sample floor before the veto can fire. Mirrors `driftAlerter.minTrades`. |
+| `SIGNAL_SELECTOR_REALIZED_FLOOR_BPS` | `-10` | Realized `avgNetBps` below this halts entries. Past the ~0–2 bps Binance.US fee + noise. |
+| `SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES` | `50` | Recency window of the active signal's closed trades. |
+
+Defaults live in both `liveDefaults.js` (locked by `liveDefaults.test.js`) and the `readNumber/readBoolean` fallbacks in `trade.js`. Surfaced at `meta.signalSelector.realizedVeto` (`{ veto, reason, signalVersion, realizedAvgNetBps, sampleSize, floorBps, minTrades, lookbackTrades, evaluatedAt }`). **Hard Rule #4 compliance:** all four vars are read in `trade.js` and the veto is wired into the live entry path; `meta.signalSelector.realizedVeto` is the active diagnostic consumer. **When extending:** keep `evaluateRealizedVeto` pure and reuse `driftAlerter.selectRealizedTrades` — the realized veto and the drift alert MUST agree on which trades count, or the dashboard and the gate will tell different stories.
+
 ## Live posture is now the code default (2026-05-16, extended 2026-05-17)
 
 The settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:

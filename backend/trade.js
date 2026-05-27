@@ -925,6 +925,21 @@ const SIGNAL_SELECTOR_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_VETO_ENABLED',
 // meaningless and the selector falls back to veto for that signal.
 const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES', 5));
 
+// Realized-expectancy circuit breaker (2026-05-27). The selector's pick is
+// backtest-driven and the backtest fill model over-states edge (no penalty
+// for passive-limit adverse selection), so a signal can backtest positive yet
+// bleed live — microstructure_30m backtested +7.8 bps but realized −31 bps
+// over 29 live fills. These knobs halt NEW entries when the active signal's
+// recent realized net bps proves it is losing. Open positions still exit
+// normally. Disable wholesale with SIGNAL_SELECTOR_REALIZED_VETO_ENABLED=false.
+const SIGNAL_SELECTOR_REALIZED_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_REALIZED_VETO_ENABLED', true);
+const SIGNAL_SELECTOR_REALIZED_MIN_TRADES = Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_MIN_TRADES', 10));
+const SIGNAL_SELECTOR_REALIZED_FLOOR_BPS = readNumber('SIGNAL_SELECTOR_REALIZED_FLOOR_BPS', -10);
+const SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES = Math.max(
+  SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
+  readNumber('SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES', 50),
+);
+
 const signalSelector = require('./modules/signalSelector');
 // Bootstrap: when the operator has overridden the signal AND disabled the
 // veto, allow trading from the moment the engine starts (without waiting
@@ -946,6 +961,13 @@ function getActiveSignalVersion() {
 }
 function getSignalSelectorDecision() {
   return signalSelector.getCurrentDecision();
+}
+// Last realized-expectancy veto evaluation (refreshed each scan in
+// scanAndEnter). Surfaced on the dashboard at meta.signalSelector.realizedVeto
+// so the operator can see WHY the bot stopped trading the active signal.
+let lastRealizedVetoState = null;
+function getRealizedVetoState() {
+  return lastRealizedVetoState;
 }
 // Legacy export-shape compatibility: code paths that read SIGNAL_VERSION as
 // a constant continue to work, but they always see the live decision.
@@ -2834,6 +2856,39 @@ async function scanAndEnter() {
   // completes mid-scan and flips the selector).
   const ACTIVE_SIGNAL_VERSION = selectorDecision.signalVersion || getActiveSignalVersion();
 
+  // Realized-expectancy circuit breaker. The backtest veto above can clear a
+  // signal whose LIVE results diverge sharply from its backtest. This checks
+  // the active signal's realized net bps over its most recent closed trades
+  // and halts NEW entries when it is bleeding beyond the floor. Open positions
+  // continue to be managed/exited by the reconciler below — this only gates
+  // entries. Evaluated every scan (the selector decision itself only refreshes
+  // when a backtest completes, which is rare in live mode).
+  const realizedVeto = signalSelector.evaluateRealizedVeto({
+    records: closedTradeStats.getRecent(SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES * 20),
+    signalVersion: ACTIVE_SIGNAL_VERSION,
+    config: {
+      enabled: SIGNAL_SELECTOR_REALIZED_VETO_ENABLED,
+      minTrades: SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
+      floorBps: SIGNAL_SELECTOR_REALIZED_FLOOR_BPS,
+      lookbackTrades: SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES,
+    },
+  });
+  lastRealizedVetoState = { ...realizedVeto, evaluatedAt: new Date().toISOString() };
+  if (realizedVeto.veto) {
+    console.log('entry_scan_skipped_realized_veto', {
+      signalVersion: realizedVeto.signalVersion,
+      realizedAvgNetBps: realizedVeto.realizedAvgNetBps,
+      sampleSize: realizedVeto.sampleSize,
+      floorBps: realizedVeto.floorBps,
+      minTrades: realizedVeto.minTrades,
+      lookbackTrades: realizedVeto.lookbackTrades,
+    });
+    bumpSkipReason('realized_expectancy_veto');
+    currentScanState = 'idle';
+    currentScanStartedAt = null;
+    return;
+  }
+
   await loadSupportedCryptoPairs();
   // Universe selection:
   //   - dynamic  → every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
@@ -4632,6 +4687,7 @@ if (IS_BINANCE_EXECUTION) {
 module.exports = {
   getActiveSignalVersion,
   getSignalSelectorDecision,
+  getRealizedVetoState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,

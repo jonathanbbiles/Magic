@@ -191,6 +191,20 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // trading.
   SIGNAL_SELECTOR_VETO_ENABLED: 'true',
   SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES: '5',
+  // Realized-expectancy circuit breaker (2026-05-27). The backtest veto above
+  // can clear a signal whose LIVE results diverge from its backtest — the
+  // backtest fill model doesn't penalise passive-limit adverse selection, so
+  // it over-states edge. The 2026-05-27 snapshot caught microstructure_30m
+  // backtesting +7.8 bps/trade while realizing −31 bps/trade over 29 live
+  // fills (overall realized −55 bps). The selector kept trading it because
+  // nothing fed realized results back into the gate. These knobs halt NEW
+  // entries when the active signal's recent realized net bps is below the
+  // floor with enough sample; open positions still exit normally. Default-ON.
+  // Revert with SIGNAL_SELECTOR_REALIZED_VETO_ENABLED='false' in Render env.
+  SIGNAL_SELECTOR_REALIZED_VETO_ENABLED: 'true',
+  SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
+  SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-10',
+  SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '50',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
   // TARGET_NET_PROFIT_BPS / SIGNAL_TARGET_MAX_NET_BPS / STOP_LOSS_BPS but

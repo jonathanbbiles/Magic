@@ -72,6 +72,18 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 
+// 2026-05-27: Realized-expectancy circuit breaker. The backtest-only selector
+// kept trading microstructure_30m (backtested +7.8 bps) while it bled −31 bps
+// live over 29 fills. The veto must stay ON in the live defaults so a signal
+// that proves unprofitable live halts NEW entries instead of bleeding until
+// the next backtest window rolls over. If this drifts to 'false', the only
+// feedback from realized results is the observational drift alert, which by
+// design cannot stop trades.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_VETO_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '10');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-10');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '50');
+
 // 2026-05-21: Binance.US execution adapter shipped dormant. Default venue
 // is 'alpaca' so the merge is zero-behavior-change. Operator flips
 // EXECUTION_VENUE='binance_us' in Render env to cut over. validateEnv.js

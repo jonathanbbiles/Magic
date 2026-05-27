@@ -1,11 +1,22 @@
 const assert = require('assert/strict');
 const {
   pickActiveSignal,
+  evaluateRealizedVeto,
   setLatestDecision,
   getCurrentDecision,
   bootstrapDecisionFromEnv,
   DEFAULTS,
+  REALIZED_VETO_DEFAULTS,
 } = require('./signalSelector');
+
+// Build N closed-trade records for `signalVersion`, each carrying
+// realizedNetBps. Mirrors the closedTradeStats.append record shape.
+function rec(signalVersion, realizedNetBps) {
+  return { type: 'closed_trade', signalVersion, realizedNetBps, ts: '2026-05-27T00:00:00Z' };
+}
+function recs(signalVersion, bpsList) {
+  return bpsList.map((b) => rec(signalVersion, b));
+}
 
 function bt(overall) {
   // 2026-05-18: extract ranAt from `overall` if provided so the test-helper
@@ -345,6 +356,106 @@ function bt(overall) {
   assert.equal(d.signalVersion, 'barrier');
   assert.equal(d.tradingVeto, true, 'no validation → veto fires');
   assert.equal(d.reason, 'operator_override_not_validated');
+}
+
+// ---- Realized-expectancy circuit breaker (evaluateRealizedVeto) ----
+
+// R1. Defaults are the conservative live posture.
+{
+  assert.equal(REALIZED_VETO_DEFAULTS.enabled, true);
+  assert.equal(REALIZED_VETO_DEFAULTS.minTrades, 10);
+  assert.equal(REALIZED_VETO_DEFAULTS.floorBps, -10);
+  assert.equal(REALIZED_VETO_DEFAULTS.lookbackTrades, 50);
+}
+
+// R2. The canonical failure case: active signal realizing well below the floor
+// over a full sample → veto fires.
+{
+  const v = evaluateRealizedVeto({
+    records: recs('microstructure_30m', new Array(29).fill(-31)),
+    signalVersion: 'microstructure_30m',
+  });
+  assert.equal(v.veto, true, 'losing signal must be vetoed');
+  assert.equal(v.reason, 'realized_below_floor');
+  assert.equal(v.sampleSize, 29);
+  assert.equal(Math.round(v.realizedAvgNetBps), -31);
+}
+
+// R3. A profitable signal is NOT vetoed.
+{
+  const v = evaluateRealizedVeto({
+    records: recs('barrier', new Array(20).fill(15)),
+    signalVersion: 'barrier',
+  });
+  assert.equal(v.veto, false);
+  assert.equal(v.reason, 'within_floor');
+}
+
+// R4. Below the sample floor → never vetoes (too noisy to act on).
+{
+  const v = evaluateRealizedVeto({
+    records: recs('microstructure_30m', [-80, -90, -100]),
+    signalVersion: 'microstructure_30m',
+  });
+  assert.equal(v.veto, false);
+  assert.equal(v.reason, 'insufficient_sample');
+  assert.equal(v.sampleSize, 3);
+}
+
+// R5. Marginally negative but inside the floor (−5 > −10) → no veto.
+{
+  const v = evaluateRealizedVeto({
+    records: recs('ols', new Array(15).fill(-5)),
+    signalVersion: 'ols',
+  });
+  assert.equal(v.veto, false);
+  assert.equal(v.reason, 'within_floor');
+}
+
+// R6. Master kill: disabled → never vetoes regardless of losses.
+{
+  const v = evaluateRealizedVeto({
+    records: recs('microstructure_30m', new Array(40).fill(-50)),
+    signalVersion: 'microstructure_30m',
+    config: { enabled: false },
+  });
+  assert.equal(v.veto, false);
+  assert.equal(v.reason, 'disabled');
+}
+
+// R7. Only the active signal's records count — other signals are filtered out.
+{
+  const mixed = [
+    ...recs('barrier', new Array(20).fill(40)),       // winners on a different signal
+    ...recs('microstructure_30m', new Array(12).fill(-40)),
+  ];
+  const v = evaluateRealizedVeto({ records: mixed, signalVersion: 'microstructure_30m' });
+  assert.equal(v.veto, true, 'other-signal winners must not rescue the active loser');
+  assert.equal(v.sampleSize, 12);
+}
+
+// R8. Recency window: only the last `lookbackTrades` of the active signal are
+// averaged, so a signal that has turned around clears the veto.
+{
+  const turned = recs('mean_reversion', [
+    ...new Array(40).fill(-60),  // ancient losers
+    ...new Array(10).fill(30),   // recent winners
+  ]);
+  const v = evaluateRealizedVeto({
+    records: turned,
+    signalVersion: 'mean_reversion',
+    config: { lookbackTrades: 10, minTrades: 10 },
+  });
+  assert.equal(v.veto, false, 'recent window of winners should clear the veto');
+  assert.equal(v.sampleSize, 10);
+  assert.equal(v.realizedAvgNetBps, 30);
+}
+
+// R9. No active signal (selector veto / pre-backtest) → no realized veto.
+{
+  const v = evaluateRealizedVeto({ records: recs('ols', new Array(20).fill(-50)), signalVersion: null });
+  assert.equal(v.veto, false);
+  assert.equal(v.reason, 'no_active_signal');
 }
 
 console.log('signalSelector.test ok');
