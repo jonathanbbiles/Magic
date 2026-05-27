@@ -578,7 +578,11 @@ async function recordEquitySnapshot() {
       portfolio_value: account?.portfolio_value,
     });
   } catch (error) {
-    console.warn('equity_snapshot_record_failed', error?.responseSnippet || error?.message || error);
+    console.warn('equity_snapshot_record_failed', {
+      message: error?.responseSnippet || error?.message || String(error),
+      binanceErrorCode: error?.binanceErrorCode ?? null,
+      binanceErrorMessage: error?.binanceErrorMessage ?? null,
+    });
   }
 }
 
@@ -1280,13 +1284,28 @@ app.get('/dashboard', async (req, res) => {
     const positionsRaw = positionsResult.status === 'fulfilled' ? positionsResult.value : [];
     const openOrdersRaw = ordersResult.status === 'fulfilled' ? ordersResult.value : [];
     if (accountResult.status === 'rejected') {
-      console.warn('dashboard_partial_failure', { source: 'account', error: accountResult.reason?.message });
+      console.warn('dashboard_partial_failure', {
+        source: 'account',
+        error: accountResult.reason?.message,
+        binanceErrorCode: accountResult.reason?.binanceErrorCode ?? null,
+        binanceErrorMessage: accountResult.reason?.binanceErrorMessage ?? null,
+      });
     }
     if (positionsResult.status === 'rejected') {
-      console.warn('dashboard_partial_failure', { source: 'positions', error: positionsResult.reason?.message });
+      console.warn('dashboard_partial_failure', {
+        source: 'positions',
+        error: positionsResult.reason?.message,
+        binanceErrorCode: positionsResult.reason?.binanceErrorCode ?? null,
+        binanceErrorMessage: positionsResult.reason?.binanceErrorMessage ?? null,
+      });
     }
     if (ordersResult.status === 'rejected') {
-      console.warn('dashboard_partial_failure', { source: 'orders', error: ordersResult.reason?.message });
+      console.warn('dashboard_partial_failure', {
+        source: 'orders',
+        error: ordersResult.reason?.message,
+        binanceErrorCode: ordersResult.reason?.binanceErrorCode ?? null,
+        binanceErrorMessage: ordersResult.reason?.binanceErrorMessage ?? null,
+      });
     }
 
     let recentBuyFillBySymbol = {};
@@ -2831,6 +2850,12 @@ async function bootstrapTrading() {
     console.error('bootstrap_step_failed', {
       step: 'initializeInventoryFromPositions',
       message: err?.responseSnippet || err?.message || String(err),
+      // Binance.US signed failures carry the venue's own code/msg; without
+      // surfacing them the operator only sees the opaque HTTP wrapper
+      // (e.g. "binance_signed_400") and can't tell -1021 clock skew from
+      // -1022 bad signature from -2015 key-permission/IP problems.
+      binanceErrorCode: err?.binanceErrorCode ?? null,
+      binanceErrorMessage: err?.binanceErrorMessage ?? null,
     });
   }
 

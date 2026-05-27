@@ -5,6 +5,7 @@ const {
   signQueryString,
   resolveCredentials,
   resolveRestUrl,
+  getServerTimeOffsetMs,
   DEFAULT_REST_URL,
   DEFAULT_RECV_WINDOW_MS,
 } = require('./binanceAuth');
@@ -132,4 +133,34 @@ const {
   assert.strictEqual(out.length, 64, 'HMAC always returns 64 hex chars regardless of key');
 }
 
-console.log('binanceAuth.test ok', { tests: 12 });
+// 13. resolveCredentials trims surrounding whitespace (a secret pasted into
+//     the Render dashboard with a trailing newline would otherwise flip
+//     every HMAC signature → -1022 INVALID_SIGNATURE / HTTP 400).
+{
+  const c = resolveCredentials({ apiKey: '  my-key\n', apiSecret: '\tmy-secret  ' });
+  assert.strictEqual(c.apiKey, 'my-key');
+  assert.strictEqual(c.apiSecret, 'my-secret');
+}
+
+// 14. resolveCredentials trims whitespace sourced from env vars too.
+{
+  const oldKey = process.env.BINANCE_US_API_KEY;
+  const oldSec = process.env.BINANCE_US_API_SECRET;
+  process.env.BINANCE_US_API_KEY = ' env-key ';
+  process.env.BINANCE_US_API_SECRET = 'env-secret\n';
+  try {
+    const c = resolveCredentials();
+    assert.strictEqual(c.apiKey, 'env-key');
+    assert.strictEqual(c.apiSecret, 'env-secret');
+  } finally {
+    if (oldKey === undefined) delete process.env.BINANCE_US_API_KEY; else process.env.BINANCE_US_API_KEY = oldKey;
+    if (oldSec === undefined) delete process.env.BINANCE_US_API_SECRET; else process.env.BINANCE_US_API_SECRET = oldSec;
+  }
+}
+
+// 15. getServerTimeOffsetMs starts at 0 (no sync performed = prior behaviour).
+{
+  assert.strictEqual(getServerTimeOffsetMs(), 0);
+}
+
+console.log('binanceAuth.test ok', { tests: 15 });

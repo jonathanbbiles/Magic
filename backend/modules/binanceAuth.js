@@ -51,13 +51,55 @@ function signQueryString(queryString, apiSecret) {
 }
 
 function resolveCredentials({ apiKey, apiSecret } = {}) {
-  const key = apiKey || process.env.BINANCE_US_API_KEY || '';
-  const secret = apiSecret || process.env.BINANCE_US_API_SECRET || '';
+  // Trim whitespace. A key/secret pasted into the Render dashboard often
+  // picks up a trailing newline or space; the HMAC is computed over the
+  // raw secret, so a single stray byte flips every signature and Binance
+  // rejects the request with -1022 (HTTP 400). Trimming is safe — valid
+  // Binance API keys/secrets never contain leading/trailing whitespace.
+  const key = String(apiKey || process.env.BINANCE_US_API_KEY || '').trim();
+  const secret = String(apiSecret || process.env.BINANCE_US_API_SECRET || '').trim();
   return { apiKey: key, apiSecret: secret };
 }
 
 function resolveRestUrl(restUrl) {
   return (restUrl || process.env.BINANCE_US_REST_URL || DEFAULT_REST_URL).replace(/\/+$/, '');
+}
+
+// --- server time offset ------------------------------------------------------
+//
+// Binance rejects a signed request whose `timestamp` falls outside
+// `[serverTime - recvWindow, serverTime + 1000ms]` with -1021
+// INVALID_TIMESTAMP (HTTP 400). Cloud hosts (Render included) drift from
+// Binance's clock often enough that a freshly-deployed bot can have EVERY
+// signed call rejected even though the key, secret, and signature are all
+// correct. To avoid this we align our timestamp to Binance server time:
+// `effectiveTs = Date.now() + offset` where `offset = serverTime - localTime`
+// measured against the public /api/v3/time endpoint (no auth needed).
+//
+// Best-effort: if the sync call fails the offset stays at its prior value
+// (0 on first boot = identical to the pre-sync behaviour), so this can
+// never make a working deployment worse.
+
+const TIME_SYNC_TTL_MS = 30 * 60 * 1000; // re-measure offset at most this often
+let _serverTimeOffsetMs = 0;
+let _lastTimeSyncMs = 0;
+
+async function syncServerTime({ restUrl, timeoutMs } = {}) {
+  try {
+    const body = await publicRequest({ path: '/api/v3/time', restUrl, timeoutMs });
+    const serverTime = Number(body?.serverTime);
+    if (Number.isFinite(serverTime) && serverTime > 0) {
+      _serverTimeOffsetMs = serverTime - Date.now();
+      _lastTimeSyncMs = Date.now();
+    }
+  } catch (_) {
+    // best-effort — keep the prior offset
+  }
+  return _serverTimeOffsetMs;
+}
+
+function getServerTimeOffsetMs() {
+  return _serverTimeOffsetMs;
 }
 
 // Low-level HTTPS request helper (uses node:https rather than fetch to
@@ -138,6 +180,7 @@ async function signedRequest({
   recvWindowMs,
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   nowMs,
+  _timestampRetry = false,
 } = {}) {
   const effectiveRecvWindowMs = Number.isFinite(recvWindowMs) ? recvWindowMs : resolveRecvWindowMs();
   if (!path) throw new Error('binance_signed_request_missing_path');
@@ -148,7 +191,14 @@ async function signedRequest({
     throw err;
   }
   const baseUrl = resolveRestUrl(restUrl);
-  const ts = Number.isFinite(nowMs) ? Math.floor(nowMs) : Date.now();
+  // Align the request timestamp to Binance server time to dodge -1021
+  // clock-skew rejections. Tests pin `nowMs` for determinism and must NOT
+  // trigger a network sync — only the live path (nowMs unset) syncs.
+  const pinnedTs = Number.isFinite(nowMs);
+  if (!pinnedTs && (Date.now() - _lastTimeSyncMs) > TIME_SYNC_TTL_MS) {
+    await syncServerTime({ restUrl, timeoutMs });
+  }
+  const ts = pinnedTs ? Math.floor(nowMs) : Date.now() + _serverTimeOffsetMs;
   const queryParams = {
     ...params,
     recvWindow: effectiveRecvWindowMs,
@@ -168,6 +218,19 @@ async function signedRequest({
     timeoutMs,
   });
   if (response.status < 200 || response.status >= 300) {
+    const binanceErrorCode = (response.body && typeof response.body === 'object')
+      ? (response.body.code ?? null)
+      : null;
+    // Self-heal clock skew: on -1021 INVALID_TIMESTAMP, force a fresh server-
+    // time measurement and retry ONCE. Skip when the caller pinned the
+    // timestamp (tests) to keep them hermetic.
+    if (binanceErrorCode === -1021 && !pinnedTs && !_timestampRetry) {
+      await syncServerTime({ restUrl, timeoutMs });
+      return signedRequest({
+        path, method, params, apiKey, apiSecret, restUrl, recvWindowMs, timeoutMs,
+        _timestampRetry: true,
+      });
+    }
     const err = new Error(`binance_signed_${response.status}`);
     err.status = response.status;
     err.body = response.body;
@@ -175,7 +238,7 @@ async function signedRequest({
     // Surface Binance's error code (e.g. -1013 LOT_SIZE, -2010 INSUFFICIENT_BALANCE)
     // so callers can branch on it without parsing the message.
     if (response.body && typeof response.body === 'object') {
-      err.binanceErrorCode = response.body.code ?? null;
+      err.binanceErrorCode = binanceErrorCode;
       err.binanceErrorMessage = response.body.msg ?? null;
     }
     throw err;
@@ -190,6 +253,8 @@ module.exports = {
   resolveRestUrl,
   publicRequest,
   signedRequest,
+  syncServerTime,
+  getServerTimeOffsetMs,
   DEFAULT_REST_URL,
   DEFAULT_RECV_WINDOW_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
