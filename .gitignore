@@ -5,6 +5,9 @@ Frontend/node_modules/
 
 # Generated runtime data
 backend/data/
+# Root-level data/ when the server is booted from the repo root (e.g. local
+# dev/test runs) instead of from backend/ — same runtime artifacts, different cwd.
+/data/
 
 # env secrets
 .env
