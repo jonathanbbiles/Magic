@@ -59,6 +59,10 @@ const NON_ENV_ALLOWLIST = new Set([
   // Internal JS local-variable names referenced by name in module headers
   'ACTIVE_SIGNAL_VERSION',
   'CALIBRATION_RELOAD_MS',
+  // index.js module-level constant (derived from EXECUTION_VENUE +
+  // BINANCE_BOOK_SIGNALS_ENABLED, both real env vars). Referenced by name in
+  // CLAUDE.md — not itself an env var.
+  'ORDERBOOK_FEED_AVAILABLE',
   // External services / deploy infrastructure (env exists, but not in this
   // backend's process.env — they're consumed by Render / Expo, not our JS)
   'RENDER_URL',

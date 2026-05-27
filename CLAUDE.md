@@ -551,6 +551,16 @@ Per symbol: `medianObservedSpreadBps`, `p90ObservedSpreadBps`, `assumedHalfSprea
 
 **Limitation — it's an upper bound, not an attribution.** It measures the spread the engine *faces*, not what it *pays* (the bot rests `bid_plus_tick`, so a clean maker fill ideally pays ~0). Read it next to `meta.drift` (the realized-vs-predicted ground truth), not instead of it. Knob: `BACKTEST_SPREAD_REALISM_ENABLED` (default `true`, master kill → `meta.backtestSpreadRealism` null).
 
+## Orderbook-dependent signals excluded on Binance.US (2026-05-27)
+
+`multi_factor` and `microstructure_*` need a live L2 depth feed for their dominant features (microprice, book imbalance). On `EXECUTION_VENUE=binance_us` that feed is NOT wired — `fetchCryptoOrderbooks` returns `{}` (`trade.js:~1641`, Phase 3 deferred). So those signals run blind: microstructure's microprice/book-imbalance terms collapse to 0 → chronic `micro_prob_below_min`, and its synthesized-book auto-backtest over-states its edge. **This is why the funded Binance.US bot stopped trading** (2026-05-27 snapshot: selector picked `microstructure_30m` at backtest +7.3 bps while it bled −32.8 bps live and barely fired).
+
+`index.js` defines `ORDERBOOK_FEED_AVAILABLE` (= venue ≠ binance_us, OR `BINANCE_BOOK_SIGNALS_ENABLED=true`). When false:
+1. `refreshSignalSelectorDecision` passes `null` for `mfBacktest` + the four `micro*Backtest` slots → they're never selection candidates. **This is the authoritative guard** — an on-demand `/debug/backtest?strategy=microstructure` could otherwise populate a micro slot on binance and let the selector pick it.
+2. The auto-backtest swarm skips the multi_factor + microstructure runs entirely (also relieves the OOM-prone swarm, #433).
+
+This leaves the book-free signals (`ols`, `mean_reversion[_5m/_15m]`, `range_mean_reversion`, `barrier`) as candidates. **barrier is book-optional** (`barrierSignal.js:~206` skips the book gate and sets `obBias=0` when orderbook is null — exactly its backtest path), so its live behavior tracks its backtest; the selector picks it (+6.2 bps) and the bot trades a signal that functions. Re-enable book signals after wiring the Phase 3 depth feed via `BINANCE_BOOK_SIGNALS_ENABLED=true`. **When wiring Phase 3, flip the default** — don't just tell operators to set the env. Alpaca (default venue) is unaffected: `ORDERBOOK_FEED_AVAILABLE` is true there, so all signals stay selectable.
+
 ## Where things live
 
 - Strategy loop: `backend/trade.js`

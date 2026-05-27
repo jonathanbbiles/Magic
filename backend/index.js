@@ -748,6 +748,20 @@ const PER_SYMBOL_AUDIT_LOOKBACK_TRADES = Math.max(
 // old) are dropped without grading.
 const GATE_REJECTION_AUDIT_ENABLED = String(process.env.GATE_REJECTION_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
 const BACKTEST_SPREAD_REALISM_ENABLED = String(process.env.BACKTEST_SPREAD_REALISM_ENABLED || 'true').toLowerCase() !== 'false';
+// Orderbook-dependent signals (multi_factor + microstructure_*) need a live L2
+// depth feed. On EXECUTION_VENUE=binance_us that feed is NOT wired (Phase 3
+// deferred — fetchCryptoOrderbooks returns {} in trade.js), so those signals
+// run blind: microstructure's dominant microprice/book-imbalance features
+// collapse to 0 (→ chronic micro_prob_below_min), and the auto-backtest — which
+// synthesizes a book — over-states their edge, so the selector picks a signal
+// that cannot function live (observed 2026-05-27: it picked microstructure_30m
+// at backtest +7.3 bps while it bled -32.8 bps live and barely fired). On a
+// venue with no book feed these signals are excluded from both auto-selection
+// and the auto-backtest swarm, leaving the book-free signals (ols / mean_rev /
+// range_mr / barrier — barrier treats the book as optional, obBias→0). Operator
+// re-enables after wiring the Phase 3 depth feed via BINANCE_BOOK_SIGNALS_ENABLED=true.
+const ORDERBOOK_FEED_AVAILABLE = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase() !== 'binance_us'
+  || String(process.env.BINANCE_BOOK_SIGNALS_ENABLED || 'false').toLowerCase() === 'true';
 const GATE_REJECTION_AUDIT_FORWARD_BARS = Math.max(
   1,
   Number(process.env.GATE_REJECTION_AUDIT_FORWARD_BARS) || 20,
@@ -911,18 +925,22 @@ function refreshSignalSelectorDecision(reason = 'manual') {
   const mfBacktest = primaryStrategy === 'multi_factor' ? lastBacktestResult : lastBacktestMf;
   const meanRevBacktest = primaryStrategy === 'mean_reversion' ? lastBacktestResult : lastBacktestMeanRev;
 
+  // Book-dependent signals are not selectable when no live L2 depth feed
+  // exists (binance_us, Phase 3 pending). Null them out here — the authoritative
+  // guard, because an on-demand /debug/backtest run could otherwise populate a
+  // micro/mf slot on binance and let the selector pick a signal that runs blind.
   const decision = signalSelector.pickActiveSignal({
     olsBacktest,
-    mfBacktest,
+    mfBacktest: ORDERBOOK_FEED_AVAILABLE ? mfBacktest : null,
     meanRevBacktest,
     meanRev5mBacktest: lastBacktestMeanRev5m,
     meanRev15mBacktest: lastBacktestMeanRev15m,
     rangeMrBacktest: lastBacktestRangeMr,
     barrierBacktest: lastBacktestBarrier,
-    micro5mBacktest: lastBacktestMicro5m,
-    micro15mBacktest: lastBacktestMicro15m,
-    micro30mBacktest: lastBacktestMicro30m,
-    micro45mBacktest: lastBacktestMicro45m,
+    micro5mBacktest: ORDERBOOK_FEED_AVAILABLE ? lastBacktestMicro5m : null,
+    micro15mBacktest: ORDERBOOK_FEED_AVAILABLE ? lastBacktestMicro15m : null,
+    micro30mBacktest: ORDERBOOK_FEED_AVAILABLE ? lastBacktestMicro30m : null,
+    micro45mBacktest: ORDERBOOK_FEED_AVAILABLE ? lastBacktestMicro45m : null,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -2976,14 +2994,19 @@ if (backtestSkipReason) {
     // upper-bound estimate of MF expectancy, with the live orderbook gate
     // making real performance equal-or-tighter. The selector compares this to
     // the primary OLS slot and picks the higher-expectancy validated signal.
-    await runBacktestAndStore({
-      strategy: 'multi_factor',
-      mfBookImbalanceMode: 'always_pass',
-      // MF backtest doesn't need MIN_PROJECTED_BPS (its projectedBps is an
-      // ATR-derived per-trade target, not a forward prediction), but the
-      // OLS-tuned defaults are harmless here — they're only consulted on
-      // the OLS code path inside replaySymbol.
-    }, 'mf').catch(() => {});
+    // Skip the orderbook-dependent multi_factor backtest when the live L2
+    // depth feed isn't wired (binance_us) — it can't be selected there anyway,
+    // and skipping it relieves the OOM-prone auto-backtest swarm (#433).
+    if (ORDERBOOK_FEED_AVAILABLE) {
+      await runBacktestAndStore({
+        strategy: 'multi_factor',
+        mfBookImbalanceMode: 'always_pass',
+        // MF backtest doesn't need MIN_PROJECTED_BPS (its projectedBps is an
+        // ATR-derived per-trade target, not a forward prediction), but the
+        // OLS-tuned defaults are harmless here — they're only consulted on
+        // the OLS code path inside replaySymbol.
+      }, 'mf').catch(() => {});
+    }
     // Mean-reversion-at-extremes signal auto-run. Provides evidence for the
     // signal selector. Built specifically to clear the +3 bps activation
     // threshold: enters only on volume-confirmed 1%+ drops where BTC is
@@ -3051,7 +3074,11 @@ if (backtestSkipReason) {
     // _ENABLED flags decide which variants fire at boot — Phase 1 ships
     // with 15m + 30m on, 5m + 45m off. The signal selector silently drops
     // un-enabled candidates rather than admitting them via veto bypass.
-    if (String(process.env.MICRO_ENABLED || 'true').toLowerCase() !== 'false') {
+    // Orderbook-dependent: skip entirely when no live L2 depth feed (binance_us,
+    // Phase 3 pending). Microstructure's microprice/book-imbalance features are
+    // its dominant signal; without a book it runs blind and the synthesized-book
+    // backtest is not representative, so it must not be a selection candidate.
+    if (ORDERBOOK_FEED_AVAILABLE && String(process.env.MICRO_ENABLED || 'true').toLowerCase() !== 'false') {
       // Per-horizon symbol blocklists (2026-05-20). Pass the same blocklist
       // the live engine uses so the auto-backtest expectancy reflects what
       // the live engine will actually trade — see Hard Rule #4 + the MR

@@ -61,6 +61,13 @@ The bot now supports two execution venues, controlled by `EXECUTION_VENUE`. Ship
 | `BINANCE_US_RECV_WINDOW_MS` | `5000` | Signed-request recv window. |
 | `BINANCE_SYMBOL_MAP` | empty (use static map) | JSON override of the 30-symbol USDT→USD preference map (USDT-first as of 2026-05-26). |
 | `FEE_BPS_ROUND_TRIP` | venue-derived | Override the venue default if observed economics drift. |
+| `BINANCE_BOOK_SIGNALS_ENABLED` | `false` | Re-enable orderbook-dependent signals (multi_factor + microstructure_*) on `binance_us`. Default off because the L2 depth feed isn't wired there yet (Phase 3) — see below. |
+
+### Orderbook-dependent signals are not selectable on Binance.US (2026-05-27)
+
+The multi_factor and microstructure_* signals need a live L2 order-book depth feed for their dominant features (microprice deviation, book imbalance). On `binance_us` that feed is **not wired** — `fetchCryptoOrderbooks` returns `{}` (Phase 3 follow-up). So those signals run blind: microstructure's microprice/book-imbalance terms collapse to 0, it sits at `micro_prob_below_min` on every liquid symbol, and its auto-backtest (which synthesizes a book) over-states its edge. Observed 2026-05-27: the selector picked `microstructure_30m` at backtest **+7.3 bps** while it bled **−32.8 bps** live and barely fired — i.e. the selector chose the one signal that cannot function on this venue, so the bot effectively stopped trading.
+
+Fix: on a venue with no book feed, multi_factor + microstructure_* are excluded from **both** the auto-selection candidate set (the authoritative guard in `refreshSignalSelectorDecision`) **and** the auto-backtest swarm (which also relieves the OOM-prone swarm, #433). That leaves the book-free signals — `ols`, `mean_reversion[_5m/_15m]`, `range_mean_reversion`, `barrier` — as candidates. `barrier` treats the order book as optional (`obBias→0` when null, exactly its backtest path), so its live behavior tracks its backtest; the selector picks it (+6.2 bps) and the bot trades a signal that actually works. Set `BINANCE_BOOK_SIGNALS_ENABLED=true` to re-enable the book signals once the Phase 3 Binance.US depth feed ships.
 
 ### Universe expansion: 12 → 30 symbols
 
