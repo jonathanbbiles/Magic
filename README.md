@@ -1,5 +1,13 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-27 fix: Binance.US equity under-counts held positions (looks like a loss)
+
+**Symptom.** The dashboard `equity` dropped ~$35 (e.g. $484 → $449) with `long_market_value: 0`, looking like the bot was bleeding money — even though the account held 324 ALGO (≈$35) against a resting sell. Cash + position actually summed to the same ~$484; nothing was lost.
+
+**Root cause.** `binanceExecution.fetchAccount` valued non-quote balances using only the injected sync `midPriceLookup` (the in-memory quote cache). On a cold cache that returns 0, so any held position contributed **$0** to equity — `equity` collapsed to cash-only and `long_market_value` read 0. Meanwhile `fetchPositions` already priced the same holding correctly (via the bookTicker fallback shipped earlier the same day), so the two surfaces disagreed: `positions[].market_value` showed $35 while `account.equity` excluded it.
+
+**Fix.** Extracted the price resolver into a shared `resolveUsdPrices(entries, …)` helper — sync lookup first, then a single batched public `bookTicker` fetch for anything the cache misses — and used it in BOTH `fetchAccount` and `fetchPositions`. Equity now includes held positions even when the quote cache is cold; an unresolvable asset stays unpriced (not double-counted) and a transient fetch error never zeroes a real holding. No trade-decision change — `buying_power`/`cash` are still quote-currency only.
+
 ## 2026-05-27 fix: Binance.US dust balances spam `exit_sell_failed` every scan
 
 **Symptom.** On `binance_us` every reconcile cycle logged a burst of `exit_sell_failed` / `exit_stop_loss_failed` — `binance_submit_min_notional_too_small` for BTC + ETH, `binance_submit_quantity_too_small_after_quantization` for BNB + DOGE + GRT — and `meta.lastExecutionFailure` was permanently pinned to one of them. The dashboard showed 5 "positions" the bot could never exit, each falsely consuming a concurrency slot.
