@@ -260,6 +260,35 @@ function progressToTarget(pos) {
 }
 
 // ----------------------------------------------------------------------------
+// computePortfolio — the backend does NOT emit an aggregate `portfolio` object;
+// it exposes per-position unrealized P&L and the account snapshot. Derive the
+// open P&L (sum of unrealized P&L) and its percentage (against cost basis) here
+// so the Stage's headline number isn't permanently blank. Cost basis per
+// position is market_value − unrealized_pl, falling back to qty × avg entry.
+// ----------------------------------------------------------------------------
+function computePortfolio(data) {
+  const positions = Array.isArray(data?.positions) ? data.positions : [];
+  let totalPL = 0;
+  let totalCost = 0;
+  let sawPL = false;
+  for (const p of positions) {
+    const upl = num(p?.unrealized_pl);
+    if (upl != null) { totalPL += upl; sawPL = true; }
+    const mv = num(p?.market_value);
+    const qty = num(p?.qty);
+    const entry = num(p?.avg_entry_price);
+    const cost = mv != null && upl != null
+      ? mv - upl
+      : (qty != null && entry != null ? qty * entry : null);
+    if (cost != null) totalCost += cost;
+  }
+  const portfolioValue = num(data?.account?.portfolio_value) ?? num(data?.account?.equity) ?? null;
+  const openPL = sawPL ? totalPL : null;
+  const openPLPct = openPL != null && totalCost > 0 ? (openPL / totalCost) * 100 : null;
+  return { portfolioValue, openPL, openPLPct };
+}
+
+// ----------------------------------------------------------------------------
 // Gradient — zero-dependency shim. We avoid expo-linear-gradient because
 // pasting App.js straight into Expo Go can fail to resolve native modules.
 // We approximate a soft diagonal gradient by layering two semi-transparent
@@ -630,7 +659,7 @@ function Stage({ data, activeRef, onJumpToCast }) {
   const meta = data?.meta || {};
   const truth = meta?.truth || {};
   const runtime = meta?.runtime || {};
-  const portfolio = data?.portfolio || {};
+  const portfolio = computePortfolio(data);
   const positions = sortPositionsByHealth(data?.positions);
   const scorecard = meta?.scorecard || {};
   const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? null;
@@ -1180,7 +1209,7 @@ function AppInner() {
   const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState;
   const scanInProgress = (truth?.currentEntryScanProgress?.state || '').toLowerCase() === 'scanning';
   const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
-  const version = runtime?.commit || meta?.runtime?.version;
+  const version = data?.version ?? runtime?.commit ?? meta?.runtime?.version;
 
   if (loading && !data) {
     return (
