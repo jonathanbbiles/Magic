@@ -29,6 +29,10 @@
 
 const { signedRequest } = require('./binanceAuth');
 const symbols = require('./binanceSymbols');
+// Public bookTicker fetch — used only as a cold-cache fallback in
+// fetchPositions' dust filter. No circular dependency: binanceMarketData
+// depends on binanceAuth + binanceSymbols, not on this module.
+const marketData = require('./binanceMarketData');
 
 const SUPPORTED_QUOTES = new Set(['USD', 'USDT', 'BUSD', 'USDC']);
 
@@ -178,11 +182,21 @@ async function fetchAccount({ midPriceLookup, signedRequestOverride } = {}) {
 
 // Synthesize Alpaca-shape positions[] from Binance account balances.
 // Binance has no native "open positions" concept — every non-quote asset
-// holding is a long position. The bot only cares about the 12-symbol
+// holding is a long position. The bot only cares about the configured
 // universe; balances of unrelated assets (BNB held for fee discount,
 // stale holdings from manual trades) are filtered out via the universe
 // argument.
-async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPriceLookup, signedRequestOverride } = {}) {
+//
+// Un-sellable DUST is also filtered out. A spot balance the bot can't place
+// a sell against — quantity below the pair's LOT_SIZE, or notional below the
+// pair's MIN_NOTIONAL — is not a manageable position: surfacing it makes the
+// exit reconciler attach a GTC sell that Binance rejects with
+// `min_notional_too_small` / `quantity_too_small_after_quantization` on every
+// scan, forever (and falsely consume a concurrency slot). Such balances are
+// near-zero value leftovers (e.g. $0.21 of ETH, 0.99 DOGE) that can never be
+// exited, so dropping them from the position list is the correct behaviour.
+// They still count toward equity in fetchAccount.
+async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPriceLookup, signedRequestOverride, bookTickerOverride } = {}) {
   const call = signedRequestOverride || signedRequest;
   const account = await call({ path: '/api/v3/account', method: 'GET' });
   const balances = Array.isArray(account?.balances) ? account.balances : [];
@@ -194,7 +208,11 @@ async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPr
     const baseAsset = canonical.split('/')[0].toUpperCase();
     baseToCanonical.set(baseAsset, canonical);
   }
-  const positions = [];
+
+  // First pass: keep balances that clear the LOT_SIZE floor. A holding whose
+  // quantized sellable quantity rounds to zero (below stepSize/minQty) can
+  // never be sold — drop it without needing a price.
+  const candidates = [];
   for (const b of balances) {
     const asset = String(b?.asset || '').toUpperCase();
     if (!baseToCanonical.has(asset)) continue;
@@ -203,21 +221,57 @@ async function fetchPositions({ universe = symbols.listCanonicalSymbols(), midPr
     const total = (Number.isFinite(free) ? free : 0) + (Number.isFinite(locked) ? locked : 0);
     if (total <= 0) continue;
     const canonical = baseToCanonical.get(asset);
-    let marketPrice = 0;
+    const sellableQty = symbols.quantizeQty(canonical, total);
+    if (!Number.isFinite(sellableQty) || sellableQty <= 0) continue; // sub-LOT_SIZE dust
+    candidates.push({ asset, canonical, total, free: Number.isFinite(free) ? free : 0, sellableQty });
+  }
+
+  // Resolve a USD reference price per candidate. Prefer the injected sync
+  // lookup (the live quote cache); for any candidate it doesn't cover, do a
+  // single batched public bookTicker fetch so the MIN_NOTIONAL dust filter is
+  // robust on a cold cache (the state that left $0.21–$0.76 dust holdings
+  // spamming exit_sell_failed every scan).
+  const priceByAsset = new Map();
+  const needPrice = [];
+  for (const c of candidates) {
+    let px = 0;
     if (typeof midPriceLookup === 'function') {
-      try {
-        const px = midPriceLookup(asset);
-        if (Number.isFinite(px) && px > 0) marketPrice = px;
-      } catch (_) { marketPrice = 0; }
+      try { const v = Number(midPriceLookup(c.asset)); if (Number.isFinite(v) && v > 0) px = v; } catch (_) { px = 0; }
     }
-    const marketValue = total * marketPrice;
+    if (px > 0) priceByAsset.set(c.asset, px);
+    else needPrice.push(c);
+  }
+  if (needPrice.length > 0) {
+    try {
+      const fetchTickers = bookTickerOverride || marketData.fetchBookTickers;
+      const { quotes } = await fetchTickers({ symbols: needPrice.map((c) => c.canonical) });
+      for (const c of needPrice) {
+        const q = quotes ? quotes[c.canonical] : null;
+        const bid = Number(q?.bp);
+        const ask = Number(q?.ap);
+        if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+          priceByAsset.set(c.asset, (bid + ask) / 2);
+        }
+      }
+    } catch (_) { /* price unavailable: keep the candidate rather than drop it on a transient fetch error */ }
+  }
+
+  const positions = [];
+  for (const c of candidates) {
+    const marketPrice = priceByAsset.get(c.asset) || 0;
+    // MIN_NOTIONAL dust: a holding worth less than the pair's minNotional
+    // can't have a sell placed against it. Only drop when we actually have a
+    // price — a missing price means "unknown", not "dust", so it stays a
+    // position (existing behaviour) until a price resolves.
+    if (marketPrice > 0 && !symbols.meetsMinNotional(c.canonical, c.sellableQty, marketPrice)) continue;
+    const marketValue = c.total * marketPrice;
     positions.push({
-      symbol: canonical,
-      asset_id: canonical,
+      symbol: c.canonical,
+      asset_id: c.canonical,
       exchange: 'binance_us',
       asset_class: 'crypto',
-      qty: String(total),
-      qty_available: String(Number.isFinite(free) ? free : 0),
+      qty: String(c.total),
+      qty_available: String(c.free),
       avg_entry_price: null, // Binance doesn't track average entry; the bot's
                               // tradePredictions Map holds this when the bot
                               // placed the order.
