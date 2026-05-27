@@ -80,6 +80,33 @@ withEnv({ ENTRY_SCAN_INTERVAL_MS: '13200' }, () => {
   assert.equal(scanIntervalDrift, undefined);
 });
 
+// Secret-bearing env vars must never log their raw value in the drift warning.
+withEnv(
+  {
+    EXECUTION_VENUE: 'binance_us',
+    BINANCE_US_API_KEY: 'FAKEKEYaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaZZ',
+    BINANCE_US_API_SECRET: 'FAKESECRETbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbWW',
+    ENTRY_SCAN_INTERVAL_MS: '16000',
+  },
+  () => {
+    const driftLogs = [];
+    emitConfigDriftWarnings(process.env, {
+      logger: { log: (event, payload) => driftLogs.push({ event, payload }) },
+    });
+    const keyDrift = driftLogs.find((entry) => entry.payload?.key === 'BINANCE_US_API_KEY');
+    const secretDrift = driftLogs.find((entry) => entry.payload?.key === 'BINANCE_US_API_SECRET');
+    assert.equal(keyDrift?.event, 'config_drift_warning');
+    assert.equal(secretDrift?.event, 'config_drift_warning');
+    // Raw secret must not appear; only the 2-char head/tail mask.
+    assert.equal(keyDrift?.payload?.runningValue, 'FA***ZZ');
+    assert.equal(secretDrift?.payload?.runningValue, 'FA***WW');
+    assert.ok(!driftLogs.some((entry) => /KEYaaaa|SECRETbbbb/.test(JSON.stringify(entry.payload))));
+    // Non-secret keys are unaffected.
+    const scanIntervalDrift = driftLogs.find((entry) => entry.payload?.key === 'ENTRY_SCAN_INTERVAL_MS');
+    assert.equal(scanIntervalDrift?.payload?.runningValue, '16000');
+  },
+);
+
 withEnv({ ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false' }, () => {
   assert.equal(getRuntimeConfig().entryUniverseExcludeStables, false);
 });

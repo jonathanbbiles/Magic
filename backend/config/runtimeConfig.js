@@ -207,6 +207,19 @@ function getRuntimeConfigSummary(env = process.env) {
 
 const CONFIG_DRIFT_NUMERIC_TOLERANCE_RATIO = 0.20;
 
+const SECRET_KEY_PATTERN = /(SECRET|API_KEY|TOKEN|PASSWORD|PRIVATE_KEY)/i;
+
+function isSecretKey(key) {
+  return SECRET_KEY_PATTERN.test(String(key || ''));
+}
+
+function maskSecretValue(value) {
+  const raw = String(value ?? '');
+  if (!raw) return '';
+  if (raw.length <= 4) return '*'.repeat(raw.length);
+  return `${raw.slice(0, 2)}***${raw.slice(-2)}`;
+}
+
 function parseNumericLike(value) {
   const parsed = Number(String(value ?? '').trim());
   return Number.isFinite(parsed) ? parsed : null;
@@ -234,10 +247,11 @@ function emitConfigDriftWarnings(env = process.env, options = {}) {
       ? shouldWarnNumericDrift(runningNumeric, defaultNumeric, toleranceRatio)
       : String(runningRaw) !== String(defaultRaw);
     if (!drifted) continue;
+    const secret = isSecretKey(key);
     log('config_drift_warning', {
       key,
-      runningValue: String(runningRaw),
-      defaultValue: String(defaultRaw),
+      runningValue: secret ? maskSecretValue(runningRaw) : String(runningRaw),
+      defaultValue: secret ? maskSecretValue(defaultRaw) : String(defaultRaw),
       valueType: bothNumeric ? 'number' : typeof defaultRaw,
       numericToleranceRatio: bothNumeric ? toleranceRatio : null,
       driftRatio: bothNumeric && defaultNumeric !== 0
