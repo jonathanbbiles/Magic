@@ -530,7 +530,7 @@ Mechanical Hard Rule #4 enforcement. Runs as part of `npm run test:scripts`. Sca
 
 ### 2. Live-vs-predicted drift alerter (`backend/modules/driftAlerter.js`)
 
-Compares the realised expectancy over the last N closed trades to the most recent backtest's predicted expectancy. Surfaces `meta.drift` (overall + per-signal). When the divergence exceeds `DRIFT_ALERT_THRESHOLD_BPS` (default 50), the alert flips on. Observational only — does not gate entries. `closedTradeStats.append` now tags each record with `signalVersion` so the per-signal slice is meaningful.
+Compares the realised expectancy over the last N closed trades to the predicted expectancy. Surfaces `meta.drift` (overall + per-signal). The **overall** slice anchors its predicted baseline to whatever signal the selector has live (`signalSelector.activeNetBps`), falling back to the OLS/primary backtest only when no signal is selected (trading veto / pre-backtest) — anchoring to OLS while a different signal trades would compare realised P&L against a baseline that isn't in play. When the divergence exceeds `DRIFT_ALERT_THRESHOLD_BPS` (default 50), the alert flips on. Observational only — does not gate entries. `closedTradeStats.append` tags each record with `signalVersion` so the per-signal slice is meaningful.
 
 ### 3. Per-symbol expectancy auditor (`backend/modules/perSymbolExpectancyAudit.js`)
 
