@@ -79,6 +79,8 @@ function getBacktestForSignal(version, backtests) {
   if (version === 'microstructure_15m') return backtests.micro15mBacktest || null;
   if (version === 'microstructure_30m') return backtests.micro30mBacktest || null;
   if (version === 'microstructure_45m') return backtests.micro45mBacktest || null;
+  if (version === 'trend_following') return backtests.trendFollowingBacktest || null;
+  if (version === 'pairs') return backtests.pairsBacktest || null;
   return backtests.olsBacktest || null;  // 'ols' or fallback
 }
 
@@ -94,6 +96,8 @@ function pickActiveSignal({
   micro15mBacktest = null,
   micro30mBacktest = null,
   micro45mBacktest = null,
+  trendFollowingBacktest = null,
+  pairsBacktest = null,
   operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion[_5m|_15m]' | 'range_mean_reversion' | 'barrier' | 'microstructure_{5,15,30,45}m' | null
   config = {},
 } = {}) {
@@ -122,6 +126,10 @@ function pickActiveSignal({
   const micro30mEntries = readBacktestEntries(micro30mBacktest);
   const micro45mNetBps = readBacktestNetBps(micro45mBacktest);
   const micro45mEntries = readBacktestEntries(micro45mBacktest);
+  const trendFollowingNetBps = readBacktestNetBps(trendFollowingBacktest);
+  const trendFollowingEntries = readBacktestEntries(trendFollowingBacktest);
+  const pairsNetBps = readBacktestNetBps(pairsBacktest);
+  const pairsEntries = readBacktestEntries(pairsBacktest);
 
   const candidates = [];
   if (olsNetBps != null && olsEntries >= cfg.minBacktestEntries && olsNetBps >= cfg.minBpsToActivate) {
@@ -157,12 +165,19 @@ function pickActiveSignal({
   if (micro45mNetBps != null && micro45mEntries >= cfg.minBacktestEntries && micro45mNetBps >= cfg.minBpsToActivate) {
     candidates.push({ version: 'microstructure_45m', netBps: micro45mNetBps, entries: micro45mEntries });
   }
+  if (trendFollowingNetBps != null && trendFollowingEntries >= cfg.minBacktestEntries && trendFollowingNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'trend_following', netBps: trendFollowingNetBps, entries: trendFollowingEntries });
+  }
+  if (pairsNetBps != null && pairsEntries >= cfg.minBacktestEntries && pairsNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'pairs', netBps: pairsNetBps, entries: pairsEntries });
+  }
   candidates.sort((a, b) => b.netBps - a.netBps);
 
   const allBacktests = {
     olsBacktest, mfBacktest, meanRevBacktest, meanRev5mBacktest, meanRev15mBacktest,
     rangeMrBacktest, barrierBacktest,
     micro5mBacktest, micro15mBacktest, micro30mBacktest, micro45mBacktest,
+    trendFollowingBacktest, pairsBacktest,
   };
 
   // Operator override wins on signal version. Veto still applies unless
@@ -172,6 +187,7 @@ function pickActiveSignal({
     'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m',
     'range_mean_reversion', 'barrier',
     'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+    'trend_following', 'pairs',
   ];
   if (allowedOverrides.includes(operatorOverride)) {
     const overrideBacktest = getBacktestForSignal(operatorOverride, allBacktests);
@@ -198,6 +214,8 @@ function pickActiveSignal({
       micro15mNetBps,
       micro30mNetBps,
       micro45mNetBps,
+      trendFollowingNetBps,
+      pairsNetBps,
       activeNetBps: overrideNetBps,
       candidates,
       operatorOverride,
@@ -241,6 +259,8 @@ function pickActiveSignal({
       micro15mNetBps,
       micro30mNetBps,
       micro45mNetBps,
+      trendFollowingNetBps,
+      pairsNetBps,
       activeNetBps: null,
       candidates,
       operatorOverride: null,
@@ -390,6 +410,7 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
     'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m',
     'range_mean_reversion', 'barrier',
     'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+    'trend_following', 'pairs',
   ];
   if (!vetoEnabled && allowed.includes(operatorOverride)) {
     latestDecision = {
@@ -404,6 +425,8 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
       meanRev15mNetBps: null,
       rangeMrNetBps: null,
       barrierNetBps: null,
+      trendFollowingNetBps: null,
+      pairsNetBps: null,
       activeNetBps: null,
       candidates: [],
       operatorOverride,

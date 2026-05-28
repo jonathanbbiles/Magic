@@ -229,4 +229,22 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_5M, 'BCH/USD');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_15M, '');
 assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_SYMBOL_BLOCKLIST, '');
 
+// 2026-05-28 add: three new strategies (trend_following, pairs, time_of_day filter).
+// trend_following and pairs are signal candidates the selector evaluates; they
+// trade live ONLY if they clear SIGNAL_SELECTOR_MIN_BPS (≥0 bps) over ≥5
+// backtest entries. Time-of-day is a meta-filter default-pass ('*') so
+// behavior is unchanged until operator sets a real schedule. Locked here so
+// drift back to 'false' on the master kills or a removal of the new signals
+// would be caught at CI.
+assert.equal(LIVE_CRITICAL_DEFAULTS.TREND_FOLLOWING_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.TREND_FOLLOWING_LOOKBACK_BARS, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.TREND_FOLLOWING_VOL_MULTIPLIER, '1.3');
+assert.equal(LIVE_CRITICAL_DEFAULTS.TREND_FOLLOWING_STOP_LOSS_BPS, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.PAIRS_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.PAIRS_LOOKBACK_BARS, '120');
+assert.equal(LIVE_CRITICAL_DEFAULTS.PAIRS_Z_ENTRY_THRESHOLD, '2.0');
+assert.equal(LIVE_CRITICAL_DEFAULTS.PAIRS_STOP_LOSS_BPS, '50');
+assert.equal(LIVE_CRITICAL_DEFAULTS.TIME_OF_DAY_FILTER_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.TIME_OF_DAY_ALLOWED_HOURS_UTC, '*');
+
 console.log('live defaults tests passed');

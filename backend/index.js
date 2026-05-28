@@ -708,6 +708,13 @@ let lastBacktestMicro5m = null;
 let lastBacktestMicro15m = null;
 let lastBacktestMicro30m = null;
 let lastBacktestMicro45m = null;
+// Trend-following + pairs slots (2026-05-28). Trend-following replays through
+// the standard single-symbol backtester. Pairs cannot — see backtest_strategy.js
+// `isPairs` short-circuit — so its slot stays null until Phase 2 wires
+// cross-symbol bar plumbing; until then an operator must pin
+// SIGNAL_VERSION=pairs + disable the veto to trade pairs live.
+let lastBacktestTrendFollowing = null;
+let lastBacktestPairs = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -922,6 +929,8 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     micro15mBacktest: lastBacktestMicro15m,
     micro30mBacktest: lastBacktestMicro30m,
     micro45mBacktest: lastBacktestMicro45m,
+    trendFollowingBacktest: lastBacktestTrendFollowing,
+    pairsBacktest: lastBacktestPairs,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -1086,6 +1095,8 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     else if (slot === 'micro_15m') lastBacktestMicro15m = stored;
     else if (slot === 'micro_30m') lastBacktestMicro30m = stored;
     else if (slot === 'micro_45m') lastBacktestMicro45m = stored;
+    else if (slot === 'trend_following') lastBacktestTrendFollowing = stored;
+    else if (slot === 'pairs') lastBacktestPairs = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
@@ -1097,6 +1108,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       'mean_rev', 'mean_rev_5m', 'mean_rev_15m',
       'range_mr', 'barrier',
       'micro_5m', 'micro_15m', 'micro_30m', 'micro_45m',
+      'trend_following', 'pairs',
     ].includes(slot)) {
       refreshSignalSelectorDecision(`after_backtest_${slot}`);
     }
@@ -1681,6 +1693,24 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestMicro45m.perSymbol,
           gateSkipped: lastBacktestMicro45m.gateSkipped || null,
           note: 'Microstructure signal candidate at 45m horizon. Disabled by default — set MICRO_HORIZON_45M_ENABLED=true to admit.',
+        } : null,
+        backtestTrendFollowing: lastBacktestTrendFollowing ? {
+          ranAt: lastBacktestTrendFollowing.ranAt,
+          windowDays: lastBacktestTrendFollowing.windowDays,
+          params: lastBacktestTrendFollowing.params,
+          overall: lastBacktestTrendFollowing.overall,
+          perSymbol: lastBacktestTrendFollowing.perSymbol,
+          gateSkipped: lastBacktestTrendFollowing.gateSkipped || null,
+          note: 'Trend-following signal candidate (2026-05-28). Buys confirmed N-bar high breakouts with volume + slope confirmation. Diversification add: validates in regimes where mean-reversion fails.',
+        } : null,
+        backtestPairs: lastBacktestPairs ? {
+          ranAt: lastBacktestPairs.ranAt,
+          windowDays: lastBacktestPairs.windowDays,
+          params: lastBacktestPairs.params,
+          overall: lastBacktestPairs.overall,
+          perSymbol: lastBacktestPairs.perSymbol,
+          gateSkipped: lastBacktestPairs.gateSkipped || null,
+          note: 'Pairs / stat-arb signal candidate (2026-05-28). Single-symbol replay cannot simulate the cross-symbol spread logic; all entries are skipped with reason pairs_backtest_unsupported. To trade pairs live, an operator must pin SIGNAL_VERSION=pairs and disable the selector veto.',
         } : null,
         // Stage 3 MR stop-loss sweep — observational diagnostic, fires at
         // each restart. Shows mean_reversion at three stop-loss caps per
@@ -3087,6 +3117,28 @@ if (backtestSkipReason) {
           blockedSymbols: microBlocklist45m,
         }, 'micro_45m').catch(() => {});
       }
+    }
+    // Trend-following auto-backtest (2026-05-28). Replays through the
+    // standard single-symbol path. Gate behind TREND_FOLLOWING_ENABLED so
+    // operators can disable the slot without touching code.
+    if (String(process.env.TREND_FOLLOWING_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'trend_following',
+      }, 'trend_following').catch(() => {});
+    }
+    // Pairs auto-backtest (2026-05-28). The single-symbol replay can't
+    // simulate the cross-symbol spread logic — see backtest_strategy.js
+    // `isPairs` short-circuit — so this run produces an empty stats
+    // record with skipped.pairs_backtest_unsupported counts. We still
+    // run it (when PAIRS_ENABLED=true) so the meta.backtestPairs slot
+    // surfaces a real `ranAt` timestamp; the selector treats null
+    // avgNetBpsPerEntry as "not validated" and silently drops the
+    // candidate. Phase 2 wiring would inject partner bars per primary
+    // symbol so the signal can actually evaluate here.
+    if (String(process.env.PAIRS_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'pairs',
+      }, 'pairs').catch(() => {});
     }
     // 2026-05-17 Stage 3 sweep: backtest MR-5m and MR-15m at three stop-loss
     // caps each (60 / 80 / 100 by default) so the dashboard can show the
