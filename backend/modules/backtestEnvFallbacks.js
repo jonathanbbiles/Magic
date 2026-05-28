@@ -49,6 +49,10 @@ const ENV_NUMBER_FALLBACKS = Object.freeze({
 // the live engine actually applied, misrepresenting the selector inputs.
 const ENV_BOOLEAN_FALLBACKS = Object.freeze({
   enforceProjectedCoversGross: 'ENFORCE_PROJECTED_COVERS_GROSS',
+  // Adverse-selection-aware passive fill model (2026-05-27). When unset,
+  // the backtester applies its own default (true). Set to 'false' in Render
+  // env to restore the legacy mid-as-rest fill behaviour for A/B comparison.
+  adverseSelectionFill: 'BACKTEST_ADVERSE_SELECTION_FILL',
 });
 
 function parseEnvNumber(raw) {

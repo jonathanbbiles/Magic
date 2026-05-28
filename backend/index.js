@@ -994,6 +994,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       microTargetNetBpsFloor: microTargetNetBpsFloorResolved,
       microSignalTargetMaxNetBps: microSignalTargetMaxNetBpsResolved,
       enforceProjectedCoversGross: enforceProjectedCoversGrossResolved,
+      adverseSelectionFill: adverseSelectionFillResolved,
     } = liveEngineFallbacks;
     // Venue-aware round-trip fee. Without this the auto-backtest falls through
     // to backtest_strategy.js's hardcoded 30-bps Alpaca default, which on the
@@ -1024,6 +1025,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
       ...(overrides.mfVolumeRequired != null ? { mfVolumeRequired: String(overrides.mfVolumeRequired) === 'true' } : {}),
       ...(overrides.rejectNearHighEnabled != null ? { rejectNearHighEnabled: String(overrides.rejectNearHighEnabled) === 'true' } : {}),
       ...(enforceProjectedCoversGrossResolved !== undefined ? { enforceProjectedCoversGross: Boolean(enforceProjectedCoversGrossResolved) } : {}),
+      ...(adverseSelectionFillResolved !== undefined ? { adverseSelectionFill: Boolean(adverseSelectionFillResolved) } : {}),
       ...(rejectNearHighBpsResolved != null ? { rejectNearHighBps: Number(rejectNearHighBpsResolved) } : {}),
       ...(rejectNearHighLookbackBarsResolved != null ? { rejectNearHighLookbackBars: Number(rejectNearHighLookbackBarsResolved) } : {}),
       ...(overrides.entrySpreadCostBps != null ? { entrySpreadCostBps: Number(overrides.entrySpreadCostBps) } : {}),

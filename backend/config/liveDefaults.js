@@ -205,6 +205,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
   SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-10',
   SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '50',
+  // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
+  // to treat mid (`candidateClose`) as both the rest price and the fill
+  // threshold, then add halfSpread to the entry price — over-filling AND
+  // over-charging. Real passive rests sit at bid+tick (below mid) and only
+  // fill when the market trades DOWN to them, so every real fill is biased
+  // toward "the market just moved against me" (adverse selection). With this
+  // ON (default), the backtest models the rest at `mid - tierHalfSpread`,
+  // requires a subsequent low to reach the rest for a fill, and prices the
+  // entry at the rest (maker — no spread on entry). Tracks forward from the
+  // bar that actually filled. Set 'false' in Render env to restore the
+  // legacy mid-as-rest behaviour for A/B comparison.
+  BACKTEST_ADVERSE_SELECTION_FILL: 'true',
   // Multi-factor signal exit-sizing knobs. Only consulted when
   // SIGNAL_VERSION='multi_factor'; ignored otherwise. Mirror the OLS-tuned
   // TARGET_NET_PROFIT_BPS / SIGNAL_TARGET_MAX_NET_BPS / STOP_LOSS_BPS but

@@ -131,6 +131,28 @@ const DEFAULTS = {
   // minutes has a low ≤ effective entry price. 0 disables (legacy behaviour:
   // fills always succeed at the candidate bar's close).
   entryFillTimeoutMin: 1,                // 1 minute = 60 s ≈ 2× live timeout (conservative)
+  // Adverse-selection-aware passive fill model (2026-05-27). The live bot
+  // rests at bid+tick — a passive maker. A real fill requires a subsequent
+  // bar's low to trade DOWN to that rest, which means every fill is biased
+  // toward "the market just moved against me" (adverse selection). The legacy
+  // model treated `candidateClose` (~mid) as BOTH the rest price and the fill
+  // threshold and then added halfSpread to the fill price — it over-filled
+  // (mid is above bid+tick, so taps of mid never reflect a real bid hit) AND
+  // over-charged (makers don't pay the half-spread). The combination
+  // systematically overstated edge — exactly the bias that produced
+  // microstructure_30m's +7.8 bps backtest while it realized −31 bps live.
+  // When TRUE (default): rest = `candidateClose * (1 - adverseRestOffsetBps/
+  // 10000)`, fill requires `low ≤ rest`, entryPrice = rest (maker, no
+  // half-spread). Forward TP/stop/maxhold tracking starts from the bar that
+  // actually filled. Set FALSE to restore the legacy mid-as-rest behaviour.
+  adverseSelectionFill: true,
+  // Rest offset (bps below mid) used by the adverse fill model. Independent
+  // of `entrySpreadCostBps` (which has historically been zeroed in live to
+  // disable the legacy spread-on-entry charge — leaving the adverse model
+  // with no spread estimate at all). When undefined, the resolver below
+  // falls back to the tier-aware `entrySpreadCostBpsTier1/2/3` values, so a
+  // tier-1 BTC sits at 8 bps below mid, a tier-3 alt at 35 bps below mid.
+  adverseRestOffsetBps: undefined,
   // HTF downtrend gate. When > 0, requires the higher-timeframe slope
   // (htfBars × 5 m closes) to be ≥ this floor (bps/bar). Matches live
   // HTF_MIN_SLOPE_BPS_PER_BAR. Set to 0 to disable.
@@ -482,6 +504,25 @@ function resolveBacktestSpreadCostBps(symbol, opts) {
   return Math.max(0, Number(opts.entrySpreadCostBpsTier3) || 0);
 }
 
+// Resolve the bps offset of the passive bid+tick rest below mid, used by the
+// adverse-selection fill model. Unlike resolveBacktestSpreadCostBps above,
+// this does NOT short-circuit on `entrySpreadCostBps` — that knob is zeroed
+// in live to disable the legacy spread-on-entry charge, but the adverse model
+// still needs a realistic half-spread estimate. Explicit override comes from
+// `opts.adverseRestOffsetBps`; otherwise the tier-aware defaults apply.
+function resolveAdverseRestOffsetBps(symbol, opts) {
+  if (opts.adverseRestOffsetBps != null) {
+    const v = Number(opts.adverseRestOffsetBps);
+    return Number.isFinite(v) ? Math.max(0, v) : 0;
+  }
+  const symUp = String(symbol || '').toUpperCase();
+  const tier1 = Array.isArray(opts.spreadCostTier1Symbols) ? opts.spreadCostTier1Symbols : [];
+  const tier2 = Array.isArray(opts.spreadCostTier2Symbols) ? opts.spreadCostTier2Symbols : [];
+  if (tier1.map((s) => s.toUpperCase()).includes(symUp)) return Math.max(0, Number(opts.entrySpreadCostBpsTier1) || 0);
+  if (tier2.map((s) => s.toUpperCase()).includes(symUp)) return Math.max(0, Number(opts.entrySpreadCostBpsTier2) || 0);
+  return Math.max(0, Number(opts.entrySpreadCostBpsTier3) || 0);
+}
+
 function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const trades = [];
   if (!Array.isArray(bars) || bars.length < opts.predictBars + 2) return trades;
@@ -495,6 +536,11 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   // null which routes to tier3 (the conservative-cost bucket).
   const resolvedSymbol = symbolHint || bars[0]?.S || null;
   const halfSpreadBpsTierAware = resolveBacktestSpreadCostBps(resolvedSymbol, opts);
+  // Adverse-fill model rest offset (bps below mid). Resolved once per symbol
+  // — see resolveAdverseRestOffsetBps. Used only when opts.adverseSelectionFill
+  // is not explicitly false.
+  const adverseRestOffsetBpsTierAware = resolveAdverseRestOffsetBps(resolvedSymbol, opts);
+  const useAdverseFillModel = opts.adverseSelectionFill !== false;
 
   // For BTC lead-lag we need to align this symbol's timestamps to BTC's bars.
   // Build the index once; resolve per-bar at gate-eval time. The caller
@@ -936,29 +982,48 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     const entryIdx = i;
     const entryTs = tsMs[i];
 
-    // Half-spread cost on entry. The live engine rests at mid; a passive mid
-    // limit at fill time means we paid half the spread to enter. Bars don't
-    // carry quote-level spread, so we use a tier-aware estimate (resolved
-    // once per replaySymbol call; symbol-aware defaults at top of file).
-    // When opts.entrySpreadCostBps is set explicitly, that flat value is
-    // used for every symbol — operator override.
+    // Passive-limit fill model. Two paths:
+    //  - Adverse model (default, useAdverseFillModel=true): the rest sits at
+    //    `candidateClose * (1 - adverseRestOffsetBps/10000)` ≈ bid+tick. A
+    //    fill requires a subsequent bar's low to reach the rest, and the
+    //    fill is at the rest price (maker — no half-spread charged). This
+    //    models passive-limit adverse selection: you only fill when the
+    //    market trades down through your bid, so the fill subset is biased.
+    //  - Legacy model (useAdverseFillModel=false): the rest is at mid
+    //    (candidateClose), fills on any tap of mid, and `entryPrice` adds
+    //    halfSpread on top — over-fills AND over-charges, which is what
+    //    historically produced the +backtest / -live divergence.
     const halfSpreadBps = halfSpreadBpsTierAware;
-    const entryPrice = halfSpreadBps > 0
-      ? candidateClose * (1 + halfSpreadBps / 10000)
+    const restOffsetBps = adverseRestOffsetBpsTierAware;
+    const restPrice = useAdverseFillModel && restOffsetBps > 0
+      ? candidateClose * (1 - restOffsetBps / 10000)
       : candidateClose;
+    const entryPrice = useAdverseFillModel
+      ? restPrice
+      : (halfSpreadBps > 0 ? candidateClose * (1 + halfSpreadBps / 10000) : candidateClose);
+    // Fill threshold: which price a subsequent bar's low must reach for the
+    // passive rest to execute. Adverse model: rest (bid+tick). Legacy: mid.
+    const fillThreshold = useAdverseFillModel ? restPrice : candidateClose;
 
     // Entry-fill-timeout cancellation. The live engine cancels passive buy
     // limits that haven't filled in ENTRY_FILL_TIMEOUT_MS (default 30 s).
-    // Backtest proxy: if no bar within the next entryFillTimeoutMin minutes
-    // has low ≤ candidateClose (the passive buy-limit reference), treat the
-    // entry as cancelled — no trade record. 0 disables (legacy behaviour).
+    // When `fillTimeoutMin > 0`, scan forward until a bar's low ≤ threshold;
+    // also record WHICH bar actually filled (fillBarIdx) so the forward
+    // TP/stop/maxhold loop below starts from real-fill timing instead of
+    // entryIdx+1. `fillTimeoutMin = 0` disables the timeout AND skips the
+    // fill check entirely (legacy: assume immediate fill at entryIdx+1).
     const fillTimeoutMin = Math.max(0, Number(opts.entryFillTimeoutMin) || 0);
+    let fillBarIdx = entryIdx;
     if (fillTimeoutMin > 0) {
       const fillDeadlineMs = entryTs + fillTimeoutMin * 60_000;
       let filled = false;
       for (let j = entryIdx + 1; j < bars.length; j += 1) {
         if (tsMs[j] > fillDeadlineMs) break;
-        if (Number.isFinite(lows[j]) && lows[j] <= candidateClose) { filled = true; break; }
+        if (Number.isFinite(lows[j]) && lows[j] <= fillThreshold) {
+          filled = true;
+          fillBarIdx = j;
+          break;
+        }
       }
       if (!filled) {
         if (!stats.skipped.entry_unfilled) stats.skipped.entry_unfilled = 0;
@@ -1013,7 +1078,13 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);
     }
     const maxHoldMs = Math.max(0, activeMaxHoldMin * 60_000);
-    for (let j = entryIdx + 1; j < bars.length; j += 1) {
+    // Forward tracking starts at the bar AFTER the actual fill when the
+    // adverse model is on (fillBarIdx was recorded above). Legacy keeps
+    // tracking from entryIdx+1 regardless. `ageMs` is measured from entryTs
+    // in both branches so hold-time accounting stays consistent with the
+    // signal's decision timestamp.
+    const trackingStartIdx = (useAdverseFillModel ? fillBarIdx : entryIdx) + 1;
+    for (let j = trackingStartIdx; j < bars.length; j += 1) {
       const ageMs = tsMs[j] - entryTs;
       const low = lows[j];
       // Stop-loss precedence: if both the stop AND the TP wick happen in the

@@ -84,6 +84,14 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '10');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-10');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '50');
 
+// 2026-05-27: Adverse-selection-aware backtest fill model. Must stay ON in the
+// live defaults so the auto-backtest stops over-promising edge that doesn't
+// survive real passive-limit fills. If this drifts to 'false', the
+// SignalSelector goes back to grading every signal on a fill model that
+// ignores adverse selection — the exact bias that drove microstructure_30m's
+// +7.8 bps backtest while live realized -31 bps.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BACKTEST_ADVERSE_SELECTION_FILL, 'true');
+
 // 2026-05-21: Binance.US execution adapter shipped dormant. Default venue
 // is 'alpaca' so the merge is zero-behavior-change. Operator flips
 // EXECUTION_VENUE='binance_us' in Render env to cut over. validateEnv.js
