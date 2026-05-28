@@ -96,15 +96,28 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // exit too fast (or pause too aggressively on portfolio drift) for that
   // pattern to play out. 6 h max-hold + 2 h break-even-decay gives positions
   // enough σ-time to reach the TP without being walked to break-even too soon.
-  BREAKEVEN_TIMEOUT_MS: '7200000',
-  MAX_HOLD_MS: '21600000',
+  //
+  // 2026-05-28 daily-compounding pass: tightened back to 2 h max-hold + 1 h
+  // breakeven-decay. The compounding objective prioritises capital RECYCLE
+  // RATE over per-trade win magnitude — a position that sits idle for 6 h
+  // wedges a concurrency slot that could otherwise have fired a new entry
+  // (which at 0.025%/day target = ~25 bps net per equity-fraction = ~one
+  // small win per slot per day). The staircase floor still pins the GTC
+  // resell at break-even-after-fees, so the floor outcome on a non-stopped
+  // hold is unchanged ($0 net). Operators can revert via Render env.
+  BREAKEVEN_TIMEOUT_MS: '3600000',
+  MAX_HOLD_MS: '7200000',
   // Signal-aware exit timing for multi-factor: its wider TP target (40-150 bps
   // net) needs longer σ-time than the OLS-tuned tight defaults. The May 2026
   // auto-backtest at maxHold=90 min observed 45.8% max_hold rate dragging MF
   // expectancy to -61 bps; 6 h max-hold + 3 h breakeven-timeout gives the
   // wider TP room to fill before being walked to break-even.
-  MF_BREAKEVEN_TIMEOUT_MS: '10800000',
-  MF_MAX_HOLD_MS: '21600000',
+  //
+  // 2026-05-28 daily-compounding pass: tightened to 3 h max-hold + 1.5 h
+  // breakeven-decay (was 6 h / 3 h). MF's wider TP still gets ~3 h of
+  // σ-time but the slot recycles 2× faster on misses.
+  MF_BREAKEVEN_TIMEOUT_MS: '5400000',
+  MF_MAX_HOLD_MS: '10800000',
   // Mean-reversion-at-extremes strategy defaults. The signal triggers on
   // a >=100 bps volume-confirmed drop (2σ-significant, RSI-confirmed,
   // BTC-decorrelated), targets half the drop, runs a tight 60 bps stop,
@@ -201,10 +214,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // entries when the active signal's recent realized net bps is below the
   // floor with enough sample; open positions still exit normally. Default-ON.
   // Revert with SIGNAL_SELECTOR_REALIZED_VETO_ENABLED='false' in Render env.
+  // 2026-05-28 daily-compounding pass: tightened the realized circuit breaker
+  // (floor -10 → -5 bps, lookback 50 → 20 trades). At the +0.025%/day target,
+  // every losing trade is ~half a day's earnings — a 50-trade window means
+  // the bot can bleed ~5 days' worth of expectancy before the breaker fires.
+  // Shorter window (20 trades) + tighter floor (-5 bps, just past Binance.US
+  // fees + single-trade noise) catches realized-vs-backtest divergence on the
+  // same order as the realized expectancy gain. min_trades stays at 10 to
+  // preserve the noise-floor sample.
   SIGNAL_SELECTOR_REALIZED_VETO_ENABLED: 'true',
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
-  SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-10',
-  SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '50',
+  SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-5',
+  SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '20',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND
@@ -236,6 +257,13 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // abort when cash gets fragmented across active positions. The previous
   // value killed entire scans when half the cash was deployed — too tight.
   MIN_SIZING_FRACTION_OF_TARGET: '0.4',
+  // 2026-05-28 daily-compounding pass: per-trade sizing dropped 10% → 7% so
+  // the bumped concurrent-position soft cap (8 → 12) can fully deploy without
+  // hitting MIN_SIZING_FRACTION_OF_TARGET. At 12 slots × 7% = 84% deployed
+  // max, leaving headroom for the staircase reconciler to repost without
+  // bumping into cash exhaustion. The trade.js fallback (0.10) is left intact
+  // for emergency revert via Render env clearing this key.
+  PORTFOLIO_SIZING_PCT: '0.07',
   // 2026-05-15 rollback: was '1.0' (block declining-volume entries). Not a
   // user-requested gate; restored to '0' (disabled). Skipped ~3,800 entries
   // in the May 2026 backtest. Re-enable if live data shows it's needed.
@@ -248,7 +276,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // P&L < -0.5%). Too tight — paused on normal market drift. Restored to
   // '-2.0', the pre-claude default. The gate still protects against
   // cascading drawdowns, just with realistic headroom.
-  MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: '-2.0',
+  //
+  // 2026-05-28 daily-compounding pass: widened -2.0 → -5.0. The compounding
+  // objective requires the bot to KEEP TRADING through small portfolio
+  // drawdowns (so a recovery trade can fire). -2% pauses on what is
+  // structurally a normal day of MTM noise on a 12-position book — a single
+  // 25 bps stop on a 7% slot is 17.5 bps of equity, six of those put the
+  // book at -1.05% and the bot would freeze. -5% reserves the gate for
+  // genuine cascading drawdown protection.
+  MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER: '-5.0',
   // Recent-high proximity gate: refuses entries within REJECT_NEAR_HIGH_BPS
   // of the highest close in the last REJECT_NEAR_HIGH_LOOKBACK_BARS minutes.
   // Defaults: refuse within 30 bps of the last-30-bar high.
@@ -310,11 +346,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_TIMEFRAME_15M_ENABLED: 'true',
   // Concurrent-position soft cap. The hard cap is "as many as cash funds";
   // this soft cap prevents fragmenting cash across more positions than the
-  // sizing math comfortably supports. At a $84 account × 10% sizing, 8
-  // positions fully deploy ~80% of cash; above that the MIN_SIZING_FRACTION_OF_TARGET
-  // gate would start aborting scans. Set to 0 to disable.
+  // sizing math comfortably supports.
+  //
+  // 2026-05-28 daily-compounding pass: bumped 8 → 12, paired with
+  // PORTFOLIO_SIZING_PCT 0.10 → 0.07. At 7% × 12 slots = 84% deployed max
+  // (same headroom as the prior 10% × 8 = 80%) but with 50% more parallel
+  // shots-on-goal — directly attacks "trades per day" as the bottleneck
+  // for the 0.025%/day compounding target. Set to 0 to disable.
   CONCURRENT_POSITIONS_SOFT_CAP_ENABLED: 'true',
-  MAX_CONCURRENT_POSITIONS_SOFT_CAP: '8',
+  MAX_CONCURRENT_POSITIONS_SOFT_CAP: '12',
   // Range mean-reversion signal. Fires on smaller drops (-50 to -100 bps)
   // within an established price range — much more frequent triggers than
   // the capitulation-grade MR signal. Tighter stops (40 bps) to match the
@@ -359,11 +399,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // MICRO_TRADES_ENABLED=false is honest — flowImbalance contribution is
   // zero in Phase 1 because no /v1beta3/crypto/us/latest/trades consumer
   // exists yet. Phase 2 wires the trades feed + flips this default.
+  // 2026-05-28 daily-compounding pass: enabled the 5m + 45m horizons. All
+  // four microstructure variants now feed the SignalSelector pool. Adds
+  // more shots-on-goal per scan; each variant still has to clear
+  // SIGNAL_SELECTOR_MIN_BPS over ≥5 backtest entries to be admitted live,
+  // so under-fired variants stay vetoed by the sample-size guard rather
+  // than diluting the live signal. The realized-veto circuit breaker
+  // catches any that backtest positive but live-trade negative.
   MICRO_ENABLED: 'true',
-  MICRO_HORIZON_5M_ENABLED: 'false',
+  MICRO_HORIZON_5M_ENABLED: 'true',
   MICRO_HORIZON_15M_ENABLED: 'true',
   MICRO_HORIZON_30M_ENABLED: 'true',
-  MICRO_HORIZON_45M_ENABLED: 'false',
+  MICRO_HORIZON_45M_ENABLED: 'true',
   MICRO_SPREAD_Z_MAX: '1.5',
   MICRO_MIN_PROB: '0.55',
   MICRO_EV_MIN_BPS: '2',

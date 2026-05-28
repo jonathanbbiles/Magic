@@ -44,7 +44,19 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.HONEST_EV_GATE_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_SIZING_FRACTION_OF_TARGET, '0.4');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_VOLUME_RATIO_TO_ENTER, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_BTC_LEAD_LAG_DROP_BPS, '0');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-2.0');
+// 2026-05-28 daily-compounding pass: widened portfolio-drawdown gate
+// -2.0 → -5.0. The compounding objective requires the bot to keep
+// trading through small drawdowns; -2% pauses on a normal day of MTM
+// noise on a 12-position book. Locked at -5.0 so the gate only fires
+// on genuine cascading drawdown rather than routine market drift.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER, '-5.0');
+
+// 2026-05-28 daily-compounding pass: per-trade sizing 0.10 → 0.07 so the
+// bumped concurrent-position soft cap (8 → 12) can fully deploy without
+// the MIN_SIZING_FRACTION_OF_TARGET gate aborting scans. Locked here so
+// a drift back to 0.10 with the higher slot cap would silently
+// over-deploy and trigger cash-fragmentation scan aborts.
+assert.equal(LIVE_CRITICAL_DEFAULTS.PORTFOLIO_SIZING_PCT, '0.07');
 
 // Recent-high proximity gate. Pinned ON so the production deploy refuses
 // entries within 30 bps of the last-30-minute high. 2026-05-17 lookback
@@ -79,10 +91,17 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 // the next backtest window rolls over. If this drifts to 'false', the only
 // feedback from realized results is the observational drift alert, which by
 // design cannot stop trades.
+// 2026-05-28 daily-compounding pass: tightened the realized circuit
+// breaker. At the +0.025%/day target, a 50-trade window means the bot
+// can bleed ~5 days' worth of expectancy before the breaker fires.
+// Shorter window (20) + tighter floor (-5 bps, just past Binance.US
+// fees + single-trade noise) catches realized-vs-backtest divergence
+// on the same order as the realized expectancy gain. min_trades stays
+// at 10 to preserve the noise-floor sample.
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '10');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-10');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '50');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-5');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '20');
 
 // 2026-05-27: Adverse-selection-aware backtest fill model. Must stay ON in the
 // live defaults so the auto-backtest stops over-promising edge that doesn't
@@ -129,11 +148,16 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.BARRIER_BREAKEVEN_TIMEOUT_MS, '10800000'); /
 // diluted by under-fired variants. flowImbalance feature returns 0 in
 // Phase 1 because MICRO_TRADES_ENABLED=false — Phase 2 wires the
 // /v1beta3/crypto/us/latest/trades consumer and flips this default.
+// 2026-05-28 daily-compounding pass: all four microstructure horizons now
+// enabled. SignalSelector pool grows from 2 → 4 microstructure candidates;
+// each variant still has to clear SIGNAL_SELECTOR_MIN_BPS over ≥5 backtest
+// entries to trade live, so under-fired variants stay vetoed by the
+// sample-size guard rather than diluting the live selector.
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_ENABLED, 'true');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_5M_ENABLED, 'false');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_5M_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_15M_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_30M_ENABLED, 'true');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_45M_ENABLED, 'false');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_HORIZON_45M_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_SPREAD_Z_MAX, '1.5');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_MIN_PROB, '0.55');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_EV_MIN_BPS, '2');
@@ -147,16 +171,24 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_TARGET_NET_BPS_FLOOR, '8');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_SIGNAL_TARGET_MAX_NET_BPS, '150');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MICRO_TRADES_ENABLED, 'false');
 
-// 2026-05-15 rollback: exit defaults restored to the pre-claude values.
-// MAX_HOLD_MS=6h gives positions σ-time to reach the TP. BREAKEVEN_TIMEOUT
-// =2h walks the TP toward break-even on a realistic decay. STOP_LOSS_BPS
-// =40 is the OG cap — tightening to 35 cut winners short. Multi-factor
-// keeps its own 6h/3h timers (unchanged).
-assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '7200000');   // 2 h
-assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '21600000');           // 6 h
-assert.equal(LIVE_CRITICAL_DEFAULTS.MF_BREAKEVEN_TIMEOUT_MS, '10800000');  // 3 h
-assert.equal(LIVE_CRITICAL_DEFAULTS.MF_MAX_HOLD_MS, '21600000');           // 6 h
+// 2026-05-28 daily-compounding pass: exit timers tightened to recycle
+// capital faster. Compounding rate is bottlenecked on trades-per-day, and
+// a position that sits 6 h consumes a slot that could otherwise have
+// fired a new entry. Floor outcome is unchanged: the staircase still
+// pins the GTC resell at break-even-after-fees on misses, so a non-
+// stopped hold still nets ≥ $0. OLS halved (6h→2h / 2h→1h); MF halved
+// (6h→3h / 3h→1.5h). STOP_LOSS_BPS unchanged — the validated MR signal's
+// per-timeframe caps (60 bps) are wider, so the OLS 40-bps cap stays.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BREAKEVEN_TIMEOUT_MS, '3600000');   // 1 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_HOLD_MS, '7200000');            // 2 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MF_BREAKEVEN_TIMEOUT_MS, '5400000');   // 1.5 h
+assert.equal(LIVE_CRITICAL_DEFAULTS.MF_MAX_HOLD_MS, '10800000');           // 3 h
 assert.equal(LIVE_CRITICAL_DEFAULTS.STOP_LOSS_BPS, '40');               // restored from 35
+
+// 2026-05-28 daily-compounding pass: concurrent-position soft cap
+// bumped 8 → 12. Paired with PORTFOLIO_SIZING_PCT 0.10 → 0.07 so
+// total deployed cash stays at ~84% max.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MAX_CONCURRENT_POSITIONS_SOFT_CAP, '12');
 
 // Mean-reversion-at-extremes strategy. The new "tiny wins, statistically
 // guaranteed" signal — enters only on volume-confirmed capitulation drops,
