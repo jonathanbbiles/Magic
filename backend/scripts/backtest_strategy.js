@@ -53,6 +53,7 @@ const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal'
 const { evaluateRangeMeanReversionSignal } = require('../modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('../modules/barrierSignal');
 const { evaluateMicrostructureSignal } = require('../modules/microstructureSignal');
+const { evaluateTrendFollowingSignal } = require('../modules/trendFollowingSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
 const DEFAULTS = {
@@ -567,6 +568,13 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   const isRangeMr = strategy === 'range_mean_reversion';
   const isBarrier = strategy === 'barrier';
   const isMicrostructure = strategy === 'microstructure';
+  const isTrendFollowing = strategy === 'trend_following';
+  // 'pairs' strategy: backtester can't (without a partner-bars feed) replay
+  // this signal. The selector sees pairsBacktest=null and never admits it
+  // automatically; an operator must pin SIGNAL_VERSION=pairs +
+  // SIGNAL_SELECTOR_VETO_ENABLED=false to trade pairs live. Phase 2 would
+  // add cross-symbol bar plumbing here.
+  const isPairs = strategy === 'pairs';
   // Microstructure signal evaluates at one of four discrete horizons. Parse
   // the suffix once per replaySymbol call so the per-bar loop just reads the
   // resolved number.
@@ -893,6 +901,52 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
           : microHorizonMinutes === 15 ? Number(opts.microStopLossBps15m) || 80
           : microHorizonMinutes === 30 ? Number(opts.microStopLossBps30m) || 100
           : Number(opts.microStopLossBps45m) || 100);
+    } else if (isTrendFollowing) {
+      // Trend-following signal: needs 70 closed 1m bars (requiredBars) +
+      // 1 synthetic in-progress bar = 71 in the window. Stateless; same
+      // synthetic-in-progress pattern as range-MR / barrier / microstructure.
+      const need = 71;
+      if (i + 1 < need) {
+        if (!stats.skipped.trend_insufficient_history) stats.skipped.trend_insufficient_history = 0;
+        stats.skipped.trend_insufficient_history += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] });  // synthetic in-progress
+      const trendCfg = {};
+      if (Number.isFinite(opts.trendLookbackBars)) trendCfg.lookbackBars = opts.trendLookbackBars;
+      if (Number.isFinite(opts.trendVolMultiplier)) trendCfg.volMultiplier = opts.trendVolMultiplier;
+      if (Number.isFinite(opts.trendMinSlopeBpsPerBar)) trendCfg.minSlopeBpsPerBar = opts.trendMinSlopeBpsPerBar;
+      if (Number.isFinite(opts.trendMaxStretchAboveSmaBps)) trendCfg.maxStretchAboveSmaBps = opts.trendMaxStretchAboveSmaBps;
+      if (Number.isFinite(opts.trendTargetNetBpsFloor)) trendCfg.targetNetBpsFloor = opts.trendTargetNetBpsFloor;
+      if (Number.isFinite(opts.trendTargetNetBpsCap)) trendCfg.targetNetBpsCap = opts.trendTargetNetBpsCap;
+      const trendSig = evaluateTrendFollowingSignal({
+        pair: bars[i]?.S || null,
+        bars1m: window,
+        config: trendCfg,
+      });
+      if (!trendSig?.ok) {
+        const reason = trendSig?.reason || 'trend_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: trendSig.projectedBps };
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.trendTargetNetBpsFloor) || 15;
+      const cap = Number(opts.trendTargetNetBpsCap) || 80;
+      const raw = trendSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Math.max(0, Number(opts.trendStopLossBps) || 60);
+    } else if (isPairs) {
+      // Pairs signal can't be replayed by the standard per-symbol backtester
+      // (it needs a partner symbol's bars). Skip every bar with a tagged
+      // reason so the run completes (entries=0, avgNetBps=null) and the
+      // selector treats it as unvalidated. Phase 2 wiring would inject
+      // partner bars in opts.
+      if (!stats.skipped.pairs_backtest_unsupported) stats.skipped.pairs_backtest_unsupported = 0;
+      stats.skipped.pairs_backtest_unsupported += 1;
+      continue;
     } else {
       const window = closes.slice(i - opts.predictBars, i);
       if (window.some((c) => !Number.isFinite(c) || c <= 0)) continue;
@@ -1073,6 +1127,9 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isMicrostructure) {
       activeMaxHoldMin = Number(opts.microMaxHoldMin || opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.microBreakevenTimeoutMin || opts.breakevenTimeoutMin || 180);
+    } else if (isTrendFollowing) {
+      activeMaxHoldMin = Number(opts.trendMaxHoldMin || opts.maxHoldMin || 180);
+      activeBreakevenMin = Number(opts.trendBreakevenTimeoutMin || opts.breakevenTimeoutMin || 90);
     } else {
       activeMaxHoldMin = Number(opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);

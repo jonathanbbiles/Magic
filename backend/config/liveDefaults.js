@@ -500,6 +500,51 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   GATE_REJECTION_AUDIT_MIN_ENTRIES: '10',
   GATE_REJECTION_AUDIT_COSTLY_BPS: '10',
   GATE_REJECTION_AUDIT_JUSTIFIED_BPS: '-10',
+  // Trend-following signal (2026-05-28). Diversification add: the existing
+  // signal pool is all mean-reversion or microstructure-mean-reversion variants,
+  // which all fail in the same regime (sustained directional trends). The
+  // trend-following signal explicitly buys momentum continuations, so it
+  // validates exactly when MR fails. Default-ENABLED for the auto-backtest —
+  // the selector veto (≥0 bps over ≥5 entries) decides whether it actually
+  // trades live. Disable the auto-backtest with TREND_FOLLOWING_ENABLED=false.
+  TREND_FOLLOWING_ENABLED: 'true',
+  TREND_FOLLOWING_LOOKBACK_BARS: '60',
+  TREND_FOLLOWING_VOL_MULTIPLIER: '1.3',
+  TREND_FOLLOWING_MIN_SLOPE_BPS_PER_BAR: '0.5',
+  TREND_FOLLOWING_MAX_STRETCH_ABOVE_SMA_BPS: '60',
+  TREND_FOLLOWING_TARGET_NET_BPS_FLOOR: '15',
+  TREND_FOLLOWING_TARGET_NET_BPS_CAP: '80',
+  TREND_FOLLOWING_STOP_LOSS_BPS: '60',
+  TREND_FOLLOWING_MAX_HOLD_MS: '10800000',         // 3 h
+  TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS: '5400000', // 1.5 h
+  // Pairs / stat-arb signal (2026-05-28). Long-only single-leg form because
+  // Binance.US spot doesn't permit shorting: when symbol X is statistically
+  // cheap (z-score < -threshold) relative to its cointegrated partner Y, buy X.
+  // PAIRS_DEFINITIONS is a comma-separated list of 'primary:partner' pairs.
+  // Primary symbols must appear in ENTRY_SYMBOLS_PRIMARY for the scanner to
+  // visit them; partner symbols are fetched on-demand by the signal getter
+  // and don't need to be in the universe. Default partners: BTC for the alts
+  // most cointegrated with it; ETH for ETC (the closest historical pair).
+  PAIRS_ENABLED: 'true',
+  PAIRS_DEFINITIONS: 'ETH/USD:BTC/USD,LTC/USD:BTC/USD,BCH/USD:BTC/USD,ETC/USD:ETH/USD,SOL/USD:ETH/USD,AVAX/USD:ETH/USD',
+  PAIRS_LOOKBACK_BARS: '120',
+  PAIRS_MIN_R_SQUARED: '0.5',
+  PAIRS_Z_ENTRY_THRESHOLD: '2.0',
+  PAIRS_FRESHNESS_BARS: '5',
+  PAIRS_TARGET_NET_BPS_FLOOR: '12',
+  PAIRS_TARGET_NET_BPS_CAP: '60',
+  PAIRS_STOP_LOSS_BPS: '50',
+  PAIRS_MAX_HOLD_MS: '10800000',         // 3 h
+  PAIRS_BREAKEVEN_TIMEOUT_MS: '5400000', // 1.5 h
+  // Time-of-day entry filter (2026-05-28). Meta-layer applied AFTER signal
+  // evaluation passes: blocks entries that would otherwise fire during
+  // disallowed hours. Default '*' (no-op) — operator opts in by setting a
+  // schedule like 'mon-fri:13-21' (US session UTC hours) or '13,14,15,16,17'
+  // (specific UTC hours every day). When enabled and a candidate hour fails,
+  // the entry is skipped with reason 'time_of_day_blocked' and recorded by
+  // gateRejectionAudit for forward-grading like every other gate.
+  TIME_OF_DAY_FILTER_ENABLED: 'true',
+  TIME_OF_DAY_ALLOWED_HOURS_UTC: '*',
 });
 
 const LIVE_CRITICAL_KEYS = Object.freeze(Object.keys(LIVE_CRITICAL_DEFAULTS));

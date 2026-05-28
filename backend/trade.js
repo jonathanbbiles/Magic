@@ -39,6 +39,16 @@ const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal')
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
+const { evaluateTrendFollowingSignal } = require('./modules/trendFollowingSignal');
+const {
+  evaluatePairsSignal,
+  parsePairDefinitions,
+  buildPartnerIndex,
+} = require('./modules/pairsSignal');
+const {
+  parseAllowedHoursSpec,
+  evaluateTimeOfDayFilter,
+} = require('./modules/timeOfDayFilter');
 const { fetchRecentTrades } = require('./modules/cryptoTrades');
 const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules/microstructureFlowShadow');
 const marketRegimeDetector = require('./modules/marketRegimeDetector');
@@ -286,6 +296,8 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_15m'
       || signalVersion === 'microstructure_30m'
       || signalVersion === 'microstructure_45m') return MICRO_MAX_HOLD_MS;
+  if (signalVersion === 'trend_following') return TREND_FOLLOWING_MAX_HOLD_MS;
+  if (signalVersion === 'pairs') return PAIRS_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
@@ -299,6 +311,8 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_15m'
       || signalVersion === 'microstructure_30m'
       || signalVersion === 'microstructure_45m') return MICRO_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'trend_following') return TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'pairs') return PAIRS_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -462,6 +476,50 @@ const MICRO_TRADES_ENABLED = readBoolean('MICRO_TRADES_ENABLED', false);
 // Default on so validation data accumulates automatically.
 const MICRO_TRADES_SHADOW_ENABLED = readBoolean('MICRO_TRADES_SHADOW_ENABLED', true);
 
+// Trend-following / breakout signal env knobs (2026-05-28). Mirror the
+// module's DEFAULT_CONFIG so an unset env behaves identically to the pure
+// module. The selector validates the candidate via auto-backtest before
+// admitting it live, so the JS-level defaults here are belt-and-suspenders
+// rather than the live source of truth (which is liveDefaults.js).
+const TREND_FOLLOWING_LOOKBACK_BARS = Math.max(10, readNumber('TREND_FOLLOWING_LOOKBACK_BARS', 60));
+const TREND_FOLLOWING_VOL_MULTIPLIER = readNumber('TREND_FOLLOWING_VOL_MULTIPLIER', 1.3);
+const TREND_FOLLOWING_MIN_SLOPE_BPS_PER_BAR = readNumber('TREND_FOLLOWING_MIN_SLOPE_BPS_PER_BAR', 0.5);
+const TREND_FOLLOWING_MAX_STRETCH_ABOVE_SMA_BPS = readNumber('TREND_FOLLOWING_MAX_STRETCH_ABOVE_SMA_BPS', 60);
+const TREND_FOLLOWING_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('TREND_FOLLOWING_TARGET_NET_BPS_FLOOR', 15));
+const TREND_FOLLOWING_TARGET_NET_BPS_CAP = Math.max(
+  TREND_FOLLOWING_TARGET_NET_BPS_FLOOR,
+  readNumber('TREND_FOLLOWING_TARGET_NET_BPS_CAP', 80),
+);
+const TREND_FOLLOWING_STOP_LOSS_BPS = Math.max(1, readNumber('TREND_FOLLOWING_STOP_LOSS_BPS', 60));
+const TREND_FOLLOWING_MAX_HOLD_MS = Math.max(60_000, readNumber('TREND_FOLLOWING_MAX_HOLD_MS', 10_800_000));         // 3 h
+const TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS', 5_400_000)); // 1.5 h
+
+// Pairs / stat-arb signal env knobs.
+const PAIRS_LOOKBACK_BARS = Math.max(30, readNumber('PAIRS_LOOKBACK_BARS', 120));
+const PAIRS_MIN_R_SQUARED = readNumber('PAIRS_MIN_R_SQUARED', 0.5);
+const PAIRS_Z_ENTRY_THRESHOLD = Math.max(0.5, readNumber('PAIRS_Z_ENTRY_THRESHOLD', 2.0));
+const PAIRS_FRESHNESS_BARS = Math.max(1, Math.floor(readNumber('PAIRS_FRESHNESS_BARS', 5)));
+const PAIRS_TARGET_NET_BPS_FLOOR = Math.max(1, readNumber('PAIRS_TARGET_NET_BPS_FLOOR', 12));
+const PAIRS_TARGET_NET_BPS_CAP = Math.max(
+  PAIRS_TARGET_NET_BPS_FLOOR,
+  readNumber('PAIRS_TARGET_NET_BPS_CAP', 60),
+);
+const PAIRS_STOP_LOSS_BPS = Math.max(1, readNumber('PAIRS_STOP_LOSS_BPS', 50));
+const PAIRS_MAX_HOLD_MS = Math.max(60_000, readNumber('PAIRS_MAX_HOLD_MS', 10_800_000));         // 3 h
+const PAIRS_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('PAIRS_BREAKEVEN_TIMEOUT_MS', 5_400_000)); // 1.5 h
+const PAIRS_DEFINITIONS_RAW = String(process.env.PAIRS_DEFINITIONS ?? '');
+const PAIRS_DEFINITIONS_PARSED = parsePairDefinitions(PAIRS_DEFINITIONS_RAW);
+const PAIRS_PARTNER_INDEX = buildPartnerIndex(PAIRS_DEFINITIONS_PARSED);
+
+// Time-of-day filter (default '*' = allow all hours). Parsed once at module
+// load; reparsed if the env is updated requires a restart. When unparseable
+// the schedule fails open (allows everything) so a typo doesn't strand the
+// bot — the operator sees the live decision payload's `timeOfDayFilter`
+// field always reflects 'filter_disabled' in that case.
+const TIME_OF_DAY_FILTER_ENABLED = readBoolean('TIME_OF_DAY_FILTER_ENABLED', true);
+const TIME_OF_DAY_ALLOWED_HOURS_RAW = String(process.env.TIME_OF_DAY_ALLOWED_HOURS_UTC ?? '*');
+const TIME_OF_DAY_SCHEDULE = parseAllowedHoursSpec(TIME_OF_DAY_ALLOWED_HOURS_RAW) || { allowAll: true };
+
 // Stale-quote single-symbol retry fallback (2026-05-20). When prefetched
 // quote ageMs exceeds the stale threshold, retry the symbol with the
 // single-symbol /latest/quotes endpoint. Alpaca's bulk endpoint can be
@@ -606,6 +664,8 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
   else if (signalVersion === 'microstructure_15m') cap = MICRO_STOP_LOSS_BPS_15M;
   else if (signalVersion === 'microstructure_30m') cap = MICRO_STOP_LOSS_BPS_30M;
   else if (signalVersion === 'microstructure_45m') cap = MICRO_STOP_LOSS_BPS_45M;
+  else if (signalVersion === 'trend_following') cap = TREND_FOLLOWING_STOP_LOSS_BPS;
+  else if (signalVersion === 'pairs') cap = PAIRS_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -2188,6 +2248,73 @@ async function getBarrierSignalForPair(pair, quote = null) {
   }
 }
 
+// Trend-following signal wrapper (2026-05-28). Needs ~70 1m bars to clear
+// the requiredBars floor; fetch 80 for the same slack the range-MR wrapper
+// uses. No orderbook or partner symbol dependency, so this is the simplest
+// of the new wrappers.
+async function getTrendFollowingSignalForPair(pair) {
+  try {
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' });
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
+    const sig = evaluateTrendFollowingSignal({
+      pair,
+      bars1m,
+      config: {
+        lookbackBars: TREND_FOLLOWING_LOOKBACK_BARS,
+        volMultiplier: TREND_FOLLOWING_VOL_MULTIPLIER,
+        minSlopeBpsPerBar: TREND_FOLLOWING_MIN_SLOPE_BPS_PER_BAR,
+        maxStretchAboveSmaBps: TREND_FOLLOWING_MAX_STRETCH_ABOVE_SMA_BPS,
+        targetNetBpsFloor: TREND_FOLLOWING_TARGET_NET_BPS_FLOOR,
+        targetNetBpsCap: TREND_FOLLOWING_TARGET_NET_BPS_CAP,
+      },
+    });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
+    return sig;
+  } catch (err) {
+    return { ok: false, reason: 'trend_following_signal_failed', error: err?.message };
+  }
+}
+
+// Pairs signal wrapper (2026-05-28). The cross-symbol dependency is the
+// architectural twist: each scan symbol has a configured partner (or none),
+// and the signal evaluator needs bars for BOTH. We fetch them in parallel
+// and short-circuit if the partner has no mapping configured for this pair.
+async function getPairsSignalForPair(pair) {
+  try {
+    const partnerPair = PAIRS_PARTNER_INDEX.get(pair) || null;
+    if (!partnerPair) {
+      return { ok: false, reason: 'pairs_no_partner_defined' };
+    }
+    const [primaryPayload, partnerPayload] = await Promise.all([
+      fetchCryptoBars({ symbols: [pair], limit: 130, timeframe: '1Min' }),
+      fetchCryptoBars({ symbols: [partnerPair], limit: 130, timeframe: '1Min' }),
+    ]);
+    const bars1m = primaryPayload?.bars?.[pair] || primaryPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const partnerBars1m = partnerPayload?.bars?.[partnerPair]
+      || partnerPayload?.bars?.[toAlpacaSymbol(partnerPair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
+    const sig = evaluatePairsSignal({
+      pair,
+      partnerPair,
+      bars1m,
+      partnerBars1m,
+      config: {
+        lookbackBars: PAIRS_LOOKBACK_BARS,
+        minRSquared: PAIRS_MIN_R_SQUARED,
+        zEntryThreshold: PAIRS_Z_ENTRY_THRESHOLD,
+        freshnessBars: PAIRS_FRESHNESS_BARS,
+        targetNetBpsFloor: PAIRS_TARGET_NET_BPS_FLOOR,
+        targetNetBpsCap: PAIRS_TARGET_NET_BPS_CAP,
+      },
+    });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m, partnerBars1m };
+    return sig;
+  } catch (err) {
+    return { ok: false, reason: 'pairs_signal_failed', error: err?.message };
+  }
+}
+
 // Shadow tracker for the trades-feed validation surface. Even when
 // MICRO_TRADES_ENABLED=false, MICRO_TRADES_SHADOW_ENABLED (default true)
 // causes recent trades to be fetched + flowImbalance observed so the
@@ -3253,6 +3380,10 @@ async function scanAndEnter() {
         sig = await getMicrostructureSignalForPair(pair, quote, 30);
       } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') {
         sig = await getMicrostructureSignalForPair(pair, quote, 45);
+      } else if (ACTIVE_SIGNAL_VERSION === 'trend_following') {
+        sig = await getTrendFollowingSignalForPair(pair);
+      } else if (ACTIVE_SIGNAL_VERSION === 'pairs') {
+        sig = await getPairsSignalForPair(pair);
       } else {
         sig = await getPredictionSignal(pair);
       }
@@ -3302,6 +3433,27 @@ async function scanAndEnter() {
         }
       }
 
+      // Time-of-day filter (2026-05-28). Meta-layer that blocks entries
+      // during disallowed hours-of-week. Default schedule '*' is a no-op
+      // (allowAll=true) so this is a zero-behavior gate until the operator
+      // sets TIME_OF_DAY_ALLOWED_HOURS_UTC to something restrictive. Placed
+      // post-signal so only would-be entries are blocked and forward-graded
+      // by gateRejectionAudit. When the filter is hard-disabled by env
+      // (TIME_OF_DAY_FILTER_ENABLED=false), skipped entirely.
+      if (TIME_OF_DAY_FILTER_ENABLED && !TIME_OF_DAY_SCHEDULE.allowAll) {
+        const todDecision = evaluateTimeOfDayFilter({
+          now: new Date(),
+          schedule: TIME_OF_DAY_SCHEDULE,
+        });
+        if (!todDecision.ok) {
+          rejectTrade(pair, 'time_of_day_blocked', {
+            dayOfWeek: todDecision.dayOfWeek,
+            hourOfDay: todDecision.hourOfDay,
+          });
+          continue;
+        }
+      }
+
       // Recent-high proximity gate. Reject when the bid is within
       // REJECT_NEAR_HIGH_BPS of the highest close in the last
       // REJECT_NEAR_HIGH_LOOKBACK_BARS minutes. Buying at local tops is the
@@ -3323,10 +3475,17 @@ async function scanAndEnter() {
       // backtest-negative and the selector hasn't admitted either. The bypass
       // matters the moment one of them validates and the selector starts
       // routing live entries to it.
+      // 2026-05-28: trend_following also bypassed — by construction it
+      // BUYS confirmed N-bar high breakouts; rejecting "near recent high"
+      // would gate away the signal's entire premise. Pairs stays in the
+      // applies list because its premise is mean-reversion of the relative
+      // spread, not directional breakout — the OLS-style "don't buy the
+      // top" intuition still applies to the absolute price level.
       const recentHighSignalApplies = ![
         'barrier',
         'microstructure_5m', 'microstructure_15m',
         'microstructure_30m', 'microstructure_45m',
+        'trend_following',
       ].includes(ACTIVE_SIGNAL_VERSION);
       const recentHighGateResult = recentHighSignalApplies
         ? evaluateRecentHighGate({

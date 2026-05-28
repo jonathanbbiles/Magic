@@ -1,5 +1,80 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-28 add: three new strategies (trend-following, pairs/stat-arb, time-of-day filter)
+
+Every previous strategy in the bot was a mean-reversion or microstructure-mean-reversion variant. They all fail in the same regime (sustained directional trends), which is exactly the state the 2026-05-28 17:02Z snapshot caught — all 10 backtest slots negative, selector veto on, bot sitting flat. This PR ships three deliberately uncorrelated additions:
+
+### 1. Trend-following / breakout (`SIGNAL_VERSION=trend_following`)
+
+**Module:** `backend/modules/trendFollowingSignal.js`. Buys confirmed N-bar high breakouts with volume + slope + pullback confirmation. The thesis: when current close > prior 60-bar high AND volume is ≥ 1.3× the lookback baseline AND OLS slope over 30 bars > 0.5 bps/bar AND price isn't > 60 bps above the SMA-30, the breakout has statistical continuation bias.
+
+Five gates (all must pass): new N-bar high, volume confirmation, slope confirmation, pullback / chase guard, stop-room sanity. Defaults sized for ~30 bps net TP on a 3 h max-hold / 1.5 h breakeven-decay horizon. Stop-loss cap 60 bps.
+
+**Why it helps:** validates in exactly the regimes where MR fails (sustained directional moves). The `near_recent_high` gate is bypassed for this signal because the entire premise IS buying at fresh highs.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `TREND_FOLLOWING_ENABLED` | `true` | Master kill — disables the auto-backtest slot. |
+| `TREND_FOLLOWING_LOOKBACK_BARS` | `60` | N-bar high lookback. |
+| `TREND_FOLLOWING_VOL_MULTIPLIER` | `1.3` | Volume confirmation threshold. |
+| `TREND_FOLLOWING_MIN_SLOPE_BPS_PER_BAR` | `0.5` | OLS slope over slopeLookback. |
+| `TREND_FOLLOWING_MAX_STRETCH_ABOVE_SMA_BPS` | `60` | Pullback / chase guard. |
+| `TREND_FOLLOWING_TARGET_NET_BPS_FLOOR` | `15` | TP floor. |
+| `TREND_FOLLOWING_TARGET_NET_BPS_CAP` | `80` | TP cap. |
+| `TREND_FOLLOWING_STOP_LOSS_BPS` | `60` | Stop-loss cap (vol-scaled at fill time). |
+| `TREND_FOLLOWING_MAX_HOLD_MS` | `10800000` (3 h) | Hard market exit. |
+| `TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS` | `5400000` (1.5 h) | Staircase decay window. |
+
+### 2. Pairs / stat-arb (`SIGNAL_VERSION=pairs`)
+
+**Module:** `backend/modules/pairsSignal.js`. Binance.US spot doesn't permit shorting, so this is the single-leg degenerate form: when symbol X is statistically cheap on a rolling z-score basis relative to its cointegrated partner Y, buy X. The exit is the same staircase the rest of the bot uses — when the spread mean-reverts, X catches up to Y, and the GTC sell fills.
+
+For each scan symbol, the signal:
+1. Fetches partner bars (default partners are mostly BTC for the alt majors, ETH for ETC/SOL/AVAX).
+2. Runs rolling OLS log(X) ~ log(Y) over the lookback window.
+3. Refuses if R² < `PAIRS_MIN_R_SQUARED` (the pair isn't actually cointegrated this window) or β ≤ 0.
+4. Computes the rolling spread z-score. When current z < −`PAIRS_Z_ENTRY_THRESHOLD` AND that threshold was crossed within the last `PAIRS_FRESHNESS_BARS` bars, fires.
+
+**Important limitation:** the single-symbol backtester (`scripts/backtest_strategy.js`) can't replay this signal — it needs partner bars per primary symbol, which the existing pipeline doesn't provide. The pairs auto-backtest runs but produces empty stats (all entries skipped with `pairs_backtest_unsupported`), so the selector treats it as unvalidated and never admits it automatically. **To trade pairs live**, an operator must pin `SIGNAL_VERSION=pairs` + `SIGNAL_SELECTOR_VETO_ENABLED=false` in Render env. Phase 2 wiring would inject partner bars into the backtester.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `PAIRS_ENABLED` | `true` | Master kill. When false, the slot's auto-backtest doesn't run. |
+| `PAIRS_DEFINITIONS` | `ETH/USD:BTC/USD,LTC/USD:BTC/USD,BCH/USD:BTC/USD,ETC/USD:ETH/USD,SOL/USD:ETH/USD,AVAX/USD:ETH/USD` | Comma-separated `primary:partner` pairs. Primary symbols must appear in `ENTRY_SYMBOLS_PRIMARY` for the scanner to visit them; partners are fetched on-demand and don't need to be in the universe. |
+| `PAIRS_LOOKBACK_BARS` | `120` | Rolling regression window. |
+| `PAIRS_MIN_R_SQUARED` | `0.5` | Cointegration quality floor. |
+| `PAIRS_Z_ENTRY_THRESHOLD` | `2.0` | z-score below `-threshold` fires the signal. |
+| `PAIRS_FRESHNESS_BARS` | `5` | Threshold must have been crossed within last N bars — guards against structural breaks. |
+| `PAIRS_TARGET_NET_BPS_FLOOR` | `12` | TP floor. |
+| `PAIRS_TARGET_NET_BPS_CAP` | `60` | TP cap. |
+| `PAIRS_STOP_LOSS_BPS` | `50` | Stop-loss cap. |
+| `PAIRS_MAX_HOLD_MS` | `10800000` (3 h) | Hard market exit. |
+| `PAIRS_BREAKEVEN_TIMEOUT_MS` | `5400000` (1.5 h) | Staircase decay window. |
+
+### 3. Time-of-day filter (meta-layer over all signals)
+
+**Module:** `backend/modules/timeOfDayFilter.js`. Wraps every signal as a post-evaluation gate: when the operator has set a schedule, entries that would otherwise fire during disallowed hours-of-week are skipped with reason `time_of_day_blocked` (captured by `gateRejectionAudit` for forward-grading).
+
+Schedule formats:
+- `*` (default) — allow all hours (filter is a no-op).
+- `13,14,15,16,17` — allow specific UTC hours, every day.
+- `13-21` — allow a UTC hour range, every day.
+- `mon-fri:13-21` — allow Mon-Fri only, 13:00-21:00 UTC. Days are `sun/mon/tue/wed/thu/fri/sat`.
+- `mon-fri:8-11,13-17` — multi-range form.
+
+Unparseable schedules fail open (allow all), so a typo doesn't strand the bot — the dashboard's decision payload reports the parsed schedule so the operator can verify.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `TIME_OF_DAY_FILTER_ENABLED` | `true` | Master kill — when `false`, the gate is bypassed entirely regardless of schedule. |
+| `TIME_OF_DAY_ALLOWED_HOURS_UTC` | `*` | Schedule (see formats above). Default `*` is a no-op so behavior is unchanged until an operator sets a real schedule. |
+
+### Why these three together
+
+The existing strategy book is highly correlated — every signal is some form of "buy a dip." When markets trend, every signal fails. When markets range, several validate. Adding trend-following gives the selector a candidate whose expectancy lights up in trending regimes (exactly when the others go dark). Adding pairs gives a market-neutral relative-value bet (uncorrelated with directional MR or trend-following). Adding the time-of-day filter gives the operator a meta-layer to express "only trade during the hours we have edge" — a knob that improves every signal's expectancy if there's real intraday seasonality, at zero implementation risk (default-pass).
+
+All three follow the same shipping pattern: default-enabled auto-backtest, but live exposure is gated by the SignalSelector (≥0 bps over ≥5 backtest entries). The realized-expectancy circuit breaker catches anything that backtests positive but live-trades negative. The time-of-day filter ships truly dark — default `*` means no entries are blocked until the operator chooses a schedule.
+
 ## 2026-05-28 retune: defaults optimised for daily compounding (+0.025%/day target)
 
 Six default knobs were retuned to support a "+0.025% daily increase" objective. The compounding rate is bottlenecked on **trades-per-day**, not bps-per-trade — at the current per-trade TP magnitudes (5–50 bps net at 10% sizing), one clean win already clears the daily target several times over, so frequency is the lever. None of the changes alters the safety architecture: the SignalSelector veto, the realized circuit breaker, vol-scaled stops, spread caps, and the staircase break-even floor all still apply.
