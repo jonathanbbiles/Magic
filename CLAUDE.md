@@ -100,6 +100,37 @@ No stubs; no "available but unimplemented" entries.
 
 Defaults live in both `liveDefaults.js` (locked by `liveDefaults.test.js`) and the `readNumber/readBoolean` fallbacks in `trade.js`. Surfaced at `meta.signalSelector.realizedVeto` (`{ veto, reason, signalVersion, realizedAvgNetBps, sampleSize, floorBps, minTrades, lookbackTrades, evaluatedAt }`). **Hard Rule #4 compliance:** all four vars are read in `trade.js` and the veto is wired into the live entry path; `meta.signalSelector.realizedVeto` is the active diagnostic consumer. **When extending:** keep `evaluateRealizedVeto` pure and reuse `driftAlerter.selectRealizedTrades` — the realized veto and the drift alert MUST agree on which trades count, or the dashboard and the gate will tell different stories.
 
+## Adverse-selection-aware backtest fill model (2026-05-27)
+
+**Why this exists.** The realized-expectancy circuit breaker above is the *live* feedback loop. This is the *predictor*: it fixes the upstream bias in the backtest that the circuit breaker was reacting to. The pre-2026-05-27 fill model in `scripts/backtest_strategy.js` was structurally wrong for a passive-maker bot:
+
+- **Old fill threshold:** `low ≤ candidateClose` (≈ mid). Any tap of mid counted as a fill, but real passive rests sit at `bid + tick` (below mid by the half-spread), so this systematically over-filled.
+- **Old fill price:** `candidateClose × (1 + halfSpread/10000)` — *added* half-spread to the entry price, over-charging by ~halfSpread bps per trade. Real makers don't pay the half-spread.
+- **Old forward tracking start:** `entryIdx + 1` regardless of when the fill actually happened, understating real hold time.
+
+Combined effect: the backtest counts trades that never would have filled, prices the ones that would at the wrong (worse) level, and pretends the post-fill path is an independent draw from the signal's forecast — when in reality the fill subset is conditioned on the market having moved *down* to the rest (adverse selection). That's the bias that produced `microstructure_30m`'s **+7.8 bps backtest while live realized −31 bps**.
+
+**The fix** (defaulted ON, gated by `BACKTEST_ADVERSE_SELECTION_FILL`):
+
+- Rest sits at `candidateClose × (1 − adverseRestOffsetBps/10000)` — `~bid + tick`.
+- Fill criterion: a subsequent bar's `low ≤ rest`.
+- Entry price = the rest (maker fill — no half-spread added).
+- Forward TP/stop/maxhold loop starts at `fillBarIdx + 1` (the bar that actually filled).
+
+**The `adverseRestOffsetBps` resolver is independent of `entrySpreadCostBps`** (which has been zeroed in live to disable the legacy spread-on-entry charge). It falls back to the tier-aware `entrySpreadCostBpsTier1/2/3` defaults (8/18/35 bps below mid) when unset. Without that independence, the live `entrySpreadCostBps=0` setting would silently disable the adverse model.
+
+**Plumbing:**
+1. `scripts/backtest_strategy.js`: `DEFAULTS.adverseSelectionFill = true`, new `resolveAdverseRestOffsetBps(symbol, opts)`, branched fill logic in `replaySymbol`, branched `trackingStartIdx`.
+2. `modules/backtestEnvFallbacks.js`: `adverseSelectionFill` added to `ENV_BOOLEAN_FALLBACKS` so the dashboard auto-backtest reads the env value (same priority chain as `enforceProjectedCoversGross`).
+3. `index.js runBacktestAndStore`: destructure + spread `adverseSelectionFillResolved` into every `runBacktest` call.
+4. `liveDefaults.js`: `BACKTEST_ADVERSE_SELECTION_FILL='true'` (locked by `liveDefaults.test.js`).
+
+**Operator workflow to A/B vs the legacy model:** `BACKTEST_ADVERSE_SELECTION_FILL=false` in Render env restores legacy behaviour on next restart. Diff the resulting `meta.backtest*.overall.avgNetBpsPerEntry` against the default-ON snapshot — the adverse model is expected to drop most signals' apparent expectancy by 20–60 bps, which is the size of the structural bias the bot was previously trading on.
+
+**Hard Rule #4 compliance:** the env var is read by the resolver, flows into `runBacktest`, and changes the live engine's selector inputs via the auto-backtest. No dead knob.
+
+**When extending the fill model:** keep the *legacy branch* working. The two paths share `restPrice`, `fillThreshold`, and `entryPrice` derivations, and tests rely on `adverseSelectionFill: false` to pin the old behaviour. New tests must explicitly set `adverseRestOffsetBps` to control the rest distance (tests pass bare opts directly to `replaySymbol`, so `DEFAULTS` are not merged — undefined tier values resolve to a 0-bps offset, which degenerates the adverse model to "rest at mid" by accident; explicit values avoid that pitfall).
+
 ## Live posture is now the code default (2026-05-16, extended 2026-05-17)
 
 The settings that used to be "recommended Render env overrides" are now the code defaults — verified by `backend/config/liveDefaults.test.js` so they can't drift silently:

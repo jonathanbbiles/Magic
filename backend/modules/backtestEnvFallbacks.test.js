@@ -263,4 +263,24 @@ const { resolveLiveEngineFallbacks, resolveBacktestFeeBps } = require('./backtes
   assert.equal(resolveBacktestFeeBps({}, { EXECUTION_VENUE: 'binance_us', FEE_BPS_ROUND_TRIP: '' }), 2, 'empty env falls through to venue default');
 }
 
+// 24. adverseSelectionFill — boolean env→opt mapping (2026-05-27).
+{
+  const off = resolveLiveEngineFallbacks({}, { BACKTEST_ADVERSE_SELECTION_FILL: 'false' });
+  assert.equal(off.adverseSelectionFill, false, 'env false → opt false');
+  const on = resolveLiveEngineFallbacks({}, { BACKTEST_ADVERSE_SELECTION_FILL: 'true' });
+  assert.equal(on.adverseSelectionFill, true, 'env true → opt true');
+  const unset = resolveLiveEngineFallbacks({}, {});
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(unset, 'adverseSelectionFill'),
+    false,
+    'unset env → key absent so backtester default applies',
+  );
+  // Explicit override wins over env.
+  const override = resolveLiveEngineFallbacks(
+    { adverseSelectionFill: false },
+    { BACKTEST_ADVERSE_SELECTION_FILL: 'true' },
+  );
+  assert.equal(override.adverseSelectionFill, false, 'explicit override wins over env');
+}
+
 console.log('backtestEnvFallbacks.test ok');

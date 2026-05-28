@@ -627,6 +627,112 @@ const { olsSlope, deriveTargetNetBps, replaySymbol, summarise, runBacktest } = r
     global.fetch = origFetch;
     if (origKey === undefined) delete process.env.APCA_API_KEY_ID; else process.env.APCA_API_KEY_ID = origKey;
     if (origSecret === undefined) delete process.env.APCA_API_SECRET_KEY; else process.env.APCA_API_SECRET_KEY = origSecret;
+    // ---- Adverse-selection-aware passive fill model (2026-05-27) ----
+    //
+    // The new fill model rests at `candidateClose * (1 - adverseRestOffsetBps/
+    // 10000)` (~bid+tick), requires a subsequent bar's low to trade DOWN to
+    // that rest, and prices the entry at the rest (maker — no half-spread on
+    // entry). The legacy model used mid as both rest and threshold and added
+    // halfSpread to the fill price. These tests pin both paths.
+
+    // ADV1. Uptrend with intra-bar dips deep enough that the NEXT bar's low
+    // (which has already moved up by the per-bar drift) still reaches the
+    // prior bar's rest → adverse model fills. With 8-bps rest, +5-bps/bar
+    // drift, and 20-bps intra-bar dip, next bar's low ≈ −15 bps below the
+    // candidate close, well past the 8-bps rest.
+    {
+      const opts = {
+        predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+        targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 2,
+        breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+        adverseSelectionFill: true, adverseRestOffsetBps: 8,
+        entryFillTimeoutMin: 5,
+      };
+      const bars = [];
+      let p = 100;
+      for (let i = 0; i < 60; i += 1) {
+        p *= 1 + 5 / 10000;
+        bars.push({
+          t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+          o: p, h: p * 1.0015, l: p * (1 - 20 / 10000), c: p, v: 1000,
+        });
+      }
+      const trades = replaySymbol(bars, opts);
+      const filled = trades.filter((t) => t.outcome !== 'stuck');
+      assert.ok(filled.length > 0, 'ADV1: adverse model should fill when lows reach the rest');
+      // Entry must be priced at the rest (BELOW candidateClose by exactly
+      // adverseRestOffsetBps), not above with half-spread added.
+      for (const t of filled) {
+        const candidateClose = Number(bars[t.entryIdx].c);
+        const expectedRest = candidateClose * (1 - 8 / 10000);
+        assert.ok(
+          Math.abs(t.entryPrice - expectedRest) < 1e-6,
+          `ADV1: entryPrice must equal the rest (mid - offset), got ${t.entryPrice} expected ${expectedRest}`,
+        );
+      }
+    }
+
+    // ADV2. Uptrend whose intra-bar lows DO NOT reach the rest → unfilled.
+    {
+      const opts = {
+        predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+        targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 2,
+        breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+        adverseSelectionFill: true, adverseRestOffsetBps: 35,
+        entryFillTimeoutMin: 1,
+      };
+      const bars = [];
+      let p = 100;
+      // Lows dip only 5 bps below close, but the rest is 35 bps below → no fills.
+      for (let i = 0; i < 60; i += 1) {
+        p *= 1 + 5 / 10000;
+        bars.push({
+          t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+          o: p, h: p * 1.0015, l: p * (1 - 5 / 10000), c: p, v: 1000,
+        });
+      }
+      const trades = replaySymbol(bars, opts);
+      const filled = trades.filter((t) => t.outcome !== 'stuck');
+      assert.equal(
+        filled.length, 0,
+        'ADV2: when bar lows never reach the rest, the adverse model must produce zero fills',
+      );
+      assert.ok(
+        (trades.gateSkipped.entry_unfilled || 0) > 0,
+        'ADV2: unfilled entries should be counted as entry_unfilled',
+      );
+    }
+
+    // ADV3. Legacy model (adverseSelectionFill: false) reproduces the old
+    // mid-as-rest behaviour: same uptrend that ADV2 leaves unfilled DOES
+    // produce fills under the legacy model (low ≤ candidateClose is trivial
+    // in a steady uptrend whose next-bar low equals or sits just below the
+    // prior close).
+    {
+      const opts = {
+        predictBars: 10, minProjectedBps: 5, signalTargetFraction: 0.5,
+        targetNetBps: 8, signalTargetMaxNetBps: 50, feeBpsRoundTrip: 2,
+        breakevenTimeoutMin: 240, cooldownAfterEntryBars: 20,
+        adverseSelectionFill: false, entrySpreadCostBps: 0,
+        entryFillTimeoutMin: 1,
+      };
+      const bars = [];
+      let p = 100;
+      for (let i = 0; i < 60; i += 1) {
+        p *= 1 + 5 / 10000;
+        bars.push({
+          t: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(),
+          o: p, h: p * 1.0015, l: p * (1 - 5 / 10000), c: p, v: 1000,
+        });
+      }
+      const trades = replaySymbol(bars, opts);
+      const filled = trades.filter((t) => t.outcome !== 'stuck');
+      assert.ok(
+        filled.length > 0,
+        'ADV3: legacy mid-as-rest model must still fill on a steady uptrend',
+      );
+    }
+
     console.log('backtest_strategy tests passed');
   })().catch((err) => {
     global.fetch = origFetch;
