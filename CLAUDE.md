@@ -119,6 +119,22 @@ Defaults live in both `liveDefaults.js` (locked by `liveDefaults.test.js`) and t
 
 **Hard Rule #4 compliance:** all four vars are read in `trade.js`, flow into the live entry path, and `meta.signalSelector.explorationBudget` is the active diagnostic consumer. The rolling window (24h) is pinned in the module `DEFAULTS`, not env-overridable. **When extending:** keep `evaluate` pure (it takes `timestamps` + `openPositionCount`, never reads internal state); never widen the bound without an explicit operator decision — the whole point is that worst-case exposure is small and known. Do NOT make exploration bypass the realized veto.
 
+## Chronic-wide-spread auto-suppress (2026-05-29)
+
+**The problem.** On Binance.US a large slice of the dynamic universe (SAND, GALA, CRV, ETC, ICP, OP, AAVE, GRT, FET, RENDER, ATOM, TRX, UNI, DOT, …) has structurally illiquid books — live logs show 60–965 bps spreads against a 45–60 bps cap — so they fail `spread_too_wide` on EVERY scan, forever: a wasted quote fetch per symbol per cycle and a flooded log, with zero chance of a trade.
+
+**The fix.** `backend/modules/spreadSuppression.js` — `createSpreadSuppressionTracker()`, a global FIFO of recent `(symbol, wide?)` spread observations modeled exactly on `staleQuoteRetryStats`'s auto-suppressor. `shouldSuppress(symbol, { minObservations, maxAcceptableRate })` is pure. In `trade.js scanAndEnter`, the per-symbol loop checks it right after the concurrent-cap check and BEFORE the quote fetch; when suppressed it `rejectTrade(pair, 'suppressed_chronic_wide_spread')` and continues. The spread gate records every observation (`wide` = spread over cap). Self-healing: a suppressed symbol stops being recorded, so its entries age out of the FIFO as other symbols push them out → it drops below `minObservations` → re-probed; a book that tightened gets re-admitted, one still wide gets re-suppressed.
+
+**Safe by construction.** Suppression only skips a symbol the spread gate is ALREADY rejecting, so it can never create or change a trade — it only removes dead weight. Liquid majors pass the gate (recorded not-wide) and are never suppressed.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SPREAD_SUPPRESS_ENABLED` | `true` | Master kill → scan + reject every wide symbol each cycle (prior behavior). |
+| `SPREAD_SUPPRESS_MIN_OBSERVATIONS` | `20` | Window observations before a symbol can be suppressed. |
+| `SPREAD_SUPPRESS_MAX_PASS_RATE` | `0.05` | Suppress when spread-gate pass-rate ≤ this over the window. |
+
+**Hard Rule #4 compliance:** all three vars are read in `trade.js`, gate the live skip, and `meta.spreadSuppression` is the diagnostic consumer. **When extending:** keep `shouldSuppress` pure; the window is a single global FIFO (not per-symbol) so cross-symbol activity drives the self-healing re-probe — don't switch to per-symbol windows or that property is lost.
+
 ## Entry-mode A/B diagnostic (2026-05-29)
 
 **The question it answers.** Post-Binance.US cutover the round-trip fee is ~0, yet every signal still backtests net-negative (live 2026-05-29: ols −15.7, meanRev −10.3, micro5m −4.2 net; `gross = net + 2`). So it is NOT a fee problem. The dominant remaining cost is **adverse selection from the passive `bid_plus_tick` entry**: a passive rest only fills when the market trades DOWN into it, so fills are negatively selected. That passive entry was adopted on Alpaca (2026-05-16) to dodge a 30 bps fee + wide spreads — a rationale that's gone at Binance's 0% maker + tight USDT books. This diagnostic measures whether dropping the passive entry would flip the near-breakeven signals positive, BEFORE any live change.

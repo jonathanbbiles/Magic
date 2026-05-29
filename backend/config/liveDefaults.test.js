@@ -263,4 +263,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_NOTIONAL_USD, '10');
 // removal/disable is caught at CI.
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_MODE_AB_ENABLED, 'true');
 
+// 2026-05-29 chronic-wide-spread auto-suppress. Default-ON; only skips symbols
+// the spread gate already rejects (safe). Locked so a disable or a loosened
+// pass-rate floor is caught at CI.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_MIN_OBSERVATIONS, '20');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_MAX_PASS_RATE, '0.05');
+
 console.log('live defaults tests passed');

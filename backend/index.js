@@ -188,6 +188,7 @@ const {
   getSignalSelectorDecision,
   getRealizedVetoState,
   getExplorationBudgetState,
+  getSpreadSuppressionState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
@@ -1790,6 +1791,17 @@ app.get('/dashboard', async (req, res) => {
         explorationBudget: (() => {
           try {
             return typeof getExplorationBudgetState === 'function' ? getExplorationBudgetState() : null;
+          } catch (_) {
+            return null;
+          }
+        })(),
+        // Chronic-wide-spread auto-suppress (2026-05-29). Symbols whose books
+        // are structurally illiquid on the active venue fail the spread gate
+        // every scan; once chronic they're skipped before the quote fetch and
+        // re-probed as the FIFO ages out. suppressedSymbols is the live list.
+        spreadSuppression: (() => {
+          try {
+            return typeof getSpreadSuppressionState === 'function' ? getSpreadSuppressionState() : null;
           } catch (_) {
             return null;
           }

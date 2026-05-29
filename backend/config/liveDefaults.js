@@ -260,6 +260,20 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // the operator reads the delta and decides whether to flip
   // ENTRY_LIMIT_PRICE_MODE=mid. Set 'false' to skip the ~8 extra boot backtests.
   ENTRY_MODE_AB_ENABLED: 'true',
+  // Chronic-wide-spread auto-suppress (2026-05-29). On Binance.US a large slice
+  // of the dynamic universe (SAND, GALA, CRV, ETC, ICP, OP, AAVE, GRT, FET,
+  // RENDER, ATOM, TRX, UNI, DOT, …) has structurally illiquid books — 60-965 bps
+  // spreads vs a 45-60 bps cap — so they fail `spread_too_wide` on EVERY scan,
+  // burning a quote fetch each time and flooding the logs. Once a symbol's
+  // pass-rate over the rolling window stays at/below SPREAD_SUPPRESS_MAX_PASS_RATE
+  // across ≥ SPREAD_SUPPRESS_MIN_OBSERVATIONS, it's skipped before the fetch and
+  // re-probed as the FIFO ages out (self-healing). SAFE: only skips symbols the
+  // spread gate already rejects — never affects a trade. Liquid majors pass the
+  // gate and are never suppressed. Surfaced at meta.spreadSuppression. Set
+  // SPREAD_SUPPRESS_ENABLED=false to scan + reject every wide symbol each cycle.
+  SPREAD_SUPPRESS_ENABLED: 'true',
+  SPREAD_SUPPRESS_MIN_OBSERVATIONS: '20',
+  SPREAD_SUPPRESS_MAX_PASS_RATE: '0.05',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND
