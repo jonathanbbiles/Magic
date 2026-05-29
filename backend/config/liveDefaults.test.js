@@ -258,4 +258,9 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_MAX_ENTRIES_PER_DAY, '3');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_MAX_CONCURRENT, '2');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_NOTIONAL_USD, '10');
 
+// 2026-05-29 entry-mode A/B diagnostic. Observational; default-ON so the
+// dashboard always shows the passive-vs-mid fill comparison. Locked so a
+// removal/disable is caught at CI.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_MODE_AB_ENABLED, 'true');
+
 console.log('live defaults tests passed');
