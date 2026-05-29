@@ -186,6 +186,7 @@ const {
   getActiveSignalVersion,
   getSignalSelectorDecision,
   getRealizedVetoState,
+  getExplorationBudgetState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
@@ -1760,6 +1761,19 @@ app.get('/dashboard', async (req, res) => {
               }
             })(),
           };
+        })(),
+        // Exploration budget (2026-05-29). The metered "middle ground" that
+        // lets a strictly-capped trickle of tiny-notional entries through when
+        // the backtest veto above would otherwise halt all trading — so the
+        // bot is neither frozen at zero trades nor force-trading a no-edge
+        // signal. Shows enabled state, rolling daily-budget usage, and the
+        // bounded worst-case exposure (maxConcurrent × notionalUsd).
+        explorationBudget: (() => {
+          try {
+            return typeof getExplorationBudgetState === 'function' ? getExplorationBudgetState() : null;
+          } catch (_) {
+            return null;
+          }
         })(),
         // Live-vs-predicted drift alerter. Observational-only — surfaces
         // when realised expectancy diverges from the most recent backtest
