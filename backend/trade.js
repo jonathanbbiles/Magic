@@ -54,6 +54,7 @@ const { createShadowTracker: createMicroFlowShadowTracker } = require('./modules
 const marketRegimeDetector = require('./modules/marketRegimeDetector');
 const regimeVetoEvaluator = require('./modules/regimeVetoEvaluator');
 const staleQuoteRetryStatsModule = require('./modules/staleQuoteRetryStats');
+const { createSpreadSuppressionTracker } = require('./modules/spreadSuppression');
 const { createRetryTracker: createStaleQuoteRetryTracker } = staleQuoteRetryStatsModule;
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
@@ -1061,6 +1062,23 @@ function getExplorationBudgetState() {
     return null;
   }
 }
+// Chronic-wide-spread suppressor state for the dashboard meta surface: which
+// symbols are currently being skipped before the quote fetch, and the rolling
+// per-symbol pass-rate that drove it.
+function getSpreadSuppressionState() {
+  try {
+    if (!SPREAD_SUPPRESS_ENABLED) return { enabled: false };
+    return {
+      enabled: true,
+      ...spreadSuppressionTracker.summary({
+        minObservations: SPREAD_SUPPRESS_MIN_OBSERVATIONS,
+        maxAcceptableRate: SPREAD_SUPPRESS_MAX_PASS_RATE,
+      }),
+    };
+  } catch (_) {
+    return null;
+  }
+}
 // Legacy export-shape compatibility: code paths that read SIGNAL_VERSION as
 // a constant continue to work, but they always see the live decision.
 // Note: this is now a getter, not a static value.
@@ -1258,6 +1276,16 @@ const ALPACA_REQ_MAX_RETRIES = Math.max(0, readNumber('ALPACA_REQ_MAX_RETRIES', 
 const ALPACA_REQ_BASE_BACKOFF_MS = Math.max(50, readNumber('ALPACA_REQ_BASE_BACKOFF_MS', 300));
 const ORDER_SUBMIT_CONCURRENCY = Math.min(2, Math.max(1, readNumber('ORDER_SUBMIT_CONCURRENCY', 1)));
 const SPREAD_TOLERANCE_BPS = Math.max(0, readNumber('SPREAD_TOLERANCE_BPS', 2));
+// Chronic-wide-spread auto-suppress (2026-05-29). Skips per-symbol scan work
+// for symbols that fail the spread gate on essentially every scan (structurally
+// illiquid books on the active venue). Self-healing via a rolling FIFO window.
+// SAFE: only skips symbols the spread gate already rejects — never affects a
+// trade. Surfaced at meta.spreadSuppression. Disable with
+// SPREAD_SUPPRESS_ENABLED=false to scan (and reject) every wide symbol each cycle.
+const SPREAD_SUPPRESS_ENABLED = readBoolean('SPREAD_SUPPRESS_ENABLED', true);
+const SPREAD_SUPPRESS_MIN_OBSERVATIONS = Math.max(1, readNumber('SPREAD_SUPPRESS_MIN_OBSERVATIONS', 20));
+const SPREAD_SUPPRESS_MAX_PASS_RATE = Math.max(0, readNumber('SPREAD_SUPPRESS_MAX_PASS_RATE', 0.05));
+const spreadSuppressionTracker = createSpreadSuppressionTracker();
 const BARS_FETCH_RETRIES = Math.max(0, readNumber('BARS_FETCH_RETRIES', 2));
 const BARS_CACHE_TTL_MS = Math.max(5000, readNumber('BARS_CACHE_TTL_MS', 45000));
 let lastHttpError = null;
@@ -3289,6 +3317,20 @@ async function scanAndEnter() {
       rejectTrade(pair, 'concurrent_position_cap', { heldCount, placed, cap: MAX_CONCURRENT_POSITIONS_SOFT_CAP });
       continue;
     }
+    // Chronic-wide-spread auto-suppress (2026-05-29). Symbols whose books are
+    // structurally illiquid on the active venue (e.g. many Binance.US alt
+    // pairs at 60-965 bps spreads) fail the spread gate on EVERY scan, burning
+    // a quote fetch each time. Once a symbol's pass-rate in the rolling window
+    // is chronically at/below the floor, skip it here — before the fetch —
+    // until the FIFO ages it out and it gets re-probed. SAFE: it only skips a
+    // symbol the spread gate is already rejecting, so it cannot change a trade.
+    if (SPREAD_SUPPRESS_ENABLED && spreadSuppressionTracker.shouldSuppress(pair, {
+      minObservations: SPREAD_SUPPRESS_MIN_OBSERVATIONS,
+      maxAcceptableRate: SPREAD_SUPPRESS_MAX_PASS_RATE,
+    })) {
+      rejectTrade(pair, 'suppressed_chronic_wide_spread');
+      continue;
+    }
     try {
       let payload;
       const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
@@ -3405,7 +3447,9 @@ async function scanAndEnter() {
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
       const spreadCapBps = resolveSpreadCapBps(pair) + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
       const spreadToleranceBps = SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS;
-      if (spreadBps > (spreadCapBps + spreadToleranceBps)) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }
+      const spreadIsWide = spreadBps > (spreadCapBps + spreadToleranceBps);
+      if (SPREAD_SUPPRESS_ENABLED) spreadSuppressionTracker.record({ symbol: pair, wide: spreadIsWide });
+      if (spreadIsWide) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
@@ -4941,6 +4985,7 @@ module.exports = {
   getSignalSelectorDecision,
   getRealizedVetoState,
   getExplorationBudgetState,
+  getSpreadSuppressionState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
