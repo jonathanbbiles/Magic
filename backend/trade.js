@@ -64,6 +64,7 @@ const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
 const crossVenueGate = require('./modules/crossVenueGate');
 const staleQuoteRescue = require('./modules/staleQuoteRescue');
+const explorationBudget = require('./modules/explorationBudget');
 // Binance.US execution adapter (2026-05-21). Dormant when EXECUTION_VENUE='alpaca'
 // (the code default). When operator flips EXECUTION_VENUE='binance_us' in Render
 // env, the venue dispatcher routes order primitives through binanceExecution
@@ -1000,6 +1001,27 @@ const SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES = Math.max(
   readNumber('SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES', 50),
 );
 
+// Exploration budget (2026-05-29). The middle ground between the backtest
+// veto's two failure modes (veto-all → never trades; veto-off → bleeds). When
+// the BACKTEST veto would halt all entries, allow a strictly-capped trickle of
+// tiny-notional entries — only on candidates the active signal still likes —
+// so the bot keeps a metered toe in the water and accumulates the labeled
+// trade data needed to ever lift the veto. Bounded by construction: total
+// exploration exposure ≤ maxConcurrent × notionalUsd, independent of runtime.
+// Does NOT bypass the realized-expectancy circuit breaker (that veto runs
+// after this decision in scanAndEnter — a signal proven to bleed live still
+// halts). See modules/explorationBudget.js for the full rationale.
+const EXPLORATION_ENTRIES_ENABLED = readBoolean('EXPLORATION_ENTRIES_ENABLED', false);
+const EXPLORATION_MAX_ENTRIES_PER_DAY = Math.max(0, readNumber('EXPLORATION_MAX_ENTRIES_PER_DAY', 3));
+const EXPLORATION_MAX_CONCURRENT = Math.max(0, readNumber('EXPLORATION_MAX_CONCURRENT', 2));
+const EXPLORATION_NOTIONAL_USD = Math.max(0, readNumber('EXPLORATION_NOTIONAL_USD', 10));
+const EXPLORATION_CONFIG = Object.freeze({
+  enabled: EXPLORATION_ENTRIES_ENABLED,
+  maxEntriesPerDay: EXPLORATION_MAX_ENTRIES_PER_DAY,
+  maxConcurrent: EXPLORATION_MAX_CONCURRENT,
+  notionalUsd: EXPLORATION_NOTIONAL_USD,
+});
+
 const signalSelector = require('./modules/signalSelector');
 // Bootstrap: when the operator has overridden the signal AND disabled the
 // veto, allow trading from the moment the engine starts (without waiting
@@ -1028,6 +1050,16 @@ function getSignalSelectorDecision() {
 let lastRealizedVetoState = null;
 function getRealizedVetoState() {
   return lastRealizedVetoState;
+}
+// Exploration-budget state for the dashboard meta surface. Shows whether the
+// metered "middle ground" path is enabled, how much of the rolling daily
+// budget is used, and the bounded worst-case exposure.
+function getExplorationBudgetState() {
+  try {
+    return explorationBudget.getState({ config: EXPLORATION_CONFIG });
+  } catch (_) {
+    return null;
+  }
 }
 // Legacy export-shape compatibility: code paths that read SIGNAL_VERSION as
 // a constant continue to work, but they always see the live decision.
@@ -2963,20 +2995,38 @@ async function scanAndEnter() {
   // failure mode the live -65 bps OLS backtest exposed. Operator can opt
   // out via SIGNAL_SELECTOR_VETO_ENABLED=false (legacy "trade anyway").
   const selectorDecision = getSignalSelectorDecision();
+  // Exploration mode: when the BACKTEST veto would halt all entries, the
+  // exploration budget (if enabled) lets a strictly-capped trickle of tiny
+  // entries through so the bot isn't frozen at zero trades. The enabled-check
+  // gates ALL extra work: when EXPLORATION_ENTRIES_ENABLED=false the path
+  // below is identical to the prior immediate-return (zero behavior change).
+  // The hard caps (daily + concurrent) are enforced after the held-position
+  // count is known. Exploration does NOT bypass the realized veto further down.
+  let explorationMode = false;
   if (selectorDecision.tradingVeto) {
-    console.log('entry_scan_skipped_backtest_veto', {
-      reason: selectorDecision.reason,
-      operatorOverride: selectorDecision.operatorOverride,
-      olsNetBps: selectorDecision.olsNetBps,
-      mfNetBps: selectorDecision.mfNetBps,
-      decisionAt: selectorDecision.decisionAt,
-      backtestRanAt: selectorDecision.backtestRanAt,
-      minBpsToActivate: selectorDecision.config?.minBpsToActivate,
+    if (!EXPLORATION_ENTRIES_ENABLED) {
+      console.log('entry_scan_skipped_backtest_veto', {
+        reason: selectorDecision.reason,
+        operatorOverride: selectorDecision.operatorOverride,
+        olsNetBps: selectorDecision.olsNetBps,
+        mfNetBps: selectorDecision.mfNetBps,
+        decisionAt: selectorDecision.decisionAt,
+        backtestRanAt: selectorDecision.backtestRanAt,
+        minBpsToActivate: selectorDecision.config?.minBpsToActivate,
+      });
+      bumpSkipReason('backtest_veto_active');
+      currentScanState = 'idle';
+      currentScanStartedAt = null;
+      return;
+    }
+    explorationMode = true;
+    console.log('entry_scan_exploration_mode', {
+      vetoReason: selectorDecision.reason,
+      notionalUsd: EXPLORATION_NOTIONAL_USD,
+      maxConcurrent: EXPLORATION_MAX_CONCURRENT,
+      maxEntriesPerDay: EXPLORATION_MAX_ENTRIES_PER_DAY,
+      entriesInWindow: explorationBudget.getState({ config: EXPLORATION_CONFIG }).entriesInWindow,
     });
-    bumpSkipReason('backtest_veto_active');
-    currentScanState = 'idle';
-    currentScanStartedAt = null;
-    return;
   }
   // Pin the active signal version for this scan so every per-symbol gate +
   // forensic field reads the same value (avoids race with a backtest that
@@ -3063,6 +3113,32 @@ async function scanAndEnter() {
   // 'concurrent_position_cap'. Disabled when CONCURRENT_POSITIONS_SOFT_CAP_ENABLED=false
   // or PHASE1_ENABLED=false; reverts to legacy "cash-only bounded" behavior.
   const heldCount = held.size;
+  // Exploration caps. During a backtest-veto window every open position is an
+  // exploration position, so heldCount IS the current exploration exposure —
+  // maxConcurrent on it bounds total capital at risk. The daily cap rate-limits
+  // churn over the rolling 24h window. If neither slot is free, halt the scan
+  // exactly like the veto would have, but with a reason that says why.
+  if (explorationMode) {
+    const exp = explorationBudget.evaluate({
+      nowMs: Date.now(),
+      openPositionCount: heldCount,
+      timestamps: explorationBudget.getEntryTimestamps(),
+      config: EXPLORATION_CONFIG,
+    });
+    if (!exp.allow) {
+      console.log('entry_scan_skipped_exploration_cap', {
+        reason: exp.reason,
+        entriesInWindow: exp.entriesInWindow,
+        openPositionCount: exp.openPositionCount,
+        maxConcurrent: exp.maxConcurrent,
+        maxEntriesPerDay: exp.maxEntriesPerDay,
+      });
+      bumpSkipReason(`exploration_${exp.reason}`);
+      currentScanState = 'idle';
+      currentScanStartedAt = null;
+      return;
+    }
+  }
   const remainingSlots = CONCURRENT_POSITIONS_SOFT_CAP_ENABLED
     ? Math.max(0, MAX_CONCURRENT_POSITIONS_SOFT_CAP - heldCount)
     : Infinity;
@@ -3114,6 +3190,13 @@ async function scanAndEnter() {
     }
   } catch (err) {
     // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
+  }
+  // Exploration entries use a fixed tiny notional (NOT a % of equity) so the
+  // capital at risk per probe is small and known. This also makes the
+  // sizing-floor gate below a no-op for exploration (target == trade size),
+  // and adaptive sizing is pinned to 1.0 at the per-symbol loop.
+  if (explorationMode) {
+    targetNotional = EXPLORATION_NOTIONAL_USD;
   }
   if (!Number.isFinite(targetNotional) || targetNotional <= 0) {
     bumpSkipReason('sizing_unavailable');
@@ -3758,7 +3841,7 @@ async function scanAndEnter() {
       // cash-clamped tradeNotional. When ADAPTIVE_SIZING_ENABLED=false
       // (or PHASE1_ENABLED=false), all trades use the static base.
       let sizingMultiplier = 1.0;
-      if (ADAPTIVE_SIZING_ENABLED) {
+      if (ADAPTIVE_SIZING_ENABLED && !explorationMode) {
         const conf = Number(sig?.confidence);
         if (Number.isFinite(conf) && conf > 0) {
           // Confidence is reported by the signal as a multiplier hint
@@ -3819,6 +3902,7 @@ async function scanAndEnter() {
         const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION, pair);
         const prediction = {
           buyOrderId: buyOrder.id,
+          exploration: explorationMode,
           buyLimit: Number(buyLimitStr),
           buyLimitPriceMode: ENTRY_LIMIT_PRICE_MODE,
           buyLimitOffsetBpsFromAsk,
@@ -3997,6 +4081,15 @@ async function scanAndEnter() {
         summary.acceptedSymbols.push(pair);
         lastSuccessfulAction = { at: nowIso, symbol: pair, action: 'buy_submitted', orderId: buyOrder.id };
         placed += 1;
+        // Exploration entries: record the timestamp (rolling daily cap) and
+        // stop after one probe per scan. The concurrent cap + one-per-scan
+        // pacing keep total exploration exposure bounded; subsequent scans
+        // re-evaluate the budget and fill the next slot only if one is free.
+        if (explorationMode) {
+          explorationBudget.recordEntry(Date.now());
+          console.log('entry_exploration_submitted', { symbol: pair, tradeId: buyOrder.id, notional: effectiveNotional });
+          break;
+        }
       } else {
         rejectTrade(pair, 'buy_rejected');
       }
@@ -4847,6 +4940,7 @@ module.exports = {
   getActiveSignalVersion,
   getSignalSelectorDecision,
   getRealizedVetoState,
+  getExplorationBudgetState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,

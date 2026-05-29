@@ -247,4 +247,15 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.PAIRS_STOP_LOSS_BPS, '50');
 assert.equal(LIVE_CRITICAL_DEFAULTS.TIME_OF_DAY_FILTER_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.TIME_OF_DAY_ALLOWED_HOURS_UTC, '*');
 
+// 2026-05-29 exploration budget. The metered middle ground between the
+// backtest veto's two failure modes (never-trades vs. bleed). Default-ON with
+// hard caps so the bot is never frozen at zero trades during a veto window,
+// while total exploration exposure stays bounded at MAX_CONCURRENT × NOTIONAL
+// = 2 × $10 = $20. Locked here so a drift back to disabled (re-freezing the
+// bot) or an unbounded notional/concurrency would be caught at CI.
+assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_ENTRIES_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_MAX_ENTRIES_PER_DAY, '3');
+assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_MAX_CONCURRENT, '2');
+assert.equal(LIVE_CRITICAL_DEFAULTS.EXPLORATION_NOTIONAL_USD, '10');
+
 console.log('live defaults tests passed');

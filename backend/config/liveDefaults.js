@@ -226,6 +226,29 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
   SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-5',
   SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '20',
+  // Exploration budget (2026-05-29). The middle ground between the backtest
+  // veto's two failure modes: veto-all (the bot never buys — the 2026-05-28/29
+  // dashboard sat at zero trades for 15h because both signals backtested
+  // negative under the honest adverse-selection fill model) and veto-off (the
+  // bot force-trades a no-edge signal until it bleeds). When the BACKTEST veto
+  // would halt all entries, this lets a strictly-capped trickle of tiny entries
+  // through — ONLY on candidates the active signal still likes — so the bot
+  // keeps a metered toe in the water and accumulates the labeled trade data
+  // that Phase 2 calibration needs to ever build a per-setup classifier good
+  // enough to clear the gate on its own. It breaks the deadlock where the veto
+  // starves the exact data required to lift the veto.
+  //
+  // Default-ON, bounded by construction: worst-case capital deployed via
+  // exploration = MAX_CONCURRENT × NOTIONAL_USD = 2 × $10 = $20 at any instant,
+  // independent of runtime. The stop-loss layer (STOP_LOSS_ENABLED='true')
+  // further caps each position's loss tail. Exploration does NOT bypass the
+  // realized-expectancy circuit breaker — a signal proven to bleed on live
+  // fills still halts. Kill instantly with EXPLORATION_ENTRIES_ENABLED='false'
+  // in Render env (reverts to the prior immediate veto-return, zero trades).
+  EXPLORATION_ENTRIES_ENABLED: 'true',
+  EXPLORATION_MAX_ENTRIES_PER_DAY: '3',
+  EXPLORATION_MAX_CONCURRENT: '2',
+  EXPLORATION_NOTIONAL_USD: '10',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND
