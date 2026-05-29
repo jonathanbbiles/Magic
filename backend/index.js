@@ -111,6 +111,7 @@ const {
   deserialize: deserializeMrSweep,
   DEFAULT_CAPS: MR_SWEEP_DEFAULT_CAPS,
 } = require('./modules/mrStopLossSweep');
+const entryModeAb = require('./modules/entryModeAb');
 const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
@@ -855,6 +856,10 @@ const OPERATOR_RECOMMENDATIONS_ENABLED = String(
 // expectancy curve. Surfaced at meta.mrStopLossSweep. Disable via
 // MR_STOP_LOSS_SWEEP_ENABLED=false in Render env if startup is too slow.
 let lastMrStopLossSweep = null;
+// Entry-mode A/B (2026-05-29): passive (bid+tick / adverse-selection) vs
+// aggressive (mid) fill model per signal, refreshed on each restart.
+// Observational; surfaced at meta.entryModeAB.
+let lastEntryModeAb = null;
 
 // Restart persistence (2026-05-18): the sweep takes ~3 minutes to repopulate
 // after a deploy, so a phone-first operator would see meta.mrStopLossSweep =
@@ -1732,6 +1737,20 @@ app.get('/dashboard', async (req, res) => {
           // of null.
           staleFromPriorRun: Boolean(lastMrStopLossSweep.staleFromPriorRun),
           note: 'Stage 3 expectancy curve: MR-5m and MR-15m at multiple stop-loss caps. Use to pick MR_STOP_LOSS_BPS_5M / MR_STOP_LOSS_BPS_15M values that flip avgNetBpsPerEntry positive without hand-rolling /debug/backtest URLs.',
+        } : null,
+        // Entry-mode A/B (2026-05-29). Per-signal net bps under the passive
+        // (bid+tick / adverse-selection) vs aggressive (mid) fill model. The
+        // diagnostic that answers "is the passive entry sinking the signals?"
+        // — if a signal's deltaBps is strongly positive (aggressive >> passive)
+        // or aggressiveFlipsPositive=true, switching ENTRY_LIMIT_PRICE_MODE to
+        // 'mid' is the lever to test live. Observational; selector unaffected.
+        entryModeAB: lastEntryModeAb ? {
+          ranAt: lastEntryModeAb.ranAt,
+          windowDays: lastEntryModeAb.windowDays,
+          feeBpsRoundTrip: lastEntryModeAb.feeBpsRoundTrip,
+          signals: lastEntryModeAb.comparison?.signals || [],
+          summary: lastEntryModeAb.comparison?.summary || null,
+          note: 'passive=bid+tick (adverse selection, current live); aggressive=mid (no adverse selection, pays ~half-spread). deltaBps>0 ⇒ mid entry improves the signal. If aggressiveFlipsPositive, test ENTRY_LIMIT_PRICE_MODE=mid live.',
         } : null,
         signalSelector: (() => {
           const decision = getSignalSelectorDecision();
@@ -3164,7 +3183,56 @@ if (backtestSkipReason) {
         console.log('mr_stop_loss_sweep_failed', { error: err?.message });
       });
     }
+    // Entry-mode A/B (2026-05-29): backtest each candidate signal under both
+    // the passive (bid+tick / adverse-selection) and aggressive (mid) fill
+    // models so the operator can SEE whether the passive entry — adopted on
+    // Alpaca to dodge a 30 bps fee that no longer applies on Binance.US — is
+    // what's sinking the signals. Observational; changes nothing live. Disable
+    // via ENTRY_MODE_AB_ENABLED=false to skip the extra ~8 backtests at boot.
+    if (String(process.env.ENTRY_MODE_AB_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runEntryModeAbSweep().catch((err) => {
+        console.log('entry_mode_ab_failed', { error: err?.message });
+      });
+    }
   }, BACKTEST_AUTORUN_DELAY_MS);
+}
+
+// Entry-mode A/B sweep helper. Runs each curated signal under both fill models
+// (passive = adverseSelectionFill true; aggressive = false) via runBacktest
+// directly (not runBacktestAndStore) so the observational sweep never disturbs
+// the live signal-selector decision. Parks the comparison in lastEntryModeAb
+// for meta.entryModeAB. Uses the live venue fee so passive/aggressive differ
+// ONLY in the fill model, isolating the adverse-selection cost.
+async function runEntryModeAbSweep() {
+  const liveSymbols = Array.isArray(runtimeConfig?.configuredPrimarySymbols) && runtimeConfig.configuredPrimarySymbols.length
+    ? runtimeConfig.configuredPrimarySymbols
+    : null;
+  const symbolsCsv = process.env.ENTRY_SYMBOLS_PRIMARY
+    || (liveSymbols ? liveSymbols.join(',') : 'BTC/USD,ETH/USD');
+  const windowDays = BACKTEST_AUTORUN_DAYS;
+  const feeBpsRoundTrip = resolveBacktestFeeBps({}, process.env);
+  const plan = entryModeAb.buildPlan();
+  const ranAt = new Date().toISOString();
+  console.log('entry_mode_ab_started', { ranAt, signals: entryModeAb.DEFAULT_SIGNALS.map((s) => s.label), windowDays });
+  const results = [];
+  for (const cell of plan) {
+    try {
+      const result = await runBacktest({
+        symbols: symbolsCsv,
+        windowDays,
+        feeBpsRoundTrip,
+        adverseSelectionFill: cell.adverseSelectionFill,
+        ...cell.params,
+      });
+      results.push({ label: cell.label, mode: cell.mode, summary: entryModeAb.summarizeCell(result) });
+    } catch (err) {
+      results.push({ label: cell.label, mode: cell.mode, summary: null, error: err?.message || 'unknown' });
+    }
+  }
+  const comparison = entryModeAb.buildComparison(results);
+  lastEntryModeAb = { ranAt, windowDays, feeBpsRoundTrip, comparison, results };
+  console.log('entry_mode_ab_completed', { ranAt, summary: comparison.summary });
+  return lastEntryModeAb;
 }
 
 // MR stop-loss sweep helper. Fires the MR-5m and MR-15m backtest at each of

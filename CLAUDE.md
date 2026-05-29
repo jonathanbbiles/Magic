@@ -119,6 +119,16 @@ Defaults live in both `liveDefaults.js` (locked by `liveDefaults.test.js`) and t
 
 **Hard Rule #4 compliance:** all four vars are read in `trade.js`, flow into the live entry path, and `meta.signalSelector.explorationBudget` is the active diagnostic consumer. The rolling window (24h) is pinned in the module `DEFAULTS`, not env-overridable. **When extending:** keep `evaluate` pure (it takes `timestamps` + `openPositionCount`, never reads internal state); never widen the bound without an explicit operator decision — the whole point is that worst-case exposure is small and known. Do NOT make exploration bypass the realized veto.
 
+## Entry-mode A/B diagnostic (2026-05-29)
+
+**The question it answers.** Post-Binance.US cutover the round-trip fee is ~0, yet every signal still backtests net-negative (live 2026-05-29: ols −15.7, meanRev −10.3, micro5m −4.2 net; `gross = net + 2`). So it is NOT a fee problem. The dominant remaining cost is **adverse selection from the passive `bid_plus_tick` entry**: a passive rest only fills when the market trades DOWN into it, so fills are negatively selected. That passive entry was adopted on Alpaca (2026-05-16) to dodge a 30 bps fee + wide spreads — a rationale that's gone at Binance's 0% maker + tight USDT books. This diagnostic measures whether dropping the passive entry would flip the near-breakeven signals positive, BEFORE any live change.
+
+**The wiring.** `backend/modules/entryModeAb.js` is a pure helper (`buildPlan` + `summarizeCell` + `buildComparison`). `runEntryModeAbSweep()` in `index.js` (boot sequence, after the MR sweep, gated by `ENTRY_MODE_AB_ENABLED`, default on) runs each of a curated 4-signal set (`ols`, `mean_reversion`, `microstructure_5m`, `microstructure_45m`) under both fill models via `runBacktest` directly — `passive` = `adverseSelectionFill: true`, `aggressive` = `false` — using the live venue fee so the ONLY difference is the fill model. Result parked in `lastEntryModeAb`, surfaced at `meta.entryModeAB` (`signals[]` with `passiveNetBps / aggressiveNetBps / deltaBps / aggressiveBetter / aggressiveFlipsPositive`, plus a `summary`). Observational ONLY — `runBacktest` (not `runBacktestAndStore`), so the signal-selector decision is never disturbed; nothing here gates a trade.
+
+**Operator workflow:** read `meta.entryModeAB`. If a signal's `deltaBps` is strongly positive or `aggressiveFlipsPositive=true`, the passive entry is the problem → test `ENTRY_LIMIT_PRICE_MODE=mid` in Render env and watch the live scorecard. If deltas are ~0 or negative, the signals genuinely lack edge and entry mode isn't the lever.
+
+**Hard Rule #4 compliance:** `ENTRY_MODE_AB_ENABLED` is read in `index.js`, gates the sweep, and `meta.entryModeAB` is the live consumer. **When extending:** keep `buildComparison` pure; the 4-signal set is curated to bound boot time (8 backtests) — adding signals widens the boot window, so weigh that against the diagnostic value.
+
 ## Adverse-selection-aware backtest fill model (2026-05-27)
 
 **Why this exists.** The realized-expectancy circuit breaker above is the *live* feedback loop. This is the *predictor*: it fixes the upstream bias in the backtest that the circuit breaker was reacting to. The pre-2026-05-27 fill model in `scripts/backtest_strategy.js` was structurally wrong for a passive-maker bot:

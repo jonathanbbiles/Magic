@@ -249,6 +249,17 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   EXPLORATION_MAX_ENTRIES_PER_DAY: '3',
   EXPLORATION_MAX_CONCURRENT: '2',
   EXPLORATION_NOTIONAL_USD: '10',
+  // Entry-mode A/B diagnostic (2026-05-29). On each restart, backtest each
+  // candidate signal under BOTH the passive (bid+tick / adverse-selection,
+  // current live) and aggressive (mid, no adverse selection) fill models, and
+  // surface the per-signal delta at meta.entryModeAB. Answers the post-
+  // Binance.US investigation question: with fees ~0, is the passive entry the
+  // thing sinking the signals? The passive entry was adopted on Alpaca to dodge
+  // a 30 bps fee + wide spreads — a rationale that's gone at Binance's 0% maker
+  // + tight USDT books. OBSERVATIONAL ONLY: nothing here changes a live entry;
+  // the operator reads the delta and decides whether to flip
+  // ENTRY_LIMIT_PRICE_MODE=mid. Set 'false' to skip the ~8 extra boot backtests.
+  ENTRY_MODE_AB_ENABLED: 'true',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND
