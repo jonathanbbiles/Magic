@@ -24,12 +24,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
 
-// 2026-05-16: Entry limit price mode flipped to 'bid_plus_tick' (rests one
-// tick above the bid, never crosses the spread). The 14-trade live scorecard
-// from the pre-veto window showed 36.85 bps avg entry spread paid — pairing
-// passive entries with the 30s ENTRY_FILL_TIMEOUT_MS recycle gives any
-// validated signal a fair shot at covering 30 bps round-trip fees.
-assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick');
+// 2026-05-30: Entry limit price mode flipped to 'mid'. On Binance.US (~0%
+// maker, tight USDT books) the prior passive 'bid_plus_tick' rest bled
+// ~16 bps/trade to adverse selection (entryModeAB diagnostic) — it only
+// fills when the market trades DOWN into it. Resting at mid removes that
+// adverse selection and is the dominant lever flipping signals positive.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_LIMIT_PRICE_MODE, 'mid');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FILL_TIMEOUT_MS, '30000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');

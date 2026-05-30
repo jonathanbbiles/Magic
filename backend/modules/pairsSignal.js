@@ -244,7 +244,6 @@ function evaluatePairsSignal({
     // Legacy compatibility fields.
     slopeBpsPerBar: 0,
     slopeTStat: 0,
-    rSquared,
     volatilityBps,
     volumeRatio: null,
     volumeWeightedSlopeBps: null,

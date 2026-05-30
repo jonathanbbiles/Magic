@@ -1,5 +1,22 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-05-30: entry path simplified to the bare 4-step loop
+
+The entry engine (`scanAndEnter` in `backend/trade.js`) was rewritten from ~1,150 lines stacking ~25 gates/vetoes down to a bare loop that does exactly what the bot is supposed to do:
+
+1. **Determine entry signal** — the active signal's per-symbol evaluator (default `mean_reversion`; override with `SIGNAL_VERSION`).
+2. **Enter** — a GTC limit buy at **mid** price.
+3. **Create the sell signal** — a GTC limit sell at `entry × (1 + signalDerivedGrossBps/10000)`, derived from the entry signal and attached by the exit manager (unchanged).
+4. **Repeat** — the entry manager re-invokes on a timer.
+
+**What was removed from the entry path** (and why it had to go): the signal-selector *backtest* veto, the exploration budget, the regime veto, the cross-venue divergence gate, the stale-quote rescue, the recent-high gate, the HTF confirmation gate, and the OLS-era EV / alpha / net-edge / projection-floor gates. Stacked together these had frozen the live bot at **zero trades** (backtest veto on + exploration budget exhausted) while the trades it did take bled **−50 bps/trade** — see the 2026-05-30 diagnosis. The backtest-driven veto in particular was the core failure: it gated *all* live trading on a one-shot-at-boot backtest that systematically over-stated edge, so it oscillated between "refuse everything" and "force a no-edge signal."
+
+**What was kept:** basic execution sanity (quote freshness, spread cap, sizing/cash clamp, one-position-per-symbol, a concurrent-position cap), the active signal's own ok/reject decision, and **one safety brake** — the realized-expectancy bleed check (`signalSelector.evaluateRealizedVeto`). If the active signal's most recent closed trades average below `SIGNAL_SELECTOR_REALIZED_FLOOR_BPS` (default `−10`) over ≥ `SIGNAL_SELECTOR_REALIZED_MIN_TRADES` (default `10`), **new** entries pause until realized expectancy recovers; open positions are still managed/exited normally. This is the single guard that would have stopped the −50 bps bleed, and it reuses the same trade set the dashboard's `meta.drift` reports so the gate and the diagnostic never disagree.
+
+**`ENTRY_LIMIT_PRICE_MODE` default flipped `bid_plus_tick` → `mid`.** The passive bid+tick rest was correct on Alpaca (30 bps fee + wide books) but on Binance.US (~0% maker, tight USDT books) the live `entryModeAB` diagnostic measured it bleeding ~16 bps/trade to adverse selection — it only fills when the market trades *down* into it. Resting at mid removes that adverse selection. Revert with `ENTRY_LIMIT_PRICE_MODE=bid_plus_tick` (or `ask`) in Render env.
+
+The dashboard meta surfaces, signal modules, Binance.US execution adapter, exit manager, and all the observational diagnostics (drift alerter, gate-rejection audit, per-symbol expectancy, etc.) are unchanged — they're still wired and surfaced; they're simply no longer in the live entry decision path. The removed gates' env vars remain read (Hard Rule #4 audit passes) and can be re-wired if a future change needs them.
+
 ## 2026-05-28 add: three new strategies (trend-following, pairs/stat-arb, time-of-day filter)
 
 Every previous strategy in the bot was a mean-reversion or microstructure-mean-reversion variant. They all fail in the same regime (sustained directional trends), which is exactly the state the 2026-05-28 17:02Z snapshot caught — all 10 backtest slots negative, selector veto on, bot sitting flat. This PR ships three deliberately uncorrelated additions:
