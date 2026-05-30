@@ -59,6 +59,11 @@ const NON_ENV_ALLOWLIST = new Set([
   // Internal JS local-variable names referenced by name in module headers
   'ACTIVE_SIGNAL_VERSION',
   'CALIBRATION_RELOAD_MS',
+  // magic-diagnostics MCP server constant (2026-05-30). The default backend
+  // URL fallback, referenced by name in CLAUDE.md. It lives in
+  // mcp/magic-diagnostics/server.js (not backend/) and is overridable by the
+  // MAGIC_BACKEND_URL env var — it is not itself an env var.
+  'DEFAULT_BACKEND_URL',
   // External services / deploy infrastructure (env exists, but not in this
   // backend's process.env — they're consumed by Render / Expo, not our JS)
   'RENDER_URL',
