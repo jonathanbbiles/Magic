@@ -75,10 +75,26 @@ for the operator to grab logs.
 - `get_scorecard()` → closed-trade summary (cheaper than full diagnostics)
 
 **Wiring:** repo-root `.mcp.json` registers the stdio server; Claude
-Code prompts for approval on first use per project. Two env vars must
-be set in the session's environment: `MAGIC_BACKEND_URL` (Render URL)
-and `MAGIC_API_TOKEN` (matches the backend's `API_TOKEN` env, used in
-the `Authorization: Bearer` header by `backend/auth.js`).
+Code prompts for approval on first use per project.
+
+**Zero-config default (2026-05-30):** `MAGIC_BACKEND_URL` now defaults to
+the production host (`https://magic-lw8t.onrender.com`, set as
+`DEFAULT_BACKEND_URL` in `server.js`) when the env var is unset, and the
+`/dashboard` + `/debug/logs` endpoints are public (no token — see
+`isPublicEndpoint` in `index.js`). So `get_diagnostics` and `get_logs`
+work with NO env config. The ONLY remaining requirement for a Claude Code
+on the web session to reach the bot is that the **host is on the session's
+network allowlist** — outbound egress is governed by the environment's
+network policy (chosen when the environment was created); add
+`magic-lw8t.onrender.com` (or `*.onrender.com`) there or every fetch
+returns `403 Host not in allowlist` from the egress proxy.
+
+Two optional env vars refine this:
+- `MAGIC_BACKEND_URL` — override the default to point at a different deploy.
+- `MAGIC_API_TOKEN` — matches the backend's `API_TOKEN` env (used in the
+  `Authorization: Bearer` header by `backend/auth.js`). Only needed for the
+  token-protected tools `get_scorecard` (`/dashboard/scorecard`) and
+  `get_runtime_config` (`/debug/runtime-config`).
 
 **Adding a new tool:** implement `async toolFoo(args)` in
 `mcp/magic-diagnostics/server.js`, register it in the `TOOLS` array

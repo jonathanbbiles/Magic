@@ -164,15 +164,26 @@ async function test_toolCall_backendError_returnsIsError() {
   }
 }
 
-async function test_noBackendUrl_returnsClearError() {
+async function test_noBackendUrl_fallsBackToDefault() {
+  // With MAGIC_BACKEND_URL unset, the server must fall back to the public
+  // production host so monitoring works with zero env config (once the host
+  // is on the session network allowlist). Pure resolution check — no network.
   delete process.env.MAGIC_BACKEND_URL;
   delete process.env.MAGIC_API_TOKEN;
   const mod = loadServer();
-  const resp = await mod.handleMessage({
-    jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'get_diagnostics', arguments: {} },
-  });
-  assert.strictEqual(resp.result.isError, true);
-  assert.match(resp.result.content[0].text, /MAGIC_BACKEND_URL not set/);
+  assert.strictEqual(mod.DEFAULT_BACKEND_URL, 'https://magic-lw8t.onrender.com');
+  assert.strictEqual(mod.BACKEND_URL, mod.DEFAULT_BACKEND_URL);
+}
+
+async function test_backendUrlEnvOverridesDefault() {
+  process.env.MAGIC_BACKEND_URL = 'https://example.test/';
+  try {
+    const mod = loadServer();
+    // trailing slash trimmed; env wins over the default.
+    assert.strictEqual(mod.BACKEND_URL, 'https://example.test');
+  } finally {
+    delete process.env.MAGIC_BACKEND_URL;
+  }
 }
 
 (async () => {
@@ -183,8 +194,9 @@ async function test_noBackendUrl_returnsClearError() {
   await test_toolCall_unknownTool_returnsError();
   await test_toolCall_dispatchesToBackend();
   await test_toolCall_backendError_returnsIsError();
-  await test_noBackendUrl_returnsClearError();
-  console.log('mcp-magic-diagnostics tests passed', { tests: 8 });
+  await test_noBackendUrl_fallsBackToDefault();
+  await test_backendUrlEnvOverridesDefault();
+  console.log('mcp-magic-diagnostics tests passed', { tests: 9 });
 })().catch((err) => {
   console.error('mcp-magic-diagnostics tests FAILED', err);
   process.exit(1);

@@ -12,10 +12,16 @@
 //   - get_scorecard():    /dashboard/scorecard (closed-trade stats)
 //
 // Environment:
-//   MAGIC_BACKEND_URL  — e.g. https://magic-...onrender.com (required)
-//   MAGIC_API_TOKEN    — matches backend's API_TOKEN env (required when
-//                         backend has API_TOKEN set, which is the
-//                         production default)
+//   MAGIC_BACKEND_URL  — e.g. https://magic-...onrender.com. OPTIONAL: when
+//                         unset it falls back to DEFAULT_BACKEND_URL (the
+//                         production Render host) so monitoring works out of
+//                         the box once the host is on the session network
+//                         allowlist. Set it to point at a different deploy.
+//   MAGIC_API_TOKEN    — matches backend's API_TOKEN env. Only needed for the
+//                         token-protected endpoints (/dashboard/scorecard,
+//                         /debug/runtime-config). The /dashboard and
+//                         /debug/logs endpoints are public, so get_diagnostics
+//                         and get_logs work without it.
 //
 // Why zero-dep: this server runs inside Claude Code sessions (local +
 // web container). Pinning it to no deps means it works the moment the
@@ -32,7 +38,11 @@ const SERVER_NAME = 'magic-diagnostics';
 const SERVER_VERSION = '1.0.0';
 const PROTOCOL_VERSION = '2024-11-05';
 
-const BACKEND_URL = String(process.env.MAGIC_BACKEND_URL || '').replace(/\/+$/, '');
+// Production Render host. Used when MAGIC_BACKEND_URL is unset so a freshly
+// cloned repo can pull live diagnostics with zero env config (the URL is
+// public, not a secret). Override via MAGIC_BACKEND_URL for other deploys.
+const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
+const BACKEND_URL = String(process.env.MAGIC_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/+$/, '');
 const API_TOKEN = String(process.env.MAGIC_API_TOKEN || '').trim();
 
 // HTTP request helper. Returns parsed JSON body or throws with a structured
@@ -278,4 +288,4 @@ if (require.main === module) {
   startStdinLoop();
 }
 
-module.exports = { TOOLS, handleMessage, httpRequest };
+module.exports = { TOOLS, handleMessage, httpRequest, BACKEND_URL, DEFAULT_BACKEND_URL };
