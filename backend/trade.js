@@ -1039,8 +1039,11 @@ signalSelector.bootstrapDecisionFromEnv({
 // returns null AND trading is happening anyway (shouldn't be reachable
 // because the veto check fires first; defensive default).
 function getActiveSignalVersion() {
-  const decision = signalSelector.getCurrentDecision();
-  return decision.signalVersion || SIGNAL_VERSION_OPERATOR_OVERRIDE || 'ols';
+  // 2026-05-30: the entry path no longer consults the backtest signal-selector
+  // decision — it trades the operator override or the mean_reversion default.
+  // This getter mirrors that exactly so the dashboard reports the signal the
+  // bot is actually trading, not the selector's (now unused) pick.
+  return SIGNAL_VERSION_OPERATOR_OVERRIDE || 'mean_reversion';
 }
 function getSignalSelectorDecision() {
   return signalSelector.getCurrentDecision();
@@ -3008,6 +3011,34 @@ async function buildHeldAndOpenSellsIndex() {
   return { held, byPair, openBuyPairs, openSellByPair, aggregateUnrealizedPct };
 }
 
+// ============================================================================
+// scanAndEnter — the bare 4-step loop.
+//
+//   1. Determine entry signal  (the active signal's per-symbol evaluator)
+//   2. Enter                   (limit buy at mid; the exit manager attaches
+//                               the GTC sell at entry × (1 + target))
+//   3. Create sell signal      (handled by the exit manager from the
+//                               prediction record written here — step 3 is
+//                               the GTC sell target, derived from the entry)
+//   4. Repeat                  (startEntryManager re-invokes on a timer)
+//
+// 2026-05-30 simplification: the prior ~1,150-line implementation stacked ~25
+// gates/vetoes (signal-selector backtest veto, exploration budget, regime
+// veto, cross-venue gate, stale-quote rescue, recent-high, HTF, OLS-era EV /
+// alpha / net-edge / projection floors, adaptive sizing, …) between the quote
+// fetch and the order. The net live result was a frozen bot (backtest veto +
+// exhausted exploration budget) bleeding -50 bps when it did trade. This
+// rewrite keeps ONLY:
+//   - basic execution sanity (quote freshness, spread cap, sizing/cash clamp,
+//     one-position-per-symbol, a concurrent-position cap)
+//   - the active signal's own ok/reject decision
+//   - ONE safety brake: the realized-expectancy bleed check. If the active
+//     signal's recent CLOSED trades average below the floor, pause NEW
+//     entries (open positions are still managed/exited normally). This is the
+//     single guard that would have stopped the -50 bps bleed.
+// Everything else was removed. The prediction-record shape is preserved so the
+// exit manager, dashboard meta, forensics, and tests keep working unchanged.
+// ============================================================================
 async function scanAndEnter() {
   if (!TRADING_ENABLED) return;
   currentScanState = 'scanning';
@@ -3016,58 +3047,18 @@ async function scanAndEnter() {
   currentScanSymbolsProcessed = 0;
   skipReasonCounts.clear();
 
-  // Signal selector veto: if no signal has cleared the backtest activation
-  // threshold (default +3 bps avgNetBpsPerEntry over the last 30-day auto-
-  // backtest), refuse the scan entirely. This is the safety net that stops
-  // the bot from bleeding when the strategy doesn't have edge — exactly the
-  // failure mode the live -65 bps OLS backtest exposed. Operator can opt
-  // out via SIGNAL_SELECTOR_VETO_ENABLED=false (legacy "trade anyway").
-  const selectorDecision = getSignalSelectorDecision();
-  // Exploration mode: when the BACKTEST veto would halt all entries, the
-  // exploration budget (if enabled) lets a strictly-capped trickle of tiny
-  // entries through so the bot isn't frozen at zero trades. The enabled-check
-  // gates ALL extra work: when EXPLORATION_ENTRIES_ENABLED=false the path
-  // below is identical to the prior immediate-return (zero behavior change).
-  // The hard caps (daily + concurrent) are enforced after the held-position
-  // count is known. Exploration does NOT bypass the realized veto further down.
-  let explorationMode = false;
-  if (selectorDecision.tradingVeto) {
-    if (!EXPLORATION_ENTRIES_ENABLED) {
-      console.log('entry_scan_skipped_backtest_veto', {
-        reason: selectorDecision.reason,
-        operatorOverride: selectorDecision.operatorOverride,
-        olsNetBps: selectorDecision.olsNetBps,
-        mfNetBps: selectorDecision.mfNetBps,
-        decisionAt: selectorDecision.decisionAt,
-        backtestRanAt: selectorDecision.backtestRanAt,
-        minBpsToActivate: selectorDecision.config?.minBpsToActivate,
-      });
-      bumpSkipReason('backtest_veto_active');
-      currentScanState = 'idle';
-      currentScanStartedAt = null;
-      return;
-    }
-    explorationMode = true;
-    console.log('entry_scan_exploration_mode', {
-      vetoReason: selectorDecision.reason,
-      notionalUsd: EXPLORATION_NOTIONAL_USD,
-      maxConcurrent: EXPLORATION_MAX_CONCURRENT,
-      maxEntriesPerDay: EXPLORATION_MAX_ENTRIES_PER_DAY,
-      entriesInWindow: explorationBudget.getState({ config: EXPLORATION_CONFIG }).entriesInWindow,
-    });
-  }
-  // Pin the active signal version for this scan so every per-symbol gate +
-  // forensic field reads the same value (avoids race with a backtest that
-  // completes mid-scan and flips the selector).
-  const ACTIVE_SIGNAL_VERSION = selectorDecision.signalVersion || getActiveSignalVersion();
+  // STEP 1 (which signal): resolve the active signal version. Operator override
+  // wins (SIGNAL_VERSION env); otherwise default to mean_reversion — the
+  // simplest signal to reason about (buy a sharp dip, sell the bounce) and the
+  // one whose entry directly defines its sell target.
+  const ACTIVE_SIGNAL_VERSION = SIGNAL_VERSION_OPERATOR_OVERRIDE || 'mean_reversion';
 
-  // Realized-expectancy circuit breaker. The backtest veto above can clear a
-  // signal whose LIVE results diverge sharply from its backtest. This checks
-  // the active signal's realized net bps over its most recent closed trades
-  // and halts NEW entries when it is bleeding beyond the floor. Open positions
-  // continue to be managed/exited by the reconciler below — this only gates
-  // entries. Evaluated every scan (the selector decision itself only refreshes
-  // when a backtest completes, which is rare in live mode).
+  // ONE SAFETY BRAKE: realized-expectancy bleed check. Reuses the same pure
+  // evaluator + trade set the dashboard's meta.drift reports, so the gate and
+  // the diagnostic never disagree. When the active signal's recent CLOSED
+  // trades average below the floor (default -10 bps over ≥10 trades), halt NEW
+  // entries. Open positions keep being managed/exited by the exit manager.
+  // The bot resumes automatically once recent realized expectancy recovers.
   const realizedVeto = signalSelector.evaluateRealizedVeto({
     records: closedTradeStats.getRecent(SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES * 20),
     signalVersion: ACTIVE_SIGNAL_VERSION,
@@ -3085,8 +3076,6 @@ async function scanAndEnter() {
       realizedAvgNetBps: realizedVeto.realizedAvgNetBps,
       sampleSize: realizedVeto.sampleSize,
       floorBps: realizedVeto.floorBps,
-      minTrades: realizedVeto.minTrades,
-      lookbackTrades: realizedVeto.lookbackTrades,
     });
     bumpSkipReason('realized_expectancy_veto');
     currentScanState = 'idle';
@@ -3095,13 +3084,8 @@ async function scanAndEnter() {
   }
 
   await loadSupportedCryptoPairs();
-  // Universe selection:
-  //   - dynamic  → every active Alpaca crypto pair (USD-quoted, ex-stablecoins)
-  //               returned by /v2/assets.
-  //   - configured → only ENTRY_SYMBOLS_PRIMARY (intersected with the tradable
-  //                  set, so dead symbols can't sneak in).
-  // Per-symbol gates inside the loop (spread, quote freshness, predicted edge,
-  // etc.) still decide whether to actually trade.
+  // Universe: configured primary list (intersected with the tradable set) or
+  // the full dynamic tradable set. Per-symbol checks below still decide.
   const allTradable = supportedPairsSnapshot.pairs || [];
   let universe;
   if (runtimeConfig.entryUniverseModeEffective === 'configured') {
@@ -3110,9 +3094,6 @@ async function scanAndEnter() {
       const allowed = new Set(allTradable);
       universe = primary.filter((s) => allowed.has(s));
     } else {
-      // /v2/assets has never returned successfully (cold-boot Alpaca outage).
-      // The configured primary list is hardcoded and known-good, so trust it
-      // rather than starving every scan with an empty universe.
       universe = primary.slice();
       bumpSkipReason('supported_pairs_unavailable_used_configured_primary');
     }
@@ -3121,60 +3102,23 @@ async function scanAndEnter() {
   }
   currentScanUniverseSize = universe.length;
 
-  let held, openBuyPairs, aggregateUnrealizedPct;
+  let held, openBuyPairs;
   try {
     const idx = await buildHeldAndOpenSellsIndex();
     held = idx.held;
     openBuyPairs = idx.openBuyPairs;
-    aggregateUnrealizedPct = idx.aggregateUnrealizedPct;
   } catch (err) {
     lastExecutionFailure = { at: new Date().toISOString(), reason: 'positions_or_orders_fetch_failed', message: err?.errorMessage || err?.message || String(err) };
     currentScanState = 'idle';
     return;
   }
 
-  // One concurrent position per symbol. Phase 1 adds a soft cap on total
-  // concurrent positions: prevents fragmenting cash across more positions
-  // than the sizing math can comfortably fund. When the cap is hit, the
-  // scan still runs (so dashboard stats stay accurate), but candidates
-  // beyond the remaining-slot budget are skipped with reason
-  // 'concurrent_position_cap'. Disabled when CONCURRENT_POSITIONS_SOFT_CAP_ENABLED=false
-  // or PHASE1_ENABLED=false; reverts to legacy "cash-only bounded" behavior.
   const heldCount = held.size;
-  // Exploration caps. During a backtest-veto window every open position is an
-  // exploration position, so heldCount IS the current exploration exposure —
-  // maxConcurrent on it bounds total capital at risk. The daily cap rate-limits
-  // churn over the rolling 24h window. If neither slot is free, halt the scan
-  // exactly like the veto would have, but with a reason that says why.
-  if (explorationMode) {
-    const exp = explorationBudget.evaluate({
-      nowMs: Date.now(),
-      openPositionCount: heldCount,
-      timestamps: explorationBudget.getEntryTimestamps(),
-      config: EXPLORATION_CONFIG,
-    });
-    if (!exp.allow) {
-      console.log('entry_scan_skipped_exploration_cap', {
-        reason: exp.reason,
-        entriesInWindow: exp.entriesInWindow,
-        openPositionCount: exp.openPositionCount,
-        maxConcurrent: exp.maxConcurrent,
-        maxEntriesPerDay: exp.maxEntriesPerDay,
-      });
-      bumpSkipReason(`exploration_${exp.reason}`);
-      currentScanState = 'idle';
-      currentScanStartedAt = null;
-      return;
-    }
-  }
-  const remainingSlots = CONCURRENT_POSITIONS_SOFT_CAP_ENABLED
-    ? Math.max(0, MAX_CONCURRENT_POSITIONS_SOFT_CAP - heldCount)
-    : Infinity;
   const candidates = universe.filter((pair) => !held.has(pair) && !openBuyPairs.has(pair));
   const summary = {
     ts: new Date().toISOString(),
     universeSize: universe.length,
-    heldCount: held.size,
+    heldCount,
     slotsAvailable: candidates.length,
     evaluated: 0,
     entered: 0,
@@ -3182,49 +3126,17 @@ async function scanAndEnter() {
     acceptedSymbols: [],
   };
 
-  // Portfolio-drawdown entry gate. The per-symbol gates have no portfolio
-  // context — they can each individually pass during a broad market top.
-  // When the live book's aggregate unrealized P&L % is below threshold,
-  // pause new entries until existing positions recover. Negative threshold
-  // only; 0 disables. Defensive: when there are no held positions, the
-  // aggregate is null and the gate is skipped.
-  if (
-    MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER < 0 &&
-    Number.isFinite(aggregateUnrealizedPct) &&
-    aggregateUnrealizedPct < MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER
-  ) {
-    bumpSkipReason('portfolio_drawdown_below_min');
-    summary.topSkipReasons = mapToObject(skipReasonCounts);
-    lastEntryScanSummary = summary;
-    lastEntryScanAt = new Date().toISOString();
-    currentScanState = 'idle';
-    return;
-  }
-
-  // Size this scan's trades as PORTFOLIO_SIZING_PCT of current equity, then
-  // clamp to available cash so the last slot can still fill when cash has
-  // drifted just under the 10% target (e.g. held positions appreciated).
+  // STEP 2 sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available cash.
   let availableCash = Infinity;
   let targetNotional = null;
   try {
     const account = await fetchAccount();
-    const cashRaw = account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power;
-    const cashNum = Number(cashRaw);
+    const cashNum = Number(account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power);
     if (Number.isFinite(cashNum)) availableCash = cashNum;
-    const equityRaw = account?.equity ?? account?.portfolio_value;
-    const equityNum = Number(equityRaw);
-    if (Number.isFinite(equityNum) && equityNum > 0) {
-      targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
-    }
+    const equityNum = Number(account?.equity ?? account?.portfolio_value);
+    if (Number.isFinite(equityNum) && equityNum > 0) targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
   } catch (err) {
-    // Soft-fail: if the account fetch fails, fall through and let submitOrder surface any real error.
-  }
-  // Exploration entries use a fixed tiny notional (NOT a % of equity) so the
-  // capital at risk per probe is small and known. This also makes the
-  // sizing-floor gate below a no-op for exploration (target == trade size),
-  // and adaptive sizing is pinned to 1.0 at the per-symbol loop.
-  if (explorationMode) {
-    targetNotional = EXPLORATION_NOTIONAL_USD;
+    // Soft-fail: let submitOrder surface any real error.
   }
   if (!Number.isFinite(targetNotional) || targetNotional <= 0) {
     bumpSkipReason('sizing_unavailable');
@@ -3234,10 +3146,7 @@ async function scanAndEnter() {
     currentScanState = 'idle';
     return;
   }
-  const tradeNotional = Math.min(
-    targetNotional,
-    Number.isFinite(availableCash) ? availableCash : targetNotional,
-  );
+  const tradeNotional = Math.min(targetNotional, Number.isFinite(availableCash) ? availableCash : targetNotional);
   if (tradeNotional < MIN_TRADE_NOTIONAL_USD) {
     bumpSkipReason('insufficient_cash');
     summary.topSkipReasons = mapToObject(skipReasonCounts);
@@ -3246,669 +3155,79 @@ async function scanAndEnter() {
     currentScanState = 'idle';
     return;
   }
-  // Sizing-floor gate: if the cash clamp shrunk us below MIN_SIZING_FRACTION_OF_TARGET
-  // of intended size, abort the scan rather than deploy a fragmented entry.
-  // Live data showed an AVAX entry at $1.78 (19% of a $9.23 target) producing the
-  // book's worst per-position drawdown; better to wait for cash to free up
-  // properly than to take an undersized signal that just locks the slot.
-  if (
-    MIN_SIZING_FRACTION_OF_TARGET > 0 &&
-    tradeNotional < targetNotional * MIN_SIZING_FRACTION_OF_TARGET
-  ) {
-    bumpSkipReason('sizing_below_floor');
-    summary.topSkipReasons = mapToObject(skipReasonCounts);
-    lastEntryScanSummary = summary;
-    lastEntryScanAt = new Date().toISOString();
-    currentScanState = 'idle';
-    return;
-  }
 
-  // Batched quote warm-up. Replaces 33 serial single-symbol /latest/quotes
-  // calls with one multi-symbol call per chunk of ENTRY_PREFETCH_CHUNK_SIZE
-  // (default 8). The per-symbol loop below reads from this Map first and
-  // only falls back to a single-symbol fetch when the prefetch is disabled
-  // or the chunk that owned this pair failed. Set ENTRY_PREFETCH_QUOTES=false
-  // to revert to legacy per-symbol fetches.
+  // Batched quote warm-up (one multi-symbol call per chunk instead of N serial
+  // single-symbol calls). The loop reads this Map first.
   const prefetchedQuotes = runtimeConfig.entryPrefetchQuotes
     ? await prefetchQuotesForCandidates(candidates, runtimeConfig.entryPrefetchChunkSize)
     : null;
-
-  // Phase A: secondary-feed shadow observation. Per-scan, per-symbol record
-  // of the prefetched Alpaca quote alongside the latest Coinbase WS quote.
-  // Pure observation — no live decision reads from this. Master kill is
-  // SECONDARY_FEED_ENABLED; when off this block is a no-op.
-  if (SECONDARY_FEED_ENABLED_TRADE) {
-    const nowMs = Date.now();
-    for (const pair of candidates) {
-      try {
-        const alpacaQuote = prefetchedQuotes && typeof prefetchedQuotes.get === 'function'
-          ? prefetchedQuotes.get(pair) || null
-          : null;
-        const coinbaseQuote = coinbaseQuotesStream.getLatestQuote(pair);
-        secondaryFeedShadow.observe({
-          symbol: pair,
-          alpacaQuote,
-          coinbaseQuote,
-          nowMs,
-        });
-      } catch (_) {
-        // Shadow observation must never break the scan. Swallow errors;
-        // the next scan will try again.
-      }
-    }
-  }
 
   let placed = 0;
   for (const pair of candidates) {
     summary.evaluated += 1;
     currentScanSymbolsProcessed += 1;
     currentScanLastProgressAt = new Date().toISOString();
-    // Per-iteration: clear the gate-audit context from the previous symbol
-    // so a rejectTrade emitted before this iteration binds context can't
-    // mis-attribute the rejection. Bind happens inside the try block once
-    // a valid bid/ask is in hand.
-    clearScanAuditCandidate();
-    // Phase 1: concurrent-position soft cap. Once we've placed enough buys
-    // this scan to reach the soft cap, skip remaining candidates with a
-    // diagnostic skip reason so the dashboard can show the cap is biting.
-    // The held-position count is the cross-scan baseline; placed counts the
-    // in-progress entries from this scan.
-    if (CONCURRENT_POSITIONS_SOFT_CAP_ENABLED && (heldCount + placed) >= MAX_CONCURRENT_POSITIONS_SOFT_CAP) {
+
+    // Concurrent-position cap: bound how much cash gets fragmented across
+    // simultaneous positions. heldCount is the cross-scan baseline; placed is
+    // this scan's in-progress entries.
+    if (heldCount + placed >= MAX_CONCURRENT_POSITIONS_SOFT_CAP) {
       rejectTrade(pair, 'concurrent_position_cap', { heldCount, placed, cap: MAX_CONCURRENT_POSITIONS_SOFT_CAP });
       continue;
     }
-    // Chronic-wide-spread auto-suppress (2026-05-29). Symbols whose books are
-    // structurally illiquid on the active venue (e.g. many Binance.US alt
-    // pairs at 60-965 bps spreads) fail the spread gate on EVERY scan, burning
-    // a quote fetch each time. Once a symbol's pass-rate in the rolling window
-    // is chronically at/below the floor, skip it here — before the fetch —
-    // until the FIFO ages it out and it gets re-probed. SAFE: it only skips a
-    // symbol the spread gate is already rejecting, so it cannot change a trade.
-    if (SPREAD_SUPPRESS_ENABLED && spreadSuppressionTracker.shouldSuppress(pair, {
-      minObservations: SPREAD_SUPPRESS_MIN_OBSERVATIONS,
-      maxAcceptableRate: SPREAD_SUPPRESS_MAX_PASS_RATE,
-    })) {
-      rejectTrade(pair, 'suppressed_chronic_wide_spread');
-      continue;
-    }
     try {
-      let payload;
       const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
-      const usedPrefetched = Boolean(prefetched);
-      if (prefetched) {
-        payload = { quotes: { [pair]: prefetched } };
-      } else {
-        payload = await fetchCryptoQuotes({ symbols: [pair] });
-      }
-      let quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
+      const payload = prefetched ? { quotes: { [pair]: prefetched } } : await fetchCryptoQuotes({ symbols: [pair] });
+      const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
-      let quoteTsMs = quoteTimestampMs(quote) || 0;
-      let nowMs = Date.now();
-      let ageMs = nowMs - quoteTsMs;
-      // Stale-quote single-symbol retry (2026-05-20). When a prefetched
-      // quote is stale, retry once via the single-symbol endpoint. Alpaca's
-      // bulk endpoint occasionally lags the single-symbol endpoint for
-      // specific symbols (observed for ETH/SOL/AVAX/XRP/LTC in the
-      // 2026-05-19 dashboard snapshot). The retry is bounded — one extra
-      // Alpaca call per stale prefetched quote per scan, capped by the
-      // entry universe size. Every attempt is tracked so the dashboard
-      // shows per-symbol recovery rate.
-      const prefetchedStale = usedPrefetched
-        && (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS));
-      const retrySuppressedForPair = prefetchedStale
-        && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED
-        && STALE_QUOTE_RETRY_AUTO_SUPPRESS_ENABLED
-        && staleQuoteRetryStatsModule.shouldSuppressRetry({
-          snapshot: staleQuoteRetryTracker.snapshot(),
-          symbol: pair,
-          minAttempts: STALE_QUOTE_RETRY_AUTO_SUPPRESS_MIN_ATTEMPTS,
-          maxRecoveryRate: STALE_QUOTE_RETRY_AUTO_SUPPRESS_MAX_RECOVERY_RATE,
-        });
-      if (prefetchedStale && STALE_QUOTE_SINGLE_SYMBOL_RETRY_ENABLED && !retrySuppressedForPair) {
-        const prefetchedAgeMs = ageMs;
-        let retryError = null;
-        let retriedAgeMs = null;
-        let recovered = false;
-        try {
-          const retryPayload = await fetchCryptoQuotes({ symbols: [pair] });
-          const retryQuote = retryPayload?.quotes?.[pair]
-            || retryPayload?.quotes?.[toAlpacaSymbol(pair)]
-            || null;
-          if (retryQuote) {
-            const retryTsMs = quoteTimestampMs(retryQuote) || 0;
-            const retryNowMs = Date.now();
-            const retryAge = retryNowMs - retryTsMs;
-            retriedAgeMs = retryAge;
-            if (Number.isFinite(retryAge)
-              && retryAge < ageMs
-              && retryAge <= (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) {
-              // Single-symbol returned a fresher, non-stale quote — adopt it.
-              quote = retryQuote;
-              quoteTsMs = retryTsMs;
-              nowMs = retryNowMs;
-              ageMs = retryAge;
-              recovered = true;
-            }
-          }
-        } catch (err) {
-          retryError = err?.message || 'fetch_failed';
-        }
-        staleQuoteRetryTracker.record({
-          symbol: pair,
-          prefetchedAgeMs,
-          retriedAgeMs,
-          recovered,
-          error: retryError,
-        });
-      }
+
+      // Quote freshness — never act on a stale price.
+      const quoteTsMs = quoteTimestampMs(quote) || 0;
+      const ageMs = Date.now() - quoteTsMs;
       if (quoteTsMs > 0) lastQuoteUpdateBySymbol.set(pair, quoteTsMs);
       quoteFreshness.record(pair, ageMs);
-      const quoteFingerprint = `${Number(quote.bp)}:${Number(quote.ap)}:${quoteTsMs}`;
-      const previousFingerprint = lastQuoteFingerprintBySymbol.get(pair) || null;
-      const quoteLooksNew = previousFingerprint !== quoteFingerprint;
-      lastQuoteFingerprintBySymbol.set(pair, quoteFingerprint);
-      if (ageMs > QUOTE_MAX_AGE_MS && quoteLooksNew) {
-        // Some venues occasionally publish delayed quote timestamps despite
-        // updating bid/ask. If the quote moved since the previous scan, avoid
-        // classifying it as stale solely due to provider timestamp lag.
-      } else if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) {
-        const rescue = tryStaleQuoteRescue(pair, quote, 'stale_quote');
-        if (!rescue.rescued) { rejectTrade(pair, 'stale_quote', { ageMs }); continue; }
-        // Rescue admitted — emit a structured log so the bypass is auditable
-        // alongside the rejected counterfactual in gateRejectionAudit.
-        console.log('stale_quote_rescued', { symbol: pair, ageMs, ...rescue.evidence });
-      }
-      if (STALE_QUOTE_PRUNE_ENABLED && quoteFreshness.isPruned(pair)) {
-        const rescue = tryStaleQuoteRescue(pair, quote, 'pruned_stale_quotes');
-        if (!rescue.rescued) { rejectTrade(pair, 'pruned_stale_quotes', { ageMs }); continue; }
-        console.log('pruned_stale_quotes_rescued', { symbol: pair, ageMs, ...rescue.evidence });
+      if (!Number.isFinite(ageMs) || ageMs > (QUOTE_MAX_AGE_MS + QUOTE_STALE_GRACE_MS)) {
+        rejectTrade(pair, 'stale_quote', { ageMs });
+        continue;
       }
 
-      // Bind the gate-audit context now that we have a freshness-passing
-      // quote. All subsequent rejects (spread_too_wide, prediction_rejected,
-      // near_recent_high, htf_*, projected_below_min, slope_not_positive,
-      // signal-internal reasons, etc.) get captured for forward-bar grading.
-      // Data-quality rejects above this line (no_quote/stale_quote/pruned)
-      // have already fired with no audit context and are also defended in
-      // depth by gateRejectionAudit.EXCLUDED_REASONS.
-      if (GATE_REJECTION_AUDIT_ENABLED) {
-        const auditBid = Number(quote.bp);
-        const auditAsk = Number(quote.ap);
-        if (Number.isFinite(auditBid) && Number.isFinite(auditAsk) && auditBid > 0 && auditAsk > 0) {
-          setScanAuditCandidate({
-            symbol: pair,
-            midPx: (auditBid + auditAsk) / 2,
-            signalVersion: ACTIVE_SIGNAL_VERSION,
-          });
-        }
-      }
-
+      // Spread sanity — refuse books too wide to clear the target after costs.
       const spreadBps = computeSpreadBps(quote);
       if (spreadBps == null) { rejectTrade(pair, 'invalid_quote'); continue; }
-      const spreadCapBps = resolveSpreadCapBps(pair) + (SPREAD_CANARY_SYMBOLS.has(pair) ? SPREAD_CANARY_EXTRA_BPS : 0);
-      const spreadToleranceBps = SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS;
-      const spreadIsWide = spreadBps > (spreadCapBps + spreadToleranceBps);
-      if (SPREAD_SUPPRESS_ENABLED) spreadSuppressionTracker.record({ symbol: pair, wide: spreadIsWide });
-      if (spreadIsWide) { rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps, spreadToleranceBps }); continue; }
+      const spreadCapBps = resolveSpreadCapBps(pair);
+      if (spreadBps > spreadCapBps + SPREAD_TOLERANCE_BPS + SPREAD_COMPARISON_EPSILON_BPS) {
+        rejectTrade(pair, 'spread_too_wide', { spreadBps, spreadCapBps });
+        continue;
+      }
 
       const ask = Number(quote.ap);
       const bid = Number(quote.bp);
       if (!Number.isFinite(ask) || ask <= 0) { rejectTrade(pair, 'invalid_ask'); continue; }
       if (!Number.isFinite(bid) || bid <= 0) { rejectTrade(pair, 'invalid_bid'); continue; }
-      const spreadCostBps = ((ask - bid) / ((ask + bid) / 2)) * 10000;
 
-      // Phase B: cross-venue divergence gate. When SECONDARY_FEED_ENABLED is
-      // on, consult Coinbase's latest quote for the same symbol. If both are
-      // fresh but disagree beyond tolerance, the Alpaca quote is suspect
-      // even though its timestamp passed the staleness check. Shadow mode
-      // (CROSS_VENUE_GATE_ENABLED=false) records `wouldHaveRejected` for
-      // operator validation but does NOT reject.
-      if (SECONDARY_FEED_ENABLED_TRADE) {
-        try {
-          const coinbaseQuote = coinbaseQuotesStream.getLatestQuote(pair);
-          const decision = crossVenueGate.evaluateCrossVenueGate({
-            alpacaQuote: quote,
-            coinbaseQuote,
-            maxDivergenceBps: CROSS_VENUE_MAX_DIVERGENCE_BPS,
-            minCoinbaseFreshnessMs: CROSS_VENUE_MIN_COINBASE_FRESHNESS_MS,
-          });
-          crossVenueGate.record({
-            symbol: pair,
-            decision,
-            gateEnabled: CROSS_VENUE_GATE_ENABLED,
-          });
-          if (CROSS_VENUE_GATE_ENABLED && decision.shouldReject) {
-            rejectTrade(pair, decision.reason, decision.evidence);
-            continue;
-          }
-        } catch (_) {
-          // Gate evaluation must never break the scan. Fall through.
-        }
-      }
-
+      // STEP 1 (per symbol): evaluate the active entry signal.
       let sig;
-      if (ACTIVE_SIGNAL_VERSION === 'multi_factor') {
-        sig = await getMultiFactorSignalForPair(pair, quote);
-      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion') {
-        sig = await getMeanReversionSignalForPair(pair, '1m');
-      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_5m') {
-        sig = await getMeanReversionSignalForPair(pair, '5m');
-      } else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m') {
-        sig = await getMeanReversionSignalForPair(pair, '15m');
-      } else if (ACTIVE_SIGNAL_VERSION === 'range_mean_reversion') {
-        sig = await getRangeMeanReversionSignalForPair(pair);
-      } else if (ACTIVE_SIGNAL_VERSION === 'barrier') {
-        sig = await getBarrierSignalForPair(pair, quote);
-      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_5m') {
-        sig = await getMicrostructureSignalForPair(pair, quote, 5);
-      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_15m') {
-        sig = await getMicrostructureSignalForPair(pair, quote, 15);
-      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_30m') {
-        sig = await getMicrostructureSignalForPair(pair, quote, 30);
-      } else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') {
-        sig = await getMicrostructureSignalForPair(pair, quote, 45);
-      } else if (ACTIVE_SIGNAL_VERSION === 'trend_following') {
-        sig = await getTrendFollowingSignalForPair(pair);
-      } else if (ACTIVE_SIGNAL_VERSION === 'pairs') {
-        sig = await getPairsSignalForPair(pair);
-      } else {
-        sig = await getPredictionSignal(pair);
-      }
+      if (ACTIVE_SIGNAL_VERSION === 'multi_factor') sig = await getMultiFactorSignalForPair(pair, quote);
+      else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion') sig = await getMeanReversionSignalForPair(pair, '1m');
+      else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_5m') sig = await getMeanReversionSignalForPair(pair, '5m');
+      else if (ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m') sig = await getMeanReversionSignalForPair(pair, '15m');
+      else if (ACTIVE_SIGNAL_VERSION === 'range_mean_reversion') sig = await getRangeMeanReversionSignalForPair(pair);
+      else if (ACTIVE_SIGNAL_VERSION === 'barrier') sig = await getBarrierSignalForPair(pair, quote);
+      else if (ACTIVE_SIGNAL_VERSION === 'microstructure_5m') sig = await getMicrostructureSignalForPair(pair, quote, 5);
+      else if (ACTIVE_SIGNAL_VERSION === 'microstructure_15m') sig = await getMicrostructureSignalForPair(pair, quote, 15);
+      else if (ACTIVE_SIGNAL_VERSION === 'microstructure_30m') sig = await getMicrostructureSignalForPair(pair, quote, 30);
+      else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') sig = await getMicrostructureSignalForPair(pair, quote, 45);
+      else if (ACTIVE_SIGNAL_VERSION === 'trend_following') sig = await getTrendFollowingSignalForPair(pair);
+      else if (ACTIVE_SIGNAL_VERSION === 'pairs') sig = await getPairsSignalForPair(pair);
+      else sig = await getPredictionSignal(pair);
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
-      if (!sig.ok) {
-        rejectTrade(pair, sig.reason || 'prediction_rejected');
-        continue;
-      }
+      if (!sig.ok) { rejectTrade(pair, sig.reason || 'prediction_rejected'); continue; }
 
-      // Phase 2 regime-aware veto (2026-05-20). When the regime detector
-      // reports a label in MARKET_REGIME_VETO_REGIMES that has held for
-      // ≥ MARKET_REGIME_VETO_CONSECUTIVE_MS, refuse the entry. Placed
-      // after signal evaluation so only would-be entries (signal said
-      // ok=true) get vetoed and forward-graded; mr_no_drop etc. handle
-      // most rejections upstream and don't pollute the veto counter.
-      // When MARKET_REGIME_VETO_ENABLED=false the veto path is observed
-      // (wouldHaveVetoed++) but the entry is allowed through — Phase 2
-      // ships dark by default so the operator gets evidence before
-      // flipping live.
-      {
-        const snap = getMarketRegimeSnapshot();
-        const decision = regimeVetoEvaluator.evaluateRegimeVeto({
-          regime: snap ? snap.regime : null,
-          snapshotAgeMs: snap ? snap.ageMs : null,
-          consecutiveStartedAt: snap ? snap.consecutiveStartedAt : null,
-          nowMs: Date.now(),
-          config: {
-            vetoRegimes: MARKET_REGIME_VETO_REGIMES,
-            consecutiveMs: MARKET_REGIME_VETO_CONSECUTIVE_MS,
-            maxSnapshotAgeMs: MARKET_REGIME_VETO_MAX_AGE_MS,
-          },
-        });
-        if (decision.shouldVeto) {
-          regimeVetoState.lastDecisionAt = Date.now();
-          regimeVetoState.lastDecisionRegime = decision.regime;
-          regimeVetoState.lastDecisionReason = decision.reason;
-          regimeVetoState.lastDecisionShouldVeto = true;
-          if (MARKET_REGIME_VETO_ENABLED) {
-            regimeVetoState.vetoed += 1;
-            rejectTrade(pair, decision.reason, {
-              regime: decision.regime,
-              consecutiveDurationMs: decision.durationMs,
-            });
-            continue;
-          }
-          regimeVetoState.wouldHaveVetoed += 1;
-        }
-      }
-
-      // Time-of-day filter (2026-05-28). Meta-layer that blocks entries
-      // during disallowed hours-of-week. Default schedule '*' is a no-op
-      // (allowAll=true) so this is a zero-behavior gate until the operator
-      // sets TIME_OF_DAY_ALLOWED_HOURS_UTC to something restrictive. Placed
-      // post-signal so only would-be entries are blocked and forward-graded
-      // by gateRejectionAudit. When the filter is hard-disabled by env
-      // (TIME_OF_DAY_FILTER_ENABLED=false), skipped entirely.
-      if (TIME_OF_DAY_FILTER_ENABLED && !TIME_OF_DAY_SCHEDULE.allowAll) {
-        const todDecision = evaluateTimeOfDayFilter({
-          now: new Date(),
-          schedule: TIME_OF_DAY_SCHEDULE,
-        });
-        if (!todDecision.ok) {
-          rejectTrade(pair, 'time_of_day_blocked', {
-            dayOfWeek: todDecision.dayOfWeek,
-            hourOfDay: todDecision.hourOfDay,
-          });
-          continue;
-        }
-      }
-
-      // Recent-high proximity gate. Reject when the bid is within
-      // REJECT_NEAR_HIGH_BPS of the highest close in the last
-      // REJECT_NEAR_HIGH_LOOKBACK_BARS minutes. Buying at local tops is the
-      // dominant source of stuck positions; this gate uses already-fetched
-      // closes (no extra Alpaca call).
-      // near_recent_high: refuse entries within REJECT_NEAR_HIGH_BPS of the
-      // highest close in the last REJECT_NEAR_HIGH_LOOKBACK_BARS bars.
-      //
-      // 2026-05-18 narrowed to non-continuation signals: this gate was
-      // designed for OLS ("don't buy the very top"). It is appropriate for
-      // OLS, multi_factor, and the MR family (where it's effectively dormant
-      // because mr_no_drop fires first). It is INAPPROPRIATE for the barrier
-      // and microstructure signals — those signals can legitimately want to
-      // buy near-recent-high setups (barrier-touch continuations,
-      // microprice-driven breakouts). The gate is bypassed for
-      // signalVersion ∈ {barrier, microstructure_5m/15m/30m/45m}.
-      //
-      // Live impact today: zero — barrier and microstructure are both
-      // backtest-negative and the selector hasn't admitted either. The bypass
-      // matters the moment one of them validates and the selector starts
-      // routing live entries to it.
-      // 2026-05-28: trend_following also bypassed — by construction it
-      // BUYS confirmed N-bar high breakouts; rejecting "near recent high"
-      // would gate away the signal's entire premise. Pairs stays in the
-      // applies list because its premise is mean-reversion of the relative
-      // spread, not directional breakout — the OLS-style "don't buy the
-      // top" intuition still applies to the absolute price level.
-      const recentHighSignalApplies = ![
-        'barrier',
-        'microstructure_5m', 'microstructure_15m',
-        'microstructure_30m', 'microstructure_45m',
-        'trend_following',
-      ].includes(ACTIVE_SIGNAL_VERSION);
-      const recentHighGateResult = recentHighSignalApplies
-        ? evaluateRecentHighGate({
-            closes: sig.closes,
-            bid,
-            lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
-            rejectBps: REJECT_NEAR_HIGH_BPS,
-            enabled: REJECT_NEAR_HIGH_ENABLED,
-          })
-        : { ok: true, recentHigh: null, recentHighBps: null, signalBypass: true };
-      if (!recentHighGateResult.ok && recentHighGateResult.reason === 'near_recent_high') {
-        rejectTrade(pair, 'near_recent_high', {
-          recentHigh: recentHighGateResult.recentHigh,
-          recentHighBps: recentHighGateResult.recentHighBps,
-          lookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
-          rejectBps: REJECT_NEAR_HIGH_BPS,
-        });
-        continue;
-      }
-
-      // Optional orderbook imbalance fetch. Only fires when the env flag is
-      // on so the default deployment makes zero extra API calls. Stored as
-      // a separate variable rather than mutating `sig` so the predictor
-      // stays a pure function.
-      let bookImbalance = null;
-      if (ORDERBOOK_IMBALANCE_FEATURE_ENABLED) {
-        try {
-          const obPayload = await fetchCryptoOrderbooks({ symbols: [pair] });
-          const book = obPayload?.orderbooks?.[pair] || obPayload?.orderbooks?.[toAlpacaSymbol(pair)] || null;
-          bookImbalance = computeOrderbookImbalance(book, ORDERBOOK_IMBALANCE_LEVELS);
-        } catch (err) {
-          // Non-fatal — feature is observational. Log but don't reject.
-          console.warn('orderbook_fetch_failed', { symbol: pair, error: err?.message });
-        }
-      }
-      const needed = requiredEdgeBps(spreadBps, sig.volatilityBps);
-
-      const entryGate = shouldEnterTrade({
-        spreadBps,
-        slippageEstimateBps: ENTRY_SLIPPAGE_BPS,
-        volatilityBps: sig.volatilityBps,
-        ask,
-        bid,
-        closes: sig.closes || [],
-      });
-      if (!entryGate.ok) {
-        rejectTrade(pair, entryGate.reason, { spreadBps, volatilityBps: sig.volatilityBps });
-        continue;
-      }
-
-      // Higher-timeframe confirmation: don't buy a 1m bounce inside a 5m
-      // downtrend.
-      //
-      // 2026-05-18 note: HTF is structurally contradictory with the MR family
-      // (mean_reversion, mean_reversion_5m/15m, range_mean_reversion). MR's
-      // thesis is "buy a capitulation drop" — which by definition implies the
-      // higher-timeframe is below its EMA. If the HTF gate ever ran for MR
-      // candidates, it would refuse ~100% of valid setups.
-      //
-      // Why this isn't a live bug today: MR's signal-internal mr_no_drop
-      // gate (in meanReversionSignal.js) rejects ~99% of bars BEFORE the
-      // signal evaluator returns ok. The rare candidate that survives mr_no_drop
-      // also tends to have a high enough HTF slope to clear this check. So
-      // HTF only fires on the tail of MR candidates where ordering happens
-      // to save us.
-      //
-      // DO NOT re-order this block to run BEFORE the signal evaluator. DO NOT
-      // loosen mr_no_drop without first making HTF signal-aware. The two
-      // gates compose only by accident; the accident is what keeps MR alive.
-      const htf = await getHigherTimeframeSignal(pair);
-      if (!htf.ok) {
-        rejectTrade(pair, htf.reason || 'htf_rejected');
-        continue;
-      }
-
-      // Probability-weighted expected net edge.
-      //
-      // Two probability proxies live side-by-side here so the change is
-      // reversible: the legacy `slopeProbabilityLegacy` is the logistic CDF
-      // of the OLS slope t-statistic — a measure of how significant the past
-      // slope was, not the forward chance the TP fills. The corrected
-      // `fillProbability` uses the closed-form GBM barrier-hitting formula
-      // (see entryEconomics.js) with the recent slope as drift and the
-      // recent realised vol as σ over BARRIER_HORIZON_BARS. That value
-      // actually answers the question the EV gate is trying to ask.
-      //
-      // CORRECTED_FILL_PROB_ENABLED selects which one feeds the gate.
-      // Default: corrected. Both are logged for parity tracking.
+      // STEP 2 (enter): limit buy at mid. Mid (not bid+tick) is deliberate —
+      // the entryModeAB diagnostic showed the passive bid+tick rest bled
+      // ~16 bps/trade to adverse selection on Binance.US's ~0% maker books.
+      // Operator can still override via ENTRY_LIMIT_PRICE_MODE.
       const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
-      const expectedMoveBps = Math.min(projectedBps, GROSS_TARGET_BPS);
-      const driftBpsPerBar = Number.isFinite(sig.slopeBpsPerBar) ? sig.slopeBpsPerBar : 0;
-      const volBpsPerBar = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
-      const slopeProbabilityLegacy = slopeProbability(sig.slopeTStat);
-      // Barrier the bid must hit for the TP to fill, expressed as bps from
-      // mid_t0: half-spread + entry slippage budget + gross-target + half
-      // spread on the way out (the SELL needs the bid to reach the limit).
-      const tpBarrierBpsFromMid = (spreadCostBps / 2) + ENTRY_SLIPPAGE_BPS + GROSS_TARGET_BPS + (spreadCostBps / 2);
-      const barrierFillProbability = barrierHitProbability({
-        barrierBps: tpBarrierBpsFromMid,
-        driftBpsPerBar,
-        volBpsPerBar,
-        horizonBars: BARRIER_HORIZON_BARS,
-      });
-      const fillProbability = CORRECTED_FILL_PROB_ENABLED ? barrierFillProbability : slopeProbabilityLegacy;
-      const realizedWinBps = Math.max(0, TARGET_NET_PROFIT_BPS - ENTRY_SLIPPAGE_BPS);
-      const netEdgeBps = realizedWinBps * fillProbability;
-      const modeledSlippageBps = ENTRY_SLIPPAGE_BPS;
-
-      // Cost-floor gate: refuse trades whose static GTC target cannot
-      // economically beat the round-trip friction. This is a deterministic
-      // accounting check — no probabilistic assumption — and answers the
-      // user-mandated "the system rejects trades that cannot beat costs".
-      const minGrossFloor = computeMinimumGrossTargetBps({
-        spreadBps: spreadCostBps,
-        entrySlippageBps: ENTRY_SLIPPAGE_BPS,
-        exitSlippageBps: EXIT_SLIPPAGE_BPS,
-        feeRoundTripBps: FEE_BPS_ROUND_TRIP,
-        minNetEdgeBps: MIN_NET_EDGE_BPS,
-      });
-      if (ENFORCE_GROSS_TARGET_FLOOR && GROSS_TARGET_BPS < minGrossFloor.minGrossTargetBps) {
-        rejectTrade(pair, 'gross_target_below_friction_floor', { minGrossTargetBps: minGrossFloor.minGrossTargetBps });
-        continue;
-      }
-
-      // Legacy alpha-cost gate was frequently the dominant blocker in live
-      // scans even when directional/EV gates were already passing. Keep a
-      // hard block for non-positive projection, but otherwise let the
-      // probability-weighted net-edge gate decide viability.
-      if (!Number.isFinite(projectedBps) || projectedBps <= 0) {
-        rejectTrade(pair, 'alpha_below_execution_cost', {
-          projectedBps,
-          requiredBps: spreadCostBps + modeledSlippageBps,
-          spreadCostBps,
-          modeledSlippageBps,
-        });
-        continue;
-      }
-
-      // Directional sanity check. With the legacy proxy a small-magnitude
-      // negative t-stat produced fillProbability ≈ 0.45 and the EV product
-      // still cleared MIN_NET_EDGE_BPS — i.e. the gate would submit a long
-      // even when the OLS fit predicted a downward move. Block long entries
-      // when the 1m model predicts down (or flat). Skipped for multi_factor
-      // signal: directional intent is already validated by the htfTrend +
-      // turnConfirm factors, and the multi_factor signal returns
-      // slopeTStat = 0 by design.
-      if (ACTIVE_SIGNAL_VERSION === 'ols' && (!Number.isFinite(sig.slopeTStat) || sig.slopeTStat <= 0)) {
-        rejectTrade(pair, 'slope_not_positive');
-        continue;
-      }
-
-      // Projection-magnitude floor (OLS-only, 2026-05-18 narrowing). After
-      // lowering TARGET_NET_PROFIT_BPS to 8 in PR #362, the EV gate
-      // (MIN_NET_EDGE_BPS=2) lets through entries with sub-3 bps projected
-      // moves — essentially noise. Live: BCH was accepted with
-      // projectedBps=2.6 and honestEvBps=-54. The 15-bps floor (~3× modelled
-      // slippage, roughly half a fee round-trip) blocks those.
-      //
-      // 2026-05-18 narrowed to OLS-only: `projectedBps` is OLS-flavoured
-      // (linear-regression forward projection over PREDICT_BARS). For
-      // multi_factor, barrier, and microstructure_*, projectedBps is repurposed
-      // to mean the signal's own per-trade TP target (ATR-derived,
-      // barrier-touch-derived, or horizon-fixed). Comparing those against a
-      // 15-bps "forward move" floor would refuse setups where the signal
-      // wants a 100+ bps net TP (barrier) or a horizon-bounded TP (micro).
-      // Other OLS-only gates (slope_not_positive, projected_below_gross_target,
-      // net_edge_below_min, honest_ev_below_min) already use the same
-      // signal-version dispatch — this brings projected_below_min in line.
-      if (ACTIVE_SIGNAL_VERSION === 'ols' && projectedBps < MIN_PROJECTED_BPS_TO_ENTER) {
-        rejectTrade(pair, 'projected_below_min', {
-          projectedBps,
-          minProjectedBps: MIN_PROJECTED_BPS_TO_ENTER,
-        });
-        continue;
-      }
-
-      // Fix 2: refuse trades whose own projection can't cover the gross move
-      // needed to fill the TP. Live forensics showed projectedBps≈38 with a
-      // GROSS_TARGET_BPS=48 + entry/exit slippage required: we were asking
-      // for ~54 bps of move when the model itself only predicted ~38.
-      // Skipped for multi_factor: that signal's projectedBps is a per-trade
-      // ATR-derived TP target, not a forward-move prediction. Comparing it
-      // against the global GROSS_TARGET_BPS double-counts the cost floor.
-      // ENFORCE_GROSS_TARGET_FLOOR above already enforces the global cost
-      // floor as a deterministic accounting check that applies to both signals.
-      if (ACTIVE_SIGNAL_VERSION === 'ols' && ENFORCE_PROJECTED_COVERS_GROSS) {
-        const requiredGrossBps = GROSS_TARGET_BPS + ENTRY_SLIPPAGE_BPS + EXIT_SLIPPAGE_BPS;
-        if (projectedBps < requiredGrossBps) {
-          rejectTrade(pair, 'projected_below_gross_target', {
-            projectedBps,
-            requiredGrossBps,
-            grossTargetBps: GROSS_TARGET_BPS,
-            entrySlippageBps: ENTRY_SLIPPAGE_BPS,
-            exitSlippageBps: EXIT_SLIPPAGE_BPS,
-          });
-          continue;
-        }
-      }
-
-      // Volume confirmation gate (top-detection candidate). Tops typically
-      // print on declining volume — `volumeRatio < 1` means recent-window
-      // volume is fading vs the OLS lookback. When this gate is enabled,
-      // refuse entries that pass slope/projection but lack volume backing.
-      // Default OFF (threshold = 0). See README for math.
-      if (MIN_VOLUME_RATIO_TO_ENTER > 0) {
-        const ratio = Number(sig.volumeRatio);
-        if (Number.isFinite(ratio) && ratio < MIN_VOLUME_RATIO_TO_ENTER) {
-          rejectTrade(pair, 'volume_below_min', {
-            volumeRatio: ratio,
-            minVolumeRatio: MIN_VOLUME_RATIO_TO_ENTER,
-          });
-          continue;
-        }
-      }
-
-      // BTC lead-lag gate (top-detection candidate). Alts lag BTC by 30–90s
-      // in crypto, so a fresh BTC drop is a leading indicator that alt
-      // momentum is about to reverse. When this gate is enabled, refuse
-      // non-BTC entries if BTC's last-5-bar return is more negative than
-      // the threshold. Default OFF (threshold = 0 means any positive value
-      // disables the gate; only negative thresholds enable it).
-      if (MAX_BTC_LEAD_LAG_DROP_BPS < 0 && pair !== BTC_LEAD_LAG_SYMBOL) {
-        const snap = getBtcLeadLagSnapshot();
-        const recent = Number(snap?.recentReturnBps);
-        if (Number.isFinite(recent) && recent < MAX_BTC_LEAD_LAG_DROP_BPS) {
-          rejectTrade(pair, 'btc_leading_drop', {
-            btcRecentReturnBps: recent,
-            btcLeadLagAgeMs: snap?.ageMs ?? null,
-            maxBtcLeadLagDropBps: MAX_BTC_LEAD_LAG_DROP_BPS,
-          });
-          continue;
-        }
-      }
-
-      // Net-edge gate uses fillProbability × realizedWinBps, which is meaningful
-      // for the OLS signal (logistic CDF of a fitted slope) but not for the
-      // multi_factor signal (probability is replaced by a discrete factor vote).
-      // Skipped for multi_factor; the factor vote IS the net-edge proxy.
-      if (ACTIVE_SIGNAL_VERSION === 'ols' && NET_EDGE_GATE_ENABLED) {
-        if (!Number.isFinite(netEdgeBps) || netEdgeBps < MIN_NET_EDGE_BPS) {
-          rejectTrade(pair, 'net_edge_below_min', { netEdgeBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
-          continue;
-        }
-      }
-
-      // Honest EV gate: charges the no-fill branch a non-zero MTM loss so
-      // the asymmetric "no stop-loss + GTC TP only" structure is priced
-      // honestly. Off by default — the assumption is regime-dependent —
-      // but available so operators can flip it on with a stuck-loss they
-      // believe in. See backend/scripts/simulate_strategy.js for guidance.
-      const honestEvBps = estimateExpectedNetBps({
-        hitProbability: fillProbability,
-        targetNetBps: TARGET_NET_PROFIT_BPS,
-        assumedStuckLossBps: STUCK_LOSS_ASSUMED_BPS,
-      });
-      // Same reasoning as the net-edge gate: hitProbability comes from the GBM
-      // barrier model parameterised by the OLS-fit drift, so it doesn't apply
-      // when the active signal is multi_factor. The factor vote already handled
-      // expectancy filtering.
-      if (ACTIVE_SIGNAL_VERSION === 'ols' && HONEST_EV_GATE_ENABLED && honestEvBps < MIN_NET_EDGE_BPS) {
-        rejectTrade(pair, 'honest_ev_below_min', { honestEvBps, minNetEdgeBps: MIN_NET_EDGE_BPS });
-        continue;
-      }
-
-      // Notional sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available
-      // cash. Phase 1 adds adaptive sizing: a high-confidence trigger
-      // (sig.confidence > 1) scales notional UP toward MAX_SIZING_FRACTION_OF_TARGET
-      // × base; a low-confidence trigger scales DOWN toward
-      // MIN_SIZING_FRACTION_OF_TARGET × base. The base is still the
-      // cash-clamped tradeNotional. When ADAPTIVE_SIZING_ENABLED=false
-      // (or PHASE1_ENABLED=false), all trades use the static base.
-      let sizingMultiplier = 1.0;
-      if (ADAPTIVE_SIZING_ENABLED && !explorationMode) {
-        const conf = Number(sig?.confidence);
-        if (Number.isFinite(conf) && conf > 0) {
-          // Confidence is reported by the signal as a multiplier hint
-          // around 1.0 (range mean reversion uses [0.5, 1.5], MR returns
-          // exactly 1, others may not return it). Clamp to the operator-
-          // configured bounds.
-          sizingMultiplier = Math.max(
-            MIN_SIZING_FRACTION_OF_TARGET,
-            Math.min(MAX_SIZING_FRACTION_OF_TARGET, conf),
-          );
-        }
-      }
-      // Don't let adaptive sizing exceed available cash; the cash clamp wins.
-      const adaptiveTarget = tradeNotional * sizingMultiplier;
-      const effectiveNotional = Math.min(
-        adaptiveTarget,
-        Number.isFinite(availableCash) ? availableCash : adaptiveTarget,
-      );
-
-      // Round buy limit to the asset's price_increment so Alpaca accepts it.
-      // Fix 1: rest the buy below the ask. 'mid' = (ask+bid)/2 (saves ~half
-      // the spread on entry); 'bid_plus_tick' = bid + one tick (most passive,
-      // pays no spread but fills less often); 'ask' = lift the offer (legacy).
       const tickInfo = await getAssetTickInfo(pair);
       let buyPriceRaw;
       if (ENTRY_LIMIT_PRICE_MODE === 'ask') buyPriceRaw = ask;
@@ -3918,11 +3237,8 @@ async function scanAndEnter() {
       const buyLimitStr = formatTickPrice(buyPriceRaw, tickInfo.priceIncrement);
       if (!buyLimitStr) { rejectTrade(pair, 'invalid_ask'); continue; }
       const buyLimitNum = Number(buyLimitStr);
-      // Bps saved vs. lifting the ask. Logged on the prediction record so the
-      // expectancy diff can be measured per trade after the fact.
-      const buyLimitOffsetBpsFromAsk = Number.isFinite(buyLimitNum) && ask > 0
-        ? ((ask - buyLimitNum) / ask) * 10000
-        : 0;
+      const buyLimitOffsetBpsFromAsk = Number.isFinite(buyLimitNum) && ask > 0 ? ((ask - buyLimitNum) / ask) * 10000 : 0;
+      const effectiveNotional = tradeNotional;
 
       const buyRes = await submitOrder({
         symbol: pair,
@@ -3936,18 +3252,17 @@ async function scanAndEnter() {
       if (buyOrder?.id) {
         const submittedAt = Date.now();
         const nowIso = new Date().toISOString();
-        // Per-trade exit target: when SIGNAL_SIZED_EXIT_ENABLED, this trade's
-        // GTC sell sits at entry × (1 + signalDerivedGrossBps/10000) instead
-        // of the global GROSS_TARGET_BPS. Floor = static target (so weak
-        // signals behave exactly like today), cap = SIGNAL_TARGET_MAX_NET_BPS.
+        // STEP 3 (the sell signal): derive this trade's GTC sell target FROM
+        // the entry signal. The exit manager reads signalDerivedGrossBps off
+        // this prediction record and rests the sell at entry × (1 + gross).
         const signalDerivedNetBps = deriveSignalTargetNetBps(projectedBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION);
         const signalDerivedGrossBps = signalDerivedNetBps + FEE_BPS_ROUND_TRIP;
         const volBpsForStop = Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null;
         const volScaledStopLossBps = deriveStopLossBps(volBpsForStop, spreadBps, sig.signalVersion || ACTIVE_SIGNAL_VERSION, pair);
         const prediction = {
           buyOrderId: buyOrder.id,
-          exploration: explorationMode,
-          buyLimit: Number(buyLimitStr),
+          exploration: false,
+          buyLimit: buyLimitNum,
           buyLimitPriceMode: ENTRY_LIMIT_PRICE_MODE,
           buyLimitOffsetBpsFromAsk,
           entryFillTimeoutMs: ENTRY_FILL_TIMEOUT_MS,
@@ -3960,23 +3275,14 @@ async function scanAndEnter() {
           rSquared: Number.isFinite(sig.rSquared) ? sig.rSquared : null,
           slopeTStat: Number.isFinite(sig.slopeTStat) ? sig.slopeTStat : null,
           volatilityBps: Number.isFinite(sig.volatilityBps) ? sig.volatilityBps : null,
-          projectedBps,            // uncapped projection (#5)
-          expectedMoveBps,         // capped at GROSS_TARGET_BPS (what the edge gate used)
-          fillProbability,
-          fillProbabilityLegacy: slopeProbabilityLegacy,
-          fillProbabilitySource: CORRECTED_FILL_PROB_ENABLED ? 'barrier_hit' : 'slope_logistic_cdf',
-          barrierHorizonBars: BARRIER_HORIZON_BARS,
-          tpBarrierBpsFromMid,
-          netEdgeBps,
-          honestEvBps,
-          stuckLossAssumedBps: STUCK_LOSS_ASSUMED_BPS,
-          minGrossTargetFloorBps: minGrossFloor.minGrossTargetBps,
+          projectedBps,
+          expectedMoveBps: Math.min(projectedBps, GROSS_TARGET_BPS),
           feeBpsRoundTrip: FEE_BPS_ROUND_TRIP,
           entrySlippageBps: ENTRY_SLIPPAGE_BPS,
           exitSlippageBps: EXIT_SLIPPAGE_BPS,
           grossTargetBps: signalDerivedGrossBps,        // per-trade gross target used by exit
           targetNetProfitBps: signalDerivedNetBps,       // per-trade net target used by exit
-          staticGrossTargetBps: GROSS_TARGET_BPS,        // global default, for parity tracking
+          staticGrossTargetBps: GROSS_TARGET_BPS,
           staticTargetNetProfitBps: TARGET_NET_PROFIT_BPS,
           signalDerivedNetBps,
           signalDerivedGrossBps,
@@ -3988,17 +3294,8 @@ async function scanAndEnter() {
           stopLossVolK: STOP_LOSS_VOL_K,
           stopLossHorizonBars: STOP_LOSS_HORIZON_BARS,
           stopOverSpreadBps: STOP_OVER_SPREAD_BPS,
-          htfSlopeBpsPerBar: Number.isFinite(htf?.slopeBpsPerBar) ? htf.slopeBpsPerBar : null,
           volumeRatio: Number.isFinite(sig.volumeRatio) ? sig.volumeRatio : null,
-          volumeWeightedSlopeBps: Number.isFinite(sig.volumeWeightedSlopeBps) ? sig.volumeWeightedSlopeBps : null,
-          recentVolumeMean: Number.isFinite(sig.recentVolumeMean) ? sig.recentVolumeMean : null,
           btcLeadLag: pair === BTC_LEAD_LAG_SYMBOL ? null : getBtcLeadLagSnapshot(),
-          recentHigh: recentHighGateResult.recentHigh,
-          recentHighBps: recentHighGateResult.recentHighBps,
-          recentHighLookbackBars: REJECT_NEAR_HIGH_LOOKBACK_BARS,
-          recentHighRejectBps: REJECT_NEAR_HIGH_BPS,
-          bookImbalance,
-          bookImbalanceFeatureEnabled: ORDERBOOK_IMBALANCE_FEATURE_ENABLED,
           signalVersion: sig.signalVersion || ACTIVE_SIGNAL_VERSION,
           multiFactor: sig.factors
             ? {
@@ -4007,35 +3304,8 @@ async function scanAndEnter() {
                 htfTrend: sig.factors.htfTrend?.ok,
                 pullback: sig.factors.pullback?.ok,
                 turnConfirm: sig.factors.turnConfirm?.ok,
-                bookImbalanceOk: sig.factors.bookImbalance?.ok,
-                volumeOk: sig.factors.volume?.ok,
-                btcLagOk: sig.factors.btcLag?.ok,
               }
             : null,
-          // Microstructure feature snapshot (2026-05-19) — recorded only
-          // when the active signal is one of the microstructure horizons.
-          // Phase 2's scripts/build_microstructure_weights.js reads these
-          // back from trade_forensics.jsonl to fit the logistic weights.
-          // Storing the 8 features at decision time avoids re-fetching bars
-          // / orderbook / trades to reconstruct them post-hoc.
-          microstructureFeatures: (() => {
-            const sv = String(sig.signalVersion || '').toLowerCase();
-            if (!sv.startsWith('microstructure_')) return null;
-            const f = sig.factors || {};
-            return {
-              microBias: Number.isFinite(Number(f.microBias)) ? Number(f.microBias) : null,
-              bookImbalance: Number.isFinite(Number(f.bookImbalance)) ? Number(f.bookImbalance) : null,
-              flowImbalance: Number.isFinite(Number(f.flowImbalance)) ? Number(f.flowImbalance) : null,
-              spreadZ: Number.isFinite(Number(f.spreadZ)) ? Number(f.spreadZ) : null,
-              volNormReturn: Number.isFinite(Number(f.volNormReturn)) ? Number(f.volNormReturn) : null,
-              rsiDelta: Number.isFinite(Number(f.rsiDelta)) ? Number(f.rsiDelta) : null,
-              btcResidual: Number.isFinite(Number(f.btcResidual)) ? Number(f.btcResidual) : null,
-              driftSharpe: Number.isFinite(Number(f.driftSharpe)) ? Number(f.driftSharpe) : null,
-              score: Number.isFinite(Number(f.score)) ? Number(f.score) : null,
-              p: Number.isFinite(Number(f.p)) ? Number(f.p) : null,
-              horizonMinutes: Number.isFinite(Number(sig.horizonMinutes)) ? Number(sig.horizonMinutes) : null,
-            };
-          })(),
         };
         pendingBuys.set(pair, { orderId: buyOrder.id, submittedAt, limit: ask });
         tradePredictions.set(pair, {
@@ -4045,31 +3315,6 @@ async function scanAndEnter() {
           buyFillObserved: false,
           actualEntryPrice: null,
         });
-        // Feature library snapshot (2026-05-18). Observational-only — runs
-        // ONLY at the entry-accepted boundary (already inside try) so live
-        // entry latency is unaffected. Do not move this call earlier into
-        // scanAndEnter; per-candidate computation would bloat labeled.jsonl
-        // 30:1 and gain nothing until rejected-candidate calibration is in
-        // scope (separate, future PR).
-        let featureSnapshot = null;
-        if (FEATURE_LIBRARY_LOGGING_ENABLED) {
-          try {
-            featureSnapshot = buildFeatureSnapshot({
-              bars1m: sig?.featureBars?.bars1m || null,
-              closes: Array.isArray(sig?.closes) ? sig.closes : null,
-              quote: { bid, ask },
-              orderbook: sig?.featureBars?.orderbook || null,
-              candidatePrice: ask,
-              enable: {
-                indicators: FEATURE_INDICATORS_EXTENDED_ENABLED,
-                stats: FEATURE_STATS_ENABLED,
-                structure: FEATURE_STRUCTURE_ENABLED,
-              },
-            });
-          } catch (err) {
-            console.warn('feature_snapshot_failed', { symbol: pair, error: err?.message });
-          }
-        }
         try {
           tradeForensics.append({
             tradeId: buyOrder.id,
@@ -4077,7 +3322,6 @@ async function scanAndEnter() {
             phase: 'entry_submitted',
             ts: nowIso,
             ...prediction,
-            featureSnapshot,
           });
         } catch (err) {
           console.warn('forensics_entry_append_failed', { symbol: pair, error: err?.message });
@@ -4093,58 +3337,25 @@ async function scanAndEnter() {
           symbol: pair,
           tradeId: buyOrder.id,
           signalVersion: prediction.signalVersion,
-          multiFactor: prediction.multiFactor,
           buyLimit: prediction.buyLimit,
           notional: effectiveNotional,
           spreadBps,
-          slopeTStat: prediction.slopeTStat,
-          fillProbability,
-          fillProbabilityLegacy: slopeProbabilityLegacy,
-          fillProbabilitySource: prediction.fillProbabilitySource,
-          tpBarrierBpsFromMid,
-          barrierHorizonBars: BARRIER_HORIZON_BARS,
           projectedBps,
-          expectedMoveBps,
-          netEdgeBps,
-          honestEvBps,
-          minGrossTargetFloorBps: minGrossFloor.minGrossTargetBps,
           signalDerivedNetBps,
           signalDerivedGrossBps,
-          signalSizedExitEnabled: SIGNAL_SIZED_EXIT_ENABLED,
           stopLossBpsResolved: volScaledStopLossBps,
-          volScaledStopEnabled: VOL_SCALED_STOP_ENABLED,
           volatilityBps: prediction.volatilityBps,
-          htfSlopeBpsPerBar: prediction.htfSlopeBpsPerBar,
-          volumeRatio: prediction.volumeRatio,
-          volumeWeightedSlopeBps: prediction.volumeWeightedSlopeBps,
-          btcRecentReturnBps: prediction.btcLeadLag?.recentReturnBps ?? null,
-          btcLeadLagAgeMs: prediction.btcLeadLag?.ageMs ?? null,
-          bookImbalance: prediction.bookImbalance,
         });
         summary.entered += 1;
         summary.acceptedSymbols.push(pair);
         lastSuccessfulAction = { at: nowIso, symbol: pair, action: 'buy_submitted', orderId: buyOrder.id };
         placed += 1;
-        // Exploration entries: record the timestamp (rolling daily cap) and
-        // stop after one probe per scan. The concurrent cap + one-per-scan
-        // pacing keep total exploration exposure bounded; subsequent scans
-        // re-evaluate the budget and fill the next slot only if one is free.
-        if (explorationMode) {
-          explorationBudget.recordEntry(Date.now());
-          console.log('entry_exploration_submitted', { symbol: pair, tradeId: buyOrder.id, notional: effectiveNotional });
-          break;
-        }
       } else {
         rejectTrade(pair, 'buy_rejected');
       }
     } catch (err) {
       // Surface the venue's own error code + message when present (Binance.US
-      // signed errors carry binanceErrorCode/binanceErrorMessage). Without
-      // this the operator only sees the opaque HTTP wrapper (e.g.
-      // "binance_signed_401") and cannot tell a key-permission/IP problem
-      // (-2015) apart from a signature problem (-1022) or insufficient
-      // balance (-2010). Account reads can succeed while order POSTs fail,
-      // so the distinction is the whole diagnosis.
+      // signed errors carry binanceErrorCode/binanceErrorMessage).
       const binanceErrorCode = err?.binanceErrorCode ?? null;
       const binanceErrorMessage = err?.binanceErrorMessage ?? null;
       const baseMessage = err?.errorMessage || err?.message || String(err);
@@ -4160,10 +3371,6 @@ async function scanAndEnter() {
   lastEntryScanSummary = summary;
   lastEntryScanAt = new Date().toISOString();
   currentScanState = 'idle';
-  // Defensive: clear the gate-audit context so a rejectTrade emitted from
-  // anywhere outside scanAndEnter (post-fill diagnostics, exit-manager
-  // rejects, etc.) doesn't mis-attribute to the last scanned symbol.
-  clearScanAuditCandidate();
   setEngineState('ready', 'scan_completed');
 }
 

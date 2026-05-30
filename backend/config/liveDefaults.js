@@ -147,14 +147,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_MAX_HOLD_MS: '2700000',
   MR_BREAKEVEN_TIMEOUT_MS: '1800000',
   // 2026-05-16: was 'mid'. The 14-trade live scorecard from the
-  // pre-veto window showed avgEntrySpreadBps of 36.85 — at $84 equity and
-  // 30 bps round-trip fees, paying half a spread on entry left no realistic
-  // path to a positive net. 'bid_plus_tick' rests one tick above the bid
-  // (passive, never crosses) and pairs with ENTRY_FILL_TIMEOUT_MS=30000 so
-  // unfilled rests recycle on the next scan instead of stranding capital.
-  // CLAUDE.md documents this as the live-recommended posture. Revert to
-  // 'mid' or 'ask' in Render env to restore spread-crossing entries.
-  ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick',
+  // 2026-05-30: flipped 'bid_plus_tick' → 'mid'. The original passive rest
+  // was adopted on Alpaca (30 bps fee + wide books) where paying half a
+  // spread on entry was fatal. On Binance.US (~0% maker, tight USDT books)
+  // that rationale is gone, and the live entryModeAB diagnostic measured the
+  // passive rest bleeding ~16 bps/trade to adverse selection (it only fills
+  // when the market trades DOWN into it). 'mid' = (ask+bid)/2 flips every
+  // signal from net-negative toward breakeven/positive. Revert to
+  // 'bid_plus_tick' or 'ask' in Render env to restore the prior behaviour.
+  ENTRY_LIMIT_PRICE_MODE: 'mid',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
   // projected forward move doesn't cover the gross target + entry/exit

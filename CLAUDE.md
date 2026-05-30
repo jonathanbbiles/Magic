@@ -8,6 +8,20 @@ Live crypto trading bot. As of 2026-05-21 the bot supports two venues, controlle
 
 The full strategy is documented in `README.md` (top level). Read it before making changes — older doc fragments in `backend/README.md` describe features that are documented but not implemented (stops, Kelly sizing, drawdown guard, correlation guard, TWAP, engine v2). Treat any env var not listed in the top-level `README.md` as not-wired until confirmed by `grep` in `backend/`.
 
+## 2026-05-30: entry path simplified — READ THIS BEFORE EDITING scanAndEnter
+
+`scanAndEnter` in `backend/trade.js` was rewritten from ~1,150 lines (≈25 stacked gates/vetoes) down to the bare 4-step loop: **determine signal → enter at mid → attach GTC sell derived from the entry → repeat.** This was a deliberate de-complication by the repo owner after the bot froze at zero trades (backtest veto + exhausted exploration budget) while bleeding −50 bps/trade when it did trade.
+
+**Removed from the LIVE ENTRY PATH** (the modules still exist, are still unit-tested, and their dashboard getters in `index.js` still surface `meta.*` — they are simply no longer consulted by `scanAndEnter`): the signal-selector **backtest** veto (`getSignalSelectorDecision().tradingVeto`), the exploration budget, the regime veto, the cross-venue gate, the stale-quote rescue/retry, the spread-suppression tracker, the recent-high gate, the HTF gate, and the OLS-era EV / alpha / net-edge / projection-floor / volume / btc-lead-lag / adaptive-sizing gates.
+
+**Kept in the entry path:** quote-freshness check, spread cap, equity-% sizing clamped to cash, one-position-per-symbol, `MAX_CONCURRENT_POSITIONS_SOFT_CAP`, the active signal's own ok/reject, and **one** safety brake — `signalSelector.evaluateRealizedVeto` (the realized-expectancy bleed check). The realized veto is the ONLY thing that can now halt entries; it reuses `driftAlerter.selectRealizedTrades` so it agrees with `meta.drift`.
+
+**`ENTRY_LIMIT_PRICE_MODE` default is now `mid`** (was `bid_plus_tick`) — the entryModeAB diagnostic showed the passive rest bled ~16 bps/trade to adverse selection on Binance.US's ~0% maker books.
+
+**Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). Set `SIGNAL_VERSION` in Render env to pin a different one.
+
+**Implications for future edits:** do NOT reintroduce the backtest veto into the entry path as a way to "stop bad trades" — that exact gate is what froze the bot; use the realized-expectancy brake instead. If you must re-wire a removed gate, justify it against this de-complication and keep the 4-step shape legible. The prediction-record shape written at entry is consumed by the exit manager, forensics, dashboard, and `closedTradeStats` — preserve it. Sections below this line describe machinery that is mostly NO LONGER in the live entry path; treat them as reference for the modules (still live as diagnostics) rather than as a description of how entries are decided today.
+
 ## Hard rules
 
 1. **Keep `README.md` (top level) current.** If a change affects any of the following, the same PR must update `README.md`:
