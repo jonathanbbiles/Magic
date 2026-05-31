@@ -34,6 +34,31 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FILL_TIMEOUT_MS, '30000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
 
+// 2026-05-31: spread caps must stay BELOW the TP target
+// (EXIT_NET_PROFIT_AFTER_FEES_BPS=45) or the bot admits books whose spread
+// can't be cleared by the GTC sell. Locked at a uniform 30 bps so a drift
+// back to the prior 60/45/90 ceiling (which admitted −EV-by-construction
+// books) can't happen silently. The global SPREAD_MAX_BPS is the
+// authoritative clamp; each tier is min(tierCap, SPREAD_MAX_BPS).
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER1, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER2, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER3, '30');
+assert.ok(
+  Number(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS)
+    < Number(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS),
+  'spread ceiling must be below the net TP target',
+);
+
+// 2026-05-31: primary universe trimmed to the 9 most-liquid Binance.US
+// majors (dropped UNI/DOT/BCH). Locked so the thin-book alts can't creep
+// back into the code default. (On binance_us the LIVE universe still comes
+// from Render's ENTRY_SYMBOLS_PRIMARY override — see liveDefaults.js note.)
+assert.equal(
+  LIVE_CRITICAL_DEFAULTS.ENTRY_SYMBOLS_PRIMARY,
+  'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD',
+);
+
 // 2026-05-15 rollback: HONEST_EV_GATE stays ON (low-cost sanity check).
 // MIN_SIZING_FRACTION lowered 0.6 → 0.4 so scans don't abort on cash
 // fragmentation. MIN_VOLUME_RATIO and MAX_BTC_LEAD_LAG_DROP_BPS disabled

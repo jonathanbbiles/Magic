@@ -764,16 +764,21 @@ const quoteFreshness = createQuoteFreshnessTracker({
   probationFreshObservations: STALE_QUOTE_PRUNE_PROBATION_FRESH,
 });
 // Hard spread cap for entries (safety net above the implicit edge-gate bound).
-// Default raised to 60 bps so the hard guardrail no longer blocks otherwise
-// valid candidates in normal-but-noisy live books; the tighter economics and
-// microstructure gates still run afterwards (entry-max, EV, alpha, etc.).
-const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 60));
-// Tier-aware spread caps: BTC/ETH stay tight, mid-caps a bit looser, long-tail
-// alts get the room their thinner books need. Each is clamped to the global
-// SPREAD_MAX_BPS at resolution so the flat cap remains an authoritative ceiling.
+// 2026-05-31: tightened 60 → 30 so the ceiling sits below the ~45 bps net TP
+// target — a book wider than the achievable TP can never net positive, so
+// admitting it only bleeds. These fallbacks mirror
+// liveDefaults.js (LIVE_CRITICAL_DEFAULTS wins at runtime; kept in sync per
+// CLAUDE.md so a bare process invocation matches the live posture).
+const SPREAD_MAX_BPS = Math.max(1, readNumber('SPREAD_MAX_BPS', 30));
+// Tier-aware spread caps, each clamped to the global SPREAD_MAX_BPS at
+// resolution so the flat cap stays an authoritative ceiling. Collapsed to a
+// uniform 30 bps: on Binance.US's USDT books the liquid majors quote well
+// inside 30 bps, while the thin alt books (60-920 bps) are exactly the names
+// the 2026-05-31 diagnosis showed bleeding — so the cap doubles as a
+// liquidity filter.
 const SPREAD_MAX_BPS_TIER1 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER1', 30));
-const SPREAD_MAX_BPS_TIER2 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER2', 45));
-const SPREAD_MAX_BPS_TIER3 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER3', 90));
+const SPREAD_MAX_BPS_TIER2 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER2', 30));
+const SPREAD_MAX_BPS_TIER3 = Math.max(1, readNumber('SPREAD_MAX_BPS_TIER3', 30));
 const TIER1_SYMBOL_SET = new Set(runtimeConfig.executionTier1Symbols || []);
 const TIER2_SYMBOL_SET = new Set(runtimeConfig.executionTier2Symbols || []);
 function resolveSymbolTier(pair) {

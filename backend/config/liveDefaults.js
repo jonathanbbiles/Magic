@@ -22,13 +22,24 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // 2026-05-16: was 'dynamic'. Alpaca's quote feed is chronically stale on
   // long-tail alts — live diagnostics observed 19/33 symbols pruned for
   // staleness at any moment, and ~24/scan rejected with reason=stale_quote.
-  // The configured 12-pair primary universe (deep-liquidity majors) is what
+  // The configured primary universe (deep-liquidity majors) is what
   // CLAUDE.md documents as the live-recommended posture and what the live
   // execution-tier configuration is actually sized for. Flipped to
   // 'configured' so the scan runs only on symbols whose quote feed is
   // reliable. Set ENTRY_UNIVERSE_MODE=dynamic in Render env to revert.
+  //
+  // 2026-05-31: trimmed 12 → 9 to the most-liquid Binance.US majors,
+  // dropping UNI/DOT/BCH. Rationale: the 2026-05-31 per-symbol expectancy
+  // audit and the spread-rejection flood (the alt books on Binance.US run
+  // 60-920 bps vs the ~30-45 bps caps) showed the thin-book names only ever
+  // fail `spread_too_wide` or bleed when they do fill; BCH was already
+  // MR-blocklisted. NOTE: `configured` mode intersects this list with the
+  // venue's tradable set, so on a binance_us deploy the LIVE universe is
+  // whatever the operator sets in Render's ENTRY_SYMBOLS_PRIMARY — to make
+  // this trim bite live, remove that override (falls back here) or set it to
+  // the same 9-major list.
   ENTRY_UNIVERSE_MODE: 'configured',
-  ENTRY_SYMBOLS_PRIMARY: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
+  ENTRY_SYMBOLS_PRIMARY: 'BTC/USD,ETH/USD,SOL/USD,AVAX/USD,LINK/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD',
   ENTRY_SYMBOLS_SECONDARY: '',
   ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'false',
   ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false',
@@ -365,11 +376,20 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // Tier-aware entry spread caps. The flat SPREAD_MAX_BPS stays as a global
   // ceiling; each per-tier cap is clamped to min(tierCap, SPREAD_MAX_BPS) at
   // resolution time so a misconfiguration can't blow past the global guardrail.
-  // Tier1 (BTC/ETH) stays tight; tier3 (long-tail alts on Alpaca) gets the
-  // room thinner books need so the dynamic universe actually produces fills.
+  //
+  // 2026-05-31: tightened the global ceiling 60 → 30 and collapsed every tier
+  // to 30. Rationale: the GTC sell targets ~45 bps net, so a book whose spread
+  // exceeds the achievable TP can NEVER produce a
+  // positive round trip — yet the prior 60-bps ceiling admitted exactly those
+  // books (the 2026-05-31 scorecard: 31% win rate, avg win ~+31 bps vs avg
+  // loss ~−80 bps, realized −50 bps/trade). Capping spread below the TP target
+  // means the bot only enters books where the GTC sell can actually clear its
+  // costs. Widen in Render env (SPREAD_MAX_BPS / SPREAD_MAX_BPS_TIER*) if a
+  // future signal targets a larger TP that can carry a wider book.
+  SPREAD_MAX_BPS: '30',
   SPREAD_MAX_BPS_TIER1: '30',
-  SPREAD_MAX_BPS_TIER2: '45',
-  SPREAD_MAX_BPS_TIER3: '90',
+  SPREAD_MAX_BPS_TIER2: '30',
+  SPREAD_MAX_BPS_TIER3: '30',
   // Phase 1 master kill switch. When 'false', all Phase 1 layers (multi-
   // timeframe MR, range mean reversion, adaptive sizing, concurrent-position
   // soft cap) revert to legacy behavior in a single env flip. Per-layer
