@@ -80,7 +80,7 @@ function withCapturedLog(fn) {
 
 function withSafetyEnv(setup, run) {
   const saved = {};
-  const keys = ['ENTRY_LIMIT_PRICE_MODE', 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK'];
+  const keys = ['ENTRY_LIMIT_PRICE_MODE', 'ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID'];
   for (const k of keys) saved[k] = process.env[k];
   for (const k of keys) delete process.env[k];
   for (const [k, v] of Object.entries(setup)) process.env[k] = v;
@@ -94,7 +94,7 @@ function withSafetyEnv(setup, run) {
   }
 }
 
-// 6. Unsafe value ('ask') without escape hatch → overridden to forcedValue,
+// 6. Unsafe value ('ask') without escape hatch → forced to 'mid',
 //    config_safety_override event emitted with the discarded value.
 withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'ask' }, () => {
   const events = withCapturedLog((logger) => {
@@ -102,18 +102,33 @@ withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'ask' }, () => {
     assert.equal(result.overridden, 1, 'unsafe ask should be overridden');
     assert.equal(result.bypassed, 0);
   });
-  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick', 'ask must be replaced with bid_plus_tick');
+  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'mid', 'ask must be replaced with mid');
   const overrideEvent = events.find((e) => e.event === 'config_safety_override');
   assert.ok(overrideEvent, 'config_safety_override must be emitted');
   assert.equal(overrideEvent.payload.key, 'ENTRY_LIMIT_PRICE_MODE');
   assert.equal(overrideEvent.payload.discardedValue, 'ask');
-  assert.equal(overrideEvent.payload.appliedValue, 'bid_plus_tick');
+  assert.equal(overrideEvent.payload.appliedValue, 'mid');
   assert.ok(typeof overrideEvent.payload.rationale === 'string' && overrideEvent.payload.rationale.length > 0);
+});
+
+// 6b. The other unsafe value ('bid_plus_tick') → also forced to 'mid'. This is
+//     the stale-passive-rest case the 2026-05-31 fix targets.
+withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick' }, () => {
+  const events = withCapturedLog((logger) => {
+    const result = applySafetyOverridesToEnv({ logger });
+    assert.equal(result.overridden, 1, 'unsafe bid_plus_tick should be overridden');
+    assert.equal(result.bypassed, 0);
+  });
+  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'mid', 'bid_plus_tick must be replaced with mid');
+  const overrideEvent = events.find((e) => e.event === 'config_safety_override');
+  assert.ok(overrideEvent, 'config_safety_override must be emitted');
+  assert.equal(overrideEvent.payload.discardedValue, 'bid_plus_tick');
+  assert.equal(overrideEvent.payload.appliedValue, 'mid');
 });
 
 // 7. Unsafe value WITH escape hatch → preserved, bypass event emitted.
 withSafetyEnv(
-  { ENTRY_LIMIT_PRICE_MODE: 'ask', ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK: 'true' },
+  { ENTRY_LIMIT_PRICE_MODE: 'ask', ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID: 'true' },
   () => {
     const events = withCapturedLog((logger) => {
       const result = applySafetyOverridesToEnv({ logger });
@@ -124,7 +139,7 @@ withSafetyEnv(
     const bypassEvent = events.find((e) => e.event === 'config_safety_override_bypassed');
     assert.ok(bypassEvent, 'config_safety_override_bypassed must be emitted');
     assert.equal(bypassEvent.payload.key, 'ENTRY_LIMIT_PRICE_MODE');
-    assert.equal(bypassEvent.payload.escapeHatchEnv, 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK');
+    assert.equal(bypassEvent.payload.escapeHatchEnv, 'ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID');
   },
 );
 
@@ -139,16 +154,20 @@ withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'mid' }, () => {
   assert.equal(events.length, 0, 'safe value must not emit any safety event');
 });
 
-// 9. Default explicit value ('bid_plus_tick') → no override, no events.
-withSafetyEnv({ ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick' }, () => {
-  const events = withCapturedLog((logger) => {
-    const result = applySafetyOverridesToEnv({ logger });
-    assert.equal(result.overridden, 0);
-    assert.equal(result.bypassed, 0);
-  });
-  assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick');
-  assert.equal(events.length, 0);
-});
+// 9. bid_plus_tick WITH escape hatch → preserved (deliberate experiment).
+withSafetyEnv(
+  { ENTRY_LIMIT_PRICE_MODE: 'bid_plus_tick', ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID: 'true' },
+  () => {
+    const events = withCapturedLog((logger) => {
+      const result = applySafetyOverridesToEnv({ logger });
+      assert.equal(result.overridden, 0);
+      assert.equal(result.bypassed, 1);
+    });
+    assert.equal(process.env.ENTRY_LIMIT_PRICE_MODE, 'bid_plus_tick');
+    const bypassEvent = events.find((e) => e.event === 'config_safety_override_bypassed');
+    assert.ok(bypassEvent, 'config_safety_override_bypassed must be emitted');
+  },
+);
 
 // 10. SAFETY_OVERRIDES is frozen so a stray require-time mutation can't
 //     silently disable a guardrail.

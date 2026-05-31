@@ -48,13 +48,22 @@ const { LIVE_CRITICAL_DEFAULTS, LIVE_CRITICAL_KEYS } = require('./liveDefaults')
 
 const SAFETY_OVERRIDES = Object.freeze({
   ENTRY_LIMIT_PRICE_MODE: Object.freeze({
-    unsafeValue: 'ask',
-    forcedValue: 'bid_plus_tick',
-    escapeHatchEnv: 'ENTRY_LIMIT_PRICE_MODE_ALLOW_UNSAFE_ASK',
+    // 2026-05-31 stop-the-bleed: the code default is now 'mid', and BOTH legacy
+    // values are unsafe — 'ask' crosses the spread; 'bid_plus_tick' rests
+    // passively and only fills when the market trades DOWN into it (adverse
+    // selection). The live entryModeAB sweep showed every signal improves at
+    // mid and microstructure_45m only flips positive at mid. A stale Render
+    // override carrying either value would silently defeat the fix, so both are
+    // forced to 'mid'. Escape hatch ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID=true
+    // restores the explicit Render value for a deliberate experiment.
+    unsafeValues: ['ask', 'bid_plus_tick'],
+    forcedValue: 'mid',
+    escapeHatchEnv: 'ENTRY_LIMIT_PRICE_MODE_ALLOW_NON_MID',
     rationale:
-      'Live scorecard 2026-05-15 (14 trades, 7.14% wins, expectancy -$0.074/trade) was '
-      + 'directly attributable to spread-crossing entries. The 36.85 bps avg entry spread '
-      + 'paid in that window does not fit inside any current backtest expectancy.',
+      'entryModeAB (live Binance.US 30-day): passive bid+tick bleeds to adverse '
+      + 'selection (mean_reversion -9.6, micro_5m -29, micro_45m -11.4 bps) while mid '
+      + 'lifts every signal and flips micro_45m to +5.0 bps. ask crosses the spread '
+      + '(2026-05-15 scorecard -$0.074/trade). Both non-mid modes are forced to mid.',
   }),
   REJECT_NEAR_HIGH_LOOKBACK_BARS: Object.freeze({
     unsafeValue: '60',
@@ -79,11 +88,17 @@ function applySafetyOverridesToEnv({ logger } = {}) {
   let bypassed = 0;
   for (const key of SAFETY_OVERRIDE_KEYS) {
     const spec = SAFETY_OVERRIDES[key];
-    if (process.env[key] !== spec.unsafeValue) continue;
+    // A spec may list a single unsafe value (`unsafeValue`) or several
+    // (`unsafeValues`). Both forms are forced to the same `forcedValue`.
+    const unsafeSet = Array.isArray(spec.unsafeValues)
+      ? spec.unsafeValues
+      : [spec.unsafeValue];
+    const current = process.env[key];
+    if (!unsafeSet.includes(current)) continue;
     if (process.env[spec.escapeHatchEnv] === 'true') {
       log('config_safety_override_bypassed', {
         key,
-        unsafeValue: spec.unsafeValue,
+        unsafeValue: current,
         escapeHatchEnv: spec.escapeHatchEnv,
         rationale: spec.rationale,
       });
@@ -92,7 +107,7 @@ function applySafetyOverridesToEnv({ logger } = {}) {
     }
     log('config_safety_override', {
       key,
-      discardedValue: spec.unsafeValue,
+      discardedValue: current,
       appliedValue: spec.forcedValue,
       escapeHatchEnv: spec.escapeHatchEnv,
       rationale: spec.rationale,

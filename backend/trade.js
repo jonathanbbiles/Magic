@@ -179,6 +179,20 @@ const ENTRY_LIMIT_PRICE_MODE = readEnum('ENTRY_LIMIT_PRICE_MODE', ['ask', 'mid',
 // Set to 0 to disable (passive buy rests until the staircase exit logic
 // detects it on a held position — not recommended outside backtest parity).
 const ENTRY_FILL_TIMEOUT_MS = Math.max(0, readNumber('ENTRY_FILL_TIMEOUT_MS', 30000));
+// 2026-05-31 stop-the-bleed: re-fetch a fresh single-symbol quote at the top of
+// each per-symbol entry evaluation instead of trusting the batch-prefetched
+// quote. Binance.US bookTicker carries no server timestamp, so a prefetched
+// quote's measured age is just scan-loop latency (the live snapshot showed an
+// ~8,500 ms avg quote age at entry). Re-quoting makes the freshness gate, the
+// spread gate, and the entry price act on a current book. Default ON; set
+// ENTRY_FRESH_REQUOTE=false to restore the prefetch-trusting path.
+const ENTRY_FRESH_REQUOTE = readBoolean('ENTRY_FRESH_REQUOTE', true);
+// 2026-05-31 stop-the-bleed: a HARD liquidity allowlist intersected into the
+// live universe (see scanAndEnter). Enforced in code so a stale Render
+// ENTRY_SYMBOLS_PRIMARY override can never re-admit the thin-book losers the
+// audit flagged. Empty list = no intersection (legacy behaviour).
+const ENTRY_UNIVERSE_HARD_ALLOWLIST = readList('ENTRY_UNIVERSE_HARD_ALLOWLIST', []);
+const ENTRY_UNIVERSE_HARD_ALLOWLIST_SET = new Set(ENTRY_UNIVERSE_HARD_ALLOWLIST);
 // Fix 2: refuse entries whose own projection doesn't cover the gross target
 // we'd need to hit TP. Live forensics: projected 38 bps move into a 48 bps
 // gross target — we were asking the market for more than the model itself
@@ -3105,6 +3119,17 @@ async function scanAndEnter() {
   } else {
     universe = allTradable.slice();
   }
+  // Hard liquidity allowlist (2026-05-31). Intersected AFTER the configured/
+  // dynamic universe is built so it is the final word on what the live scan can
+  // reach — a stale Render ENTRY_SYMBOLS_PRIMARY override cannot widen past it.
+  // Empty list = disabled (no intersection).
+  if (ENTRY_UNIVERSE_HARD_ALLOWLIST_SET.size > 0) {
+    const beforeCount = universe.length;
+    universe = universe.filter((s) => ENTRY_UNIVERSE_HARD_ALLOWLIST_SET.has(s));
+    if (universe.length !== beforeCount) {
+      bumpSkipReason('universe_hard_allowlist_filtered');
+    }
+  }
   currentScanUniverseSize = universe.length;
 
   let held, openBuyPairs;
@@ -3181,8 +3206,24 @@ async function scanAndEnter() {
       continue;
     }
     try {
-      const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
-      const payload = prefetched ? { quotes: { [pair]: prefetched } } : await fetchCryptoQuotes({ symbols: [pair] });
+      // Fresh re-quote (2026-05-31): when enabled, fetch a current single-symbol
+      // quote so the freshness/spread gates and the entry price all act on a
+      // live book — the prefetched quote's "age" on Binance.US is only loop
+      // latency (bookTicker has no server timestamp). Falls back to the
+      // prefetched quote if the fresh fetch fails, so a transient error can't
+      // wholesale starve the scan.
+      let payload;
+      if (ENTRY_FRESH_REQUOTE) {
+        try {
+          payload = await fetchCryptoQuotes({ symbols: [pair] });
+        } catch (_) {
+          const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
+          payload = prefetched ? { quotes: { [pair]: prefetched } } : null;
+        }
+      } else {
+        const prefetched = prefetchedQuotes ? prefetchedQuotes.get(pair) : null;
+        payload = prefetched ? { quotes: { [pair]: prefetched } } : await fetchCryptoQuotes({ symbols: [pair] });
+      }
       const quote = payload?.quotes?.[pair] || payload?.quotes?.[toAlpacaSymbol(pair)] || null;
       if (!quote) { rejectTrade(pair, 'no_quote'); continue; }
 

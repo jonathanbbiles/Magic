@@ -44,6 +44,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_SYMBOLS_INCLUDE_SECONDARY: 'false',
   ENTRY_UNIVERSE_EXCLUDE_STABLES: 'false',
   ENTRY_UNIVERSE_MAX_SYMBOLS: '',
+  // 2026-05-31 stop-the-bleed: a HARD liquidity allowlist intersected into the
+  // live universe AFTER `ENTRY_SYMBOLS_PRIMARY` + the tradable set. Unlike
+  // ENTRY_SYMBOLS_PRIMARY (which a stale Render override can widen back out to
+  // illiquid alts), this list is enforced in `scanAndEnter` so the live scan
+  // can never reach the thin-book losers the 2026-05-31 audit flagged
+  // (DOT/NEAR/XLM/HBAR/ONDO/SKY all bled -100+ bps/trade). Measured live
+  // Binance.US USD spreads on these eight: BTC 4.4, ETH 0.55, SOL 1.2, XRP 2.3,
+  // ADA 4.3, LINK 4.4, DOGE 6.0, AVAX 14.6 bps — all but AVAX clear the 12-bps
+  // SPREAD_MAX_BPS comfortably; AVAX is admitted only when its book tightens.
+  // Reversible: set ENTRY_UNIVERSE_HARD_ALLOWLIST='' in Render to disable the
+  // intersection entirely (falls back to ENTRY_SYMBOLS_PRIMARY behaviour).
+  ENTRY_UNIVERSE_HARD_ALLOWLIST: 'BTC/USD,ETH/USD,SOL/USD,XRP/USD,ADA/USD,LINK/USD,DOGE/USD,AVAX/USD',
   EXECUTION_TIER1_SYMBOLS: 'BTC/USD,ETH/USD',
   EXECUTION_TIER2_SYMBOLS: 'LINK/USD,AVAX/USD,SOL/USD,UNI/USD,DOT/USD,ADA/USD,XRP/USD,DOGE/USD,LTC/USD,BCH/USD',
   EXECUTION_TIER3_DEFAULT: 'true',
@@ -55,6 +67,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_PREFETCH_CHUNK_SIZE: '8',
   ENTRY_PREFETCH_QUOTES: 'true',
   ENTRY_PREFETCH_ORDERBOOKS: 'true',
+  // 2026-05-31 stop-the-bleed: re-fetch a FRESH single-symbol quote at the top
+  // of each per-symbol entry evaluation instead of trusting the batch-prefetched
+  // quote. Binance.US bookTicker carries NO server timestamp, so the prefetched
+  // quote's measured "age" is just scan-loop latency — and the live snapshot
+  // showed an ~8,500 ms avg quote age at entry. Re-quoting makes the freshness
+  // gate, the spread gate, and the entry price all act on a current book, which
+  // is what the tight ENTRY_QUOTE_MAX_AGE_MS=2000 cap needs to be meaningful.
+  // Reversible: ENTRY_FRESH_REQUOTE='false' restores the prefetch-trusting path.
+  ENTRY_FRESH_REQUOTE: 'true',
   ALPACA_MD_MAX_CONCURRENCY: '4',
   BARS_MAX_CONCURRENT: '4',
   BARS_PREFETCH_INTERVAL_MS: '90000',
@@ -88,8 +109,12 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_SLIPPAGE_BUFFER_BPS_TIER2: '8',
   EXIT_SLIPPAGE_BUFFER_BPS_TIER1: '6',
   EXIT_SLIPPAGE_BUFFER_BPS_TIER2: '10',
-  ENTRY_QUOTE_MAX_AGE_MS: '15000',
-  ENTRY_QUOTE_STALE_GRACE_MS: '15000',
+  // 2026-05-31 stop-the-bleed: tightened from 15000/15000 (a 30 s effective hard
+  // cap) to 2000/0. Scalping a sub-1% target on an 8,500 ms-stale quote is fatal.
+  // Paired with ENTRY_FRESH_REQUOTE=true so the quote feeding this gate is a
+  // fresh single-symbol fetch (age ≈ network round-trip), not the stale prefetch.
+  ENTRY_QUOTE_MAX_AGE_MS: '2000',
+  ENTRY_QUOTE_STALE_GRACE_MS: '0',
   ENTRY_REGIME_STALE_QUOTE_MAX_AGE_MS: '120000',
   // Per-symbol stale-quote pruner. After STALE_QUOTE_PRUNE_LOOKBACK observed
   // fetches whose fresh-fraction drops below STALE_QUOTE_PRUNE_MIN_FRESH_RATIO,
@@ -190,7 +215,22 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // selector will route to whichever signal clears SIGNAL_SELECTOR_MIN_BPS
   // (currently only mean_reversion at +23 bps over 6 entries). Pin to
   // 'ols' in Render env to force-trade OLS again.
-  SIGNAL_VERSION: '',
+  //
+  // 2026-05-31 stop-the-bleed: pinned to 'microstructure_45m'. Evidence: the
+  // live entryModeAB sweep (meta.entryModeAB, 30-day Binance.US backtest at the
+  // 2-bps venue fee) showed it is the ONLY signal that flips POSITIVE once the
+  // passive bid+tick entry is replaced with mid entry: -11.4 bps passive →
+  // +5.0 bps mid (aggressiveFlipsPositive=true), vs mean_reversion -1.8,
+  // micro_5m -1.6, ols -3.4 (all still negative at mid). mean_reversion — the
+  // prior live default — had bled the account to a realized-veto halt at
+  // -27.7 bps over its last 10 trades. Pinning a signal with ZERO recent closed
+  // trades also resets the realized-expectancy circuit breaker's sample
+  // (insufficient_sample → no veto) so trading resumes; the breaker re-arms
+  // once micro_45m accumulates its own ≥minTrades history and halts it if it
+  // bleeds. Reversible: set SIGNAL_VERSION='' (auto) or any other signal in
+  // Render env. micro_45m needs MICRO_ENABLED + MICRO_HORIZON_45M_ENABLED
+  // (both already 'true' below).
+  SIGNAL_VERSION: 'microstructure_45m',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
@@ -386,10 +426,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // means the bot only enters books where the GTC sell can actually clear its
   // costs. Widen in Render env (SPREAD_MAX_BPS / SPREAD_MAX_BPS_TIER*) if a
   // future signal targets a larger TP that can carry a wider book.
-  SPREAD_MAX_BPS: '30',
-  SPREAD_MAX_BPS_TIER1: '30',
-  SPREAD_MAX_BPS_TIER2: '30',
-  SPREAD_MAX_BPS_TIER3: '30',
+  //
+  // 2026-05-31 stop-the-bleed: tightened 30 → 12. The live snapshot showed a
+  // ~23 bps avg spread at entry — most of the per-trade cost on a sub-1% scalp.
+  // Measured live Binance.US USD spreads on the hard-allowlist majors (BTC 4.4,
+  // ETH 0.55, SOL 1.2, XRP 2.3, ADA 4.3, LINK 4.4, DOGE 6.0 bps) all clear 12
+  // with room; AVAX (14.6) and the broken-book names (LTC ~730) are filtered.
+  // 12 also matches the existing TIGHT_QUOTE_MAX_BPS and the sparse-orderbook
+  // cap, so the whole entry path agrees on what "tight" means.
+  SPREAD_MAX_BPS: '12',
+  SPREAD_MAX_BPS_TIER1: '12',
+  SPREAD_MAX_BPS_TIER2: '12',
+  SPREAD_MAX_BPS_TIER3: '12',
   // Phase 1 master kill switch. When 'false', all Phase 1 layers (multi-
   // timeframe MR, range mean reversion, adaptive sizing, concurrent-position
   // soft cap) revert to legacy behavior in a single env flip. Per-layer
