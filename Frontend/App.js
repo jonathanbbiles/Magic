@@ -191,7 +191,16 @@ async function fetchWithRetry(path, retries = 0) {
 // ----------------------------------------------------------------------------
 // Formatting helpers.
 // ----------------------------------------------------------------------------
-const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+// num — null-safe number parse. CRITICAL: `Number(null)` and `Number('')` are
+// both 0 (a finite number), so a naive parse turns every missing/null backend
+// field into a fake 0 — the root of the "everything shows zeros" bug, since the
+// Binance position shape returns avg_entry_price / unrealized_pl / etc. as null.
+// We map null / undefined / '' to null so callers can fall back or render "—".
+const num = (v) => {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
 
 function usd(v, decimals = 2) {
   const n = num(v);
@@ -243,20 +252,62 @@ function fmtLogTime(ts) {
   return `${hh}:${mm}:${ss}`;
 }
 
-function distToTarget(pos) {
-  const cur = num(pos?.current_price);
-  const lim = num(pos?.sell?.activeLimit) ?? num(pos?.bot?.targetPrice);
-  if (cur == null || lim == null || cur === 0) return null;
-  return ((lim - cur) / cur) * 100;
-}
-
-function progressToTarget(pos) {
-  const cur = num(pos?.current_price);
-  const entry = num(pos?.avg_entry_price);
-  const target = num(pos?.sell?.activeLimit) ?? num(pos?.bot?.targetPrice);
-  if (cur == null || entry == null || target == null || target === entry) return 0;
-  const pct = (cur - entry) / (target - entry);
-  return Math.max(-0.5, Math.min(1.2, pct));
+// ----------------------------------------------------------------------------
+// derivePosition — single source of truth for every per-token number.
+//
+// THE ZEROS BUG: on Binance.US the position object returns avg_entry_price,
+// unrealized_pl, unrealized_plpc and cost_basis as NULL (those are Alpaca-only
+// fields). The old tiles read them directly, so entry price, P&L and % all
+// rendered blank/zero. The real data is present elsewhere: the entry price is
+// in the attached entry forensics (`forensics.buyLimit`), current_price +
+// market_value are populated, the resting take-profit is `sell.activeLimit`,
+// and the signal's per-trade target lives in `forensics` / `bot`. We recompute
+// everything here so each tile shows live, non-zero values — and fall back to a
+// clean null (rendered as "—") only when a field is genuinely absent.
+// ----------------------------------------------------------------------------
+function derivePosition(p) {
+  const fz = p?.forensics || {};
+  const bot = p?.bot || {};
+  const symbol = String(p?.symbol || '—');
+  const symShort = symbol.replace('/USD', '').replace('USD', '');
+  const qty = num(p?.qty);
+  const current = num(p?.current_price);
+  const marketValue = num(p?.market_value);
+  // entry: prefer the venue avg, then the entry forensics (Binance path).
+  const entry = num(p?.avg_entry_price) ?? num(fz.buyLimit) ?? num(bot.entryPrice);
+  // unrealized P&L: prefer venue-reported, else derive from entry + current.
+  let upl = num(p?.unrealized_pl);
+  let uplPct = num(p?.unrealized_plpc);
+  if (uplPct != null && Math.abs(uplPct) <= 1.5) uplPct *= 100; // Alpaca reports a fraction
+  if (upl == null && entry != null && current != null && qty != null) {
+    upl = qty * (current - entry);
+  }
+  if (uplPct == null && entry != null && current != null && entry !== 0) {
+    uplPct = (current / entry - 1) * 100;
+  }
+  // take-profit target price + the signal's per-trade net target.
+  const grossBps = num(fz.signalDerivedGrossBps) ?? num(fz.grossTargetBps);
+  const targetPrice = num(p?.sell?.activeLimit) ?? num(bot.targetPrice)
+    ?? (entry != null && grossBps != null ? entry * (1 + grossBps / 10000) : null);
+  const targetNetBps = num(fz.targetNetProfitBps) ?? num(bot.expectedNetProfitBps) ?? num(fz.signalDerivedNetBps);
+  const stopBps = num(fz.stopLossBpsResolved) ?? num(fz.staticStopLossBps);
+  const spreadBps = num(fz.spreadBps);
+  const volBps = num(fz.volatilityBps);
+  const signal = fz.signalVersion || bot.signalVersion || null;
+  const state = p?.state || null;
+  // progress entry → target (clamped), and distance current → target (%).
+  let progress = 0;
+  if (entry != null && current != null && targetPrice != null && targetPrice !== entry) {
+    progress = Math.max(-0.5, Math.min(1.2, (current - entry) / (targetPrice - entry)));
+  }
+  const distToTargetPct = (current != null && targetPrice != null && current !== 0)
+    ? ((targetPrice - current) / current) * 100 : null;
+  const tone = upl == null ? 'neutral' : upl >= 0 ? 'good' : 'bad';
+  return {
+    symbol, symShort, qty, entry, current, marketValue, upl, uplPct,
+    targetPrice, targetNetBps, stopBps, spreadBps, volBps, signal, state,
+    progress, distToTargetPct, tone,
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -270,22 +321,22 @@ function computePortfolio(data) {
   const positions = Array.isArray(data?.positions) ? data.positions : [];
   let totalPL = 0;
   let totalCost = 0;
+  let exposure = 0;
   let sawPL = false;
   for (const p of positions) {
-    const upl = num(p?.unrealized_pl);
-    if (upl != null) { totalPL += upl; sawPL = true; }
-    const mv = num(p?.market_value);
-    const qty = num(p?.qty);
-    const entry = num(p?.avg_entry_price);
-    const cost = mv != null && upl != null
-      ? mv - upl
-      : (qty != null && entry != null ? qty * entry : null);
+    const d = derivePosition(p);
+    if (d.upl != null) { totalPL += d.upl; sawPL = true; }
+    const cost = (d.entry != null && d.qty != null)
+      ? d.entry * d.qty
+      : (d.marketValue != null && d.upl != null ? d.marketValue - d.upl : null);
     if (cost != null) totalCost += cost;
+    if (d.marketValue != null) exposure += d.marketValue;
   }
   const portfolioValue = num(data?.account?.portfolio_value) ?? num(data?.account?.equity) ?? null;
+  const cash = num(data?.account?.cash) ?? num(data?.account?.buying_power) ?? null;
   const openPL = sawPL ? totalPL : null;
   const openPLPct = openPL != null && totalCost > 0 ? (openPL / totalCost) * 100 : null;
-  return { portfolioValue, openPL, openPLPct };
+  return { portfolioValue, cash, openPL, openPLPct, exposure, positionCount: positions.length };
 }
 
 // ----------------------------------------------------------------------------
@@ -560,32 +611,57 @@ function StatTriple({ items }) {
 }
 
 // ----------------------------------------------------------------------------
-// CastCard — single position tile, big and theatrical.
+// Chip — small in-theme label pill. Used for per-token signal/spread/stop tags.
+// ----------------------------------------------------------------------------
+function Chip({ label, tone = 'neutral' }) {
+  const color = tone === 'good' ? palette.emerald : tone === 'bad' ? palette.rose : palette.gold;
+  return (
+    <View style={[s.chip, { borderColor: color }]}>
+      <Text style={[s.chipText, { color }]} numberOfLines={1}>{label}</Text>
+    </View>
+  );
+}
+
+// prettyReason — humanise a backend skip/blocker reason for the watchlist.
+function prettyReason(reason) {
+  const map = {
+    micro_spread_regime_wide: 'spread too wide',
+    micro_prob_below_min: 'edge too low',
+    spread_too_wide: 'spread too wide',
+    stale_quote: 'quote stale',
+    no_quote: 'no quote',
+    universe_hard_allowlist_filtered: 'off allowlist',
+    concurrent_position_cap: 'slots full',
+    realized_expectancy_veto: 'bleed-halt',
+    insufficient_cash: 'low cash',
+    sizing_unavailable: 'sizing n/a',
+  };
+  if (map[reason]) return map[reason];
+  return String(reason || '').replace(/_/g, ' ');
+}
+
+// price formatter that scales decimals to the magnitude of the price.
+function priceFmt(px) {
+  if (px == null) return '—';
+  const abs = Math.abs(px);
+  return usd(px, abs >= 100 ? 2 : abs >= 1 ? 3 : 5);
+}
+
+// ----------------------------------------------------------------------------
+// CastCard — single position tile, big and theatrical. Reads DERIVED values so
+// entry / P&L / % / target are always live (never the null Binance fields).
 // ----------------------------------------------------------------------------
 function CastCard({ position, activeRef }) {
   useTicker(TICKER_MS, activeRef);
-  const sym = (position?.symbol || '—').replace('USD', '/USD');
-  const symShort = sym.replace('/USD', '');
-  const upnl = num(position?.unrealized_pl);
-  const upnlPctRaw = num(position?.unrealized_plpc);
-  const upnlPct = upnlPctRaw != null ? upnlPctRaw * 100 : null;
-  const isUp = (upnl ?? 0) >= 0;
-  const tone = upnl == null ? 'neutral' : upnl >= 0 ? 'good' : 'bad';
-  const accent = tone === 'good' ? palette.emerald : tone === 'bad' ? palette.rose : palette.gold;
-  const dist = distToTarget(position);
-  const progress = progressToTarget(position);
-  const heldSec = num(position?.heldSeconds) ?? 0;
-  const targetPx = num(position?.sell?.activeLimit) ?? num(position?.bot?.targetPrice);
-  const entryPx = num(position?.avg_entry_price);
-  const curPx = num(position?.current_price);
-  // Per-trade target: prefer explicit minNetProfitBps/expectedNetProfitBps from bot
-  const targetNetBps = num(position?.bot?.expectedNetProfitBps);
+  const d = derivePosition(position);
+  const accent = d.tone === 'good' ? palette.emerald : d.tone === 'bad' ? palette.rose : palette.gold;
+  const heldSec = num(position?.heldSeconds);
 
   return (
     <Gradient
-      colors={tone === 'good'
+      colors={d.tone === 'good'
         ? [palette.emeraldPale, palette.velvetSoft]
-        : tone === 'bad'
+        : d.tone === 'bad'
           ? [palette.rosePale, palette.velvetSoft]
           : [palette.velvetSoft, palette.velvet]}
       start={{ x: 0, y: 0 }}
@@ -593,31 +669,41 @@ function CastCard({ position, activeRef }) {
       style={[s.castCard, { borderColor: accent }]}
     >
       <View style={s.castHeader}>
-        <Text style={[s.castSym, { color: palette.cream }]}>{symShort}</Text>
-        <Text style={[s.castPL, { color: accent }]}>{signedUsd(upnl)}</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Text style={[s.castSym, { color: palette.cream }]}>{d.symShort}</Text>
+          {d.state ? <Text style={s.castStateBadge}>{String(d.state).toUpperCase()}</Text> : null}
+        </View>
+        <Text style={[s.castPL, { color: accent }]}>{signedUsd(d.upl)}</Text>
       </View>
       <View style={s.castSubRow}>
-        <Text style={[s.castPct, { color: accent }]}>{pct(upnlPct, 3)}</Text>
-        <Text style={s.castMeta}>held {fmtElapsed(heldSec * 1000)}</Text>
+        <Text style={[s.castPct, { color: accent }]}>{pct(d.uplPct, 3)}</Text>
+        <Text style={s.castMeta}>
+          {d.marketValue != null ? `${usd(d.marketValue)} • ` : ''}held {heldSec != null ? fmtElapsed(heldSec * 1000) : '—'}
+        </Text>
       </View>
       <View style={{ marginTop: T.sp.md }}>
-        <Bar value={progress} height={10} />
+        <Bar value={d.progress} height={10} />
         <View style={s.castPriceRow}>
           <Text style={s.castPriceLabel}>entry</Text>
           <Text style={s.castPriceLabel}>now</Text>
-          <Text style={s.castPriceLabel}>target {targetNetBps != null ? `+${targetNetBps.toFixed(0)}bps` : ''}</Text>
+          <Text style={s.castPriceLabel}>TP {d.targetNetBps != null ? `+${d.targetNetBps.toFixed(0)}bps` : ''}</Text>
         </View>
         <View style={s.castPriceRow}>
-          <Text style={s.castPriceVal}>{usd(entryPx, entryPx > 100 ? 2 : 4)}</Text>
-          <Text style={[s.castPriceVal, { color: accent }]}>{usd(curPx, curPx > 100 ? 2 : 4)}</Text>
-          <Text style={s.castPriceVal}>{usd(targetPx, targetPx > 100 ? 2 : 4)}</Text>
+          <Text style={s.castPriceVal}>{priceFmt(d.entry)}</Text>
+          <Text style={[s.castPriceVal, { color: accent }]}>{priceFmt(d.current)}</Text>
+          <Text style={s.castPriceVal}>{priceFmt(d.targetPrice)}</Text>
         </View>
+      </View>
+      <View style={s.castChipRow}>
+        {d.signal ? <Chip label={String(d.signal).replace('microstructure_', 'micro ')} /> : null}
+        {d.spreadBps != null ? <Chip label={`spread ${d.spreadBps.toFixed(1)}bps`} /> : null}
+        {d.stopBps != null ? <Chip label={`stop −${d.stopBps.toFixed(0)}bps`} tone="bad" /> : null}
       </View>
       <View style={s.castFooter}>
         <Text style={s.castFooterText}>
-          {dist != null
-            ? `${dist >= 0 ? '↑' : '↓'} ${Math.abs(dist).toFixed(2)}% to TP`
-            : '—'}
+          {d.distToTargetPct != null
+            ? `${d.distToTargetPct >= 0 ? '↑' : '↓'} ${Math.abs(d.distToTargetPct).toFixed(2)}% to take-profit`
+            : 'take-profit resting'}
         </Text>
       </View>
     </Gradient>
@@ -631,24 +717,22 @@ function CastCard({ position, activeRef }) {
 // ----------------------------------------------------------------------------
 function sortPositionsByHealth(positions) {
   if (!Array.isArray(positions)) return [];
-  const score = (p) => {
-    const pct = num(p?.unrealized_plpc);
-    const usd = num(p?.unrealized_pl);
-    return { pct, usd };
-  };
-  return [...positions].sort((a, b) => {
-    const A = score(a);
-    const B = score(b);
-    const aValid = A.pct != null;
-    const bValid = B.pct != null;
-    if (!aValid && !bValid) return 0;
-    if (!aValid) return 1;
-    if (!bValid) return -1;
-    if (A.pct !== B.pct) return B.pct - A.pct;
-    const au = A.usd == null ? -Infinity : A.usd;
-    const bu = B.usd == null ? -Infinity : B.usd;
-    return bu - au;
-  });
+  // Sort on DERIVED unrealized P&L% (winners on top), since the venue field is
+  // null on Binance. Ties break on derived P&L $.
+  return [...positions]
+    .map((p) => ({ p, d: derivePosition(p) }))
+    .sort((a, b) => {
+      const ap = a.d.uplPct;
+      const bp = b.d.uplPct;
+      if (ap == null && bp == null) return 0;
+      if (ap == null) return 1;
+      if (bp == null) return -1;
+      if (ap !== bp) return bp - ap;
+      const au = a.d.upl == null ? -Infinity : a.d.upl;
+      const bu = b.d.upl == null ? -Infinity : b.d.upl;
+      return bu - au;
+    })
+    .map((x) => x.p);
 }
 
 // ----------------------------------------------------------------------------
@@ -802,25 +886,22 @@ function Stage({ data, activeRef, onJumpToCast }) {
 // ----------------------------------------------------------------------------
 function CastCardCompact({ position, activeRef }) {
   useTicker(TICKER_MS, activeRef);
-  const sym = (position?.symbol || '—').replace('USD', '/USD').replace('/USD', '');
-  const upnl = num(position?.unrealized_pl);
-  const upnlPctRaw = num(position?.unrealized_plpc);
-  const upnlPct = upnlPctRaw != null ? upnlPctRaw * 100 : null;
-  const tone = upnl == null ? 'neutral' : upnl >= 0 ? 'good' : 'bad';
-  const accent = tone === 'good' ? palette.emerald : tone === 'bad' ? palette.rose : palette.gold;
-  const heldSec = num(position?.heldSeconds) ?? 0;
-  const progress = progressToTarget(position);
+  const d = derivePosition(position);
+  const accent = d.tone === 'good' ? palette.emerald : d.tone === 'bad' ? palette.rose : palette.gold;
+  const heldSec = num(position?.heldSeconds);
   return (
     <View style={[s.compactCard, { borderColor: accent }]}>
       <View style={s.compactRow}>
-        <Text style={[s.compactSym, { color: palette.cream }]}>{sym}</Text>
-        <Text style={[s.compactPct, { color: accent }]}>{pct(upnlPct, 2)}</Text>
-        <Text style={[s.compactPL, { color: accent }]}>{signedUsd(upnl)}</Text>
+        <Text style={[s.compactSym, { color: palette.cream }]}>{d.symShort}</Text>
+        <Text style={[s.compactPct, { color: accent }]}>{pct(d.uplPct, 2)}</Text>
+        <Text style={[s.compactPL, { color: accent }]}>{signedUsd(d.upl)}</Text>
       </View>
       <View style={{ marginTop: T.sp.xs }}>
-        <Bar value={progress} height={6} />
+        <Bar value={d.progress} height={6} />
       </View>
-      <Text style={s.compactMeta}>held {fmtElapsed(heldSec * 1000)}</Text>
+      <Text style={s.compactMeta}>
+        {d.signal ? `${String(d.signal).replace('microstructure_', 'micro ')} • ` : ''}held {heldSec != null ? fmtElapsed(heldSec * 1000) : '—'}
+      </Text>
     </View>
   );
 }
@@ -828,25 +909,99 @@ function CastCardCompact({ position, activeRef }) {
 // ----------------------------------------------------------------------------
 // Cast — full-detail positions tab.
 // ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// ScanBoard — per-token WATCHLIST. Surfaces what the bot is doing with every
+// universe symbol right now: HOLDING (live), or scanning/blocked (with the
+// reason + the symbol's historical edge). Fed by meta.tradeFeasibility +
+// meta.perSymbolExpectancy, so tokens that never open a position are still
+// visible — this is the "why isn't it trading X?" answer the old UI hid.
+// ----------------------------------------------------------------------------
+function ScanBoard({ data }) {
+  const meta = data?.meta || {};
+  const feas = Array.isArray(meta?.tradeFeasibility?.symbols) ? meta.tradeFeasibility.symbols : [];
+  const grid = Array.isArray(meta?.perSymbolExpectancy?.grid) ? meta.perSymbolExpectancy.grid : [];
+  const heldSet = new Set((Array.isArray(data?.positions) ? data.positions : []).map((p) => String(p?.symbol)));
+
+  // best historical avg net bps per symbol (across signals)
+  const edgeBySym = {};
+  for (const g of grid) {
+    const k = String(g?.symbol);
+    const v = num(g?.avgNetBps);
+    if (v == null) continue;
+    if (edgeBySym[k] == null || v > edgeBySym[k]) edgeBySym[k] = v;
+  }
+
+  const rows = {};
+  for (const f of feas) { const k = String(f?.symbol); if (k) rows[k] = { symbol: k, ...f }; }
+  for (const sym of heldSet) if (sym && !rows[sym]) rows[sym] = { symbol: sym };
+  const list = Object.values(rows);
+  if (list.length === 0) return null;
+
+  list.sort((a, b) => {
+    const ah = heldSet.has(a.symbol) ? 1 : 0;
+    const bh = heldSet.has(b.symbol) ? 1 : 0;
+    if (ah !== bh) return bh - ah;
+    return (num(b.feasibilityPct) ?? -1) - (num(a.feasibilityPct) ?? -1);
+  });
+
+  return (
+    <View style={{ marginTop: T.sp.xl }}>
+      <View style={s.sectionHeader}>
+        <Text style={s.sectionHeaderTitle}>🔍 WATCHLIST</Text>
+        <Text style={s.sectionHeaderSub}>{list.length} symbols · why each is in or out</Text>
+      </View>
+      {list.map((r) => {
+        const held = heldSet.has(r.symbol);
+        const blocker = r.topBlocker ? prettyReason(r.topBlocker) : null;
+        const edge = edgeBySym[r.symbol];
+        const status = held ? 'HOLDING' : (blocker || 'scanning');
+        const statusColor = held ? palette.emerald : (r.chronicallyInfeasible ? palette.rose : palette.gold);
+        const feasPct = num(r.feasibilityPct);
+        return (
+          <View key={r.symbol} style={s.scanRow}>
+            <Text style={s.scanSym}>{r.symbol.replace('/USD', '')}</Text>
+            <View style={{ flex: 1, paddingHorizontal: T.sp.sm }}>
+              <Text style={[s.scanStatus, { color: statusColor }]} numberOfLines={1}>{status}</Text>
+              {!held && feasPct != null
+                ? <Text style={s.scanSub}>{`passes ${feasPct.toFixed(0)}% · ${num(r.rejections) ?? 0} skips`}</Text>
+                : null}
+            </View>
+            <Text style={[s.scanEdge, { color: edge == null ? palette.fog : edge >= 0 ? palette.emerald : palette.rose }]}>
+              {edge == null ? '—' : `${edge >= 0 ? '+' : ''}${edge.toFixed(0)}bps`}
+            </Text>
+          </View>
+        );
+      })}
+      <Text style={s.scanLegend}>edge = historical avg net bps/trade for this symbol (— = no closes yet)</Text>
+    </View>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Cast — full-detail positions tab + the per-token watchlist beneath it.
+// ----------------------------------------------------------------------------
 function Cast({ data, activeRef }) {
   const positions = sortPositionsByHealth(data?.positions);
-  if (positions.length === 0) {
-    return (
-      <View style={s.tabBody}>
-        <View style={s.emptyTile}>
-          <Text style={s.emptyTitle}>🎭 The stage is empty</Text>
-          <Text style={s.emptyBody}>Pull to refresh, or wait for the engine to find a setup.</Text>
-        </View>
-      </View>
-    );
-  }
+  const meta = data?.meta || {};
+  const scan = meta?.lastEntryScanSummary || {};
+  const scanSub = scan?.universeSize != null
+    ? `${positions.length} live · scanning ${scan.universeSize}`
+    : `${positions.length} live`;
   return (
     <View style={s.tabBody}>
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>🎭 TONIGHT&apos;S CAST</Text>
-        <Text style={s.sectionHeaderSub}>{positions.length} live</Text>
+        <Text style={s.sectionHeaderSub}>{scanSub}</Text>
       </View>
-      {positions.map((p, i) => <CastCard key={p?.symbol || i} position={p} activeRef={activeRef} />)}
+      {positions.length === 0 ? (
+        <View style={s.emptyTile}>
+          <Text style={s.emptyTitle}>🎭 No open positions</Text>
+          <Text style={s.emptyBody}>The engine is scanning — the watchlist below shows why each token is in or out.</Text>
+        </View>
+      ) : (
+        positions.map((p, i) => <CastCard key={p?.symbol || i} position={p} activeRef={activeRef} />)
+      )}
+      <ScanBoard data={data} />
     </View>
   );
 }
@@ -1815,5 +1970,87 @@ const s = StyleSheet.create({
     fontWeight: '800',
     letterSpacing: 1.5,
     fontFamily: T.font,
+  },
+  // -- Per-token enrichments (2026-05-31 redesign)
+  castStateBadge: {
+    color: palette.gold,
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 1,
+    marginLeft: T.sp.sm,
+    paddingHorizontal: T.sp.sm,
+    paddingVertical: 1,
+    borderRadius: T.r.sm,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.goldDim,
+    overflow: 'hidden',
+    fontFamily: T.font,
+  },
+  castChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: T.sp.xs,
+    marginTop: T.sp.md,
+  },
+  chip: {
+    paddingHorizontal: T.sp.sm,
+    paddingVertical: 2,
+    borderRadius: T.r.sm,
+    borderWidth: StyleSheet.hairlineWidth,
+    backgroundColor: palette.velvet,
+    marginRight: T.sp.xs,
+    marginBottom: T.sp.xs,
+  },
+  chipText: {
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.3,
+    fontFamily: T.font,
+  },
+  // -- Watchlist / scan board
+  scanRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: T.sp.sm,
+    paddingHorizontal: T.sp.md,
+    backgroundColor: palette.velvetSoft,
+    borderRadius: T.r.md,
+    marginBottom: T.sp.xs,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.velvetEdge,
+  },
+  scanSym: {
+    color: palette.cream,
+    fontSize: 14,
+    fontWeight: '800',
+    fontFamily: T.font,
+    minWidth: 56,
+  },
+  scanStatus: {
+    fontSize: 12,
+    fontWeight: '700',
+    fontFamily: T.font,
+    letterSpacing: 0.3,
+  },
+  scanSub: {
+    color: palette.fog,
+    fontSize: 10,
+    fontFamily: T.font,
+    marginTop: 1,
+  },
+  scanEdge: {
+    fontSize: 12,
+    fontWeight: '800',
+    fontFamily: T.font,
+    fontVariant: ['tabular-nums'],
+    minWidth: 56,
+    textAlign: 'right',
+  },
+  scanLegend: {
+    color: palette.fog,
+    fontSize: 9,
+    fontFamily: T.font,
+    marginTop: T.sp.xs,
+    fontStyle: 'italic',
   },
 });
