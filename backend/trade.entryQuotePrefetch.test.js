@@ -30,6 +30,11 @@ process.env.PORTFOLIO_SIZING_PCT = '0.10';
 process.env.MIN_TRADE_NOTIONAL_USD = '1';
 process.env.ENTRY_PREFETCH_QUOTES = 'true';
 process.env.ENTRY_PREFETCH_CHUNK_SIZE = '8';
+// This test pins the prefetch-reuse path: zero single-symbol fetches when the
+// batch prefetch covers the universe. The 2026-05-31 ENTRY_FRESH_REQUOTE
+// default (true) deliberately bypasses prefetch to re-quote per symbol, so it
+// is disabled here to exercise the prefetch coordinator specifically.
+process.env.ENTRY_FRESH_REQUOTE = 'false';
 
 const trade = require('./trade');
 

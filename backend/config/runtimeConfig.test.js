@@ -130,11 +130,13 @@ withEnv({}, () => {
   assert.equal(cfg.predictorWarmupMinBars1m, 35);
   assert.equal(cfg.predictorWarmupMinBars5m, 30);
   assert.equal(cfg.predictorWarmupMinBars15m, 20);
-  // Fix 5: tighter entry quote staleness cutoff (was 120000 = 2 min).
-  assert.equal(cfg.entryQuoteMaxAgeMs, 15000);
+  // 2026-05-31 stop-the-bleed: entry quote staleness cutoff tightened
+  // 15000 → 2000 (paired with ENTRY_FRESH_REQUOTE so the gate sees a fresh
+  // single-symbol fetch, not a loop-latency-aged prefetch).
+  assert.equal(cfg.entryQuoteMaxAgeMs, 2000);
   assert.equal(cfg.entryPrefetchQuotes, true);
   assert.equal(cfg.entryPrefetchOrderbooks, true);
-  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 15000);
+  assert.equal(cfg.normalEntryQuoteMaxAgeMs, 2000);
   assert.equal(cfg.entryRegimeStaleQuoteMaxAgeMs, 120000);
   assert.equal(cfg.sparseQuoteFreshMs, 5000);
   assert.equal(cfg.sparseStaleToleranceMs, 15000);

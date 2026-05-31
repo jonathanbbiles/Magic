@@ -40,10 +40,14 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
 // back to the prior 60/45/90 ceiling (which admitted −EV-by-construction
 // books) can't happen silently. The global SPREAD_MAX_BPS is the
 // authoritative clamp; each tier is min(tierCap, SPREAD_MAX_BPS).
-assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS, '30');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER1, '30');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER2, '30');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER3, '30');
+// 2026-05-31 stop-the-bleed: tightened 30 → 12 after the live snapshot showed
+// a ~23 bps avg entry spread. Measured live Binance.US USD major spreads
+// (BTC 4.4 / ETH 0.55 / SOL 1.2 / XRP 2.3 / ADA 4.3 / LINK 4.4 / DOGE 6.0 bps)
+// all clear 12; wide books (AVAX 14.6, LTC ~730) are filtered.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS, '12');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER1, '12');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER2, '12');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS_TIER3, '12');
 assert.ok(
   Number(LIVE_CRITICAL_DEFAULTS.SPREAD_MAX_BPS)
     < Number(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS),
@@ -104,7 +108,23 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 // 2026-05-17: SIGNAL_SELECTOR_MIN_BPS lowered to '0'. Sample-size guard
 // (MIN_BACKTEST_ENTRIES=5) remains the real safety net; any signal with
 // non-negative expectancy and >=5 backtest entries is admitted.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '');
+//
+// 2026-05-31 stop-the-bleed: pinned to 'microstructure_45m' — the only signal
+// the live entryModeAB sweep showed flipping POSITIVE under mid entry
+// (-11.4 passive → +5.0 mid). Pinning a fresh-sample signal also resets the
+// realized-expectancy veto that had halted the bot on mean_reversion (-27.7 bps
+// over 10 trades). Reversible: SIGNAL_VERSION='' (auto) in Render env.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'microstructure_45m');
+
+// 2026-05-31 stop-the-bleed: quote freshness, fresh re-quote, and the hard
+// liquidity allowlist. See liveDefaults.js for the full rationale.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_MAX_AGE_MS, '2000');
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_QUOTE_STALE_GRACE_MS, '0');
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FRESH_REQUOTE, 'true');
+assert.equal(
+  LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_HARD_ALLOWLIST,
+  'BTC/USD,ETH/USD,SOL/USD,XRP/USD,ADA/USD,LINK/USD,DOGE/USD,AVAX/USD',
+);
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BPS, '0');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_VETO_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
