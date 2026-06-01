@@ -18,7 +18,17 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 **`ENTRY_LIMIT_PRICE_MODE` default is now `mid`** (was `bid_plus_tick`) — the entryModeAB diagnostic showed the passive rest bled ~16 bps/trade to adverse selection on Binance.US's ~0% maker books.
 
-**Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). Set `SIGNAL_VERSION` in Render env to pin a different one.
+**Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). Set `SIGNAL_VERSION` in Render env to pin a different one. **NOTE: the code default is a PIN, not unset** — `liveDefaults.js` ships `SIGNAL_VERSION='microstructure_5m'` (see the 2026-06-01 entry below), so the `mean_reversion` fallback only applies if an operator explicitly sets `SIGNAL_VERSION=''` in Render.
+
+## 2026-06-01: micro_45m deadlock-halt → re-pinned to `microstructure_5m`
+
+The bot sat at **zero trades for ~18h**. Root cause: `SIGNAL_VERSION` was pinned to `microstructure_45m` on the strength of its **MID** entryModeAB backtest cell (+5.0 bps). But `ENTRY_LIMIT_PRICE_MODE=mid` rests a **passive** mid limit — it only fills when the market trades DOWN into it, so live fills are adversely selected exactly like the **PASSIVE** backtest cell (−11.4 bps), not the aggressive/mid one. micro_45m realized **~−9.3 bps over its last 20 closed trades**, tripping the realized-expectancy circuit breaker (`floorBps=-5`). Logs showed `entry_scan_skipped_realized_veto { realizedAvgNetBps: -9.30, sampleSize: 20, floorBps: -5 }` every scan.
+
+**Why it could not self-recover (deadlock):** the realized veto reads *closed* trades. Halted entries → no new positions → no new closed trades → the 20-trade window is frozen at −9.3 forever. A pinned losing signal + a closed-trade-only veto window can ONLY be broken by a re-pin. (Exploration budget can't help — it bypasses the *backtest* veto, never the realized veto.)
+
+**The fix:** re-pinned to `microstructure_5m`. Picked by the **honest passive** backtest (2026-05-29: ols −15.7, mean_reversion −10.3, micro_5m −4.2) — micro_5m is the ONLY signal above the −5 floor. A fresh-sample signal resets the breaker (`insufficient_sample` → no veto), so trading resumes; the breaker re-arms if micro_5m's own realized window drops below −5. micro_5m's 5m horizon means it accumulates validating/invalidating sample fast.
+
+**LESSON (encoded in `liveDefaults.js` comments):** when picking a signal to pin under `ENTRY_LIMIT_PRICE_MODE=mid`, judge it by its **passive** (`adverseSelectionFill: true`) backtest, NEVER the mid/aggressive cell — a resting mid limit is passive and fills adversely. The micro_45m pin made exactly this error. **None of the signals have demonstrated positive live edge**; this is a controlled re-probe with the breaker as backstop, not a profitability fix.
 
 **Implications for future edits:** do NOT reintroduce the backtest veto into the entry path as a way to "stop bad trades" — that exact gate is what froze the bot; use the realized-expectancy brake instead. If you must re-wire a removed gate, justify it against this de-complication and keep the 4-step shape legible. The prediction-record shape written at entry is consumed by the exit manager, forensics, dashboard, and `closedTradeStats` — preserve it. Sections below this line describe machinery that is mostly NO LONGER in the live entry path; treat them as reference for the modules (still live as diagnostics) rather than as a description of how entries are decided today.
 

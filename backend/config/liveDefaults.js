@@ -216,21 +216,38 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // (currently only mean_reversion at +23 bps over 6 entries). Pin to
   // 'ols' in Render env to force-trade OLS again.
   //
-  // 2026-05-31 stop-the-bleed: pinned to 'microstructure_45m'. Evidence: the
-  // live entryModeAB sweep (meta.entryModeAB, 30-day Binance.US backtest at the
-  // 2-bps venue fee) showed it is the ONLY signal that flips POSITIVE once the
-  // passive bid+tick entry is replaced with mid entry: -11.4 bps passive →
-  // +5.0 bps mid (aggressiveFlipsPositive=true), vs mean_reversion -1.8,
-  // micro_5m -1.6, ols -3.4 (all still negative at mid). mean_reversion — the
-  // prior live default — had bled the account to a realized-veto halt at
-  // -27.7 bps over its last 10 trades. Pinning a signal with ZERO recent closed
-  // trades also resets the realized-expectancy circuit breaker's sample
-  // (insufficient_sample → no veto) so trading resumes; the breaker re-arms
-  // once micro_45m accumulates its own ≥minTrades history and halts it if it
-  // bleeds. Reversible: set SIGNAL_VERSION='' (auto) or any other signal in
-  // Render env. micro_45m needs MICRO_ENABLED + MICRO_HORIZON_45M_ENABLED
-  // (both already 'true' below).
-  SIGNAL_VERSION: 'microstructure_45m',
+  // 2026-05-31 stop-the-bleed: pinned to 'microstructure_45m' on the strength
+  // of its entryModeAB MID cell (+5.0 bps) — the only signal that flipped
+  // positive when the passive bid+tick entry was replaced with mid entry.
+  //
+  // 2026-06-01 re-pin to 'microstructure_5m'. WHY THE 45m PIN FAILED: the +5.0
+  // that justified it was the MID (aggressive, adverseSelectionFill=false)
+  // backtest cell. But ENTRY_LIMIT_PRICE_MODE=mid rests a PASSIVE mid limit —
+  // it only fills when the market trades DOWN into it, so live fills are
+  // adversely selected exactly like the PASSIVE backtest cell (-11.4 bps), NOT
+  // the aggressive one. micro_45m duly realized ~-9.3 bps over its last 20
+  // closed trades (right next to the -11.4 passive prediction) and the
+  // realized-expectancy circuit breaker re-armed and halted the bot for ~18h
+  // (logs: entry_scan_skipped_realized_veto, realizedAvgNetBps -9.30,
+  // sampleSize 20, floorBps -5). That is a DEADLOCK: a pinned losing signal +
+  // a closed-trade-only veto window = it can never self-recover (no new closed
+  // trades to push the losers out). The only break is to re-pin.
+  //
+  // LESSON ENCODED HERE: pick the next signal by its HONEST passive backtest,
+  // never the mid/aggressive cell. By the 2026-05-29 passive numbers
+  // (ols -15.7, mean_reversion -10.3, micro_5m -4.2 net) micro_5m is the ONLY
+  // signal above the -5 realized floor, so it has the best shot at not
+  // immediately re-arming the breaker. Pinning it also resets the breaker's
+  // sample (micro_5m has ZERO recent live closed trades → insufficient_sample
+  // → no veto) so trading resumes now; the breaker re-arms if micro_5m's own
+  // realized window drops below -5. micro_5m is high-frequency (5m horizon) so
+  // it accumulates its validating/invalidating sample fast. NONE of the signals
+  // have demonstrated POSITIVE live edge — this is a controlled re-probe with
+  // the breaker as backstop, not a profitability fix. Reversible: set
+  // SIGNAL_VERSION to any other signal (or '' → mean_reversion fallback) in
+  // Render env. micro_5m needs MICRO_ENABLED + MICRO_HORIZON_5M_ENABLED (both
+  // already 'true' below).
+  SIGNAL_VERSION: 'microstructure_5m',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
