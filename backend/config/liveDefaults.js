@@ -233,21 +233,39 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // a closed-trade-only veto window = it can never self-recover (no new closed
   // trades to push the losers out). The only break is to re-pin.
   //
-  // LESSON ENCODED HERE: pick the next signal by its HONEST passive backtest,
-  // never the mid/aggressive cell. By the 2026-05-29 passive numbers
-  // (ols -15.7, mean_reversion -10.3, micro_5m -4.2 net) micro_5m is the ONLY
-  // signal above the -5 realized floor, so it has the best shot at not
-  // immediately re-arming the breaker. Pinning it also resets the breaker's
-  // sample (micro_5m has ZERO recent live closed trades → insufficient_sample
-  // → no veto) so trading resumes now; the breaker re-arms if micro_5m's own
-  // realized window drops below -5. micro_5m is high-frequency (5m horizon) so
-  // it accumulates its validating/invalidating sample fast. NONE of the signals
-  // have demonstrated POSITIVE live edge — this is a controlled re-probe with
-  // the breaker as backstop, not a profitability fix. Reversible: set
-  // SIGNAL_VERSION to any other signal (or '' → mean_reversion fallback) in
-  // Render env. micro_5m needs MICRO_ENABLED + MICRO_HORIZON_5M_ENABLED (both
-  // already 'true' below).
-  SIGNAL_VERSION: 'microstructure_5m',
+  // 2026-06-02 UN-PIN — restore the realized-veto's authority. Two problems
+  // with the 2026-06-01 micro_5m pin (#455):
+  //   1. It was a "pin a fresh-sample signal to RESET the circuit breaker"
+  //      move. But the realized-expectancy breaker firing is CORRECT behaviour
+  //      — it halts a signal that is proven to bleed on live fills. Re-pinning
+  //      to dodge it defeats the one safety mechanism that has actually
+  //      protected capital this whole project (it kept the drawdown at ~$1.40).
+  //   2. micro_5m is the WORST signal on the evidence. The 2026-06-01 two-window
+  //      backtest sweep (binance_us, 8 liquid majors, fee=2, adverse-selection
+  //      fill) graded every signal across two NON-overlapping 30-day windows:
+  //        micro_5m:  -21.1 (W1) / worst tier (W2)   ← the pinned signal
+  //        micro_45m: -12.7 (W1) / +5.0 (W2)         ← unstable sign
+  //        ols:        -5.6
+  //        mean_reversion_5m: +3.8 (W1) / -38.1 (W2) ← regime luck, not edge
+  //      No signal showed a STABLE positive edge; every sign flipped between
+  //      windows. Picking micro_5m (the single worst W1 cell) to "probe" is
+  //      backwards. micro_45m then realized -7.3 bps over 27 LIVE closes (48%
+  //      win) and the breaker correctly halted it — exactly as designed.
+  //
+  // THE FIX: stop hand-pinning a loser to outrun the breaker. Return to the
+  // documented self-correcting default of '' (empty → the simplified engine's
+  // `mean_reversion` fallback in scanAndEnter; auto-select via signalSelector
+  // when the legacy path is used). The realized-expectancy breaker stays the
+  // ONLY thing that halts entries, and it now governs whatever the engine
+  // trades instead of being reset by a manual re-pin. If the active signal
+  // bleeds past the -5 floor, the bot SHOULD halt — that is capital protection
+  // working, not a deadlock to engineer around. The durable path forward is to
+  // accumulate labeled trades at tiny size and FIT the entry weights from
+  // outcomes (build_microstructure_weights.js), not to rotate hand-picked
+  // signals on single-window backtests. Reversible: set SIGNAL_VERSION=<signal>
+  // in Render env to operator-pin again (e.g. SIGNAL_VERSION=ols for an
+  // emergency force-trade).
+  SIGNAL_VERSION: '',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from

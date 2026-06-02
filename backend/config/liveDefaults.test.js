@@ -109,16 +109,16 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 // (MIN_BACKTEST_ENTRIES=5) remains the real safety net; any signal with
 // non-negative expectancy and >=5 backtest entries is admitted.
 //
-// 2026-06-01 re-pin to 'microstructure_5m'. The 45m pin was justified on its
-// entryModeAB MID cell (+5.0) but ENTRY_LIMIT_PRICE_MODE=mid is a PASSIVE mid
-// limit, so live fills tracked the PASSIVE cell (-11.4); micro_45m realized
-// ~-9.3 bps over 20 trades and the realized-expectancy breaker deadlock-halted
-// the bot for ~18h. Re-pinned to the best HONEST passive performer
-// (micro_5m -4.2, the only signal above the -5 floor); fresh sample also
-// resets the breaker so trading resumes. Reversible: SIGNAL_VERSION=<other>
-// (or '' → mean_reversion fallback) in Render env. Full rationale in
-// liveDefaults.js.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'microstructure_5m');
+// 2026-06-02 UN-PIN back to '' (self-correcting default). The 2026-06-01
+// micro_5m pin (#455) was a "reset the realized-veto by pinning a fresh-sample
+// signal" move — but the breaker firing is CORRECT capital protection, and
+// micro_5m was the worst signal on the two-window backtest sweep (-21 bps).
+// micro_45m subsequently realized -7.3 bps over 27 live closes and the breaker
+// correctly halted it. Empty string returns the engine to its documented
+// mean_reversion fallback with the realized-expectancy breaker as the sole,
+// un-dodged halt authority. Operator-pin via SIGNAL_VERSION=<signal> in Render
+// env. Full rationale in liveDefaults.js.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '');
 
 // 2026-05-31 stop-the-bleed: quote freshness, fresh re-quote, and the hard
 // liquidity allowlist. See liveDefaults.js for the full rationale.
