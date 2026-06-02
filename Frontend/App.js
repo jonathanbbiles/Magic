@@ -514,12 +514,31 @@ function deriveMood({ openPL, engineOk, scanInProgress, hasPositions }) {
 // ----------------------------------------------------------------------------
 // HeaderStrip — top of every tab. Pulse dot, app name, build / version.
 // ----------------------------------------------------------------------------
-function HeaderStrip({ engineState, scanInProgress, lastScanAt, version }) {
+// interpretMonitor — turn a /monitor payload into a single health verdict the
+// header pill + Backstage panel both read. Returns { tone, label, hb }.
+//   green  = trading, no flags
+//   gold   = veto active (benign — the safety brake is halting new entries)
+//   rose   = a real alert flag is present ([EXEC_FAIL]/[EQUITY_LOW]/[VETO_NEW])
+function interpretMonitor(monitor) {
+  const hb = monitor?.latest || null;
+  if (!hb) return { tone: 'idle', label: 'monitor —', hb: null };
+  const flags = Array.isArray(hb.flags) ? hb.flags : [];
+  if (flags.length > 0) return { tone: 'bad', label: flags.join(' · '), hb };
+  if (hb.veto) return { tone: 'warn', label: 'safety veto', hb };
+  return { tone: 'good', label: 'healthy', hb };
+}
+
+function HeaderStrip({ engineState, scanInProgress, lastScanAt, version, monitor }) {
   const pulseColor = !engineState ? palette.fog
     : scanInProgress ? palette.magenta
     : String(engineState).toLowerCase() === 'ready' ? palette.emerald
     : palette.gold;
   const ageMs = liveAge(lastScanAt);
+  const mon = interpretMonitor(monitor);
+  const monColor = mon.tone === 'good' ? palette.emerald
+    : mon.tone === 'warn' ? palette.gold
+    : mon.tone === 'bad' ? palette.rose
+    : palette.fog;
   return (
     <View style={s.headerStrip}>
       <View style={s.headerLeft}>
@@ -532,11 +551,18 @@ function HeaderStrip({ engineState, scanInProgress, lastScanAt, version }) {
           </Text>
         </View>
       </View>
-      {version ? (
-        <View style={s.versionPill}>
-          <Text style={s.versionPillText}>{String(version).slice(0, 7)}</Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+        {/* Monitor health pill — at-a-glance "is the bot ok?" without leaving the header. */}
+        <View style={[s.monPill, { borderColor: monColor }]}>
+          <View style={[s.monDot, { backgroundColor: monColor }]} />
+          <Text style={[s.monPillText, { color: monColor }]} numberOfLines={1}>{mon.label}</Text>
         </View>
-      ) : null}
+        {version ? (
+          <View style={[s.versionPill, { marginLeft: T.sp.xs }]}>
+            <Text style={s.versionPillText}>{String(version).slice(0, 7)}</Text>
+          </View>
+        ) : null}
+      </View>
     </View>
   );
 }
@@ -1009,7 +1035,96 @@ function Cast({ data, activeRef }) {
 // ----------------------------------------------------------------------------
 // Backstage — diagnostics tab. Skip reasons, scan progress, scorecard detail.
 // ----------------------------------------------------------------------------
-function Backstage({ data, activeRef }) {
+// ----------------------------------------------------------------------------
+// MonitorPanel — the heartbeat "report" surfaced inside Backstage. Shows the
+// latest health verdict big, the key heartbeat fields, and a recent history
+// list. Reads the /monitor payload (latest + heartbeats[]).
+// ----------------------------------------------------------------------------
+function MonitorPanel({ monitor }) {
+  const mon = interpretMonitor(monitor);
+  const hb = mon.hb;
+  const heartbeats = Array.isArray(monitor?.heartbeats) ? monitor.heartbeats.slice(-12).reverse() : [];
+  const accent = mon.tone === 'good' ? palette.emerald
+    : mon.tone === 'warn' ? palette.gold
+    : mon.tone === 'bad' ? palette.rose
+    : palette.fog;
+  const ageMs = hb ? liveAge(hb.ts) : null;
+  const verdict = mon.tone === 'good' ? 'HEALTHY'
+    : mon.tone === 'warn' ? 'SAFETY VETO ACTIVE'
+    : mon.tone === 'bad' ? 'NEEDS ATTENTION'
+    : 'NO HEARTBEAT YET';
+
+  return (
+    <View>
+      <View style={s.sectionHeader}>
+        <Text style={s.sectionHeaderTitle}>💓 MONITOR</Text>
+        <Text style={s.sectionHeaderSub}>
+          {ageMs != null ? `heartbeat ${fmtElapsed(ageMs)} ago` : 'awaiting first heartbeat'}
+        </Text>
+      </View>
+      <Gradient
+        colors={mon.tone === 'good' ? [palette.emeraldPale, palette.velvetSoft]
+          : mon.tone === 'bad' ? [palette.rosePale, palette.velvetSoft]
+          : [palette.velvetSoft, palette.velvet]}
+        style={[s.boxOffice, { borderColor: accent, borderWidth: 1 }]}
+      >
+        <View style={s.monVerdictRow}>
+          <View style={[s.monDot, { backgroundColor: accent, width: 12, height: 12, borderRadius: 6 }]} />
+          <Text style={[s.monVerdict, { color: accent }]}>{verdict}</Text>
+        </View>
+        {hb ? (
+          <>
+            <View style={s.boRow}><Text style={s.boLabel}>Equity</Text><Text style={s.boValue}>{hb.equity != null ? usd(hb.equity) : '—'}</Text></View>
+            <View style={s.boRow}><Text style={s.boLabel}>Open positions</Text><Text style={s.boValue}>{hb.openPositions ?? '—'}</Text></View>
+            <View style={s.boRow}>
+              <Text style={s.boLabel}>Trading state</Text>
+              <Text style={[s.boValue, { color: hb.veto ? palette.gold : palette.emerald }]}>
+                {hb.veto ? `halted (${hb.vetoReason || 'veto'})` : 'trading'}
+              </Text>
+            </View>
+            <View style={s.boRow}>
+              <Text style={s.boLabel}>Realized edge</Text>
+              <Text style={[s.boValue, { color: hb.realizedAvgNetBps == null ? palette.fog : hb.realizedAvgNetBps >= 0 ? palette.emerald : palette.rose }]}>
+                {hb.realizedAvgNetBps == null ? '—' : fmtBps(hb.realizedAvgNetBps)}{hb.sampleSize != null ? ` · n=${hb.sampleSize}` : ''}
+              </Text>
+            </View>
+            <View style={s.boRow}><Text style={s.boLabel}>Signal</Text><Text style={s.boValue}>{hb.signalVersion || '—'}</Text></View>
+            {hb.execFailure ? (
+              <View style={s.boRow}><Text style={s.boLabel}>Exec error</Text><Text style={[s.boValue, { color: palette.rose, flex: 1, textAlign: 'right' }]} numberOfLines={1}>{hb.execFailure}</Text></View>
+            ) : null}
+          </>
+        ) : (
+          <Text style={s.emptyBody}>The bot hasn&apos;t recorded a heartbeat yet — it records one each snapshot cycle (~30 min and on key events).</Text>
+        )}
+        <Text style={s.monLegend}>green = healthy · gold = safety brake halting entries (benign) · rose = needs eyes</Text>
+      </Gradient>
+
+      {heartbeats.length > 0 ? (
+        <View style={s.reasonsTile}>
+          {heartbeats.map((h, i) => {
+            const flags = Array.isArray(h.flags) ? h.flags : [];
+            const dot = flags.length ? palette.rose : h.veto ? palette.gold : palette.emerald;
+            const a = liveAge(h.ts);
+            return (
+              <View key={h.tsMs || i} style={s.monHistRow}>
+                <View style={[s.monDot, { backgroundColor: dot }]} />
+                <Text style={s.monHistTime}>{a != null ? `${fmtElapsed(a)} ago` : '—'}</Text>
+                <Text style={s.monHistMid} numberOfLines={1}>
+                  {h.equity != null ? usd(h.equity, 0) : '—'} · {h.veto ? 'veto' : 'trading'}
+                  {h.realizedAvgNetBps != null ? ` · ${fmtBps(h.realizedAvgNetBps)}` : ''}
+                </Text>
+                {flags.length ? <Text style={s.monHistFlag} numberOfLines={1}>{flags.join(' ')}</Text> : null}
+              </View>
+            );
+          })}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+// ----------------------------------------------------------------------------
+function Backstage({ data, monitor, activeRef }) {
   useTicker(TICKER_MS, activeRef);
   const meta = data?.meta || {};
   const truth = meta?.truth || {};
@@ -1023,6 +1138,8 @@ function Backstage({ data, activeRef }) {
 
   return (
     <View style={s.tabBody}>
+      <MonitorPanel monitor={monitor} />
+
       <View style={s.sectionHeader}>
         <Text style={s.sectionHeaderTitle}>📜 BOX OFFICE</Text>
         <Text style={s.sectionHeaderSub}>scorecard since last restart</Text>
@@ -1311,6 +1428,7 @@ export default function App() {
 
 function AppInner() {
   const [data, setData] = useState(null);
+  const [monitor, setMonitor] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState(null);
@@ -1346,6 +1464,12 @@ function AppInner() {
       setLoading(false);
       setRefreshing(false);
     }
+    // Monitor heartbeat ring — separate, best-effort fetch. Never blocks or
+    // errors the main dashboard load; the panel just shows "—" if it fails.
+    try {
+      const mon = await apiFetch('/monitor?limit=40');
+      setMonitor(mon);
+    } catch (_) { /* monitor is non-critical; leave prior value */ }
   }, []);
 
   useEffect(() => {
@@ -1388,6 +1512,7 @@ function AppInner() {
         scanInProgress={scanInProgress}
         lastScanAt={lastScanAt}
         version={version}
+        monitor={monitor}
       />
 
       {error ? <Banner tone="error">{error}</Banner> : null}
@@ -1400,7 +1525,7 @@ function AppInner() {
       >
         {tab === 'stage' && <Stage data={data} activeRef={activeRef} onJumpToCast={() => setTab('cast')} />}
         {tab === 'cast' && <Cast data={data} activeRef={activeRef} />}
-        {tab === 'backstage' && <Backstage data={data} activeRef={activeRef} />}
+        {tab === 'backstage' && <Backstage data={data} monitor={monitor} activeRef={activeRef} />}
         {tab === 'send' && <Send data={data} logsRef={logsRef} activeRef={activeRef} />}
       </ScrollView>
 
@@ -2052,5 +2177,74 @@ const s = StyleSheet.create({
     fontFamily: T.font,
     marginTop: T.sp.xs,
     fontStyle: 'italic',
+  },
+  // -- Monitor (header pill + Backstage panel)
+  monPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: T.sp.sm,
+    paddingVertical: 3,
+    borderRadius: 10,
+    borderWidth: 1,
+    backgroundColor: palette.velvet,
+    maxWidth: 132,
+  },
+  monDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    marginRight: 5,
+  },
+  monPillText: {
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+    fontFamily: T.font,
+  },
+  monVerdictRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: T.sp.sm,
+  },
+  monVerdict: {
+    fontSize: 16,
+    fontWeight: '900',
+    letterSpacing: 1,
+    marginLeft: T.sp.sm,
+    fontFamily: T.font,
+  },
+  monLegend: {
+    color: palette.fog,
+    fontSize: 9,
+    fontFamily: T.font,
+    marginTop: T.sp.md,
+    fontStyle: 'italic',
+  },
+  monHistRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 5,
+    borderBottomColor: palette.velvetEdge,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  monHistTime: {
+    color: palette.pearl,
+    fontSize: 10,
+    fontFamily: T.font,
+    width: 74,
+    marginLeft: T.sp.xs,
+  },
+  monHistMid: {
+    color: palette.cream,
+    fontSize: 11,
+    fontFamily: T.font,
+    flex: 1,
+  },
+  monHistFlag: {
+    color: palette.rose,
+    fontSize: 9,
+    fontWeight: '800',
+    fontFamily: T.font,
+    marginLeft: T.sp.xs,
   },
 });
