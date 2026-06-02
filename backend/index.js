@@ -407,6 +407,7 @@ const isPublicEndpoint = (req) =>
     || req.path === '/debug/status'
     || req.path === '/dashboard'
     || req.path === '/debug/logs'
+    || req.path === '/debug/feed-shadow'
     || req.path === '/monitor'
   );
 
@@ -2431,6 +2432,38 @@ app.get('/dashboard/scorecard', (req, res) => {
   res.json({
     ts: new Date().toISOString(),
     scorecard: closedTradeStats.buildScorecard(limit),
+  });
+});
+
+// Phone-friendly slice of the data-feed state (2026-06-02). The full
+// /dashboard blob is a firehose on mobile; this returns just the execution
+// venue, the three Phase-3 feed flags, and the WS shadow summary so an
+// operator can verify a feed flip at a glance. Public (the same data is
+// already public via /dashboard) and observational only.
+app.get('/debug/feed-shadow', (req, res) => {
+  const executionVenue = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
+  let binanceFeedShadow = null;
+  if (BINANCE_FEED_SHADOW_ENABLED) {
+    try {
+      binanceFeedShadow = binanceFeedStream.buildSummary({
+        freshThresholdMs: SECONDARY_FEED_FRESH_THRESHOLD_MS,
+      });
+    } catch (err) {
+      binanceFeedShadow = { error: err?.message || String(err) };
+    }
+  }
+  res.json({
+    ts: new Date().toISOString(),
+    executionVenue,
+    flags: {
+      binanceFeedShadowEnabled: BINANCE_FEED_SHADOW_ENABLED,
+      orderbookImbalanceFeatureEnabled: String(process.env.ORDERBOOK_IMBALANCE_FEATURE_ENABLED || 'false').toLowerCase() === 'true',
+      microTradesEnabled: String(process.env.MICRO_TRADES_ENABLED || 'false').toLowerCase() === 'true',
+    },
+    // Gating reminder: the Phase-3 feeds only run on binance_us. If the venue
+    // is alpaca, the flags above have no effect and binanceFeedShadow is null.
+    feedsActive: executionVenue === 'binance_us',
+    binanceFeedShadow,
   });
 });
 
