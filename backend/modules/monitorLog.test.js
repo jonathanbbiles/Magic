@@ -28,13 +28,33 @@ const monitorLog = require('./monitorLog');
   assert.deepEqual(hb.flags, [], 'steady veto is benign');
 }
 
-// 3. Veto transition false→true → raises VETO_NEW (the alertable moment).
+// 3. Veto transition false→true FROM AN EVALUATED state → raises VETO_NEW.
 {
   const hb = monitorLog.buildHeartbeat({
     ts: 3000, equity: 479, openPositions: 0,
-    veto: true, prevVeto: false, vetoReason: 'realized_below_floor',
+    veto: true, prevVeto: false, prevEvaluated: true, sampleSize: 10,
+    vetoReason: 'realized_below_floor',
   });
-  assert.ok(hb.flags.includes('VETO_NEW'), 'false->true veto transition must raise VETO_NEW');
+  assert.ok(hb.flags.includes('VETO_NEW'), 'real false->true transition (prior was evaluated) must raise VETO_NEW');
+}
+
+// 3b. Restart artifact: veto=true now, prior was a JUST-BOOTED false (not yet
+//     evaluated) → must NOT raise VETO_NEW. This is the deploy false-alarm fix.
+{
+  const hb = monitorLog.buildHeartbeat({
+    ts: 3100, equity: 479, openPositions: 0,
+    veto: true, prevVeto: false, prevEvaluated: false, sampleSize: 10,
+    vetoReason: 'realized_below_floor',
+  });
+  assert.ok(!hb.flags.includes('VETO_NEW'),
+    'null->veto on restart (prior not evaluated) must NOT raise VETO_NEW');
+  assert.deepEqual(hb.flags, [], 'restart re-arm of a pre-existing veto is benign');
+}
+
+// 3c. `evaluated` is true iff sampleSize is populated (drives the next tick).
+{
+  assert.equal(monitorLog.buildHeartbeat({ ts: 3200, sampleSize: 12 }).evaluated, true);
+  assert.equal(monitorLog.buildHeartbeat({ ts: 3201, sampleSize: null }).evaluated, false);
 }
 
 // 4. Equity below floor → EQUITY_LOW.
@@ -82,4 +102,4 @@ const monitorLog = require('./monitorLog');
     'flagged line surfaces every flag');
 }
 
-console.log('monitorLog.test ok', { tests: 7 });
+console.log('monitorLog.test ok', { tests: 10 });

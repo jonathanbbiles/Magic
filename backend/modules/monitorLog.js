@@ -32,6 +32,7 @@ const dirPath = filePath ? path.dirname(filePath) : null;
 
 const recent = [];
 let lastVeto = null; // tracks veto state across ticks for the false->true transition flag
+let lastEvaluated = false; // was the prior heartbeat a genuine veto evaluation (populated sampleSize)?
 
 function toFiniteNumber(value) {
   if (value == null || value === '') return null;
@@ -84,11 +85,24 @@ function buildHeartbeat(input = {}) {
   const execFailure = input.execFailure ? String(input.execFailure).slice(0, 200) : null;
   const equityFloor = toFiniteNumber(input.equityFloor) ?? DEFAULT_EQUITY_FLOOR;
   const prevVeto = input.prevVeto === true;
+  // Whether the PRIOR heartbeat was a genuinely-evaluated state (the realized
+  // veto had actually run, i.e. a populated sampleSize). A fresh server boot
+  // emits a first heartbeat with veto=false ONLY because the veto hasn't
+  // computed yet (sampleSize=null) — that is NOT "the bot was trading fine".
+  // Without this guard, every Render restart trips a false VETO_NEW the moment
+  // the first real scan re-arms the (pre-existing) veto. Default true so
+  // non-boot ticks behave exactly as before.
+  const prevEvaluated = input.prevEvaluated !== false;
+  // Is THIS heartbeat a genuine evaluation? (used as the next tick's prevEvaluated)
+  const evaluated = sampleSize != null;
 
   const flags = [];
   if (execFailure) flags.push('EXEC_FAIL');
   if (equity != null && equity < equityFloor) flags.push('EQUITY_LOW');
-  if (veto && !prevVeto) flags.push('VETO_NEW'); // benign once steady, alert on the transition
+  // VETO_NEW only on a real transition: vetoing now, NOT vetoing before, AND the
+  // prior state was actually evaluated (not a just-booted null). Steady veto is
+  // benign (no flag); a restart's null->veto is suppressed.
+  if (veto && !prevVeto && prevEvaluated) flags.push('VETO_NEW');
 
   return {
     type: 'monitor_heartbeat',
@@ -101,6 +115,7 @@ function buildHeartbeat(input = {}) {
     signalVersion,
     realizedAvgNetBps,
     sampleSize,
+    evaluated,
     execFailure,
     flags,
   };
@@ -111,12 +126,13 @@ function buildHeartbeat(input = {}) {
 function record(input = {}) {
   let hb;
   try {
-    hb = buildHeartbeat({ ...input, prevVeto: lastVeto === true });
+    hb = buildHeartbeat({ ...input, prevVeto: lastVeto === true, prevEvaluated: lastEvaluated });
   } catch (err) {
     logOnce('warn', 'monitor_log_build_failed', 'monitor_log_build_failed', { error: err?.message || err });
     return null;
   }
   lastVeto = hb.veto;
+  lastEvaluated = hb.evaluated;
   try {
     if (ensureFileReady()) {
       fs.appendFileSync(filePath, `${JSON.stringify(hb)}\n`, { encoding: 'utf8' });
@@ -161,6 +177,12 @@ function hydrateRecentFromDisk() {
         if (!Number.isFinite(tsMs)) continue;
         pushRecent({ ...item, tsMs });
         if (typeof item?.veto === 'boolean') lastVeto = item.veto;
+        // Restore whether the last persisted heartbeat was a genuine evaluation,
+        // so a restart that hydrates history doesn't re-flag VETO_NEW. Older
+        // records predate the `evaluated` field — infer it from sampleSize.
+        lastEvaluated = (typeof item?.evaluated === 'boolean')
+          ? item.evaluated
+          : (item?.sampleSize != null);
       } catch (_) { /* ignore malformed historical lines */ }
     }
   } catch (err) {
