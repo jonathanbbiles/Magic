@@ -126,5 +126,33 @@ function makeFakeWs() {
   delete process.env.BINANCE_FEED_SHADOW_ENABLED;
 }
 
+// 7. Deferred start: when symbols don't resolve yet (binanceSymbols not
+//    hydrated), start() returns false + arms a retry; once the resolver
+//    starts resolving, attemptConnect() connects. Regression for the boot
+//    race where the WS started before hydration and bailed with 0 symbols.
+{
+  process.env.BINANCE_FEED_SHADOW_ENABLED = 'true';
+  let hydrated = false;
+  const lateResolver = (canonical) => (hydrated ? fakeResolver(canonical) : null);
+  const fakeWs = makeFakeWs();
+  const stream = createStream({ wsFactory: () => fakeWs, resolveBinance: lateResolver });
+  const started = stream.start({ symbols: ['BTC/USD'] });
+  assert.strictEqual(started, false, 'no immediate connect while unresolved');
+  assert.strictEqual(stream._getStreamNames().length, 0, 'no streams resolved yet');
+  assert.strictEqual(stream._hasStartRetry(), true, 'retry timer armed');
+
+  // Simulate hydration completing, then the retry poll firing.
+  hydrated = true;
+  const connected = stream._attemptConnect();
+  assert.strictEqual(connected, true, 'connects once symbols resolve');
+  fakeWs._fire('open');
+  fakeWs._fire('message', JSON.stringify({ s: 'BTCUSDT', b: '60000', B: '1', a: '60012', A: '2' }));
+  assert.ok(stream.getLatestQuote('BTC/USD'), 'cached after self-heal');
+
+  stream.stop();
+  assert.strictEqual(stream._hasStartRetry(), false, 'retry timer cleared on stop');
+  delete process.env.BINANCE_FEED_SHADOW_ENABLED;
+}
+
 assert.strictEqual(typeof DEFAULT_WS_URL, 'string');
-console.log('binanceFeedStream.test ok', { tests: 6 });
+console.log('binanceFeedStream.test ok', { tests: 7 });

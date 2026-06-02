@@ -32,6 +32,13 @@
 const DEFAULT_WS_URL = 'wss://stream.binance.us:9443/ws';
 const INITIAL_RECONNECT_DELAY_MS = 1000;
 const MAX_RECONNECT_DELAY_MS = 30000;
+// Symbol resolution depends on binanceSymbols.hydrate() (an async
+// /api/v3/exchangeInfo fetch fired at trade.js load). start() can run before
+// that promise resolves — in which case no symbols resolve and the feed would
+// otherwise bail permanently. We defer + retry resolution on a bounded poll so
+// the feed self-heals once hydration lands.
+const START_RETRY_DELAY_MS = 2000;
+const MAX_START_ATTEMPTS = 60; // ~2 min of retries
 
 // canonical "BTC/USD" → binance stream symbol "btcusdt" using the hydrated
 // symbol map. Returns null when the canonical isn't resolvable.
@@ -97,6 +104,8 @@ function createStream({
   let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
   let reconnectTimer = null;
   let subscribeId = 1;
+  let startRetryTimer = null;
+  let startAttempts = 0;
 
   function resolveWsFactory() {
     if (typeof wsFactory === 'function') return wsFactory;
@@ -212,6 +221,17 @@ function createStream({
     });
   }
 
+  // Build maps and connect if any symbols resolve. Returns true on connect,
+  // false when no symbol resolves yet (map not hydrated). Pure of timers so
+  // tests can drive the deferred path without waiting.
+  function attemptConnect() {
+    if (shutdown) return false;
+    buildSymbolMaps();
+    if (!streamNames.length) return false;
+    connect();
+    return true;
+  }
+
   function start({ symbols: symbolList = [], resolveBinance: resolverOverride } = {}) {
     if (shutdown) return false;
     const requested = String(process.env.BINANCE_FEED_SHADOW_ENABLED || 'false').toLowerCase();
@@ -221,10 +241,20 @@ function createStream({
     if (!cleaned.length) return false;
     if (typeof resolverOverride === 'function') resolverFn = resolverOverride;
     symbols = cleaned;
-    buildSymbolMaps();
-    if (!streamNames.length) return false;
-    connect();
-    return true;
+    if (attemptConnect()) return true;
+    // Symbols didn't resolve yet (binanceSymbols not hydrated). Defer and
+    // retry on a bounded poll; stop once connected, exhausted, or shut down.
+    if (!startRetryTimer) {
+      startRetryTimer = setInterval(() => {
+        startAttempts += 1;
+        if (attemptConnect() || startAttempts >= MAX_START_ATTEMPTS || shutdown) {
+          clearInterval(startRetryTimer);
+          startRetryTimer = null;
+        }
+      }, START_RETRY_DELAY_MS);
+      if (startRetryTimer.unref) startRetryTimer.unref();
+    }
+    return false;
   }
 
   function stop() {
@@ -232,6 +262,10 @@ function createStream({
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+    if (startRetryTimer) {
+      clearInterval(startRetryTimer);
+      startRetryTimer = null;
     }
     if (ws) {
       try { ws.close(); } catch (_) {}
@@ -300,6 +334,8 @@ function createStream({
     buildSummary,
     // Test-only:
     _injectMessage,
+    _attemptConnect: attemptConnect,
+    _hasStartRetry: () => startRetryTimer !== null,
     _getCache: () => cache,
     _getReverseMap: () => reverseMap,
     _getStreamNames: () => streamNames,
