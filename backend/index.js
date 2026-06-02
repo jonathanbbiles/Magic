@@ -123,6 +123,7 @@ const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
 const operatorRecommendations = require('./modules/operatorRecommendations');
 const coinbaseQuotesStream = require('./modules/coinbaseQuotesStream');
 const secondaryFeedShadow = require('./modules/secondaryFeedShadow');
+const binanceFeedStream = require('./modules/binanceFeedStream');
 const crossVenueGate = require('./modules/crossVenueGate');
 const staleQuoteRescue = require('./modules/staleQuoteRescue');
 
@@ -848,6 +849,13 @@ const SECONDARY_FEED_FRESH_THRESHOLD_MS = Math.max(
   1000,
   Number(process.env.SECONDARY_FEED_FRESH_THRESHOLD_MS) || 30000,
 );
+// Phase 3 (2026-06-02): Binance.US bookTicker WS shadow feed. Default OFF and
+// observational only — surfaces `meta.binanceFeedShadow` to compare WS push
+// freshness against the live REST polling, before any live cutover. Only
+// meaningful on venue=binance_us; index.js gates the start on both.
+const BINANCE_FEED_SHADOW_ENABLED = String(
+  process.env.BINANCE_FEED_SHADOW_ENABLED || 'false',
+).toLowerCase() === 'true';
 // Phase B: cross-venue divergence gate. Default OFF (shadow mode only).
 // Meta surface always renders when SECONDARY_FEED_ENABLED is true so the
 // operator can observe `wouldHaveRejected` stats before flipping the gate
@@ -2112,6 +2120,20 @@ app.get('/dashboard', async (req, res) => {
               streamStats: null,
               error: err?.message,
             };
+          }
+        })() : null,
+        // Binance.US WS shadow feed (Phase 3 — 2026-06-02). Observational
+        // bookTicker push-feed health + per-symbol freshness. Null unless
+        // BINANCE_FEED_SHADOW_ENABLED=true. Read this to decide whether a WS
+        // push feed is materially fresher than the REST polling before any
+        // live quote-path cutover.
+        binanceFeedShadow: BINANCE_FEED_SHADOW_ENABLED ? (() => {
+          try {
+            return binanceFeedStream.buildSummary({
+              freshThresholdMs: SECONDARY_FEED_FRESH_THRESHOLD_MS,
+            });
+          } catch (err) {
+            return { ranAt: new Date().toISOString(), overall: null, bySymbol: [], error: err?.message };
           }
         })() : null,
         // Cross-venue divergence gate (Phase B — 2026-05-20). Shadow stats
@@ -3411,6 +3433,25 @@ if (SECONDARY_FEED_ENABLED) {
   }
 }
 
+// Phase 3: start the Binance.US bookTicker WS shadow feed if enabled AND the
+// execution venue is binance_us (the only venue whose symbols resolve to
+// Binance stream names). Observational — surfaces meta.binanceFeedShadow.
+if (BINANCE_FEED_SHADOW_ENABLED && String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase() === 'binance_us') {
+  try {
+    const universeSymbols = Array.isArray(runtimeConfig.configuredPrimarySymbols)
+      ? runtimeConfig.configuredPrimarySymbols.filter(Boolean)
+      : [];
+    const started = binanceFeedStream.start({ symbols: universeSymbols });
+    console.log('binance_feed_shadow_started', {
+      started,
+      symbols: universeSymbols,
+      wsUrl: process.env.BINANCE_US_WS_URL || binanceFeedStream.DEFAULT_WS_URL,
+    });
+  } catch (err) {
+    console.warn('binance_feed_shadow_start_failed', { error: err?.message || String(err) });
+  }
+}
+
 bootstrapTrading().catch((err) => {
   console.error('bootstrap_step_failed', {
     step: 'bootstrapTrading',
@@ -3425,6 +3466,7 @@ function gracefulShutdown(signal) {
   shuttingDown = true;
   console.log('shutdown_initiated', { signal });
   try { coinbaseQuotesStream.stop(); } catch (_) {}
+  try { binanceFeedStream.stop(); } catch (_) {}
   server.close(() => {
     console.log('server_closed', { signal });
     recordEquitySnapshot();

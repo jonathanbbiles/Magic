@@ -18,6 +18,7 @@
 
 const { publicRequest } = require('./binanceAuth');
 const binanceSymbols = require('./binanceSymbols');
+const cryptoTrades = require('./cryptoTrades');
 
 // Map Alpaca timeframe strings → Binance interval strings. Both APIs
 // require the granularity in the request; the labels just differ. When
@@ -220,6 +221,152 @@ async function fetchBookTickers({ symbols, restUrl }) {
   return { quotes };
 }
 
+// --- Order book depth (Phase 3 — 2026-06-02) -----------------------------
+//
+// Wires Binance.US /api/v3/depth (PUBLIC, no auth) into the microstructure
+// signal's bookImbalance / microprice features. Before this, the data path
+// returned an empty orderbook on binance_us, so `computeOrderbookImbalance`
+// fed a null book and `bookImbalance` was always 0 — the signal ran half-blind
+// on its single most theory-central feature. Gated downstream by the existing
+// ORDERBOOK_IMBALANCE_FEATURE_ENABLED flag (default off), so flipping this on
+// is an explicit operator decision; the fetch is otherwise dormant.
+
+// Binance /api/v3/depth supports only a fixed set of `limit` values. Anything
+// else is rejected by the API, so we snap a requested depth to the smallest
+// allowed value that is >= the request (and cap at 5000).
+const DEPTH_ALLOWED_LIMITS = Object.freeze([5, 10, 20, 50, 100, 500, 1000, 5000]);
+function snapDepthLimit(requested) {
+  const want = Number.isFinite(requested) ? requested : 20;
+  for (const allowed of DEPTH_ALLOWED_LIMITS) {
+    if (allowed >= want) return allowed;
+  }
+  return 5000;
+}
+
+// Translate one Binance depth side ([[price, qty], ...]) → Alpaca level shape
+// ([{ p, s }, ...]). Binance returns bids best-first (descending price) and
+// asks best-first (ascending price), which matches Alpaca's best-first
+// ordering, so no re-sort is needed. Drops malformed/zero levels.
+function translateDepthSide(side) {
+  if (!Array.isArray(side)) return [];
+  const out = [];
+  for (const level of side) {
+    if (!Array.isArray(level) || level.length < 2) continue;
+    const p = Number(level[0]);
+    const s = Number(level[1]);
+    if (!Number.isFinite(p) || !Number.isFinite(s) || p <= 0 || s <= 0) continue;
+    out.push({ p, s });
+  }
+  return out;
+}
+
+// Translate a Binance depth snapshot ({ bids, asks, lastUpdateId }) → the
+// Alpaca orderbook shape ({ a, b }) that computeOrderbookImbalance in trade.js
+// already consumes. Keys: a = asks, b = bids. Returns null on malformed input.
+function translateDepthSnapshot(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const a = translateDepthSide(raw.asks);
+  const b = translateDepthSide(raw.bids);
+  if (!a.length && !b.length) return null;
+  return { a, b };
+}
+
+// Single-symbol depth fetch. Binance's /depth is single-symbol only.
+async function fetchDepthForSymbol(canonicalSymbol, { limit = 20, restUrl } = {}) {
+  const binanceSymbol = resolveSymbolToBinance(canonicalSymbol);
+  if (!binanceSymbol) return null;
+  const data = await publicRequest({
+    path: '/api/v3/depth',
+    params: { symbol: binanceSymbol, limit: snapDepthLimit(limit) },
+    restUrl,
+  });
+  return translateDepthSnapshot(data);
+}
+
+// Public-facing orderbook fetch. Mirrors fetchCryptoOrderbooks from trade.js.
+// Returns `{ orderbooks: { 'BTC/USD': { a: [...], b: [...] } } }`. Per-symbol
+// failures leave the key absent — same partial-response semantics as the
+// Alpaca path and the fetchKlines fan-out above.
+async function fetchOrderbooks({ symbols, limit = 20, restUrl } = {}) {
+  const list = Array.isArray(symbols)
+    ? symbols
+    : String(symbols || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!list.length) return { orderbooks: {} };
+  const results = await Promise.allSettled(list.map((sym) =>
+    fetchDepthForSymbol(sym, { limit, restUrl })
+  ));
+  const orderbooks = {};
+  for (let i = 0; i < list.length; i += 1) {
+    const r = results[i];
+    if (r.status === 'fulfilled' && r.value) orderbooks[list[i]] = r.value;
+  }
+  return { orderbooks };
+}
+
+// --- Trade tape (Phase 3 — 2026-06-02) -----------------------------------
+//
+// Wires Binance.US /api/v3/trades (PUBLIC, no auth) into the microstructure
+// signal's flowImbalance feature (Lee-Ready aggressor). Before this, the
+// binance_us trades path returned empty and flowImbalance was hardcoded to 0.
+// Output shape matches cryptoTrades.normalizePayload (the Alpaca path), so the
+// microstructure getter consumes either venue's feed identically.
+//
+// Lee-Ready mapping: Binance marks each trade with `isBuyerMaker`. When the
+// buyer is the maker, the SELLER crossed the spread → taker side = sell. When
+// false, the buyer crossed → taker side = buy.
+function translateBinanceTrade(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const price = Number(raw.price ?? raw.p);
+  const size = Number(raw.qty ?? raw.q);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  if (!Number.isFinite(size) || size <= 0) return null;
+  const tsRaw = raw.time ?? raw.T;
+  const ts = Number.isFinite(Number(tsRaw)) ? Number(tsRaw) : null;
+  const isBuyerMaker = raw.isBuyerMaker ?? raw.m;
+  const takerSide = isBuyerMaker === true ? 'sell' : (isBuyerMaker === false ? 'buy' : null);
+  return { ts, price, size, takerSide };
+}
+
+async function fetchTradesForSymbol(canonicalSymbol, { limit = 200, restUrl } = {}) {
+  const binanceSymbol = resolveSymbolToBinance(canonicalSymbol);
+  if (!binanceSymbol) return null;
+  const data = await publicRequest({
+    path: '/api/v3/trades',
+    params: { symbol: binanceSymbol, limit: Math.min(Math.max(1, limit), 1000) },
+    restUrl,
+  });
+  if (!Array.isArray(data)) return [];
+  return data.map(translateBinanceTrade).filter(Boolean);
+}
+
+// Public-facing recent-trades fetch. Mirrors cryptoTrades.fetchRecentTrades
+// (the Alpaca path) in both signature intent and return shape: a per-symbol
+// map keyed by canonical pair, each value an oldest-first array of
+// { ts, price, size, takerSide } trimmed to the trailing `windowMs`.
+async function fetchRecentTrades({
+  symbols,
+  windowMs = cryptoTrades.DEFAULT_WINDOW_MS,
+  limit = cryptoTrades.DEFAULT_TRADE_LIMIT,
+  nowMs = Date.now(),
+  restUrl,
+} = {}) {
+  const list = Array.isArray(symbols)
+    ? symbols.map((s) => String(s || '').trim()).filter(Boolean)
+    : String(symbols || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (!list.length) return {};
+  const results = await Promise.allSettled(list.map((sym) =>
+    fetchTradesForSymbol(sym, { limit, restUrl })
+  ));
+  const out = {};
+  for (let i = 0; i < list.length; i += 1) {
+    const r = results[i];
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      out[list[i]] = cryptoTrades.filterAndSort(r.value, { nowMs, windowMs });
+    }
+  }
+  return out;
+}
+
 module.exports = {
   TIMEFRAME_MAP,
   mapTimeframe,
@@ -230,4 +377,14 @@ module.exports = {
   fetchKlines,
   fetchAllKlinesForSymbol,
   fetchBookTickers,
+  // Phase 3 (2026-06-02): depth + trade tape
+  DEPTH_ALLOWED_LIMITS,
+  snapDepthLimit,
+  translateDepthSide,
+  translateDepthSnapshot,
+  fetchDepthForSymbol,
+  fetchOrderbooks,
+  translateBinanceTrade,
+  fetchTradesForSymbol,
+  fetchRecentTrades,
 };
