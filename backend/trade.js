@@ -1788,12 +1788,18 @@ async function fetchCryptoTrades({ symbols, location = 'us' }) {
 async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   const list = normalizeSymbolsParam(symbols);
   if (!list.length) return { orderbooks: {} };
-  // Phase 2 (venue=binance_us): L2 orderbook is consumed only when
-  // ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true (default off). Return empty
-  // until the Binance.US depth feed is wired (Phase 3 follow-up).
-  // multi_factor's `orderbook_missing` reason fires for that signal when
-  // the feature flag is on, which is the documented fallback path.
-  if (IS_BINANCE_EXECUTION) return { orderbooks: {} };
+  // Phase 3 (2026-06-02): venue=binance_us routes the L2 orderbook through
+  // Binance.US's public /api/v3/depth feed so the microstructure signal's
+  // bookImbalance / microprice features see real depth instead of a null
+  // book. Consumed only when ORDERBOOK_IMBALANCE_FEATURE_ENABLED=true
+  // (default off), so this fetch stays dormant until an operator opts in.
+  if (IS_BINANCE_EXECUTION) {
+    try {
+      return await binanceMarketData.fetchOrderbooks({ symbols: list });
+    } catch (err) {
+      return { orderbooks: {} };
+    }
+  }
   return alpacaRequest({
     base: 'data',
     path: `/v1beta3/crypto/${encodeURIComponent(location)}/latest/orderbooks`,
@@ -2474,23 +2480,33 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
     // an operator who wants to skip the trades fetch entirely flips
     // MICRO_TRADES_SHADOW_ENABLED=false in Render env.
     //
-    // The trades feed is Alpaca-only (/v1beta3/crypto/{loc}/trades). On
-    // binance_us — or any venue without Alpaca creds — the fetch can only
-    // throw alpaca_auth_missing, which previously logged a per-symbol
-    // crypto_trades_fetch_failed warning every scan. Gate on Alpaca auth so
-    // the venue silently keeps Phase-1 flowImbalance=0 behaviour instead of
-    // hammering an endpoint that cannot succeed.
+    // The trades feed is venue-aware. On binance_us (Phase 3 — 2026-06-02)
+    // it routes through Binance.US's public /api/v3/trades endpoint, which
+    // needs NO auth — so flowImbalance is available on Binance for the first
+    // time. On Alpaca it uses /v1beta3/crypto/{loc}/trades, which requires
+    // creds: gate on Alpaca auth so a credential-less Alpaca venue silently
+    // keeps Phase-1 flowImbalance=0 behaviour instead of hammering an endpoint
+    // that can only throw alpaca_auth_missing every scan.
+    const tradesDesired = MICRO_TRADES_ENABLED || MICRO_TRADES_SHADOW_ENABLED;
     const alpacaDataAvailable = resolveAlpacaAuth().alpacaAuthOk;
-    const shouldFetchTrades = (MICRO_TRADES_ENABLED || MICRO_TRADES_SHADOW_ENABLED) && alpacaDataAvailable;
-    const tradesFetch = shouldFetchTrades
-      ? fetchRecentTrades({
-          request: (args) => alpacaRequest({ base: 'data', ...args }),
-          symbols: [pair],
-        }).catch((err) => {
-          console.warn('crypto_trades_fetch_failed', { symbol: pair, error: err?.message });
+    let tradesFetch;
+    if (tradesDesired && IS_BINANCE_EXECUTION) {
+      tradesFetch = binanceMarketData.fetchRecentTrades({ symbols: [pair] })
+        .catch((err) => {
+          console.warn('crypto_trades_fetch_failed', { symbol: pair, venue: 'binance_us', error: err?.message });
           return {};
-        })
-      : Promise.resolve({});
+        });
+    } else if (tradesDesired && alpacaDataAvailable) {
+      tradesFetch = fetchRecentTrades({
+        request: (args) => alpacaRequest({ base: 'data', ...args }),
+        symbols: [pair],
+      }).catch((err) => {
+        console.warn('crypto_trades_fetch_failed', { symbol: pair, error: err?.message });
+        return {};
+      });
+    } else {
+      tradesFetch = Promise.resolve({});
+    }
     const [bars1mPayload, obPayload, tradesBySymbol] = await Promise.all([
       fetchCryptoBars({ symbols: [pair], limit: 80, timeframe: '1Min' }),
       fetchCryptoOrderbooks({ symbols: [pair] }).catch((err) => {

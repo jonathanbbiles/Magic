@@ -232,8 +232,72 @@ async function runTests() {
     assert.strictEqual(bars.length, 3, 'should accumulate all bars');
   });
 
+  // 10. translateDepthSnapshot / fetchOrderbooks → Alpaca { a, b } shape.
+  {
+    const { translateDepthSnapshot, snapDepthLimit } = require('./binanceMarketData');
+    assert.strictEqual(snapDepthLimit(20), 20);
+    assert.strictEqual(snapDepthLimit(7), 10);
+    assert.strictEqual(snapDepthLimit(undefined), 20);
+    const snap = translateDepthSnapshot({
+      lastUpdateId: 123,
+      bids: [['100.50', '2.0'], ['100.40', '1.0'], ['0', '5']],
+      asks: [['100.60', '1.5'], ['bad', '1']],
+    });
+    assert.strictEqual(snap.b.length, 2, 'zero-price bid dropped');
+    assert.deepStrictEqual(snap.b[0], { p: 100.5, s: 2.0 });
+    assert.strictEqual(snap.a.length, 1, 'NaN-price ask dropped');
+    assert.deepStrictEqual(snap.a[0], { p: 100.6, s: 1.5 });
+    assert.strictEqual(translateDepthSnapshot(null), null);
+    assert.strictEqual(translateDepthSnapshot({ bids: [], asks: [] }), null);
+  }
+  injectUniverse(['BTC/USD', 'ETH/USD']);
+  await withStubbedPublicRequest(async ({ path: p, params }) => {
+    assert.strictEqual(p, '/api/v3/depth');
+    assert.ok(params.limit, 'depth limit must be set');
+    if (params.symbol === 'BTCUSD') {
+      return { lastUpdateId: 1, bids: [['50000.1', '0.5']], asks: [['50000.2', '0.4']] };
+    }
+    const err = new Error('binance_public_500'); err.status = 500; throw err;
+  }, async () => {
+    const mod = freshRequireBinanceMarketData();
+    const { orderbooks } = await mod.fetchOrderbooks({ symbols: ['BTC/USD', 'ETH/USD'] });
+    assert.ok(orderbooks['BTC/USD'], 'BTC book present');
+    assert.deepStrictEqual(orderbooks['BTC/USD'].b[0], { p: 50000.1, s: 0.5 });
+    assert.ok(!('ETH/USD' in orderbooks), 'failed ETH book absent (tolerant fan-out)');
+  });
+
+  // 11. translateBinanceTrade Lee-Ready mapping + fetchRecentTrades window.
+  {
+    const { translateBinanceTrade } = require('./binanceMarketData');
+    const buyAggressor = translateBinanceTrade({ price: '100', qty: '2', time: 1000, isBuyerMaker: false });
+    assert.strictEqual(buyAggressor.takerSide, 'buy', 'buyer crossed → taker buy');
+    const sellAggressor = translateBinanceTrade({ price: '100', qty: '2', time: 1000, isBuyerMaker: true });
+    assert.strictEqual(sellAggressor.takerSide, 'sell', 'buyer maker → taker sell');
+    assert.strictEqual(translateBinanceTrade({ price: '0', qty: '2' }), null);
+    assert.strictEqual(translateBinanceTrade(null), null);
+  }
+  injectUniverse(['BTC/USD']);
+  await withStubbedPublicRequest(async ({ path: p, params }) => {
+    assert.strictEqual(p, '/api/v3/trades');
+    assert.strictEqual(params.symbol, 'BTCUSD');
+    const now = Date.now();
+    return [
+      { price: '100', qty: '1', time: now - 5000, isBuyerMaker: false },
+      { price: '101', qty: '2', time: now - 1000, isBuyerMaker: true },
+      { price: '99', qty: '1', time: now - 120000, isBuyerMaker: false }, // outside 60s window
+    ];
+  }, async () => {
+    const mod = freshRequireBinanceMarketData();
+    const bySymbol = await mod.fetchRecentTrades({ symbols: ['BTC/USD'] });
+    const trades = bySymbol['BTC/USD'];
+    assert.ok(Array.isArray(trades), 'per-symbol array returned');
+    assert.strictEqual(trades.length, 2, 'stale trade filtered out of 60s window');
+    assert.ok(trades[0].ts <= trades[1].ts, 'sorted oldest-first');
+    assert.strictEqual(trades[1].takerSide, 'sell');
+  });
+
   binanceSymbols._testReset();
-  console.log('binanceMarketData.test ok', { tests: 9 });
+  console.log('binanceMarketData.test ok', { tests: 11 });
 }
 
 runTests().catch((err) => {
