@@ -47,6 +47,7 @@ function resolveStoragePaths() {
     tradeForensicsFile: path.join(writableRoot, 'trade_forensics.jsonl'),
     closedTradeStatsFile: path.join(writableRoot, 'closed_trade_stats.jsonl'),
     equitySnapshotsFile: path.join(writableRoot, 'equity_snapshots.jsonl'),
+    monitorLogFile: path.join(writableRoot, 'monitor_log.jsonl'),
     runSnapshotFile: path.join(writableRoot, 'run_snapshot.json'),
     mrStopLossSweepFile: path.join(writableRoot, 'mr_stop_loss_sweep.json'),
     gateRejectionAuditFile: path.join(writableRoot, 'gate_rejection_audit.jsonl'),

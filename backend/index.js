@@ -101,6 +101,7 @@ const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
+const monitorLog = require('./modules/monitorLog');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
 const { resolveLiveEngineFallbacks, resolveBacktestFeeBps } = require('./modules/backtestEnvFallbacks');
@@ -405,6 +406,7 @@ const isPublicEndpoint = (req) =>
     || req.path === '/debug/status'
     || req.path === '/dashboard'
     || req.path === '/debug/logs'
+    || req.path === '/monitor'
   );
 
 const serializeError = (error, fallbackMessage = 'Request failed') => {
@@ -581,6 +583,36 @@ async function recordEquitySnapshot() {
       equity: account?.equity,
       portfolio_value: account?.portfolio_value,
     });
+    // Monitor heartbeat (2026-06-02): server-side replacement for the local
+    // ~/Magic-monitor cron. Reuses the account fetch above + the in-memory
+    // veto/positions state; never throws (monitorLog swallows its own errors).
+    try {
+      const veto = (typeof getRealizedVetoState === 'function' ? getRealizedVetoState() : null) || {};
+      let openPositions = 0;
+      try {
+        const positions = await fetchPositions();
+        openPositions = Array.isArray(positions) ? positions.length : 0;
+      } catch (_) { /* positions optional for the heartbeat */ }
+      const equityValue = Number(account?.equity ?? account?.portfolio_value);
+      let execFailure = null;
+      try {
+        const diag = typeof getEntryDiagnosticsSnapshot === 'function' ? getEntryDiagnosticsSnapshot() : null;
+        execFailure = diag?.lastExecutionFailure?.message || null;
+      } catch (_) { /* exec-failure surfacing is best-effort */ }
+      monitorLog.record({
+        ts: Date.now(),
+        equity: Number.isFinite(equityValue) ? equityValue : null,
+        openPositions,
+        veto: veto?.veto === true,
+        vetoReason: veto?.reason || null,
+        signalVersion: veto?.signalVersion || null,
+        realizedAvgNetBps: veto?.realizedAvgNetBps ?? null,
+        sampleSize: veto?.sampleSize ?? null,
+        execFailure,
+      });
+    } catch (hbError) {
+      console.warn('monitor_heartbeat_record_failed', hbError?.message || hbError);
+    }
   } catch (error) {
     console.warn('equity_snapshot_record_failed', error?.responseSnippet || error?.message || error);
   }
@@ -1208,6 +1240,25 @@ app.get('/debug/logs', (req, res) => {
   if (level) entries = entries.filter((e) => e.level === level);
   entries = entries.slice(-limit);
   res.json({ ok: true, count: entries.length, entries });
+});
+
+// Built-in monitor heartbeat (2026-06-02). Public, server-side replacement for
+// the local ~/Magic-monitor cron — readable from a phone with no laptop/tooling.
+// `?format=text` returns one human-readable line per heartbeat (newest last);
+// default JSON returns the structured ring + an `alerts` slice (only heartbeats
+// carrying a real flag). `?limit=N` caps how many recent heartbeats to return.
+app.get('/monitor', (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 2000);
+  const recent = monitorLog.getRecent(limit);
+  if (String(req.query.format || '').toLowerCase() === 'text') {
+    const header = `Magic monitor — ${recent.length} heartbeats (newest last). `
+      + 'flags: [EXEC_FAIL] [EQUITY_LOW] [VETO_NEW] need eyes; VETO alone is benign.\n';
+    res.type('text/plain').send(header + monitorLog.formatText(limit) + '\n');
+    return;
+  }
+  const alerts = recent.filter((h) => Array.isArray(h.flags) && h.flags.length > 0);
+  const latest = recent.length ? recent[recent.length - 1] : null;
+  res.json({ ok: true, count: recent.length, latest, alerts, heartbeats: recent });
 });
 
 app.get('/debug/runtime-config', (req, res) => {
