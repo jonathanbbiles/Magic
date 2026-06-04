@@ -109,16 +109,19 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 // (MIN_BACKTEST_ENTRIES=5) remains the real safety net; any signal with
 // non-negative expectancy and >=5 backtest entries is admitted.
 //
-// 2026-06-02 UN-PIN back to '' (self-correcting default). The 2026-06-01
-// micro_5m pin (#455) was a "reset the realized-veto by pinning a fresh-sample
-// signal" move — but the breaker firing is CORRECT capital protection, and
-// micro_5m was the worst signal on the two-window backtest sweep (-21 bps).
-// micro_45m subsequently realized -7.3 bps over 27 live closes and the breaker
-// correctly halted it. Empty string returns the engine to its documented
-// mean_reversion fallback with the realized-expectancy breaker as the sole,
-// un-dodged halt authority. Operator-pin via SIGNAL_VERSION=<signal> in Render
-// env. Full rationale in liveDefaults.js.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, '');
+// 2026-06-04 BOUNDED RE-PROBE — pinned to 'mean_reversion_5m'. The realized
+// breaker held the bot at zero trades >24h on the mean_reversion(1m) fallback
+// (10 stale closes that can't refresh while halted — a real deadlock). A replay
+// of the LAST 3 DAYS of real data showed mean_reversion_5m is the only
+// currently-positive signal (+6.4 bps / 26 trades / 69% win) and would have
+// fired 26x where 1m fired once and lost. This pin matches the live regime AND
+// breaks the deadlock with a fresh sample. NOT a durable-edge claim
+// (mean_reversion_5m was +3.8/-38.1 across two prior windows) — the breaker
+// stays armed at -5, so a bleed auto-halts within ~10 closes. Reversible:
+// SIGNAL_VERSION='' (-> mean_reversion fallback) in Render. Full rationale in
+// liveDefaults.js. NB: mean_reversion_5m must be in trade.js's
+// SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist or the pin silently falls back.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'mean_reversion_5m');
 
 // 2026-05-31 stop-the-bleed: quote freshness, fresh re-quote, and the hard
 // liquidity allowlist. See liveDefaults.js for the full rationale.

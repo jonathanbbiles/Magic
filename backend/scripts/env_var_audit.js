@@ -59,6 +59,10 @@ const NON_ENV_ALLOWLIST = new Set([
   // Internal JS local-variable names referenced by name in module headers
   'ACTIVE_SIGNAL_VERSION',
   'CALIBRATION_RELOAD_MS',
+  // trade.js module-level allowlist constant (the set of valid SIGNAL_VERSION
+  // operator-pin values). Referenced by name in docs as where new signal names
+  // must be registered; it is a code constant, not an env var.
+  'SIGNAL_VERSION_OPERATOR_OVERRIDE',
   // magic-diagnostics MCP server constant (2026-05-30). The default backend
   // URL fallback, referenced by name in CLAUDE.md. It lives in
   // mcp/magic-diagnostics/server.js (not backend/) and is overridable by the
