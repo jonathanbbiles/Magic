@@ -987,7 +987,7 @@ const STUCK_LOSS_ASSUMED_BPS = Math.max(0, readNumber('STUCK_LOSS_ASSUMED_BPS', 
 // freshness, spread, vol-cap, HTF) still apply to both signals.
 const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
 const SIGNAL_VERSION_OPERATOR_OVERRIDE = [
-  'ols', 'multi_factor', 'mean_reversion', 'barrier',
+  'ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'barrier',
   'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
 ].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW

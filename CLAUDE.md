@@ -18,7 +18,7 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 **`ENTRY_LIMIT_PRICE_MODE` default is now `mid`** (was `bid_plus_tick`) — the entryModeAB diagnostic showed the passive rest bled ~16 bps/trade to adverse selection on Binance.US's ~0% maker books.
 
-**Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). The code default is now `SIGNAL_VERSION=''` (un-pinned 2026-06-02), so the `mean_reversion` fallback is the live default out of the box. Set `SIGNAL_VERSION` in Render env to operator-pin a different one.
+**Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). **As of 2026-06-04 the code default is pinned to `mean_reversion_5m`** — a *bounded re-probe* after the breaker held the bot at zero trades >24h on the 1m fallback; a 3-day replay of real data showed `mean_reversion_5m` is the only currently-positive signal (+6.4 bps / 26 trades / 69% win). The realized breaker stays armed at −5 so a bleed auto-halts within ~10 closes; this is a controlled experiment, NOT a durable-edge claim (it was +3.8/−38.1 across two prior windows). **`mean_reversion_5m` and `mean_reversion_15m` were added to the `SIGNAL_VERSION_OPERATOR_OVERRIDE` allowlist in `trade.js` (2026-06-04)** — without that, a `*_5m/_15m` pin silently nulls to the bare `mean_reversion` (1m) fallback. Set `SIGNAL_VERSION=''` in Render to revert to the fallback, or any other signal to pin.
 
 ## 2026-06-02: UN-PIN — re-pinning to dodge the realized veto is an anti-pattern
 

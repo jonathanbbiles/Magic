@@ -265,7 +265,31 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // signals on single-window backtests. Reversible: set SIGNAL_VERSION=<signal>
   // in Render env to operator-pin again (e.g. SIGNAL_VERSION=ols for an
   // emergency force-trade).
-  SIGNAL_VERSION: '',
+  //
+  // 2026-06-04 BOUNDED RE-PROBE — pinned to 'mean_reversion_5m'. Context: the
+  // realized breaker has held the bot at zero trades for >24h on the
+  // mean_reversion (1m) fallback (10 stale closes @ -27.7 bps that can never
+  // refresh while halted — a genuine closed-trade-window deadlock). A fresh
+  // replay of the LAST 3 DAYS of real Binance.US data (8 liquid majors, fee=2,
+  // adverse-selection fill) shows mean_reversion_5m is the ONLY currently-
+  // positive signal: +6.4 bps over 26 trades, 69% win — and it would have
+  // FIRED 26x while mean_reversion_1m fired once and lost. So the live default
+  // was mismatched to the regime. This pin (a) matches the signal that is
+  // actually working right now and (b) breaks the deadlock with a fresh sample.
+  //
+  // IMPORTANT — this is a CONTROLLED re-probe, NOT a claim of durable edge.
+  // mean_reversion_5m was +3.8/-38.1 across two prior 30-day windows: it has
+  // regime-dependent luck, not proven edge. The realized-expectancy breaker
+  // stays armed at the -5 floor, so if this pin bleeds it auto-halts within
+  // ~10 closes (downside bounded ~$1-2, same as before). We watch ~20-30 live
+  // closes: if it holds positive, we found a real match; if it reverts, the
+  // breaker catches it cheaply and we've learned it's noise. The durable fix
+  // remains fitting entry weights from accumulated outcomes, not signal-
+  // rotation. Reversible: SIGNAL_VERSION='' (-> mean_reversion fallback) or any
+  // other signal in Render env. Requires mean_reversion_5m in the trade.js
+  // SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-04) or the pin
+  // silently nulls to the 1m fallback.
+  SIGNAL_VERSION: 'mean_reversion_5m',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
