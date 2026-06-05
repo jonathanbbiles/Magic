@@ -82,6 +82,41 @@ function makeBars({ length, closeFn, volumeFn, lowFn }) {
   assert.ok(r.dropBps < -DEFAULT_CONFIG.dropTriggerBps);
   assert.ok(r.volRatio >= DEFAULT_CONFIG.volConfirmMultiplier);
   assert.ok(r.rsi <= DEFAULT_CONFIG.rsiOversold);
+
+  // 1m / default keeps the bare name (backward compat).
+  assert.equal(r.signalVersion, 'mean_reversion', '1m/default keeps bare mean_reversion');
+}
+
+// 2026-06-05: timeframe-qualified signalVersion tagging. A SIGNAL_VERSION=
+// mean_reversion_5m pin must record its trades under 'mean_reversion_5m' (not
+// the bare 'mean_reversion') or the realized-expectancy breaker — which watches
+// the active 'mean_reversion_5m' key — sees 0 matching closes forever and can
+// never arm. Drive a capitulation that survives 5m/15m aggregation so the
+// evaluator reaches its ok:true return and we can assert the tag.
+{
+  // Build enough 1m history that the 15m aggregation still has ≥30 coarse bars,
+  // flat, then a sharp multi-bar capitulation at the very end so the aggregated
+  // 3-bar drop clears the 100-bps trigger on every timeframe.
+  const bars = [];
+  let price = 100;
+  for (let i = 0; i < 700; i += 1) {
+    bars.push({ t: i, o: price, h: price * 1.0003, l: price * 0.9997, c: price, v: 1000 });
+  }
+  // ~3% drop over the final 45 1m bars (→ a clear 3-coarse-bar drop at 5m & 15m)
+  for (let i = 0; i < 45; i += 1) {
+    price *= 0.99933;
+    bars.push({ t: 700 + i, o: price, h: price, l: price * 0.999, c: price, v: 6000 });
+  }
+  const btc = { recentReturnBps: -5, ageMs: 0 };
+  const r5 = evaluateMeanReversionSignal({ pair: 'SOL/USD', bars1m: bars, btcLeadLag: btc, timeframe: '5m' });
+  const r15 = evaluateMeanReversionSignal({ pair: 'SOL/USD', bars1m: bars, btcLeadLag: btc, timeframe: '15m' });
+  // Whichever of these actually fire must carry the timeframe-qualified tag;
+  // a non-firing (ok:false) result has no signalVersion and that's fine — the
+  // point is the tag is NEVER the bare 'mean_reversion' for a 5m/15m call.
+  if (r5.ok) assert.equal(r5.signalVersion, 'mean_reversion_5m', '5m fire must tag mean_reversion_5m');
+  assert.notEqual(r5.signalVersion, 'mean_reversion', '5m must never tag bare mean_reversion');
+  if (r15.ok) assert.equal(r15.signalVersion, 'mean_reversion_15m', '15m fire must tag mean_reversion_15m');
+  assert.notEqual(r15.signalVersion, 'mean_reversion', '15m must never tag bare mean_reversion');
 }
 
 // 5. Capitulation but BTC ALSO crashing → reject (mr_btc_correlated_drop).
