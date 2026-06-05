@@ -287,10 +287,23 @@ function evaluateMeanReversionSignal({
 
   // Signal-interface shape — same as the OLS / multi-factor return shapes
   // so the trade engine's downstream code can read it uniformly.
+  //
+  // 2026-06-05 FIX: tag the timeframe-qualified signalVersion so the live
+  // prediction record, perSymbolExpectancy grid, drift alerter, and the
+  // realized-expectancy circuit breaker can tell the 1m / 5m / 15m variants
+  // apart. Previously this hardcoded 'mean_reversion' for ALL timeframes, so a
+  // SIGNAL_VERSION=mean_reversion_5m pin recorded its trades under the bare
+  // 'mean_reversion' bucket — and the breaker (which watches the active
+  // 'mean_reversion_5m' key) saw 0 matching closes forever (insufficient_sample),
+  // so it could never arm on the pinned signal. The 1m variant keeps the bare
+  // 'mean_reversion' name for backward compatibility with historical records +
+  // the bare-loop fallback default.
   return {
     ok: true,
     reason: null,
-    signalVersion: 'mean_reversion',
+    signalVersion: timeframe === '5m' ? 'mean_reversion_5m'
+      : timeframe === '15m' ? 'mean_reversion_15m'
+      : 'mean_reversion',
     timeframe,
     projectedBps,
     dropBps,
