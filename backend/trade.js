@@ -3015,8 +3015,31 @@ async function initializeInventoryFromPositions() {
   return inventory;
 }
 
+// Bounded retry for a single transient network call (2026-06-05). The
+// positions/orders fetches below feed the entry scan; a single transient
+// AggregateError (observed once from Binance.US) previously aborted the WHOLE
+// scan cycle for ENTRY_SCAN_INTERVAL_MS, silently skipping any entry that cycle.
+// One quick retry absorbs the common transient blip without masking a real
+// outage (a persistent failure still throws after the retry, hitting the same
+// `positions_or_orders_fetch_failed` handler — behaviour unchanged for real
+// failures). Backoff is small + fixed; the caller is already inside a
+// try/catch, so a final throw is safe.
+async function fetchWithOneRetry(fn, label) {
+  try {
+    return await fn();
+  } catch (err) {
+    const transient = err?.name === 'AggregateError'
+      || /AggregateError|ECONNRESET|ETIMEDOUT|socket hang up|EAI_AGAIN|network/i.test(
+        String(err?.errorMessage || err?.message || err));
+    if (!transient) throw err;
+    console.warn('fetch_transient_retry', { label, error: err?.errorMessage || err?.message || String(err) });
+    await new Promise((r) => setTimeout(r, 400));
+    return fn();
+  }
+}
+
 async function buildHeldAndOpenSellsIndex() {
-  const positions = await fetchPositions();
+  const positions = await fetchWithOneRetry(() => fetchPositions(), 'fetchPositions');
   const held = new Set();
   const byPair = new Map();
   let totalUnrealizedPl = 0;
@@ -3032,7 +3055,8 @@ async function buildHeldAndOpenSellsIndex() {
   const aggregateUnrealizedPct = totalCostBasis > 0
     ? (totalUnrealizedPl / totalCostBasis) * 100
     : null;
-  const openOrders = await fetchOrders({ status: 'open', nested: true, limit: 500 });
+  const openOrders = await fetchWithOneRetry(
+    () => fetchOrders({ status: 'open', nested: true, limit: 500 }), 'fetchOrders');
   const openBuyPairs = new Set();
   const openSellByPair = new Map();
   expandNestedOrders(openOrders).forEach((o) => {
