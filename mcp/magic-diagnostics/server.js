@@ -42,7 +42,21 @@ const PROTOCOL_VERSION = '2024-11-05';
 // cloned repo can pull live diagnostics with zero env config (the URL is
 // public, not a secret). Override via MAGIC_BACKEND_URL for other deploys.
 const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
-const BACKEND_URL = String(process.env.MAGIC_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/+$/, '');
+// Resolve the backend URL defensively. .mcp.json interpolates
+// MAGIC_BACKEND_URL: "${MAGIC_BACKEND_URL}" — when the host var is unset, some
+// harnesses pass the LITERAL unexpanded "${MAGIC_BACKEND_URL}" string through
+// instead of an empty string. That non-empty garbage defeats a plain
+// `process.env.X || DEFAULT` fallback AND is not a valid URL, so `new URL()`
+// later throws "Invalid URL" and every tool call fails (observed 2026-06-05).
+// Treat anything that isn't a real http(s) URL as "unset" so we fall back to
+// the public production default and self-heal regardless of how the env was
+// passed.
+function resolveBackendUrl() {
+  const candidate = String(process.env.MAGIC_BACKEND_URL || '').trim();
+  const isValid = /^https?:\/\/[^\s${}]+/i.test(candidate);
+  return (isValid ? candidate : DEFAULT_BACKEND_URL).replace(/\/+$/, '');
+}
+const BACKEND_URL = resolveBackendUrl();
 const API_TOKEN = String(process.env.MAGIC_API_TOKEN || '').trim();
 
 // HTTP request helper. Returns parsed JSON body or throws with a structured
@@ -288,4 +302,4 @@ if (require.main === module) {
   startStdinLoop();
 }
 
-module.exports = { TOOLS, handleMessage, httpRequest, BACKEND_URL, DEFAULT_BACKEND_URL };
+module.exports = { TOOLS, handleMessage, httpRequest, BACKEND_URL, DEFAULT_BACKEND_URL, resolveBackendUrl };

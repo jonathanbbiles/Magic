@@ -96,12 +96,27 @@ the production host (`https://magic-lw8t.onrender.com`, set as
 `DEFAULT_BACKEND_URL` in `server.js`) when the env var is unset, and the
 `/dashboard` + `/debug/logs` endpoints are public (no token — see
 `isPublicEndpoint` in `index.js`). So `get_diagnostics` and `get_logs`
-work with NO env config. The ONLY remaining requirement for a Claude Code
-on the web session to reach the bot is that the **host is on the session's
-network allowlist** — outbound egress is governed by the environment's
-network policy (chosen when the environment was created); add
-`magic-lw8t.onrender.com` (or `*.onrender.com`) there or every fetch
-returns `403 Host not in allowlist` from the egress proxy.
+work with NO env config.
+
+**Placeholder-URL hardening (2026-06-05):** `.mcp.json` interpolates
+`MAGIC_BACKEND_URL: "${MAGIC_BACKEND_URL}"`. When the host var is unset,
+some harnesses pass the **literal unexpanded** `${MAGIC_BACKEND_URL}` string
+through (not an empty string). That non-empty garbage previously defeated the
+plain `|| DEFAULT_BACKEND_URL` fallback and then threw `Invalid URL` from
+`new URL()`, breaking every tool call (observed 2026-06-05 — the failure
+masquerades as a network problem but is pure config). `resolveBackendUrl()`
+in `server.js` now treats any value that isn't a real `http(s)` URL as unset
+and falls back to `DEFAULT_BACKEND_URL`, so the server self-heals regardless
+of how the env was passed.
+
+If the resolved host is valid but unreachable, the remaining requirement for a
+cloud Claude Code session is that the **host is on the session's network
+allowlist** — outbound egress is governed by the environment's network policy
+(chosen when the environment was created); add `magic-lw8t.onrender.com` (or
+`*.onrender.com`) there or every fetch returns `403 Host not in allowlist`
+from the egress proxy. (Note: `403 Host not in allowlist` and `Invalid URL`
+are different failures — the former is a real egress block, the latter is the
+config bug fixed above.)
 
 Two optional env vars refine this:
 - `MAGIC_BACKEND_URL` — override the default to point at a different deploy.

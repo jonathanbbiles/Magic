@@ -166,13 +166,33 @@ async function test_toolCall_backendError_returnsIsError() {
 
 async function test_noBackendUrl_fallsBackToDefault() {
   // With MAGIC_BACKEND_URL unset, the server must fall back to the public
-  // production host so monitoring works with zero env config (once the host
-  // is on the session network allowlist). Pure resolution check — no network.
+  // production host so monitoring works with zero env config. Pure resolution
+  // check — no network.
   delete process.env.MAGIC_BACKEND_URL;
   delete process.env.MAGIC_API_TOKEN;
   const mod = loadServer();
   assert.strictEqual(mod.DEFAULT_BACKEND_URL, 'https://magic-lw8t.onrender.com');
   assert.strictEqual(mod.BACKEND_URL, mod.DEFAULT_BACKEND_URL);
+}
+
+async function test_placeholderBackendUrl_fallsBackToDefault() {
+  // Regression (2026-06-05): .mcp.json interpolates MAGIC_BACKEND_URL:
+  // "${MAGIC_BACKEND_URL}". When the host var is unset, the LITERAL
+  // unexpanded "${MAGIC_BACKEND_URL}" string was passed through — non-empty,
+  // so it defeated the `|| DEFAULT` fallback and `new URL()` threw
+  // "Invalid URL", breaking every tool call. The resolver must treat any
+  // value that isn't a real http(s) URL as unset.
+  for (const bad of ['${MAGIC_BACKEND_URL}', '   ', 'not-a-url', 'ftp://x']) {
+    process.env.MAGIC_BACKEND_URL = bad;
+    try {
+      const mod = loadServer();
+      assert.strictEqual(mod.BACKEND_URL, mod.DEFAULT_BACKEND_URL, `expected fallback for ${JSON.stringify(bad)}`);
+      // And the resolved URL must actually be constructible.
+      assert.doesNotThrow(() => new URL(`${mod.BACKEND_URL}/dashboard`));
+    } finally {
+      delete process.env.MAGIC_BACKEND_URL;
+    }
+  }
 }
 
 async function test_backendUrlEnvOverridesDefault() {
@@ -195,8 +215,9 @@ async function test_backendUrlEnvOverridesDefault() {
   await test_toolCall_dispatchesToBackend();
   await test_toolCall_backendError_returnsIsError();
   await test_noBackendUrl_fallsBackToDefault();
+  await test_placeholderBackendUrl_fallsBackToDefault();
   await test_backendUrlEnvOverridesDefault();
-  console.log('mcp-magic-diagnostics tests passed', { tests: 9 });
+  console.log('mcp-magic-diagnostics tests passed', { tests: 10 });
 })().catch((err) => {
   console.error('mcp-magic-diagnostics tests FAILED', err);
   process.exit(1);
