@@ -667,7 +667,16 @@ app.get('/health', (req, res) => {
 // stats by polling /dashboard.meta.backtest. Auto-fires once ~60 seconds
 // after server start so the engine has time to settle. Can also be triggered
 // on demand at /debug/backtest?days=...&fraction=...
-const BACKTEST_AUTORUN_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_ENABLED || 'true').toLowerCase());
+// 2026-06-05: default flipped 'true' -> 'false'. The boot-time backtest/sweep/AB
+// swarm is observational only — post-2026-05-30 simplification the live entry
+// path (scanAndEnter) does NOT consult the backtest selector to gate trades
+// (only the realized-expectancy veto does, which is unaffected). Running a
+// 30-day backtest for every signal on each restart burst-fetched market data
+// for diagnostics nothing reads for decisions. Disabling stops that quota burn;
+// meta.backtest* simply stays null (the dashboard already handles null — same
+// state as the first 60s of every restart). Operator can re-enable on demand
+// via BACKTEST_AUTORUN_ENABLED=true in Render env, or run /debug/backtest ad hoc.
+const BACKTEST_AUTORUN_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKTEST_AUTORUN_ENABLED || 'false').toLowerCase());
 const BACKTEST_AUTORUN_DELAY_MS = Math.max(5_000, Number(process.env.BACKTEST_AUTORUN_DELAY_MS) || 60_000);
 const BACKTEST_AUTORUN_DAYS = Math.max(1, Number(process.env.BACKTEST_AUTORUN_DAYS) || 30);
 // A/B: master switch for the two alt backtest runs (alt + alt2). When ON,
@@ -792,7 +801,16 @@ const PER_SYMBOL_AUDIT_LOOKBACK_TRADES = Math.max(
 // N minutes later" semantics. The grader fetches up to maxPerCycle
 // captures every gradeIntervalMs; expired pending (> staleMin minutes
 // old) are dropped without grading.
-const GATE_REJECTION_AUDIT_ENABLED = String(process.env.GATE_REJECTION_AUDIT_ENABLED || 'true').toLowerCase() !== 'false';
+// 2026-06-05: default flipped ON -> OFF. The gate-rejection audit grader runs a
+// 60s setInterval that fetches 1m bars for every captured rejection to forward-
+// grade it — observational only; no live decision reads meta.gateRejectionAudit
+// (the trade.js call is capture-only, and scanAndEnter does not consult it).
+// Disabling stops the continuous bars-API quota burn; the dashboard's
+// `gateRejectionAudit:` field is already a `GATE_REJECTION_AUDIT_ENABLED ? ... : null`
+// ternary, so it cleanly returns null when off (no error). Re-enable via
+// GATE_REJECTION_AUDIT_ENABLED=true in Render env. Default ON would be
+// `!== 'false'`; default OFF requires an explicit truthy opt-in.
+const GATE_REJECTION_AUDIT_ENABLED = ['1', 'true', 'yes', 'on'].includes(String(process.env.GATE_REJECTION_AUDIT_ENABLED || 'false').toLowerCase());
 const GATE_REJECTION_AUDIT_FORWARD_BARS = Math.max(
   1,
   Number(process.env.GATE_REJECTION_AUDIT_FORWARD_BARS) || 20,

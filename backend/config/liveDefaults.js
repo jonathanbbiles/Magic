@@ -665,12 +665,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // N bars later fetches the 1m close to compute the realised forward bps.
   // Aggregates per-reason at meta.gateRejectionAudit so operators can see
   // which gates rejected candidates that would have been profitable.
-  // Default-ON because the capture+grade overhead is bounded (one fetch
-  // per symbol per minute, capped at 40 captures graded per cycle); the
-  // value of having a real "is the gate costing us money" answer beats
-  // the opportunity cost of running blind. Flip to 'false' in Render env
-  // to disable both capture and grading entirely.
-  GATE_REJECTION_AUDIT_ENABLED: 'true',
+  // 2026-06-05: default-OFF. Was 'true' (bounded one-fetch-per-symbol-per-minute
+  // grading), but post-2026-05-30 simplification the live entry path no longer
+  // consults the gate-rejection audit to gate any trade — it is observational
+  // only, and no operator workflow currently reads meta.gateRejectionAudit for a
+  // decision. The 60s grader was therefore burning bars-API quota continuously
+  // for an unread diagnostic. Disabling stops capture + grading; the dashboard's
+  // `gateRejectionAudit:` field is a `... ? ... : null` ternary so it cleanly
+  // returns null. Re-enable via GATE_REJECTION_AUDIT_ENABLED=true in Render env
+  // if the gate-cost diagnostic is wanted again. NOTE: this default lives BOTH
+  // here (bridged into process.env by bootstrapLiveEnv) and as the index.js
+  // read-fallback — both were flipped together; keep them in sync.
+  GATE_REJECTION_AUDIT_ENABLED: 'false',
   // Forward horizon in 1m bars. Default 20 mirrors the OLS/MR-1m backtester's
   // predictBars=20, giving an apples-to-apples comparison against the same
   // forward window used to evaluate signal expectancy. Operators wanting
