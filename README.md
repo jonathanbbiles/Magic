@@ -1,5 +1,49 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-05: why avg win < avg loss — full scorecard math (diagnosis only, no behavior change)
+
+A live scorecard snapshot (258 closed trades since last restart) asked the question directly: **why is the average win smaller than the average loss?** This entry is the worked answer. It is **documentation only** — no signal, gate, sizing, or exit logic changed in this PR. (A stop-loss or TP-target change is a separate, explicit decision per Hard Rule #5; this diagnosis sets it up but does not make it.)
+
+**The snapshot** (`meta.scorecard`, computed by `closedTradeStats.buildScorecard`):
+
+| Field | Value |
+|---|---|
+| Closed trades | 258 |
+| Win rate | 35% |
+| Avg win | **+$0.08** |
+| Avg loss | **−$0.15** |
+| Expectancy | **−$0.04 / trade** |
+| Profit factor | 0.42 |
+| TP fill rate | 56% |
+| Median hold | 13m 11s |
+
+**Step 1 — recover the trade counts.** `buildScorecard` splits closes into `wins` (`netPnl > 0`), `losses` (`netPnl < 0`), and breakevens (`netPnl === 0`, counted in the denominator but neither bucket). Solving from the published figures: **90 wins, 117 losses, 51 breakevens.** This reproduces the scorecard exactly — expectancy `(90·0.08 − 117·0.15) / 258 = −$0.0401`, profit factor `7.20 / 17.55 = 0.41` — so the numbers are internally consistent and the 51 (~20%) breakeven/flat closes are real, not rounding.
+
+**Step 2 — the per-trade asymmetry (the literal "why").** Avg loss is **1.9× the avg win** because the two exits are not symmetric *by design*:
+- **Upside is capped.** Every entry attaches one GTC limit sell at `entry × (1 + signalDerivedGrossBps/10000)`. The best a winner can do is fill that fixed, small take-profit — so winners cluster at **+$0.08** and cannot run further. The bot walks away after placing the sell (intentional, Hard Rule #5).
+- **Downside is not capped.** There is **no stop-loss**. When price goes against the entry the GTC sell simply doesn't fill; the position drifts and eventually closes (reconciler / flat exit / manual) at whatever it has reached — averaging **−$0.15**, ~2× a win.
+
+Capped upside + uncapped downside ⇒ avg win < avg loss. That is the whole mechanism.
+
+**Step 3 — why that *loses money* (the portfolio math).** The asymmetry alone isn't fatal; a high enough win rate can pay for big losers. The breakeven win rate for a given payoff ratio `b = avgWin/|avgLoss|` is `p* = 1/(1 + b)`:
+
+```
+b  = 0.08 / 0.15            = 0.53   (payoff ratio)
+p* = |avgLoss|/(avgWin+|avgLoss|)
+   = 0.15 / (0.08 + 0.15)   = 65.2%  (win rate needed just to break even)
+```
+
+The bot wins **35%** (43.5% if you drop the 51 breakevens from the denominator). Both are far below the **65.2%** the payoff ratio demands, so expectancy is negative by construction. Profit factor restates the same fact: `0.42` means **~$2.38 lost per $1 made**.
+
+**Step 4 — the TP-fill-vs-win-rate gap.** TP fill rate is **56%** but net win rate is only **35%** — a ~21-point gap. So ~1 in 5 closes that *touched* the take-profit still finished ≤ $0 (entry at `mid` gives up the half-spread, plus the 51 breakeven/flat closes), and the **44%** that never reached TP are the −$0.15 losers dragging the book. The take-profit target is small enough that hitting it is not the same as winning.
+
+**What would flip it positive** (any one suffices; none done here):
+1. **Win rate ≥ 65%** — better entry selection (the signal's job), or
+2. **Payoff ratio ≥ 1.9** — a larger TP target / letting winners run so avg win ≥ avg loss, or
+3. **Cap the −$0.15 tail** — a stop-loss (forbidden without explicit operator instruction, Hard Rule #5).
+
+The realized-expectancy circuit breaker (`SIGNAL_SELECTOR_REALIZED_FLOOR_BPS`) is the existing backstop: it halts new entries when this exact realized bleed persists, which is the correct response to a −$0.04/trade book until one of the three levers above is deliberately changed.
+
 ## 2026-05-30: entry path simplified to the bare 4-step loop
 
 The entry engine (`scanAndEnter` in `backend/trade.js`) was rewritten from ~1,150 lines stacking ~25 gates/vetoes down to a bare loop that does exactly what the bot is supposed to do:
