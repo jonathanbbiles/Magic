@@ -1,5 +1,21 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-05 PM (2): shadow labeler — break the data-starvation deadlock so the learning loop feeds itself
+
+The auto-calibration scheduler (entry below) automated the *fit*, but it was **inert**: the fitter needs ≥500 labeled **microstructure** trades, and the live signal is `mean_reversion_5m`, so microstructure almost never trades → no labels → the fit never has fuel. That's the data-starvation deadlock CLAUDE.md flagged.
+
+**The fix** (`backend/modules/microstructureShadowLabeler.js` + a boot cycle in `index.js`): evaluate the microstructure signal **observationally** across the universe on a timer (default 5 min), record each would-fire candidate's features + entry mid, then **forward-grade** it at the signal's horizon into a realised net-bps outcome — producing a labeled training sample **without placing a single real trade and without bypassing any veto.** Labeled records are written in the exact shape `extractSamples` consumes, to a **separate** file (`microstructure_shadow_labeled.jsonl`); the auto-calibration scheduler now fits on the **union** of real forensics + shadow samples. `scanAndEnter` is **untouched** — the cycle is parallel to the gate-audit grader, not part of the entry path.
+
+**Why this is the rule-respecting deadlock fix.** It does NOT trickle real trades past the realized-expectancy breaker (the exploration-budget design forbids that). It places no orders and changes no entry decision — it only generates training data the fit was previously starved of.
+
+**Honest limitation (not hidden).** The shadow label is a **forward-return proxy**: `realizedNetBps = mid→close return at the horizon − round-trip fee`. It is NOT a full TP/stop/staircase trade simulation (the same limitation `gateRejectionAudit` carries). Shadow records are tagged `shadow:true` and kept in their own file so a future fit can weight or exclude them, and the two data sources never silently blur. Surfaced at `meta.microstructureShadowLabeler` (`pendingCount`, `gradedCount`, `recentWinRate`, …).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MICRO_SHADOW_LABELER_ENABLED` | `true` | Master kill. Off → no observational evaluation, no labeled file, auto-calibration reads only real forensics. |
+| `MICRO_SHADOW_LABELER_INTERVAL_MS` | `300000` (5 min) | Capture+grade cadence. |
+| `MICRO_SHADOW_LABELER_HORIZON_MIN` | `15` | Horizon the would-be trade is forward-graded at. |
+
 ## 2026-06-05 PM: shrink the losses (stop 60→40) + close the learning loop (auto-calibration) + correct the no-stop doc drift
 
 Three changes, all responding to the win<loss diagnosis in the entry below.
