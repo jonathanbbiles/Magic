@@ -1,5 +1,32 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-05 PM: shrink the losses (stop 60→40) + close the learning loop (auto-calibration) + correct the no-stop doc drift
+
+Three changes, all responding to the win<loss diagnosis in the entry below.
+
+### 1. The stop was ALREADY on — and set wider than the TP (doc correction)
+
+The diagnosis entry below originally said "there is no stop-loss." **That was wrong.** Reading the exit code (`reconcileExits`, `backend/trade.js`) shows the bot has had a live stop the whole time: `STOP_LOSS_ENABLED='true'` (a locked live default), vol-scaled, exiting via IOC market sell, plus a max-hold market exit and a breakeven staircase. The README's "walk away after the GTC sell / no stop-loss" language and CLAUDE.md Hard Rule #5 were **stale and contradicted the code.** Both are corrected in this PR.
+
+The real cause of avg loss (−$0.15) > avg win (+$0.08) is **not** "no stop" — it's that the **stop (60 bps) was set WIDER than the take-profit (~50 bps net)**, so a stopped-out loss is mechanically bigger than a TP win. (On thin alt books the IOC taker exit also slips past the trigger, widening it further.)
+
+### 2. Tighten the stop below the TP: `MR_STOP_LOSS_BPS_5M` 60→40, tier-3 100→70
+
+MR fires only on a ≥100-bps drop and targets `drop_bps × 0.5 ≈ 50+ bps net`. Setting the stop to **40 bps** puts it cleanly *below* that target, so a full loss (≤40 bps + slippage) is smaller than a full win (~50 bps) — flipping the per-trade payoff ratio the right way up. Only the **active `mean_reversion_5m`** caps move; the 1m and 15m variants keep their own documented tuning (1m BCH-blocklist economics; 15m "widening is exhausted" analysis). Revert with `MR_STOP_LOSS_BPS_5M=60` / `_TIER3=100` in Render env.
+
+**Honest caveat:** a tighter stop fires more often, so it can lower the win rate even as it shrinks each loss. The realized-expectancy breaker (armed at −5 bps) is the backstop if the net effect is negative; watch the live scorecard's avg-loss and win-rate after this deploys.
+
+### 3. Close the learning loop: auto-calibration scheduler
+
+The Phase 2 weight-fitter (`build_microstructure_weights.js`) was **manual-only** — nobody ever SSH'd in to run it, so the bot never "learned" updated entry weights from realised outcomes. `backend/modules/microstructureAutoCalibration.js` + a boot scheduler in `index.js` now run the **identical fit** (`buildModel`) on a timer and write the weights file when the sample count clears the `--min-samples=500` floor. It follows the signal's sanctioned "write file → next restart picks it up" pattern (the signal resolves weights at init and deliberately does not hot-reload), so nothing is hot-swapped mid-process. Below the floor it writes nothing, exactly like the CLI. Surfaced at `meta.microstructureCalibration.autoRun`.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MICRO_AUTO_CALIBRATION_ENABLED` | `true` | Master kill → prior manual-only behaviour. |
+| `MICRO_AUTO_CALIBRATION_INTERVAL_MS` | `21600000` (6h) | Fit cadence. |
+
+**Scope honesty — what this does NOT do.** It does not bypass any veto and does not place trades. The deeper "data-starvation deadlock" (the fitter needs labeled *microstructure* trades, but the active signal is `mean_reversion_5m`, so microstructure rarely trades) is **not** solved here: the rule-respecting fix is a shadow-labeling path, and the alternative (trickle real trades past the realized breaker) is explicitly forbidden by the exploration-budget design ("Do NOT make exploration bypass the realized veto"). This PR ships the scheduler half; the shadow-labeler is a separate, focused follow-up.
+
 ## 2026-06-05: why avg win < avg loss — full scorecard math (diagnosis only, no behavior change)
 
 A live scorecard snapshot (258 closed trades since last restart) asked the question directly: **why is the average win smaller than the average loss?** This entry is the worked answer. It is **documentation only** — no signal, gate, sizing, or exit logic changed in this PR. (A stop-loss or TP-target change is a separate, explicit decision per Hard Rule #5; this diagnosis sets it up but does not make it.)
@@ -19,11 +46,19 @@ A live scorecard snapshot (258 closed trades since last restart) asked the quest
 
 **Step 1 — recover the trade counts.** `buildScorecard` splits closes into `wins` (`netPnl > 0`), `losses` (`netPnl < 0`), and breakevens (`netPnl === 0`, counted in the denominator but neither bucket). Solving from the published figures: **90 wins, 117 losses, 51 breakevens.** This reproduces the scorecard exactly — expectancy `(90·0.08 − 117·0.15) / 258 = −$0.0401`, profit factor `7.20 / 17.55 = 0.41` — so the numbers are internally consistent and the 51 (~20%) breakeven/flat closes are real, not rounding.
 
-**Step 2 — the per-trade asymmetry (the literal "why").** Avg loss is **1.9× the avg win** because the two exits are not symmetric *by design*:
-- **Upside is capped.** Every entry attaches one GTC limit sell at `entry × (1 + signalDerivedGrossBps/10000)`. The best a winner can do is fill that fixed, small take-profit — so winners cluster at **+$0.08** and cannot run further. The bot walks away after placing the sell (intentional, Hard Rule #5).
-- **Downside is not capped.** There is **no stop-loss**. When price goes against the entry the GTC sell simply doesn't fill; the position drifts and eventually closes (reconciler / flat exit / manual) at whatever it has reached — averaging **−$0.15**, ~2× a win.
+> **⚠️ CORRECTED 2026-06-05 PM — see the entry above.** Step 2 as originally
+> written claimed "there is no stop-loss." **That was wrong** — it trusted the
+> stale "walk away after the GTC sell" doc instead of reading the exit code.
+> The bot *does* have a live stop-loss (`STOP_LOSS_ENABLED='true'`, `reconcileExits`
+> in `trade.js`). The real asymmetry is that the **stop sits WIDER than the TP**,
+> not that there's no stop. The corrected mechanism is below, struck through where
+> wrong.
 
-Capped upside + uncapped downside ⇒ avg win < avg loss. That is the whole mechanism.
+**Step 2 — the per-trade asymmetry (the literal "why").** Avg loss is **1.9× the avg win** because the stop distance is wider than the take-profit:
+- **Upside is capped at the TP.** Every entry attaches one GTC limit sell at `entry × (1 + signalDerivedGrossBps/10000)`. The best a winner can do is fill that take-profit (~50 bps net for MR) — so winners cluster at **+$0.08**.
+- **Downside is capped at the STOP — but the stop is set wider than the TP.** ~~There is no stop-loss.~~ The active `mean_reversion_5m` signal stops at `MR_STOP_LOSS_BPS_5M` = **60 bps** (vol-scaled, IOC market exit). A full stopped-out loss (60 bps + IOC slippage) is therefore *mechanically larger* than a full TP win (~50 bps), averaging **−$0.15**, ~2× a win.
+
+Stop (60) wider than TP (~50) ⇒ avg loss > avg win. That is the corrected mechanism — and it's directly fixable by tightening the stop below the TP (done in the entry above).
 
 **Step 3 — why that *loses money* (the portfolio math).** The asymmetry alone isn't fatal; a high enough win rate can pay for big losers. The breakeven win rate for a given payoff ratio `b = avgWin/|avgLoss|` is `p* = 1/(1 + b)`:
 
@@ -37,10 +72,10 @@ The bot wins **35%** (43.5% if you drop the 51 breakevens from the denominator).
 
 **Step 4 — the TP-fill-vs-win-rate gap.** TP fill rate is **56%** but net win rate is only **35%** — a ~21-point gap. So ~1 in 5 closes that *touched* the take-profit still finished ≤ $0 (entry at `mid` gives up the half-spread, plus the 51 breakeven/flat closes), and the **44%** that never reached TP are the −$0.15 losers dragging the book. The take-profit target is small enough that hitting it is not the same as winning.
 
-**What would flip it positive** (any one suffices; none done here):
+**What would flip it positive** (any one suffices):
 1. **Win rate ≥ 65%** — better entry selection (the signal's job), or
 2. **Payoff ratio ≥ 1.9** — a larger TP target / letting winners run so avg win ≥ avg loss, or
-3. **Cap the −$0.15 tail** — a stop-loss (forbidden without explicit operator instruction, Hard Rule #5).
+3. **Stop tighter than the TP** — ~~add a stop-loss~~ the stop already exists; tightening it below the TP (60→40 bps) makes a full loss smaller than a full win. **This is the lever taken in the 2026-06-05 PM entry above.**
 
 The realized-expectancy circuit breaker (`SIGNAL_SELECTOR_REALIZED_FLOOR_BPS`) is the existing backstop: it halts new entries when this exact realized bleed persists, which is the correct response to a −$0.04/trade book until one of the three levers above is deliberately changed.
 
