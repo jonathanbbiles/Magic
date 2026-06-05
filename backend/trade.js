@@ -2571,7 +2571,48 @@ async function getMicrostructureSignalForPair(pair, quote, horizonMinutes) {
   }
 }
 
-// --- engine state -------------------------------------------------------
+// Shadow-labeler support (2026-06-05). Evaluate the microstructure signal
+// OBSERVATIONALLY for one symbol — no order is ever placed — and, when it
+// would fire, return the feature factors + entry mid so the shadow labeler can
+// forward-grade it into a labeled training sample. This is the rule-respecting
+// fix for the data-starvation deadlock: it lets the microstructure weights
+// learn from would-be trades even while a different signal (e.g.
+// mean_reversion_5m) is the live trader, WITHOUT placing real trades and
+// WITHOUT bypassing any veto. Called only from the index.js shadow cycle, never
+// from scanAndEnter — the live entry path is untouched.
+async function getMicrostructureShadowSample(pair, horizonMinutes) {
+  try {
+    const quote = await getLatestQuote(pair).catch(() => null);
+    const bid = Number(quote?.bp);
+    const ask = Number(quote?.ap);
+    if (!(bid > 0) || !(ask > 0)) return { ok: false, reason: 'no_quote' };
+    const midPx = (bid + ask) / 2;
+    const sig = await getMicrostructureSignalForPair(pair, quote, horizonMinutes);
+    if (!sig || !sig.ok) return { ok: false, reason: sig?.reason || 'micro_not_fired' };
+    const f = sig.factors || {};
+    const features = {
+      microBias: f.microBias,
+      bookImbalance: f.bookImbalance,
+      flowImbalance: f.flowImbalance,
+      volNormReturn: f.volNormReturn,
+      rsiDelta: f.rsiDelta,
+      btcResidual: f.btcResidual,
+      driftSharpe: f.driftSharpe,
+      horizonMinutes,
+    };
+    return { ok: true, features, midPx, horizonMinutes };
+  } catch (err) {
+    return { ok: false, reason: 'micro_shadow_sample_failed', error: err?.message };
+  }
+}
+
+// Fetch recent 1m bars for a pair and return the resolved bars array (handles
+// the venue-specific symbol-key resolution internally). Used by the shadow
+// labeler's forward grader; mirrors the bar resolution in the signal getters.
+async function fetchBarsArray(pair, limit = 130) {
+  const payload = await fetchCryptoBars({ symbols: [pair], limit, timeframe: '1Min' });
+  return payload?.bars?.[pair] || payload?.bars?.[toAlpacaSymbol(pair)] || [];
+}
 
 const inventory = new Map();              // symbol -> { qty, avg_entry_price }
 const exitState = new Map();              // symbol -> { sellOrderId, targetPrice, ... }
@@ -4314,6 +4355,8 @@ module.exports = {
   getBtcLeadLagSnapshot,
   getMarketRegimeSnapshot,
   fetchCryptoBars,
+  getMicrostructureShadowSample,
+  fetchBarsArray,
   fetchStockQuotes,
   fetchStockTrades,
   fetchStockBars,

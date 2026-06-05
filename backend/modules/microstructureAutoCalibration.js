@@ -64,6 +64,7 @@ function readRecords(filePath, fsImpl = fs) {
 function runCalibration({
   forensicsPath,
   weightsPath,
+  extraForensicsPaths = [],
   minSamples = DEFAULTS.minSamples,
   nowMs = Date.now(),
   fsImpl = fs,
@@ -75,7 +76,15 @@ function runCalibration({
 
   let model;
   try {
-    const records = readRecords(forensicsPath, fsImpl);
+    // Fit on the union of the real forensics file and any extra labeled
+    // sources (e.g. the shadow labeler's would-be-trade records). This is how
+    // the shadow labeler breaks the data-starvation deadlock: its samples flow
+    // into the same fit as real trades. extractSamples joins by tradeId, so
+    // records from different files never collide as long as ids are unique.
+    let records = readRecords(forensicsPath, fsImpl);
+    for (const extra of Array.isArray(extraForensicsPaths) ? extraForensicsPaths : []) {
+      if (extra && extra !== forensicsPath) records = records.concat(readRecords(extra, fsImpl));
+    }
     model = buildModel({ records, minSamples, nowMs });
   } catch (err) {
     return { ok: false, wrote: false, reason: 'fit_error', error: err?.message || String(err), ranAt: startedAt };
@@ -130,6 +139,7 @@ function runCalibration({
 function createScheduler({
   forensicsPath,
   weightsPath,
+  extraForensicsPaths = [],
   minSamples = DEFAULTS.minSamples,
   intervalMs = DEFAULTS.intervalMs,
   onRun = () => {},
@@ -137,7 +147,7 @@ function createScheduler({
   setIntervalImpl = setInterval,
 } = {}) {
   const tick = () => {
-    const result = runCalibration({ forensicsPath, weightsPath, minSamples, nowMs: now() });
+    const result = runCalibration({ forensicsPath, weightsPath, extraForensicsPaths, minSamples, nowMs: now() });
     try { onRun(result); } catch (_) { /* logging must never crash the tick */ }
     return result;
   };

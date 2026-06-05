@@ -118,6 +118,7 @@ const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
 const microAutoCalibration = require('./modules/microstructureAutoCalibration');
+const microShadowLabeler = require('./modules/microstructureShadowLabeler');
 const microFlowShadow = require('./modules/microstructureFlowShadow');
 const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
 const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
@@ -852,6 +853,38 @@ const MICRO_AUTO_CALIBRATION_INTERVAL_MS = Math.max(
 );
 let lastMicroAutoCalibration = null;
 let microAutoCalibrationScheduler = null;
+
+// Microstructure shadow labeler (2026-06-05). Breaks the data-starvation
+// deadlock that makes the auto-calibration above inert: the fitter needs ≥500
+// labeled MICROSTRUCTURE trades, but the live signal is mean_reversion_5m so
+// microstructure rarely trades. This cycle evaluates the microstructure signal
+// OBSERVATIONALLY across the universe on a timer, forward-grades each would-fire
+// candidate at its horizon, and writes labeled samples (shape extractSamples
+// consumes) to a SEPARATE file the auto-calibration scheduler also reads. No
+// real trade is ever placed and no veto is bypassed — the live entry path
+// (scanAndEnter) is untouched. Honest caveat: the label is a forward-return
+// proxy (see microstructureShadowLabeler.js header), tagged shadow:true.
+const MICRO_SHADOW_LABELER_ENABLED = String(
+  process.env.MICRO_SHADOW_LABELER_ENABLED || 'true',
+).toLowerCase() !== 'false';
+const MICRO_SHADOW_LABELER_INTERVAL_MS = Math.max(
+  60000,
+  Number(process.env.MICRO_SHADOW_LABELER_INTERVAL_MS) || 300000, // 5 min
+);
+const MICRO_SHADOW_LABELER_HORIZON_MIN = Math.max(
+  1,
+  Number(process.env.MICRO_SHADOW_LABELER_HORIZON_MIN) || 15,
+);
+// Shadow labels land beside the forensics file but in their own JSONL so the
+// real and would-be data sources never silently blur.
+const MICRO_SHADOW_LABELED_FILE = (() => {
+  const forensics = storagePaths?.paths?.tradeForensicsFile;
+  if (!forensics) return './data/microstructure_shadow_labeled.jsonl';
+  return path.join(path.dirname(forensics), 'microstructure_shadow_labeled.jsonl');
+})();
+let microShadowLabelerInstance = null;
+let microShadowLabelerIntervalId = null;
+let microShadowLabelerLastError = null;
 
 // Microstructure trades-feed shadow tracker (2026-05-20). Mirrors trade.js's
 // MICRO_TRADES_SHADOW_ENABLED gate — when off, the meta field becomes null
@@ -2015,6 +2048,25 @@ app.get('/dashboard', async (req, res) => {
             };
           }
         })() : null,
+        // Shadow labeler: would-be microstructure trades, forward-graded into
+        // labeled samples that feed the auto-calibration fit (breaks the
+        // data-starvation deadlock without placing real trades).
+        microstructureShadowLabeler: MICRO_SHADOW_LABELER_ENABLED && microShadowLabelerInstance
+          ? (() => {
+            try {
+              return {
+                enabled: true,
+                horizonMin: MICRO_SHADOW_LABELER_HORIZON_MIN,
+                intervalMs: MICRO_SHADOW_LABELER_INTERVAL_MS,
+                labeledFile: MICRO_SHADOW_LABELED_FILE,
+                lastError: microShadowLabelerLastError,
+                ...microShadowLabelerInstance.buildSummary(),
+              };
+            } catch (err) {
+              return { enabled: true, error: err?.message };
+            }
+          })()
+          : null,
         // Microstructure trades-feed shadow observer. When
         // MICRO_TRADES_SHADOW_ENABLED=true (default), recent trades are
         // fetched on every microstructure scan and flowImbalance is
@@ -3484,6 +3536,10 @@ if (MICRO_AUTO_CALIBRATION_ENABLED) {
   microAutoCalibrationScheduler = microAutoCalibration.createScheduler({
     forensicsPath: storagePaths?.paths?.tradeForensicsFile || null,
     weightsPath: MICRO_WEIGHTS_FILE_PATH,
+    // Also fit on the shadow labeler's would-be-trade samples when enabled —
+    // that's what makes the auto-calibration non-inert while a non-micro signal
+    // is the live trader.
+    extraForensicsPaths: MICRO_SHADOW_LABELER_ENABLED ? [MICRO_SHADOW_LABELED_FILE] : [],
     minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
     intervalMs: MICRO_AUTO_CALIBRATION_INTERVAL_MS,
     onRun: (result) => {
@@ -3508,6 +3564,78 @@ if (MICRO_AUTO_CALIBRATION_ENABLED) {
     intervalMs: MICRO_AUTO_CALIBRATION_INTERVAL_MS,
     minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
     weightsPath: MICRO_WEIGHTS_FILE_PATH,
+  });
+}
+
+// Shadow-labeler cycle: evaluate the microstructure signal observationally
+// across the universe, record would-fire candidates, forward-grade matured
+// ones, and append labeled samples to MICRO_SHADOW_LABELED_FILE. Parallel to
+// the gate-audit grader; never touches scanAndEnter. Append is fire-and-forget
+// (sync appendFileSync of one line per record) and wrapped so a disk error can
+// never crash the cycle.
+function appendShadowLabeledRecord(record) {
+  try {
+    fs.mkdirSync(path.dirname(MICRO_SHADOW_LABELED_FILE), { recursive: true });
+    fs.appendFileSync(MICRO_SHADOW_LABELED_FILE, `${JSON.stringify(record)}\n`);
+  } catch (err) {
+    microShadowLabelerLastError = err?.message || String(err);
+  }
+}
+async function runMicroShadowLabelerCycle() {
+  if (!microShadowLabelerInstance) return;
+  try {
+    const universe = Array.isArray(runtimeConfig.configuredPrimarySymbols)
+      ? runtimeConfig.configuredPrimarySymbols.filter(Boolean)
+      : [];
+    // 1. Capture: evaluate each symbol; record would-fire candidates.
+    for (const symbol of universe) {
+      try {
+        const sample = await trade.getMicrostructureShadowSample(symbol, MICRO_SHADOW_LABELER_HORIZON_MIN);
+        if (sample && sample.ok) {
+          microShadowLabelerInstance.recordCandidate({
+            symbol,
+            horizonMinutes: MICRO_SHADOW_LABELER_HORIZON_MIN,
+            features: sample.features,
+            midPx: sample.midPx,
+            nowMs: Date.now(),
+          });
+        }
+      } catch (err) {
+        microShadowLabelerLastError = err?.message || String(err);
+      }
+    }
+    // 2. Grade: forward-grade matured candidates and append labeled records.
+    const res = await microShadowLabelerInstance.gradePending({
+      fetchBars: (sym) => trade.fetchBarsArray(sym, 130),
+      nowMs: Date.now(),
+      append: appendShadowLabeledRecord,
+    });
+    if (res.graded > 0 || res.dropped > 0) {
+      console.log('micro_shadow_labeler_cycle', {
+        graded: res.graded,
+        dropped: res.dropped,
+        ...microShadowLabelerInstance.buildSummary(),
+      });
+    }
+  } catch (err) {
+    microShadowLabelerLastError = err?.message || String(err);
+    console.warn('micro_shadow_labeler_cycle_failed', { error: err?.message || err });
+  }
+}
+if (MICRO_SHADOW_LABELER_ENABLED) {
+  microShadowLabelerInstance = microShadowLabeler.createShadowLabeler({
+    horizonMs: MICRO_SHADOW_LABELER_HORIZON_MIN * 60 * 1000,
+    feeBpsRoundTrip: Number(process.env.FEE_BPS_ROUND_TRIP)
+      || (String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase() === 'binance_us' ? 2 : 30),
+  });
+  microShadowLabelerIntervalId = setInterval(runMicroShadowLabelerCycle, MICRO_SHADOW_LABELER_INTERVAL_MS);
+  if (microShadowLabelerIntervalId && typeof microShadowLabelerIntervalId.unref === 'function') {
+    microShadowLabelerIntervalId.unref();
+  }
+  console.log('micro_shadow_labeler_started', {
+    intervalMs: MICRO_SHADOW_LABELER_INTERVAL_MS,
+    horizonMin: MICRO_SHADOW_LABELER_HORIZON_MIN,
+    labeledFile: MICRO_SHADOW_LABELED_FILE,
   });
 }
 
@@ -3566,6 +3694,7 @@ function gracefulShutdown(signal) {
   try { coinbaseQuotesStream.stop(); } catch (_) {}
   try { binanceFeedStream.stop(); } catch (_) {}
   try { if (microAutoCalibrationScheduler) microAutoCalibrationScheduler.stop(); } catch (_) {}
+  try { if (microShadowLabelerIntervalId) clearInterval(microShadowLabelerIntervalId); } catch (_) {}
   server.close(() => {
     console.log('server_closed', { signal });
     recordEquitySnapshot();
