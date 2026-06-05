@@ -253,8 +253,10 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS, '60');
 // 5m / 15m variants to default to a wider cap (e.g. backtest evidence flips
 // MR-5m positive at 100 bps), bump the default here and the same-PR-update
 // docs in README + CLAUDE.md will keep the doc/code aligned.
-assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M, '60');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M_TIER3, '100');
+// 2026-06-05: 5m caps tightened 60→40 / 100→70 so the stop sits below the
+// MR TP target (≥50 bps net), fixing the avg-loss > avg-win asymmetry.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M, '40');
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_5M_TIER3, '70');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_15M, '60');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_STOP_LOSS_BPS_15M_TIER3, '100');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_MAX_HOLD_MS, '2700000');            // 45 min

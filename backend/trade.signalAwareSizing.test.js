@@ -155,24 +155,27 @@ const { deriveSignalTargetNetBps, deriveStopLossBps } = require('./trade');
   assert.equal(noPair, 60, `MR with no pair should use tier-1/2 cap (60), got ${noPair}`);
 }
 
-// 15. Per-timeframe MR stop caps (Stage 3). At defaults the 5m and 15m
-// signal versions resolve to the SAME stop as the 1m variant — by design,
-// since MR_STOP_LOSS_BPS_5M / _15M default to MR_STOP_LOSS_BPS. This is the
-// zero-behavior-change check: until an operator sets one of the new env
-// vars, the per-timeframe dispatch produces identical numbers across all
-// three signalVersion strings.
+// 15. Per-timeframe MR stop caps (Stage 3, updated 2026-06-05). The active
+// 5m variant was deliberately TIGHTENED below the 1m/15m variants so the stop
+// sits under the MR TP target (≥50 bps net) — fixing the avg-loss > avg-win
+// asymmetry. So MR-5m no longer matches MR-1m; MR-15m still does (it keeps its
+// own "widening is exhausted" tuning). At vol=20 the scaled stop exceeds every
+// cap, so each result equals its cap: 1m/15m tier1=60, 5m tier1=40; 1m/15m
+// tier3=100, 5m tier3=70.
 {
   const tier1MrOneM = deriveStopLossBps(20, 5, 'mean_reversion', 'BTC/USD');
   const tier1MrFiveM = deriveStopLossBps(20, 5, 'mean_reversion_5m', 'BTC/USD');
   const tier1MrFifteenM = deriveStopLossBps(20, 5, 'mean_reversion_15m', 'BTC/USD');
-  assert.equal(tier1MrFiveM, tier1MrOneM, 'MR-5m default cap must match MR-1m');
-  assert.equal(tier1MrFifteenM, tier1MrOneM, 'MR-15m default cap must match MR-1m');
+  assert.equal(tier1MrOneM, 60, `MR-1m tier-1 cap should be 60, got ${tier1MrOneM}`);
+  assert.equal(tier1MrFiveM, 40, `MR-5m tier-1 cap tightened to 40, got ${tier1MrFiveM}`);
+  assert.equal(tier1MrFifteenM, tier1MrOneM, 'MR-15m default cap must still match MR-1m');
 
   const tier3MrOneM = deriveStopLossBps(20, 5, 'mean_reversion', 'PEPE/USD');
   const tier3MrFiveM = deriveStopLossBps(20, 5, 'mean_reversion_5m', 'PEPE/USD');
   const tier3MrFifteenM = deriveStopLossBps(20, 5, 'mean_reversion_15m', 'PEPE/USD');
-  assert.equal(tier3MrFiveM, tier3MrOneM, 'MR-5m tier-3 default cap must match MR-1m tier-3');
-  assert.equal(tier3MrFifteenM, tier3MrOneM, 'MR-5m tier-3 default cap must match MR-1m tier-3');
+  assert.equal(tier3MrOneM, 100, `MR-1m tier-3 cap should be 100, got ${tier3MrOneM}`);
+  assert.equal(tier3MrFiveM, 70, `MR-5m tier-3 cap tightened to 70, got ${tier3MrFiveM}`);
+  assert.equal(tier3MrFifteenM, tier3MrOneM, 'MR-15m tier-3 default cap must still match MR-1m tier-3');
 }
 
 console.log('trade.signalAwareSizing.test.js passed');

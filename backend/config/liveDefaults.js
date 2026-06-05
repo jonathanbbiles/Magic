@@ -176,8 +176,17 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // MR-5m / MR-15m from negative to positive expectancy without lowering
   // MR_DROP_TRIGGER_BPS (forbidden by the in-code A/B). Validate any flip
   // via /debug/backtest?days=90&refresh=true&strategy=mean_reversion&mrTimeframe=5m
-  MR_STOP_LOSS_BPS_5M: '60',
-  MR_STOP_LOSS_BPS_5M_TIER3: '100',
+  // 2026-06-05: tightened 60→40 (tier3 100→70) so the stop sits BELOW the
+  // signal's realistic TP target. MR fires only on a ≥100-bps drop and targets
+  // drop_bps × 0.5 ≈ 50+ bps net, while the prior 60-bps stop sat ABOVE that
+  // target — making a stopped-out loss mechanically larger than a TP win (the
+  // avg-loss > avg-win asymmetry on the live scorecard: −$0.15 loss vs +$0.08
+  // win). With the stop below the TP, a full loss (≤40 bps + IOC slippage) is
+  // smaller than a full win (~50 bps). Active signal is mean_reversion_5m, so
+  // only the 5m caps move here; the 1m/15m caps keep their own documented
+  // tuning (1m BCH-blocklist economics; 15m widening-is-exhausted analysis).
+  MR_STOP_LOSS_BPS_5M: '40',
+  MR_STOP_LOSS_BPS_5M_TIER3: '70',
   MR_STOP_LOSS_BPS_15M: '60',
   MR_STOP_LOSS_BPS_15M_TIER3: '100',
   MR_MAX_HOLD_MS: '2700000',

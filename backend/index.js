@@ -117,6 +117,7 @@ const driftAlerter = require('./modules/driftAlerter');
 const perSymbolAudit = require('./modules/perSymbolExpectancyAudit');
 const gateRejectionAudit = require('./modules/gateRejectionAudit');
 const microCalibrationStatus = require('./modules/microstructureCalibrationStatus');
+const microAutoCalibration = require('./modules/microstructureAutoCalibration');
 const microFlowShadow = require('./modules/microstructureFlowShadow');
 const staleQuoteRetryStats = require('./modules/staleQuoteRetryStats');
 const tradeFeasibilityAudit = require('./modules/tradeFeasibilityAudit');
@@ -832,6 +833,25 @@ const MICRO_CALIBRATION_MIN_SAMPLES = Math.max(
 const MICRO_WEIGHTS_FILE_PATH = String(
   process.env.MICRO_WEIGHTS_FILE || './data/microstructure_weights.json',
 ).trim() || './data/microstructure_weights.json';
+
+// Phase 2 microstructure AUTO-calibration (2026-06-05). Closes the learning
+// loop the status surface above only observed: instead of waiting for an
+// operator to SSH in and run build_microstructure_weights.js by hand, this
+// runs the identical fit (buildModel) on a timer and writes the weights file
+// when sample count clears the floor. The new weights go live on the next
+// restart (the signal loads at init and does not hot-reload — see
+// microstructureSignal.js:147 and microstructureAutoCalibration.js header).
+// Below the floor it writes nothing, exactly like the CLI. Master kill leaves
+// the prior manual-only behaviour intact.
+const MICRO_AUTO_CALIBRATION_ENABLED = String(
+  process.env.MICRO_AUTO_CALIBRATION_ENABLED || 'true',
+).toLowerCase() !== 'false';
+const MICRO_AUTO_CALIBRATION_INTERVAL_MS = Math.max(
+  60000,
+  Number(process.env.MICRO_AUTO_CALIBRATION_INTERVAL_MS) || microAutoCalibration.DEFAULTS.intervalMs,
+);
+let lastMicroAutoCalibration = null;
+let microAutoCalibrationScheduler = null;
 
 // Microstructure trades-feed shadow tracker (2026-05-20). Mirrors trade.js's
 // MICRO_TRADES_SHADOW_ENABLED gate — when off, the meta field becomes null
@@ -1970,11 +1990,19 @@ app.get('/dashboard', async (req, res) => {
         // design (see CLAUDE.md "Phase 2 microstructure calibration").
         microstructureCalibration: MICRO_CALIBRATION_STATUS_ENABLED ? (() => {
           try {
-            return microCalibrationStatus.buildCalibrationStatus({
+            const status = microCalibrationStatus.buildCalibrationStatus({
               forensicsPath: storagePaths?.paths?.tradeForensicsFile || null,
               weightsPath: MICRO_WEIGHTS_FILE_PATH,
               minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
             });
+            // 2026-06-05: surface the auto-calibration scheduler's last pass so
+            // the dashboard shows the loop is actually running (or why it's
+            // refusing) — not just the static sample-progress count.
+            return {
+              ...status,
+              autoCalibrationEnabled: MICRO_AUTO_CALIBRATION_ENABLED,
+              autoRun: lastMicroAutoCalibration,
+            };
           } catch (err) {
             return {
               ranAt: new Date().toISOString(),
@@ -1982,6 +2010,8 @@ app.get('/dashboard', async (req, res) => {
               minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
               ready: false,
               error: err?.message,
+              autoCalibrationEnabled: MICRO_AUTO_CALIBRATION_ENABLED,
+              autoRun: lastMicroAutoCalibration,
             };
           }
         })() : null,
@@ -3446,6 +3476,41 @@ if (GATE_REJECTION_AUDIT_ENABLED) {
   });
 }
 
+// Auto-calibration scheduler: fit + write the microstructure weights on a
+// timer so the learning loop closes without manual SSH. Effective on next
+// restart. Logs each pass; parks the last result for meta.microstructure
+// Calibration.autoRun.
+if (MICRO_AUTO_CALIBRATION_ENABLED) {
+  microAutoCalibrationScheduler = microAutoCalibration.createScheduler({
+    forensicsPath: storagePaths?.paths?.tradeForensicsFile || null,
+    weightsPath: MICRO_WEIGHTS_FILE_PATH,
+    minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+    intervalMs: MICRO_AUTO_CALIBRATION_INTERVAL_MS,
+    onRun: (result) => {
+      lastMicroAutoCalibration = result;
+      if (result.wrote) {
+        console.log('microstructure_weights_auto_written', {
+          weightsPath: result.weightsPath,
+          sampleCount: result.sampleCount,
+          accuracy: result.accuracy,
+          logLoss: result.logLoss,
+        });
+      } else {
+        console.log('microstructure_weights_auto_refused', {
+          reason: result.reason,
+          sampleCount: result.sampleCount ?? null,
+          minSamples: result.minSamples ?? MICRO_CALIBRATION_MIN_SAMPLES,
+        });
+      }
+    },
+  });
+  console.log('microstructure_auto_calibration_started', {
+    intervalMs: MICRO_AUTO_CALIBRATION_INTERVAL_MS,
+    minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
+    weightsPath: MICRO_WEIGHTS_FILE_PATH,
+  });
+}
+
 // Phase A: start the Coinbase secondary-feed WS subscription if enabled.
 // Symbols come from the configured primary universe (matches the same set
 // trade.js scans, so the shadow observation has a complete cross-section).
@@ -3500,6 +3565,7 @@ function gracefulShutdown(signal) {
   console.log('shutdown_initiated', { signal });
   try { coinbaseQuotesStream.stop(); } catch (_) {}
   try { binanceFeedStream.stop(); } catch (_) {}
+  try { if (microAutoCalibrationScheduler) microAutoCalibrationScheduler.stop(); } catch (_) {}
   server.close(() => {
     console.log('server_closed', { signal });
     recordEquitySnapshot();
