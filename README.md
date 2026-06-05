@@ -870,7 +870,7 @@ On MR-15m, BCH is one of the **best** symbols (−16.1 vs −30.7 overall), so t
 | Env var | Default | Rationale |
 |---|---|---|
 | `MR_SYMBOL_BLOCKLIST_1M` | `BCH/USD` | Removes the one symbol that flipped MR-1m negative. |
-| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD` | Mild improvement; consistency with 1m. |
+| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD,DOGE/USD,XRP/USD` | BCH (consistency with 1m). DOGE+XRP added 2026-06-05 — `mean_reversion_5m` is the live-pinned signal and both are structural losers (live DOGE −17.3 over 5 trades; 30-day backtest DOGE −19.1 / XRP −32.8). Blocking both flips overall expectancy −2.8 → +1.5 bps/trade (A/B verified, 72-trade sample, 64% win). |
 | `MR_SYMBOL_BLOCKLIST_15M` | *(empty)* | BCH is BEST on 15m; do not block. |
 | `RANGE_MR_SYMBOL_BLOCKLIST` | *(empty)* | No symbol has a documented edge problem here yet. |
 

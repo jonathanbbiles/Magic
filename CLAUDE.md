@@ -445,7 +445,7 @@ Bug it fixes: `liveDefaults.js` has `ENFORCE_PROJECTED_COVERS_GROSS: 'false'` (p
 | Env var | Default | Why |
 |---|---|---|
 | `MR_SYMBOL_BLOCKLIST_1M` | `BCH/USD` | BCH was 5 of 13 MR-1m entries with 4 stops at avg −66.6 bps. Excluding BCH flips MR-1m from −13.4 to +19.9 bps net over 8 winners — first signal to validate the selector post-veto. |
-| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD` | BCH mildly worse than overall on MR-5m (−42.3 vs −32.2). Consistency with 1m. |
+| `MR_SYMBOL_BLOCKLIST_5M` | `BCH/USD,DOGE/USD,XRP/USD` | BCH (consistency with 1m). DOGE+XRP added 2026-06-05: `mean_reversion_5m` is the live-pinned signal; live (DOGE −17.3 over 5) + 30-day backtest (DOGE −19.1 / XRP −32.8, the two worst symbols) converge, and A/B confirms blocking both flips the overall signal −2.8 → +1.5 bps/trade (+4.3, 64% win, 72-trade sample). |
 | `MR_SYMBOL_BLOCKLIST_15M` | *(empty)* | **DO NOT add BCH here.** BCH is one of the best symbols on MR-15m (−16.1 vs −30.7 overall); blocking it would make MR-15m worse. |
 | `RANGE_MR_SYMBOL_BLOCKLIST` | *(empty)* | No symbol has a documented edge problem here yet; knob exists so an operator can add one without a code change. |
 

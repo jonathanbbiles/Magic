@@ -279,7 +279,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.FEATURE_STRUCTURE_ENABLED, 'true');
 // best 15m symbols (-16.1 vs -30.7 overall); blocking BCH there would make
 // MR-15m worse.
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_1M, 'BCH/USD');
-assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_5M, 'BCH/USD');
+// 2026-06-05: DOGE + XRP added — both backtest <-15 bps on mean_reversion_5m
+// (the live-pinned signal) and live DOGE was -17.3; A/B flips the overall
+// signal -2.8 -> +1.5 bps/trade. Locked so the evidence-backed block can't
+// silently drop out.
+assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_5M, 'BCH/USD,DOGE/USD,XRP/USD');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_15M, '');
 assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_SYMBOL_BLOCKLIST, '');
 

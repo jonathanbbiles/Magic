@@ -641,7 +641,15 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // floor cleared), making it the first signal to validate the selector
   // since the veto restoration. Operator can override via Render env.
   MR_SYMBOL_BLOCKLIST_1M: 'BCH/USD',
-  MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD',
+  // 2026-06-05: added DOGE + XRP. mean_reversion_5m is the live-pinned signal,
+  // and both live + a 30-day backtest converge on these two as structural
+  // losers on this timeframe. Live (9 closes): DOGE -17.3 bps over 5 trades.
+  // Backtest (30d, binance_us, 8 majors, fee=2, adverse-selection fill):
+  // DOGE -19.1 / XRP -32.8 — the two worst symbols. A/B confirms blocking both
+  // flips the overall signal from -2.8 to +1.5 bps/trade (+4.3 delta, 64% win)
+  // while keeping a 72-trade sample. Same evidence-driven mechanism as the BCH
+  // entries. Operator can override via MR_SYMBOL_BLOCKLIST_5M in Render env.
+  MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD,DOGE/USD,XRP/USD',
   MR_SYMBOL_BLOCKLIST_15M: '',
   RANGE_MR_SYMBOL_BLOCKLIST: '',
   // Per-horizon microstructure blocklists (2026-05-20). The 30m default
