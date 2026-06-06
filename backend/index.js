@@ -198,6 +198,8 @@ const {
   getStaleQuoteRetryTrackerSnapshot,
   getRollingSkipSnapshot,
   getRegimeVetoState,
+  getMicrostructureShadowSample,
+  fetchBarsArray,
 } = require('./trade');
 
 const signalSelector = require('./modules/signalSelector');
@@ -3608,7 +3610,7 @@ async function runMicroShadowLabelerCycle() {
     // 1. Capture: evaluate each symbol; record would-fire candidates.
     for (const symbol of universe) {
       try {
-        const sample = await trade.getMicrostructureShadowSample(symbol, MICRO_SHADOW_LABELER_HORIZON_MIN);
+        const sample = await getMicrostructureShadowSample(symbol, MICRO_SHADOW_LABELER_HORIZON_MIN);
         if (sample && sample.ok) {
           microShadowLabelerInstance.recordCandidate({
             symbol,
@@ -3624,7 +3626,7 @@ async function runMicroShadowLabelerCycle() {
     }
     // 2. Grade: forward-grade matured candidates and append labeled records.
     const res = await microShadowLabelerInstance.gradePending({
-      fetchBars: (sym) => trade.fetchBarsArray(sym, 130),
+      fetchBars: (sym) => fetchBarsArray(sym, 130),
       nowMs: Date.now(),
       append: appendShadowLabeledRecord,
     });
