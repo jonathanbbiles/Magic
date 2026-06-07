@@ -458,4 +458,36 @@ function bt(overall) {
   assert.equal(v.reason, 'no_active_signal');
 }
 
+// R10 (2026-06-07). excludeSymbols: trades from now-blocklisted symbols are
+// dropped from the veto window, so the breaker judges only symbols the bot
+// still trades. Build a window where the blocklisted symbol bleeds but the
+// tradable symbols are net positive.
+{
+  const recSym = (sym, bps) => ({ type: 'closed_trade', signalVersion: 'mean_reversion_5m', symbol: sym, realizedNetBps: bps, ts: '2026-06-07T00:00:00Z' });
+  const mixed = [
+    ...new Array(5).fill(0).map(() => recSym('DOGE/USD', -17)), // now blocklisted
+    ...new Array(5).fill(0).map(() => recSym('LINK/USD', 12)),  // still traded, positive
+    ...new Array(5).fill(0).map(() => recSym('BTC/USD', 8)),    // still traded, positive
+  ];
+  // WITHOUT exclusion: 15 trades, avg = (5*-17 + 5*12 + 5*8)/15 = (-85+60+40)/15 = +1.0 ... make DOGE drag harder
+  const heavy = [
+    ...new Array(6).fill(0).map(() => recSym('DOGE/USD', -30)),
+    ...new Array(4).fill(0).map(() => recSym('LINK/USD', 15)),
+  ];
+  const without = evaluateRealizedVeto({ records: heavy, signalVersion: 'mean_reversion_5m', config: { minTrades: 5, floorBps: -5, lookbackTrades: 50 } });
+  assert.equal(without.veto, true, 'without exclusion, DOGE drag should trip the veto');
+  const withExcl = evaluateRealizedVeto({
+    records: heavy, signalVersion: 'mean_reversion_5m',
+    excludeSymbols: new Set(['DOGE/USD']),
+    config: { minTrades: 4, floorBps: -5, lookbackTrades: 50 },
+  });
+  assert.equal(withExcl.veto, false, 'excluding the blocklisted symbol leaves only positive tradable symbols → no veto');
+  assert.equal(withExcl.sampleSize, 4, 'only the 4 LINK trades remain in the window');
+  assert.equal(withExcl.realizedAvgNetBps, 15);
+  assert.equal(withExcl.excludedSymbolTradeCount, 6, 'all 6 DOGE trades excluded');
+  // array form also accepted
+  const withArr = evaluateRealizedVeto({ records: heavy, signalVersion: 'mean_reversion_5m', excludeSymbols: ['doge/usd'], config: { minTrades: 4, floorBps: -5 } });
+  assert.equal(withArr.excludedSymbolTradeCount, 6, 'array + case-insensitive exclusion works');
+}
+
 console.log('signalSelector.test ok');

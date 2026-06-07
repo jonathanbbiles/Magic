@@ -3159,9 +3159,19 @@ async function scanAndEnter() {
   // trades average below the floor (default -10 bps over ≥10 trades), halt NEW
   // entries. Open positions keep being managed/exited by the exit manager.
   // The bot resumes automatically once recent realized expectancy recovers.
+  // Exclude the active signal's blocklisted symbols from the realized-veto
+  // window (2026-06-07). A symbol added to MR_SYMBOL_BLOCKLIST_* will never be
+  // traded again on that timeframe, so its old closed trades must not keep the
+  // breaker halting the bot (and deadlocking the flush). Map the active MR
+  // timeframe to its blocklist set; non-MR signals pass null (no change).
+  const realizedVetoExcludeSymbols = ACTIVE_SIGNAL_VERSION === 'mean_reversion' ? MR_BLOCKLISTS.mr1m
+    : ACTIVE_SIGNAL_VERSION === 'mean_reversion_5m' ? MR_BLOCKLISTS.mr5m
+    : ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m' ? MR_BLOCKLISTS.mr15m
+    : null;
   const realizedVeto = signalSelector.evaluateRealizedVeto({
     records: closedTradeStats.getRecent(SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES * 20),
     signalVersion: ACTIVE_SIGNAL_VERSION,
+    excludeSymbols: realizedVetoExcludeSymbols,
     config: {
       enabled: SIGNAL_SELECTOR_REALIZED_VETO_ENABLED,
       minTrades: SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
