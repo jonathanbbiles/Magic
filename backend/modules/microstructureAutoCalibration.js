@@ -30,11 +30,24 @@
 
 const fs = require('fs');
 const path = require('path');
-const { buildModel, SCHEMA_VERSION } = require('../scripts/build_microstructure_weights');
+const { buildModel, SCHEMA_VERSION, extractSamples } = require('../scripts/build_microstructure_weights');
+const learningEngine = require('./learningEngine');
 
 const DEFAULTS = Object.freeze({
   minSamples: 500,
   intervalMs: 6 * 60 * 60 * 1000, // 6h — calibration is a slow batch, not a hot loop
+  // 2026-06-07: held-out validation gate (default ON). Before overwriting the
+  // live weights file, re-fit on a TRAIN split and require the candidate to beat
+  // the incumbent on a held-out split (learningEngine.evaluatePromotion). This
+  // closes the overfitting hole: previously this writer shipped EVERY fit with
+  // sample count alone — a tiny/unlucky-sample fit could replace good weights
+  // with worse ones, and the bot would then trade them. With the gate, a
+  // not-better candidate is HELD (incumbent stands). Set
+  // validateBeforeWrite=false to restore the legacy unconditional-write path.
+  validateBeforeWrite: true,
+  holdoutFraction: 0.2,
+  minImprovementBps: 2,
+  minHoldoutBps: 0,
 });
 
 // Read a JSONL file into an array of parsed records. Mirrors the CLI's
@@ -68,6 +81,10 @@ function runCalibration({
   minSamples = DEFAULTS.minSamples,
   nowMs = Date.now(),
   fsImpl = fs,
+  validateBeforeWrite = DEFAULTS.validateBeforeWrite,
+  holdoutFraction = DEFAULTS.holdoutFraction,
+  minImprovementBps = DEFAULTS.minImprovementBps,
+  minHoldoutBps = DEFAULTS.minHoldoutBps,
 } = {}) {
   const startedAt = new Date(nowMs).toISOString();
   if (!forensicsPath || !weightsPath) {
@@ -75,17 +92,29 @@ function runCalibration({
   }
 
   let model;
+  let records;
+  let holdoutSamples = [];
   try {
     // Fit on the union of the real forensics file and any extra labeled
     // sources (e.g. the shadow labeler's would-be-trade records). This is how
     // the shadow labeler breaks the data-starvation deadlock: its samples flow
     // into the same fit as real trades. extractSamples joins by tradeId, so
     // records from different files never collide as long as ids are unique.
-    let records = readRecords(forensicsPath, fsImpl);
+    records = readRecords(forensicsPath, fsImpl);
     for (const extra of Array.isArray(extraForensicsPaths) ? extraForensicsPaths : []) {
       if (extra && extra !== forensicsPath) records = records.concat(readRecords(extra, fsImpl));
     }
-    model = buildModel({ records, minSamples, nowMs });
+    if (validateBeforeWrite) {
+      // Held-out split: fit on the older TRAIN portion, validate the candidate
+      // against the most-recent HOLDOUT portion (data it was not fit on).
+      const holdoutN = Math.floor(records.length * holdoutFraction);
+      const trainRecords = holdoutN > 0 ? records.slice(0, records.length - holdoutN) : records;
+      const holdoutRecords = holdoutN > 0 ? records.slice(records.length - holdoutN) : [];
+      holdoutSamples = (typeof extractSamples === 'function') ? extractSamples(holdoutRecords) : [];
+      model = buildModel({ records: trainRecords, minSamples, nowMs });
+    } else {
+      model = buildModel({ records, minSamples, nowMs });
+    }
   } catch (err) {
     return { ok: false, wrote: false, reason: 'fit_error', error: err?.message || String(err), ranAt: startedAt };
   }
@@ -100,6 +129,36 @@ function runCalibration({
       minSamples,
       ranAt: model.ranAt || startedAt,
     };
+  }
+
+  // Held-out validation gate (2026-06-07). Only overwrite the live weights if
+  // the freshly-fit candidate beats the incumbent on data it was not trained on.
+  if (validateBeforeWrite) {
+    let incumbent = null;
+    try {
+      if (fsImpl.existsSync(weightsPath)) {
+        const cur = JSON.parse(fsImpl.readFileSync(weightsPath, 'utf8'));
+        incumbent = cur?.weights || null;
+      }
+    } catch (_) { incumbent = null; }
+    const verdict = learningEngine.evaluatePromotion({
+      candidate: model,
+      incumbent,
+      holdout: holdoutSamples,
+      config: { minImprovementBps, minHoldoutBps },
+    });
+    if (!verdict.promote) {
+      return {
+        ok: true,
+        wrote: false,
+        validated: true,
+        reason: 'held_not_better',
+        verdict,
+        sampleCount: model.sampleCount,
+        ranAt: model.ranAt || startedAt,
+        note: 'candidate did not beat incumbent on held-out data; incumbent weights kept',
+      };
+    }
   }
 
   try {
@@ -127,8 +186,11 @@ function runCalibration({
     sampleCount: model.sampleCount,
     accuracy: model.metrics?.accuracy ?? null,
     logLoss: model.metrics?.logLoss ?? null,
+    validated: validateBeforeWrite,
     ranAt: model.ranAt || startedAt,
-    note: 'weights written; effective on next restart (signal loads at init)',
+    note: validateBeforeWrite
+      ? 'candidate beat incumbent on held-out data; weights written (effective next restart)'
+      : 'weights written unconditionally (validation gate off); effective on next restart',
   };
 }
 
@@ -142,12 +204,19 @@ function createScheduler({
   extraForensicsPaths = [],
   minSamples = DEFAULTS.minSamples,
   intervalMs = DEFAULTS.intervalMs,
+  validateBeforeWrite = DEFAULTS.validateBeforeWrite,
+  holdoutFraction = DEFAULTS.holdoutFraction,
+  minImprovementBps = DEFAULTS.minImprovementBps,
+  minHoldoutBps = DEFAULTS.minHoldoutBps,
   onRun = () => {},
   now = () => Date.now(),
   setIntervalImpl = setInterval,
 } = {}) {
   const tick = () => {
-    const result = runCalibration({ forensicsPath, weightsPath, extraForensicsPaths, minSamples, nowMs: now() });
+    const result = runCalibration({
+      forensicsPath, weightsPath, extraForensicsPaths, minSamples, nowMs: now(),
+      validateBeforeWrite, holdoutFraction, minImprovementBps, minHoldoutBps,
+    });
     try { onRun(result); } catch (_) { /* logging must never crash the tick */ }
     return result;
   };
