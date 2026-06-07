@@ -102,6 +102,7 @@ const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
 const monitorLog = require('./modules/monitorLog');
+const learningEngine = require('./modules/learningEngine');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
 const { runBacktest } = require('./scripts/backtest_strategy');
 const { resolveLiveEngineFallbacks, resolveBacktestFeeBps } = require('./modules/backtestEnvFallbacks');
@@ -2346,6 +2347,14 @@ app.get('/dashboard', async (req, res) => {
             return { ranAt: new Date().toISOString(), count: 0, bySeverity: {}, recommendations: [], error: err?.message };
           }
         })() : null,
+        // Learning engine last cycle (2026-06-07). Read-only surface; the engine
+        // is off by default (LEARNING_ENGINE_ENABLED) and never edits code — it
+        // re-fits entry weights from closed trades and promotes only when a
+        // held-out backtest beats the incumbent. Null until it has run.
+        learningEngine: (() => {
+          try { return typeof learningEngine?.getLastCycle === 'function' ? learningEngine.getLastCycle() : null; }
+          catch (_) { return null; }
+        })(),
         connectionState: {
           hasLastHttpError: Boolean(lastError),
           alpaca: getAlpacaAuthStatus(),
