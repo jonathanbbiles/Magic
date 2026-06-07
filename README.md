@@ -1,5 +1,27 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-07: learning engine — held-out validation gate (promote weights only when proven better)
+
+The auto-calibration scheduler (below) closes the *fit* loop, but until now it **wrote new weights unconditionally** whenever it had ≥500 samples — with no check that the freshly-fit weights were actually *better* than what the bot was already using. A small or unlucky-sample fit could silently replace good weights with worse ones, and the bot would trade them on the next restart. That's the classic overfitting trap.
+
+**The fix — a two-layer learning engine:**
+
+1. **`backend/modules/learningEngine.js`** — a pure validation gate. `scoreOnHoldout(weights, holdout)` measures the mean realised net bps of the trades a weight set *would* have taken on data it was **not** fit on. `evaluatePromotion()` promotes a candidate **only if** it beats the incumbent on that held-out split by ≥ `minImprovementBps` **and** clears an absolute holdout floor — otherwise the incumbent stands. It never edits code, never throws, and is off by default as a standalone loop (`LEARNING_ENGINE_ENABLED`).
+2. **`microstructureAutoCalibration`** (the existing writer) now runs through that gate (`validateBeforeWrite`, default **ON**): fit on a train split → score candidate vs incumbent on the held-out split → overwrite the live weights file **only on promotion**; otherwise hold (`reason: held_not_better`, incumbent file untouched). With no incumbent file, the hand-tuned **priors** are the baseline, so theory-anchored weights are never replaced unless a fit is meaningfully better.
+
+**The "learn every 30 min?" answer (honest):** no. Trades close a few per hour at best, so a 30-min refit would fit on ~0 new data points and thrash. The standalone engine is **event-triggered** (refit only after ≥ `minNewTradesToRefit` new closes); the calibration writer runs on a slow 6h batch. Cadence is matched to where adjustments are real signal, not noise.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `MICRO_AUTO_CALIBRATION_ENABLED` | `true` | Master switch for the 6h auto-fit batch. |
+| `MICRO_CALIBRATION_VALIDATE` | `true` | The held-out gate. `false` restores the legacy unconditional-write (NOT recommended). |
+| `MICRO_CALIBRATION_MIN_SAMPLES` | `500` | Absolute floor — below this, no fit, no write (overfitting guard). Unchanged. |
+| `LEARNING_ENGINE_ENABLED` | `false` | Master kill for the standalone event-triggered engine. Off until the operator opts in. |
+| `LEARNING_MIN_NEW_TRADES` | `50` | Event trigger: standalone engine refits only after this many new closes. |
+| `LEARNING_MIN_IMPROVEMENT_BPS` | `2` | A candidate must beat the incumbent by ≥ this on held-out data to promote. |
+
+**Safety:** never edits code (only the weights data file the signal loads at boot); never promotes a worse model; the realized-expectancy breaker stays the live backstop; rollback = delete the weights file. **Relying on learned weights needs ≥500 quality trades** — until then the gate keeps the hand-tuned priors. Surfaced read-only at `meta.learningEngine` + `meta.microstructureCalibration`. Enabling it to actually drive live weights is an operator decision.
+
 ## 2026-06-05 PM (2): shadow labeler — break the data-starvation deadlock so the learning loop feeds itself
 
 The auto-calibration scheduler (entry below) automated the *fit*, but it was **inert**: the fitter needs ≥500 labeled **microstructure** trades, and the live signal is `mean_reversion_5m`, so microstructure almost never trades → no labels → the fit never has fuel. That's the data-starvation deadlock CLAUDE.md flagged.
