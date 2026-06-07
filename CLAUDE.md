@@ -36,6 +36,15 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 **Implications for future edits:** do NOT reintroduce the backtest veto into the entry path as a way to "stop bad trades" — that exact gate is what froze the bot; use the realized-expectancy brake instead. If you must re-wire a removed gate, justify it against this de-complication and keep the 4-step shape legible. The prediction-record shape written at entry is consumed by the exit manager, forensics, dashboard, and `closedTradeStats` — preserve it. Sections below this line describe machinery that is mostly NO LONGER in the live entry path; treat them as reference for the modules (still live as diagnostics) rather than as a description of how entries are decided today.
 
+## 2026-06-07: learning engine — held-out validation gate (READ before touching calibration)
+
+The weight-learning loop is now two layers, and the key invariant is: **new entry weights are promoted to live ONLY when proven better on held-out data.**
+
+- `backend/modules/learningEngine.js` — pure gate. `scoreOnHoldout(weights, holdout)` = mean realised net bps of trades a weight set *would* have taken on data it was NOT fit on; `evaluatePromotion()` promotes only if the candidate beats the incumbent by ≥ `minImprovementBps` AND clears an absolute holdout floor. With no incumbent file, the hand-tuned **priors** are the baseline (so theory is never replaced unless meaningfully beaten). Off by default as a standalone loop (`LEARNING_ENGINE_ENABLED`); event-triggered (`LEARNING_MIN_NEW_TRADES`, default 50) — NOT clock-triggered, because trades close too slowly for a short timer to be signal.
+- `backend/modules/microstructureAutoCalibration.js` — the existing 6h auto-fit writer now runs through that gate (`validateBeforeWrite`, default ON via `MICRO_CALIBRATION_VALIDATE`). Before #476 it wrote EVERY fit on sample-count alone (the overfitting hole). Now: fit on train split → score vs incumbent on held-out split → write only on promotion, else hold (`reason: held_not_better`, file untouched).
+
+**Rules for future edits:** (1) Do NOT remove the validation gate to "make it learn faster" — unconditional weight writes are exactly the overfitting failure this closes. (2) Keep `evaluatePromotion` pure + the 500-sample floor intact. (3) Relying on learned weights needs ≥500 quality trades; below that the gate correctly keeps priors. (4) Enabling the learned weights to actually drive live trading is an OPERATOR decision — never auto-enable `LEARNING_ENGINE_ENABLED` in prod. (5) `MICRO_CALIBRATION_VALIDATE` and `LEARNING_ENGINE_ENABLED` are read in `index.js`/`learningEngine.js` (Hard Rule #4 — wired, not dead). Surfaced at `meta.learningEngine` + `meta.microstructureCalibration`.
+
 ## Hard rules
 
 1. **Keep `README.md` (top level) current.** If a change affects any of the following, the same PR must update `README.md`:
