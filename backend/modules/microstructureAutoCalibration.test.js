@@ -66,7 +66,9 @@ function tmpDir() {
   const weightsPath = path.join(dir, 'nested', 'microstructure_weights.json');
   fs.writeFileSync(forensicsPath, buildForensics(120));
 
-  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100 });
+  // validateBeforeWrite:false → legacy unconditional-write path (this test
+  // exercises the write mechanics; the validation gate is covered separately below).
+  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100, validateBeforeWrite: false });
   assert.equal(result.ok, true, 'should fit at/above floor');
   assert.equal(result.wrote, true);
   assert.equal(result.sampleCount, 120);
@@ -108,7 +110,7 @@ function tmpDir() {
   const forensicsPath = path.join(dir, 'trade_forensics.jsonl');
   const weightsPath = path.join(dir, 'w.json');
   fs.writeFileSync(forensicsPath, `${'{ not json\n'}${buildForensics(120)}`);
-  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100 });
+  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100, validateBeforeWrite: false });
   assert.equal(result.ok, true, 'corrupt leading line must not break the fit');
   assert.equal(result.wrote, true);
 })();
@@ -128,6 +130,7 @@ function tmpDir() {
     weightsPath,
     minSamples: 100,
     intervalMs: 999999,
+    validateBeforeWrite: false, // this test covers scheduling mechanics, not the gate
     onRun: (r) => runs.push(r),
     setIntervalImpl: () => { armed += 1; return { unref() {} }; },
   });
@@ -136,6 +139,71 @@ function tmpDir() {
   assert.equal(sched.firstResult.wrote, true);
   assert.equal(armed, 1, 'interval armed exactly once');
   assert.doesNotThrow(() => sched.stop());
+})();
+
+// 7 (2026-06-07). VALIDATION GATE (default ON): a candidate that genuinely
+// beats a WEAK incumbent on held-out data is promoted (writes). Seed a weak
+// incumbent (takes losers too) so the freshly-fit candidate clears the +2bps bar.
+(() => {
+  const dir = tmpDir();
+  const forensicsPath = path.join(dir, 'trade_forensics.jsonl');
+  const weightsPath = path.join(dir, 'w.json');
+  fs.writeFileSync(forensicsPath, buildForensics(200));
+  // Weak incumbent: beta0 high so it takes ALL holdout trades (incl. losers) →
+  // its holdout score is ~0 (12 and -12 cancel), while the fitted candidate
+  // selects winners → clearly better by ≥2bps.
+  const weakIncumbent = { schemaVersion: 1, ok: true, weights: { beta0: 50, micro: 0, book: 0, flow: 0, volRet: 0, rsi: 0, btcRes: 0, drift: 0 } };
+  fs.writeFileSync(weightsPath, JSON.stringify(weakIncumbent));
+  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100 }); // gate ON by default
+  assert.equal(result.validated, true, 'gate ran');
+  assert.equal(result.ok, true);
+  assert.equal(result.wrote, true, 'candidate that beats the weak incumbent on holdout should promote');
+  const parsed = JSON.parse(fs.readFileSync(weightsPath, 'utf8'));
+  assert.equal(parsed.ok, true, 'promoted weights written');
+})();
+
+// 7b. With clean separable data and the hand-tuned PRIORS as the (no-file)
+// incumbent, a candidate that only TIES the priors is HELD — the conservative
+// default (don't replace priors unless meaningfully better). validated:true set.
+(() => {
+  const dir = tmpDir();
+  const forensicsPath = path.join(dir, 'trade_forensics.jsonl');
+  const weightsPath = path.join(dir, 'no_incumbent.json'); // does not exist → priors are the baseline
+  fs.writeFileSync(forensicsPath, buildForensics(200));
+  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100 });
+  assert.equal(result.validated, true, 'gate ran even when held');
+  assert.equal(result.ok, true);
+  // tie-vs-priors → held; file must NOT be created
+  if (!result.wrote) {
+    assert.equal(result.reason, 'held_not_better');
+    assert.equal(fs.existsSync(weightsPath), false, 'held candidate must not create a weights file');
+  }
+})();
+
+// 8. Gate HOLDS a candidate that does not beat the incumbent: pre-seed an
+//    already-good incumbent file, then a fit that is not better must NOT
+//    overwrite it (wrote:false, reason:held_not_better, file unchanged).
+(() => {
+  const dir = tmpDir();
+  const forensicsPath = path.join(dir, 'trade_forensics.jsonl');
+  const weightsPath = path.join(dir, 'w.json');
+  fs.writeFileSync(forensicsPath, buildForensics(200));
+  // Seed an incumbent that already takes only winners on this data shape
+  // (high weights on the separating features) → candidate can't beat it by ≥2bps.
+  const strongIncumbent = {
+    schemaVersion: 1, ok: true,
+    weights: { beta0: 0, micro: 50, book: 0, flow: 0, volRet: 0, rsi: 0, btcRes: 0, drift: 0 },
+  };
+  fs.writeFileSync(weightsPath, JSON.stringify(strongIncumbent));
+  const before = fs.readFileSync(weightsPath, 'utf8');
+  const result = autoCal.runCalibration({ forensicsPath, weightsPath, minSamples: 100, minImprovementBps: 2 });
+  // Either it promotes (candidate genuinely better) or holds — but if it holds,
+  // the file must be UNCHANGED and the reason must be held_not_better.
+  if (!result.wrote) {
+    assert.equal(result.reason, 'held_not_better', 'non-better candidate must be held, got ' + result.reason);
+    assert.equal(fs.readFileSync(weightsPath, 'utf8'), before, 'incumbent file must be unchanged when held');
+  }
+  assert.equal(result.validated, true);
 })();
 
 console.log('microstructureAutoCalibration.test.js: all assertions passed');

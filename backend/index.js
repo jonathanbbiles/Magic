@@ -3571,6 +3571,12 @@ if (MICRO_AUTO_CALIBRATION_ENABLED) {
     extraForensicsPaths: MICRO_SHADOW_LABELER_ENABLED ? [MICRO_SHADOW_LABELED_FILE] : [],
     minSamples: MICRO_CALIBRATION_MIN_SAMPLES,
     intervalMs: MICRO_AUTO_CALIBRATION_INTERVAL_MS,
+    // Held-out validation gate (2026-06-07, #475 follow-up). Default ON: the
+    // auto-calibrator now overwrites the live weights ONLY when a freshly-fit
+    // candidate beats the incumbent on a held-out split (closes the prior
+    // overfitting hole where every fit shipped on sample-count alone). Set
+    // MICRO_CALIBRATION_VALIDATE=false to restore the legacy unconditional write.
+    validateBeforeWrite: String(process.env.MICRO_CALIBRATION_VALIDATE || 'true').toLowerCase() !== 'false',
     onRun: (result) => {
       lastMicroAutoCalibration = result;
       if (result.wrote) {
