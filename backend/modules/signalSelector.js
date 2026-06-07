@@ -331,7 +331,7 @@ const REALIZED_VETO_DEFAULTS = Object.freeze({
   lookbackTrades: 50,
 });
 
-function evaluateRealizedVeto({ records = [], signalVersion = null, config = {} } = {}) {
+function evaluateRealizedVeto({ records = [], signalVersion = null, config = {}, excludeSymbols = null } = {}) {
   const cfg = { ...REALIZED_VETO_DEFAULTS, ...(config || {}) };
   const base = {
     veto: false,
@@ -346,10 +346,34 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {} 
   if (cfg.enabled === false) return { ...base, reason: 'disabled' };
   if (!signalVersion) return { ...base, reason: 'no_active_signal' };
 
-  const filtered = driftAlerter.selectRealizedTrades(records, signalVersion);
+  // 2026-06-07: exclude trades from symbols now blocklisted for this signal.
+  // Without this, a per-symbol blocklist (e.g. MR_SYMBOL_BLOCKLIST_5M) leaves
+  // the losing symbol's CLOSED trades sitting in the realized-veto window — so
+  // the breaker keeps halting the bot on losses from symbols it can no longer
+  // trade, and because it's halted those stale trades never flush. That
+  // re-creates the exact deadlock the blocklist was meant to fix. Filtering
+  // them out makes the veto judge ONLY the symbols the bot still trades; the
+  // breaker stays fully armed on genuinely-bleeding tradable symbols.
+  let sourceRecords = Array.isArray(records) ? records : [];
+  let excludedSymbolTradeCount = 0;
+  if (excludeSymbols) {
+    const exclSet = new Set(
+      (excludeSymbols instanceof Set ? Array.from(excludeSymbols) : excludeSymbols)
+        .map((s) => String(s).toUpperCase()),
+    );
+    if (exclSet.size > 0) {
+      sourceRecords = sourceRecords.filter((rec) => {
+        const sym = String(rec?.symbol || '').toUpperCase();
+        if (sym && exclSet.has(sym)) { excludedSymbolTradeCount += 1; return false; }
+        return true;
+      });
+    }
+  }
+
+  const filtered = driftAlerter.selectRealizedTrades(sourceRecords, signalVersion);
   const recent = cfg.lookbackTrades > 0 ? filtered.slice(-cfg.lookbackTrades) : filtered;
   if (recent.length < cfg.minTrades) {
-    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length };
+    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length, excludedSymbolTradeCount };
   }
   let sum = 0;
   for (const t of recent) sum += t.realizedNetBps;
@@ -361,6 +385,7 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {} 
     reason: veto ? 'realized_below_floor' : 'within_floor',
     sampleSize: recent.length,
     realizedAvgNetBps: avg,
+    excludedSymbolTradeCount,
   };
 }
 
