@@ -488,6 +488,20 @@ function bt(overall) {
   // array form also accepted
   const withArr = evaluateRealizedVeto({ records: heavy, signalVersion: 'mean_reversion_5m', excludeSymbols: ['doge/usd'], config: { minTrades: 4, floorBps: -5 } });
   assert.equal(withArr.excludedSymbolTradeCount, 6, 'array + case-insensitive exclusion works');
+
+  // R10b (2026-06-07): the exclusion count is scoped to the ACTIVE signal. A
+  // DOGE trade from a DIFFERENT signal must NOT inflate excludedSymbolTradeCount
+  // (selectRealizedTrades already filters it out by signalVersion), so the
+  // diagnostic stays truthful about THIS signal's window.
+  const crossSignal = [
+    ...new Array(6).fill(0).map(() => recSym('DOGE/USD', -30)),                  // active-signal DOGE (excluded + counted)
+    ...new Array(8).fill(0).map(() => ({ type: 'closed_trade', signalVersion: 'microstructure_30m', symbol: 'DOGE/USD', realizedNetBps: -50, ts: '2026-06-07T00:00:00Z' })), // other-signal DOGE
+    ...new Array(4).fill(0).map(() => recSym('LINK/USD', 15)),
+  ];
+  const scoped = evaluateRealizedVeto({ records: crossSignal, signalVersion: 'mean_reversion_5m', excludeSymbols: new Set(['DOGE/USD']), config: { minTrades: 4, floorBps: -5 } });
+  assert.equal(scoped.excludedSymbolTradeCount, 6, 'only active-signal DOGE trades count toward the exclusion (not other signals)');
+  assert.equal(scoped.sampleSize, 4, 'window is the 4 LINK trades');
+  assert.equal(scoped.realizedAvgNetBps, 15);
 }
 
 console.log('signalSelector.test ok');

@@ -362,9 +362,20 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
         .map((s) => String(s).toUpperCase()),
     );
     if (exclSet.size > 0) {
+      const activeTag = String(signalVersion).toLowerCase();
       sourceRecords = sourceRecords.filter((rec) => {
         const sym = String(rec?.symbol || '').toUpperCase();
-        if (sym && exclSet.has(sym)) { excludedSymbolTradeCount += 1; return false; }
+        if (!sym || !exclSet.has(sym)) return true;
+        // Only drop (and count) excluded-symbol trades that belong to the
+        // ACTIVE signal — those are the ones that would otherwise pollute this
+        // signal's veto window. A same-symbol trade from a different signal is
+        // already filtered out by selectRealizedTrades below, so dropping it
+        // here changes nothing but would inflate excludedSymbolTradeCount and
+        // mislead the diagnostic. Scope the count to the active signal.
+        if (String(rec?.signalVersion || '').toLowerCase() === activeTag) {
+          excludedSymbolTradeCount += 1;
+          return false;
+        }
         return true;
       });
     }
