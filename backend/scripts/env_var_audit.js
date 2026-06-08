@@ -83,6 +83,13 @@ const NON_ENV_ALLOWLIST = new Set([
   'MR_BLOCKLISTS',
   'REJECT_NEAR_HIGH',
   'GROSS_TARGET_BPS',
+  // Doc filenames in docs/ referenced by name in CLAUDE.md (2026-06-08). These
+  // are markdown basenames (docs/BTC_LEAD_LAG_ROLLOUT.md, docs/
+  // PROFITABILITY_ANALYSIS_2026-06.md) — the UPPER_SNAKE filename shape collides
+  // with the env-var extractor. The '-06' suffix truncates the second token at
+  // the hyphen, so the extracted token is 'PROFITABILITY_ANALYSIS_2026'.
+  'BTC_LEAD_LAG_ROLLOUT',
+  'PROFITABILITY_ANALYSIS_2026',
 ]);
 
 // Patterns the codebase uses to read env vars. Order doesn't matter —
