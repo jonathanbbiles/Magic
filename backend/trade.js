@@ -36,6 +36,7 @@ const {
 } = require('./modules/entryEconomics');
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
+const { evaluateBtcLeadLagSignal } = require('./modules/btcLeadLagSignal');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
@@ -173,6 +174,17 @@ function readEnum(name, allowed, fallback) {
 // behaviour. Reposting a passive buy that doesn't fill is handled by
 // ENTRY_FILL_TIMEOUT_MS below.
 const ENTRY_LIMIT_PRICE_MODE = readEnum('ENTRY_LIMIT_PRICE_MODE', ['ask', 'mid', 'bid_plus_tick'], 'mid');
+// Post-only entries (2026-06-08, default OFF). When true, entry orders go in as
+// Binance LIMIT_MAKER — the exchange rejects them if they would cross, so the
+// fill is GUARANTEED maker (never pays taker / never crosses the spread). This
+// is the execution half of the BTC lead-lag rebuild: the +7.6bps edge only
+// survives if we don't cross a ~17bps spread (docs/PROFITABILITY_ANALYSIS_2026
+// -06.md). Pairs naturally with ENTRY_LIMIT_PRICE_MODE=bid_plus_tick (rests
+// below the ask so it is never rejected for crossing). At 'mid' on a 1-tick
+// book a post-only order may be rejected — that is a safe no-op (no entry that
+// scan), not an error. Left OFF so existing behavior is byte-for-byte unchanged
+// until an operator opts in.
+const ENTRY_POST_ONLY = readBoolean('ENTRY_POST_ONLY', false);
 // Cancel-the-buy-if-not-filled timeout (Fix 1). The mid/bid_plus_tick modes
 // require active management — if the market runs away, we don't want a stale
 // passive buy filling minutes later at a no-longer-edge price. Default 30 s.
@@ -298,6 +310,18 @@ const MF_MAX_HOLD_MS = Math.max(0, readNumber('MF_MAX_HOLD_MS', 21600000));
 const MR_MAX_HOLD_MS = Math.max(0, readNumber('MR_MAX_HOLD_MS', 2700000));     // 45 min
 const MR_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MR_BREAKEVEN_TIMEOUT_MS', 1800000));  // 30 min
 
+// BTC lead-lag exit timing (2026-06-08, docs/PROFITABILITY_ANALYSIS_2026-06.md).
+// The lead-lag catch-up plays out in ~5 minutes; the sandbox edge came from a
+// short time-bounded hold. So: short max-hold, fast breakeven decay, a TIGHT
+// protective stop (cut the trade if BTC reverses) and a TP from the projected
+// catch-up. This is the inverted-exit shape (let the catch-up run on a short
+// clock, cut losers fast) vs the legacy small-TP/huge-SL bleed.
+const BLL_MAX_HOLD_MS = Math.max(60000, readNumber('BLL_MAX_HOLD_MS', 360000));          // 6 min
+const BLL_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BLL_BREAKEVEN_TIMEOUT_MS', 300000)); // 5 min
+const BLL_STOP_LOSS_BPS = Math.max(1, readNumber('BLL_STOP_LOSS_BPS', 25));
+const BLL_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('BLL_TARGET_NET_PROFIT_BPS_FLOOR', 10));
+const BLL_SIGNAL_TARGET_MAX_NET_BPS = Math.max(BLL_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('BLL_SIGNAL_TARGET_MAX_NET_BPS', 60));
+
 // Signal-aware exit timing helpers. The live exit manager and the
 // computeStaircaseExitGrossBps function consult these via the position's
 // signal version (recorded in tradePredictions at entry time).
@@ -314,6 +338,7 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_45m') return MICRO_MAX_HOLD_MS;
   if (signalVersion === 'trend_following') return TREND_FOLLOWING_MAX_HOLD_MS;
   if (signalVersion === 'pairs') return PAIRS_MAX_HOLD_MS;
+  if (signalVersion === 'btc_lead_lag') return BLL_MAX_HOLD_MS;
   return MAX_HOLD_MS;
 }
 function getBreakevenTimeoutMsForSignal(signalVersion) {
@@ -329,6 +354,7 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_45m') return MICRO_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'trend_following') return TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'pairs') return PAIRS_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'btc_lead_lag') return BLL_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
 }
 // Stop-loss is ON by default — matches LIVE_CRITICAL_DEFAULTS. The original
@@ -418,6 +444,18 @@ const MR_SIGNAL_CONFIG_OVERRIDES = Object.freeze({
   maxBtcDropBps: MR_MAX_BTC_DROP_BPS,
   rsiOversold: MR_RSI_OVERSOLD,
   deepDropGuardBps: MR_DEEP_DROP_GUARD_BPS,
+});
+
+// BTC lead-lag signal config (2026-06-08). Operator-tunable knobs over the
+// module's DEFAULT_CONFIG. Only keys present here override; the rest fall back
+// to the module defaults. Thresholds chosen from the 60-day sandbox sweep
+// (BTC ret>=30bps lead, alt still <60% caught up).
+const BLL_SIGNAL_CONFIG_OVERRIDES = Object.freeze({
+  btcMinReturnBps: readNumber('BLL_BTC_MIN_RETURN_BPS', 30),
+  btcMaxAgeMs: Math.max(5000, readNumber('BLL_BTC_MAX_AGE_MS', 90000)),
+  maxCatchupFraction: readNumber('BLL_MAX_CATCHUP_FRACTION', 0.6),
+  captureFraction: readNumber('BLL_CAPTURE_FRACTION', 0.5),
+  minProjectedBps: readNumber('BLL_MIN_PROJECTED_BPS', 12),
 });
 
 // Phase 1: master kill switch + per-layer feature flags. PHASE1_ENABLED=false
@@ -682,6 +720,7 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
   else if (signalVersion === 'microstructure_45m') cap = MICRO_STOP_LOSS_BPS_45M;
   else if (signalVersion === 'trend_following') cap = TREND_FOLLOWING_STOP_LOSS_BPS;
   else if (signalVersion === 'pairs') cap = PAIRS_STOP_LOSS_BPS;
+  else if (signalVersion === 'btc_lead_lag') cap = BLL_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
   if (!VOL_SCALED_STOP_ENABLED) return cap;
   const sigma = Number(volatilityBps);
@@ -989,6 +1028,7 @@ const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLow
 const SIGNAL_VERSION_OPERATOR_OVERRIDE = [
   'ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'barrier',
   'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
+  'btc_lead_lag',
 ].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW
   : null;
@@ -1203,6 +1243,15 @@ function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
     if (!Number.isFinite(projected)) return MICRO_TARGET_NET_BPS_FLOOR;
     const signalNet = projected - FEE_BPS_ROUND_TRIP;
     return Math.max(MICRO_TARGET_NET_BPS_FLOOR, Math.min(MICRO_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  }
+  // BTC lead-lag: projectedBps is the expected forward catch-up move (gross).
+  // Net = gross − fees, clamped to the lead-lag floor/cap. Same convention as
+  // microstructure (a forward-move prediction, not a half-drop).
+  if (signalVersion === 'btc_lead_lag') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return BLL_TARGET_NET_PROFIT_BPS_FLOOR;
+    const signalNet = projected - FEE_BPS_ROUND_TRIP;
+    return Math.max(BLL_TARGET_NET_PROFIT_BPS_FLOOR, Math.min(BLL_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
   }
   // Range mean-reversion: projectedBps is the half-distance to the range
   // midpoint. Same conversion pattern as MR — gross to net by subtracting
@@ -2275,6 +2324,48 @@ async function getMeanReversionSignalForPair(pair, timeframe = '1m') {
   }
 }
 
+// BTC lead-lag signal wrapper (2026-06-08). Trades the cross-asset lag: when
+// BTC has just moved up and this alt has not yet caught up, go long expecting
+// it to follow. Reads the same btcLeadLag snapshot the engine already maintains
+// (recorded when BTC/USD is scanned). BTC itself has no lead source, so the
+// signal refuses BTC. Needs only a short 1m history for vol + the lag window.
+async function getBtcLeadLagSignalForPair(pair) {
+  // BTC is the LEADER, not a tradable target here. But we still must fetch its
+  // bars and refresh the lead-lag snapshot — otherwise, with btc_lead_lag as
+  // the active signal, nothing else would ever populate it (the legacy
+  // recordBtcLeadLagSnapshot path needs an ok:true BTC signal, which this
+  // signal never produces for BTC). Refresh here, then refuse to trade BTC.
+  // NOTE: this relies on BTC/USD being scanned BEFORE the alts each cycle so
+  // the alts see a fresh snapshot (enforced by orderUniverseBtcFirst).
+  if (pair === BTC_LEAD_LAG_SYMBOL) {
+    try {
+      const btcPayload = await fetchCryptoBars({ symbols: [pair], limit: 40, timeframe: '1Min' });
+      const btcBars = btcPayload?.bars?.[pair] || btcPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+      maybeUpdateMarketRegimeFromBars(pair, btcBars);
+      // Closed bars only (drop the in-progress bar), matching the sig.closes
+      // convention recordBtcLeadLagSnapshot expects.
+      const closes = [];
+      for (const b of btcBars.slice(0, -1)) {
+        const c = Number(b?.c ?? b?.close);
+        if (Number.isFinite(c) && c > 0) closes.push(c);
+      }
+      if (closes.length >= 5) recordBtcLeadLagSnapshot({ ok: true, closes });
+    } catch (_) { /* snapshot refresh is best-effort; never fatal */ }
+    return { ok: false, reason: 'btc_is_leader' };
+  }
+  try {
+    const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 40, timeframe: '1Min' });
+    const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    maybeUpdateMarketRegimeFromBars(pair, bars1m);
+    const btcLeadLag = getBtcLeadLagSnapshot();
+    const sig = evaluateBtcLeadLagSignal({ pair, bars1m, btcLeadLag, config: BLL_SIGNAL_CONFIG_OVERRIDES });
+    if (sig && typeof sig === 'object') sig.featureBars = { bars1m };
+    return sig;
+  } catch (err) {
+    return { ok: false, reason: 'btc_lead_lag_signal_failed', error: err?.message };
+  }
+}
+
 // Phase 1: range mean-reversion signal wrapper. Smaller drops within an
 // established range; only needs 1m bars (more of them than capitulation MR
 // because the range identification window is wider).
@@ -3235,7 +3326,12 @@ async function scanAndEnter() {
   }
 
   const heldCount = held.size;
-  const candidates = universe.filter((pair) => !held.has(pair) && !openBuyPairs.has(pair));
+  let candidates = universe.filter((pair) => !held.has(pair) && !openBuyPairs.has(pair));
+  // BTC lead-lag: BTC is the leader, never a tradable target. Drop it from the
+  // candidate list; its snapshot is refreshed separately below.
+  if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag') {
+    candidates = candidates.filter((pair) => pair !== BTC_LEAD_LAG_SYMBOL);
+  }
   const summary = {
     ts: new Date().toISOString(),
     universeSize: universe.length,
@@ -3282,6 +3378,16 @@ async function scanAndEnter() {
   const prefetchedQuotes = runtimeConfig.entryPrefetchQuotes
     ? await prefetchQuotesForCandidates(candidates, runtimeConfig.entryPrefetchChunkSize)
     : null;
+
+  // BTC lead-lag: refresh the lead snapshot ONCE per scan, before the candidate
+  // loop and independent of any per-symbol entry gate, so every alt this cycle
+  // scores against a fresh BTC move. (getBtcLeadLagSignalForPair fetches BTC
+  // bars and updates btcLeadLagSnapshot when pair===BTC, then returns
+  // btc_is_leader, which we discard.) Without this the snapshot would only
+  // refresh if BTC happened to pass the entry gates — fragile.
+  if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag') {
+    try { await getBtcLeadLagSignalForPair(BTC_LEAD_LAG_SYMBOL); } catch (_) { /* best-effort */ }
+  }
 
   let placed = 0;
   for (const pair of candidates) {
@@ -3356,6 +3462,7 @@ async function scanAndEnter() {
       else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') sig = await getMicrostructureSignalForPair(pair, quote, 45);
       else if (ACTIVE_SIGNAL_VERSION === 'trend_following') sig = await getTrendFollowingSignalForPair(pair);
       else if (ACTIVE_SIGNAL_VERSION === 'pairs') sig = await getPairsSignalForPair(pair);
+      else if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag') sig = await getBtcLeadLagSignalForPair(pair);
       else sig = await getPredictionSignal(pair);
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
       if (!sig.ok) { rejectTrade(pair, sig.reason || 'prediction_rejected'); continue; }
@@ -3384,6 +3491,7 @@ async function scanAndEnter() {
         time_in_force: 'gtc',
         limit_price: buyLimitStr,
         notional: effectiveNotional.toFixed(2),
+        post_only: ENTRY_POST_ONLY,
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {

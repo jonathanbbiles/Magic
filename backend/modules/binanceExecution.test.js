@@ -311,6 +311,56 @@ async function runAsyncTests() {
     assert.strictEqual(capturedParams.quantity, '0.00021');
   }
 
+  // 9b. post_only upgrades a LIMIT to LIMIT_MAKER (guaranteed maker entry):
+  //     Binance type = LIMIT_MAKER, price present, NO timeInForce param.
+  {
+    injectUniverse();
+    let capturedParams = null;
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/order', method: 'POST', respond: (params) => {
+        capturedParams = params;
+        return {
+          symbol: params.symbol, orderId: 1001, clientOrderId: params.newClientOrderId,
+          transactTime: 1700000000000, price: params.price, origQty: params.quantity,
+          executedQty: '0', cummulativeQuoteQty: '0', status: 'NEW',
+          timeInForce: params.timeInForce, type: params.type, side: params.side,
+        };
+      }},
+    ]);
+    const result = await submitOrder({
+      symbol: 'BTC/USD', side: 'buy', type: 'limit', time_in_force: 'gtc',
+      notional: '10.50', limit_price: 50000, client_order_id: 'test-maker-1',
+      post_only: true, midPriceLookup: () => 50000, signedRequestOverride: fakeReq,
+    });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(capturedParams.type, 'LIMIT_MAKER', 'post_only must send LIMIT_MAKER');
+    assert.strictEqual(capturedParams.price, '50000', 'LIMIT_MAKER carries a price');
+    assert.strictEqual(capturedParams.timeInForce, undefined, 'LIMIT_MAKER must NOT carry timeInForce');
+    assert.strictEqual(capturedParams.quantity, '0.00021');
+  }
+
+  // 9c. post_only:false leaves a plain LIMIT untouched (regression guard).
+  {
+    injectUniverse();
+    let capturedParams = null;
+    const fakeReq = makeFakeSignedRequest([
+      { path: '/api/v3/order', method: 'POST', respond: (params) => {
+        capturedParams = params;
+        return { symbol: params.symbol, orderId: 1002, clientOrderId: params.newClientOrderId,
+          transactTime: 1, price: params.price, origQty: params.quantity, executedQty: '0',
+          cummulativeQuoteQty: '0', status: 'NEW', timeInForce: params.timeInForce,
+          type: params.type, side: params.side };
+      }},
+    ]);
+    await submitOrder({
+      symbol: 'BTC/USD', side: 'buy', type: 'limit', time_in_force: 'gtc',
+      notional: '10.50', limit_price: 50000, post_only: false,
+      midPriceLookup: () => 50000, signedRequestOverride: fakeReq,
+    });
+    assert.strictEqual(capturedParams.type, 'LIMIT');
+    assert.strictEqual(capturedParams.timeInForce, 'GTC');
+  }
+
   // 10. submitOrder SELL returns the order directly (no { buy, sell } wrapper).
   {
     injectUniverse();

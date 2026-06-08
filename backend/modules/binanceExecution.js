@@ -516,10 +516,19 @@ async function submitOrder(payload = {}) {
   }
   const binanceSymbol = resolved.binanceSymbol;
   const side = String(sideRaw || 'buy').toUpperCase();
-  const type = String(typeRaw || 'limit').toUpperCase();
+  let type = String(typeRaw || 'limit').toUpperCase();
   const timeInForce = String(tifRaw || 'gtc').toUpperCase();
 
-  if (type !== 'LIMIT') {
+  // post_only (2026-06-08): upgrade a LIMIT to Binance LIMIT_MAKER, which the
+  // exchange REJECTS if it would immediately match — a guaranteed-maker entry
+  // that can never accidentally cross the spread and pay taker. Used by the
+  // BTC lead-lag strategy (docs/PROFITABILITY_ANALYSIS_2026-06.md): the +7.6bps
+  // edge depends on not crossing a ~17bps spread. LIMIT_MAKER carries no
+  // timeInForce (it is inherently resting). post_only is ignored for non-LIMIT.
+  const postOnly = payload.post_only === true || String(payload.post_only).toLowerCase() === 'true';
+  if (type === 'LIMIT' && postOnly) type = 'LIMIT_MAKER';
+
+  if (type !== 'LIMIT' && type !== 'LIMIT_MAKER') {
     // The bot uses LIMIT for entries+TPs and IOC for stop exits. The IOC
     // variant in this codebase still places a LIMIT order, just with
     // timeInForce=IOC — not a MARKET order. Reject any other type rather
@@ -559,9 +568,9 @@ async function submitOrder(payload = {}) {
     throw err;
   }
 
-  // Translate limit_price → price (LIMIT orders only; MARKET orders skip)
+  // Translate limit_price → price (LIMIT / LIMIT_MAKER only; MARKET skips)
   let price = null;
-  if (type === 'LIMIT') {
+  if (type === 'LIMIT' || type === 'LIMIT_MAKER') {
     if (limit_price == null) {
       throw new Error('binance_submit_limit_needs_price');
     }
@@ -595,6 +604,10 @@ async function submitOrder(payload = {}) {
   };
   if (type === 'LIMIT') {
     params.timeInForce = timeInForce;
+    params.price = String(price);
+  } else if (type === 'LIMIT_MAKER') {
+    // LIMIT_MAKER takes a price but NO timeInForce (it is inherently a resting
+    // post-only order). Sending timeInForce would be rejected by Binance.
     params.price = String(price);
   }
   if (client_order_id) {
