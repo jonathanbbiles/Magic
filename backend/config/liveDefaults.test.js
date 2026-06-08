@@ -193,6 +193,10 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.ADAPTIVE_SIZING_ENABLED, 'true');
 // 2026-06-08: conviction engine (selectivity + conviction sizing) on by default.
 assert.equal(LIVE_CRITICAL_DEFAULTS.CONVICTION_ENGINE_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.CONVICTION_MIN, '0.45');
+// 2026-06-08: performance epoch ("point 0") for the strategy rebuild. Must be a
+// parseable ISO timestamp; non-destructive since-reset tracking on the dashboard.
+assert.ok(!Number.isNaN(Date.parse(LIVE_CRITICAL_DEFAULTS.PERFORMANCE_EPOCH_AT)),
+  'PERFORMANCE_EPOCH_AT must be a valid ISO timestamp');
 
 // 2026-05-17: Barrier signal restored as a backtested candidate. The signal
 // (from commit fbdb924, the project's initial commit) targets ~100 bps net

@@ -101,6 +101,12 @@ const recorder = require('./modules/recorder');
 const tradeForensics = require('./modules/tradeForensics');
 const closedTradeStats = require('./modules/closedTradeStats');
 const equitySnapshots = require('./modules/equitySnapshots');
+const performanceEpoch = require('./modules/performanceEpoch');
+// Resolve the performance epoch ("point 0" for tracking a strategy change) from
+// config at boot. Non-destructive: the since-reset scorecard filters to trades
+// at/after this timestamp; full history + the all-time scorecard are unchanged.
+// Reset by bumping PERFORMANCE_EPOCH_AT and redeploying.
+performanceEpoch.loadEpoch({ epochAtIso: process.env.PERFORMANCE_EPOCH_AT });
 const monitorLog = require('./modules/monitorLog');
 const learningEngine = require('./modules/learningEngine');
 const { startLabeler, getRecentLabels, getLabelStats } = require('./jobs/labeler');
@@ -1641,6 +1647,20 @@ app.get('/dashboard', async (req, res) => {
 
     const latestEquity = toFiniteNumberOrNull(account?.equity) ?? toFiniteNumberOrNull(account?.portfolio_value);
     const weekly = equitySnapshots.getWeeklyChangePct(latestEquity, nowMs);
+    // Performance epoch: stamp the baseline equity the first time we have a real
+    // reading after a reset, then expose the since-reset block (P&L + a scorecard
+    // filtered to trades at/after the epoch). Non-destructive; null when off.
+    if (Number.isFinite(latestEquity)) {
+      try { performanceEpoch.ensureBaseline(latestEquity, { nowMs }); } catch (_) { /* best-effort */ }
+    }
+    const performanceSinceEpoch = (() => {
+      try {
+        return performanceEpoch.buildSinceEpoch({
+          scorecardFn: (limit, sinceMs) => closedTradeStats.buildScorecard(limit, sinceMs),
+          currentEquity: latestEquity,
+        });
+      } catch (_) { return null; }
+    })();
     const rankedAcceptedSymbolsCount = toFiniteNumberOrNull(
       universeDiagnostics?.rankedAcceptedSymbolsCount ?? universeDiagnostics?.acceptedSymbolsCount,
     );
@@ -1700,6 +1720,10 @@ app.get('/dashboard', async (req, res) => {
         weeklyChangePct: toFiniteNumberOrNull(weekly?.weeklyPct),
         weekAgoEquity: toFiniteNumberOrNull(weekly?.weekAgoEquity),
         latestEquity: toFiniteNumberOrNull(weekly?.latestEquity),
+        // "Since reset" performance — the honest view of the current strategy,
+        // filtered to trades at/after the configured epoch (point 0). Non-
+        // destructive; meta.scorecard remains the all-time view.
+        performanceEpoch: performanceSinceEpoch,
         pollAgeMs: lastQuote?.ageMs ?? null,
         botMood: governorSummary?.coolDownActive ? 'defensive' : 'normal',
         guardSummary: managerStatus?.sessionGovernor || null,

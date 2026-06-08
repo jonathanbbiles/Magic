@@ -604,6 +604,14 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // toward 0.6 to be pickier; CONVICTION_ENGINE_ENABLED=false to disable.
   CONVICTION_ENGINE_ENABLED: 'true',
   CONVICTION_MIN: '0.45',
+  // Performance epoch — "point 0" for tracking the reality of the 2026-06-08
+  // strategy rebuild (btc_lead_lag + maker execution + conviction engine), set
+  // just after that stack went live. The dashboard's meta.performanceEpoch shows
+  // the since-reset P&L + a scorecard filtered to trades at/after this time, so
+  // the ~274 legacy mean-reversion trades stop polluting the view. NON-
+  // destructive — meta.scorecard remains the all-time view; nothing is deleted.
+  // To reset again, bump this timestamp and redeploy (baseline re-anchors).
+  PERFORMANCE_EPOCH_AT: '2026-06-08T23:00:00Z',
   // Barrier signal — restored from commit fbdb924 (the project's initial
   // commit). Trade-construction signal: barrier-touch probability + EWMA
   // vol-scaled stop + EMA momentum + micro-momentum + orderbook bias.

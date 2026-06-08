@@ -101,8 +101,18 @@ function median(values = []) {
   return arr.length % 2 === 0 ? (arr[m - 1] + arr[m]) / 2 : arr[m];
 }
 
-function buildScorecard(limit = 5000) {
-  const rows = getRecent(limit);
+// buildScorecard(limit, sinceMs): when sinceMs is a finite number, only count
+// closed trades with ts >= sinceMs. This powers the "since reset" performance
+// epoch view (docs / performanceEpoch.js) without deleting any history — the
+// all-time scorecard is just buildScorecard() with no sinceMs.
+function buildScorecard(limit = 5000, sinceMs = null) {
+  let rows = getRecent(limit);
+  if (Number.isFinite(sinceMs)) {
+    rows = rows.filter((r) => {
+      const t = Date.parse(r?.ts);
+      return Number.isFinite(t) && t >= sinceMs;
+    });
+  }
   const count = rows.length;
   if (!count) {
     return {
@@ -118,11 +128,13 @@ function buildScorecard(limit = 5000) {
       avgEntryQuoteAgeMs: null,
       avgEntrySpreadBps: null,
       tpFillRate: null,
+      avgRealizedNetBps: null,
     };
   }
 
   const gross = rows.map((r) => Number(r.grossPnlUsd)).filter((v) => Number.isFinite(v));
   const net = rows.map((r) => Number(r.netPnlUsd)).filter((v) => Number.isFinite(v));
+  const realizedBps = rows.map((r) => Number(r.realizedNetBps)).filter((v) => Number.isFinite(v));
   const wins = net.filter((v) => v > 0);
   const losses = net.filter((v) => v < 0);
   const holds = rows.map((r) => Number(r.holdSeconds)).filter((v) => Number.isFinite(v));
@@ -146,6 +158,7 @@ function buildScorecard(limit = 5000) {
     avgEntryQuoteAgeMs: entryQuoteAges.length ? entryQuoteAges.reduce((a, b) => a + b, 0) / entryQuoteAges.length : null,
     avgEntrySpreadBps: entrySpreads.length ? entrySpreads.reduce((a, b) => a + b, 0) / entrySpreads.length : null,
     tpFillRate: count ? tpCount / count : null,
+    avgRealizedNetBps: realizedBps.length ? realizedBps.reduce((a, b) => a + b, 0) / realizedBps.length : null,
   };
 }
 

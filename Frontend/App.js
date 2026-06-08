@@ -830,6 +830,16 @@ function Stage({ data, activeRef, onJumpToCast }) {
   const skipEntries = Object.entries(skipReasons).sort((a, b) => b[1] - a[1]).slice(0, 4);
   const skipTotal = skipEntries.reduce((a, [, v]) => a + v, 0);
 
+  // Performance epoch — the honest "since reset" view of the current strategy.
+  const epoch = meta?.performanceEpoch || null;
+  const epochSc = epoch?.scorecard || {};
+  const epochPnl = num(epoch?.pnlUsd);
+  const epochPct = num(epoch?.pctChange);
+  const epochTrades = num(epochSc?.totalClosedTrades);
+  const epochWin = num(epochSc?.winRate);
+  const epochAvgBps = num(epochSc?.avgRealizedNetBps);
+  const epochDate = epoch?.epochStartIso ? String(epoch.epochStartIso).slice(0, 16).replace('T', ' ') : null;
+
   return (
     <View style={s.tabBody}>
       <MoneyTile
@@ -839,6 +849,39 @@ function Stage({ data, activeRef, onJumpToCast }) {
         mood={mood}
         deltaSinceLast={delta}
       />
+
+      {/* Since-reset performance — the real read on the current strategy */}
+      {epoch?.active && (
+        <>
+          <View style={s.sectionHeader}>
+            <Text style={s.sectionHeaderTitle}>📍 SINCE RESET</Text>
+            <Text style={s.sectionHeaderSub}>{epochDate ? `point 0: ${epochDate} UTC` : 'tracking the new strategy'}</Text>
+          </View>
+          <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>P&amp;L since reset</Text>
+              <Text style={[s.pulseValue, { color: epochPnl == null ? palette.fog : epochPnl >= 0 ? palette.emerald : palette.rose }]}>
+                {epochPnl == null ? '—' : signedUsd(epochPnl)}
+                {epochPct != null ? <Text style={{ color: epochPnl >= 0 ? palette.emerald : palette.rose }}>{`  (${epochPct >= 0 ? '+' : ''}${epochPct.toFixed(2)}%)`}</Text> : null}
+              </Text>
+            </View>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Trades / win rate</Text>
+              <Text style={s.pulseValue}>
+                {epochTrades == null ? '0' : epochTrades} closed
+                {epochWin != null ? <Text style={{ color: epochWin >= 0.5 ? palette.emerald : palette.fog }}>{`  ·  ${(epochWin * 100).toFixed(0)}% win`}</Text> : null}
+              </Text>
+            </View>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Avg net / trade</Text>
+              <Text style={[s.pulseValue, { color: epochAvgBps == null ? palette.fog : epochAvgBps >= 0 ? palette.emerald : palette.rose }]}>
+                {epochAvgBps == null ? '— (warming up)' : `${epochAvgBps >= 0 ? '+' : ''}${epochAvgBps.toFixed(1)} bps`}
+              </Text>
+            </View>
+          </Gradient>
+        </>
+      )}
+
       <StatTriple items={stats} />
 
       {/* Engine pulse */}
