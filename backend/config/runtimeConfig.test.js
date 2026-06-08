@@ -69,7 +69,8 @@ withEnv(
   },
 );
 
-withEnv({ ENTRY_SCAN_INTERVAL_MS: '13200' }, () => {
+// Within 20% of the default (5000 as of 2026-06-08) → no drift warning.
+withEnv({ ENTRY_SCAN_INTERVAL_MS: '5500' }, () => {
   const driftLogs = [];
   emitConfigDriftWarnings(process.env, {
     logger: {

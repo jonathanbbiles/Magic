@@ -63,7 +63,10 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   ENTRY_DYNAMIC_ALLOW_TIER3_OVERRIDE: 'false',
   ENTRY_DYNAMIC_REQUIRE_FRESH_QUOTE: 'true',
   ENTRY_DYNAMIC_REQUIRE_ORDERBOOK_FOR_TIER3: 'true',
-  ENTRY_SCAN_INTERVAL_MS: '12000',
+  // 2026-06-08: 5s (was 12s) for btc_lead_lag — the lead-lag alpha decays inside
+  // ~60s, so scan fast to react before the alt catches up. Faster scans = more
+  // market-data calls; 5s stays well within the Binance.US rate budget.
+  ENTRY_SCAN_INTERVAL_MS: '5000',
   ENTRY_PREFETCH_CHUNK_SIZE: '8',
   ENTRY_PREFETCH_QUOTES: 'true',
   ENTRY_PREFETCH_ORDERBOOKS: 'true',
@@ -201,6 +204,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // signal from net-negative toward breakeven/positive. Revert to
   // 'bid_plus_tick' or 'ask' in Render env to restore the prior behaviour.
   ENTRY_LIMIT_PRICE_MODE: 'mid',
+  // 2026-06-08: post-only entries for the btc_lead_lag rebuild. Order goes in as
+  // Binance LIMIT_MAKER (rejected by the exchange if it would cross), so the fill
+  // is GUARANTEED maker — the +edge only survives if we don't cross the spread
+  // (docs/PROFITABILITY_ANALYSIS_2026-06.md). Kept at ENTRY_LIMIT_PRICE_MODE=mid
+  // (the sanctioned mode — a config safety guard forces non-mid back to mid, and
+  // mid matches the maker validation, which posted at the last/mid level for
+  // +1.94 bps/trade). mid + post_only rests at mid (below ask) and fills on a
+  // small dip while BTC leads up. Reject = safe no-op (no entry that scan).
+  // Revert to 'false' in Render env if pinning a mean-reversion signal again.
+  ENTRY_POST_ONLY: 'true',
   ENTRY_FILL_TIMEOUT_MS: '30000',
   // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
   // projected forward move doesn't cover the gross target + entry/exit
@@ -298,7 +311,28 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // other signal in Render env. Requires mean_reversion_5m in the trade.js
   // SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-04) or the pin
   // silently nulls to the 1m fallback.
-  SIGNAL_VERSION: 'mean_reversion_5m',
+  //
+  // 2026-06-08 STRATEGY REBUILD — pinned to 'btc_lead_lag'. Context: a 60-day
+  // study of all closed trades + real Binance.US klines (docs/PROFITABILITY_
+  // ANALYSIS_2026-06.md) found mean-reversion at 1m/5m is the WRONG SIGN (it
+  // loses before costs; crypto continues at this scale, it doesn't revert) and
+  // that execution (crossing a ~17bps spread) exceeded any edge. The one robust
+  // predictor is BTC lead-lag (BTC's recent move predicts alt forward returns,
+  // corr 0.13-0.15, pooled t=15, robust in both 30-day halves). The new signal
+  // trades that lag and enters POST-ONLY (maker) on tight-spread alts.
+  //
+  // HONEST RISK NOTE: validated +1.94 bps/trade under a MAKER fill model
+  // (t=6.5); the backtest HARNESS models a taker entry and scores it -13 bps —
+  // the edge is maker-dependent and only live maker fills settle which is right.
+  // This pin IS that experiment. The realized-expectancy breaker stays armed at
+  // the -5 floor: if it bleeds it auto-halts within ~10 closes (downside bounded
+  // to a few dollars on the ~$477 account at 7% sizing). Paired with
+  // ENTRY_POST_ONLY=true + ENTRY_LIMIT_PRICE_MODE=bid_plus_tick + SPREAD_MAX_BPS
+  // =12 + ENTRY_SCAN_INTERVAL_MS=5000 below. Reversible: SIGNAL_VERSION=<signal>
+  // (or '' for the mean_reversion fallback) in Render env. Requires btc_lead_lag
+  // in the trade.js SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-08).
+  // Runbook: docs/BTC_LEAD_LAG_ROLLOUT.md.
+  SIGNAL_VERSION: 'btc_lead_lag',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from
