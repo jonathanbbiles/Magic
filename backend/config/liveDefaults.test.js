@@ -190,6 +190,9 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MR_TIMEFRAME_15M_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.CONCURRENT_POSITIONS_SOFT_CAP_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ADAPTIVE_SIZING_ENABLED, 'true');
+// 2026-06-08: conviction engine (selectivity + conviction sizing) on by default.
+assert.equal(LIVE_CRITICAL_DEFAULTS.CONVICTION_ENGINE_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.CONVICTION_MIN, '0.45');
 
 // 2026-05-17: Barrier signal restored as a backtested candidate. The signal
 // (from commit fbdb924, the project's initial commit) targets ~100 bps net

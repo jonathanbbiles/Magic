@@ -37,6 +37,7 @@ const {
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
 const { evaluateBtcLeadLagSignal } = require('./modules/btcLeadLagSignal');
+const convictionEngine = require('./modules/convictionEngine');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
@@ -473,6 +474,57 @@ const MAX_CONCURRENT_POSITIONS_SOFT_CAP = Math.max(0, readNumber('MAX_CONCURRENT
 // the default 10% base). Bounded conservatively because backtest evidence
 // for the new signal classes is still thin.
 const MAX_SIZING_FRACTION_OF_TARGET = Math.max(1.0, readNumber('MAX_SIZING_FRACTION_OF_TARGET', 1.5));
+
+// Conviction engine (2026-06-08). Turns the active signal + market regime + the
+// signal's recent LIVE realized edge into a 0..1 conviction score, then (a) sits
+// out marginal setups (selectivity) and (b) sizes the A+ setups up within the
+// MAX_SIZING_FRACTION_OF_TARGET cap. A pure GATE in front of the entry path — it
+// never relaxes any safety (breaker/spread/freshness all still apply); it can
+// only make the bot pickier and lean winners up. See modules/convictionEngine.js.
+const CONVICTION_ENGINE_ENABLED = readBoolean('CONVICTION_ENGINE_ENABLED', true);
+const CONVICTION_CONFIG_OVERRIDES = Object.freeze({
+  minConviction: readNumber('CONVICTION_MIN', convictionEngine.DEFAULT_CONFIG.minConviction),
+  maxSizeMult: Math.max(1.0, readNumber('CONVICTION_MAX_SIZE_MULT', MAX_SIZING_FRACTION_OF_TARGET)),
+  edgeScaleBps: readNumber('CONVICTION_EDGE_SCALE_BPS', convictionEngine.DEFAULT_CONFIG.edgeScaleBps),
+  projRefBps: readNumber('CONVICTION_PROJ_REF_BPS', convictionEngine.DEFAULT_CONFIG.projRefBps),
+  // 'adverse' hard-veto on by default; set CONVICTION_HARD_VETO_REGIMES='' to clear.
+  hardVetoRegimes: String(process.env.CONVICTION_HARD_VETO_REGIMES ?? 'adverse')
+    .split(',').map((s) => s.trim()).filter(Boolean),
+});
+// Rolling conviction telemetry for the dashboard (observational; no gate reads it).
+let lastConvictionState = null;
+const convictionCounters = { evaluated: 0, entered: 0, satOut: 0, regimeVetoed: 0, sumConviction: 0 };
+function recordConvictionObservation(result) {
+  if (!result) return;
+  lastConvictionState = {
+    conviction: result.conviction,
+    enter: result.enter,
+    sizeMultiplier: result.sizeMultiplier,
+    reason: result.reason,
+    components: result.components,
+    at: new Date().toISOString(),
+  };
+  convictionCounters.evaluated += 1;
+  if (Number.isFinite(result.conviction)) convictionCounters.sumConviction += result.conviction;
+  if (result.enter) convictionCounters.entered += 1;
+  else if (String(result.reason || '').startsWith('regime_veto')) convictionCounters.regimeVetoed += 1;
+  else convictionCounters.satOut += 1;
+}
+function getConvictionState() {
+  const n = convictionCounters.evaluated || 0;
+  return {
+    enabled: CONVICTION_ENGINE_ENABLED,
+    minConviction: CONVICTION_CONFIG_OVERRIDES.minConviction,
+    maxSizeMult: CONVICTION_CONFIG_OVERRIDES.maxSizeMult,
+    last: lastConvictionState,
+    evaluated: n,
+    entered: convictionCounters.entered,
+    satOut: convictionCounters.satOut,
+    regimeVetoed: convictionCounters.regimeVetoed,
+    selectivityRate: n > 0 ? (convictionCounters.satOut + convictionCounters.regimeVetoed) / n : null,
+    avgConviction: n > 0 ? convictionCounters.sumConviction / n : null,
+  };
+}
 
 // Range mean-reversion env knobs.
 const RANGE_MR_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('RANGE_MR_TARGET_NET_BPS_FLOOR', 5));
@@ -3467,6 +3519,40 @@ async function scanAndEnter() {
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
       if (!sig.ok) { rejectTrade(pair, sig.reason || 'prediction_rejected'); continue; }
 
+      // STEP 1b (selectivity + conviction sizing). Blend the signal's own
+      // confidence with the market regime (BTC-derived) and the active signal's
+      // recent LIVE realized edge into a 0..1 conviction. Sit out marginal
+      // setups; size A+ setups up within the existing cap. Pure gate — never
+      // relaxes any downstream safety. The realized veto already ran this scan
+      // (realizedVeto), so its avg/sample feed the "is the edge working now?"
+      // term for free.
+      let convictionSizeMult = 1.0;
+      if (CONVICTION_ENGINE_ENABLED) {
+        const convictionResult = convictionEngine.evaluateConviction({
+          signal: {
+            confidence: sig.confidence,
+            projectedBps: sig.projectedBps,
+            signalVersion: sig.signalVersion || ACTIVE_SIGNAL_VERSION,
+          },
+          regime: getMarketRegimeSnapshot(),
+          recentRealized: (realizedVeto && Number.isFinite(realizedVeto.realizedAvgNetBps))
+            ? { avgNetBps: realizedVeto.realizedAvgNetBps, sampleSize: realizedVeto.sampleSize }
+            : null,
+          config: CONVICTION_CONFIG_OVERRIDES,
+        });
+        recordConvictionObservation(convictionResult);
+        if (!convictionResult.enter) {
+          rejectTrade(pair, convictionResult.reason || 'low_conviction', {
+            conviction: Number(convictionResult.conviction.toFixed(3)),
+            regime: convictionResult.components?.regimeLabel || null,
+          });
+          continue;
+        }
+        if (ADAPTIVE_SIZING_ENABLED && Number.isFinite(convictionResult.sizeMultiplier) && convictionResult.sizeMultiplier > 0) {
+          convictionSizeMult = Math.max(1.0, Math.min(MAX_SIZING_FRACTION_OF_TARGET, convictionResult.sizeMultiplier));
+        }
+      }
+
       // STEP 2 (enter): limit buy at mid. Mid (not bid+tick) is deliberate —
       // the entryModeAB diagnostic showed the passive bid+tick rest bled
       // ~16 bps/trade to adverse selection on Binance.US's ~0% maker books.
@@ -3482,7 +3568,14 @@ async function scanAndEnter() {
       if (!buyLimitStr) { rejectTrade(pair, 'invalid_ask'); continue; }
       const buyLimitNum = Number(buyLimitStr);
       const buyLimitOffsetBpsFromAsk = Number.isFinite(buyLimitNum) && ask > 0 ? ((ask - buyLimitNum) / ask) * 10000 : 0;
-      const effectiveNotional = tradeNotional;
+      // Conviction sizing: scale the base notional up for high-conviction setups
+      // (1.0x..maxSizeMult), re-clamped to available cash so a sized-up order can
+      // never exceed buying power. tradeNotional was already cash-clamped, so the
+      // multiplier only ever scales UP from a safe base.
+      const sizedNotional = tradeNotional * convictionSizeMult;
+      const effectiveNotional = Number.isFinite(availableCash)
+        ? Math.min(sizedNotional, availableCash)
+        : sizedNotional;
 
       const buyRes = await submitOrder({
         symbol: pair,
@@ -4472,6 +4565,7 @@ module.exports = {
   recordBtcLeadLagSnapshot,
   getBtcLeadLagSnapshot,
   getMarketRegimeSnapshot,
+  getConvictionState,
   fetchCryptoBars,
   getMicrostructureShadowSample,
   fetchBarsArray,

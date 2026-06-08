@@ -594,6 +594,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // the static 10% sizing.
   ADAPTIVE_SIZING_ENABLED: 'true',
   MAX_SIZING_FRACTION_OF_TARGET: '1.5',
+  // Conviction engine (2026-06-08). Selectivity + conviction-sizing gate in
+  // front of the entry path: blends the signal's confidence + market regime +
+  // the signal's recent LIVE realized edge into a 0..1 score, sits out marginal
+  // setups (CONVICTION_MIN), and sizes A+ setups up to MAX_SIZING_FRACTION_OF_
+  // TARGET. The "wait for the fat pitch" layer (docs/PROFITABILITY_ANALYSIS_
+  // 2026-06.md). Pure gate — never relaxes the breaker/spread/freshness safety.
+  // 0.45 is moderate (cuts the weakest ~third of setups, keeps trading). Raise
+  // toward 0.6 to be pickier; CONVICTION_ENGINE_ENABLED=false to disable.
+  CONVICTION_ENGINE_ENABLED: 'true',
+  CONVICTION_MIN: '0.45',
   // Barrier signal — restored from commit fbdb924 (the project's initial
   // commit). Trade-construction signal: barrier-touch probability + EWMA
   // vol-scaled stop + EMA momentum + micro-momentum + orderbook bias.
