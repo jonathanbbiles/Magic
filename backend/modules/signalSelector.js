@@ -187,7 +187,7 @@ function pickActiveSignal({
     'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m',
     'range_mean_reversion', 'barrier',
     'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
-    'trend_following', 'pairs',
+    'trend_following', 'pairs', 'btc_lead_lag',
   ];
   if (allowedOverrides.includes(operatorOverride)) {
     const overrideBacktest = getBacktestForSignal(operatorOverride, allBacktests);
