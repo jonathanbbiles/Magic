@@ -800,6 +800,17 @@ function Stage({ data, activeRef, onJumpToCast }) {
   const avgWin = num(scorecard?.avgWinUsd);
   const avgLoss = num(scorecard?.avgLossUsd);
 
+  // Conviction engine + regime (2026-06-08): the "fat pitch" telemetry.
+  const conviction = meta?.conviction || {};
+  const regimeSnap = meta?.marketRegime || {};
+  const convLast = num(conviction?.last?.conviction);
+  const convMin = num(conviction?.minConviction);
+  const convSelectivity = num(conviction?.selectivityRate);
+  const convSizeMult = num(conviction?.last?.sizeMultiplier);
+  const regimeLabel = regimeSnap?.regime || conviction?.last?.components?.regimeLabel || null;
+  const regimeFavor = { benign: palette.emerald, wild: palette.gold, flat: palette.fog, quiet: palette.rose, adverse: palette.rose };
+  const regimeColor = regimeFavor[regimeLabel] || palette.fog;
+
   const stats = [
     { label: 'OPEN P&L',
       value: signedUsd(openPL),
@@ -863,6 +874,42 @@ function Stage({ data, activeRef, onJumpToCast }) {
           </Text>
         </View>
       </Gradient>
+
+      {/* Conviction & regime — the "fat pitch" engine */}
+      {conviction?.enabled !== false && (
+        <>
+          <View style={s.sectionHeader}>
+            <Text style={s.sectionHeaderTitle}>🎯 CONVICTION</Text>
+            <Text style={s.sectionHeaderSub}>wait for the fat pitch, bet bigger on it</Text>
+          </View>
+          <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Last conviction</Text>
+              <Text style={[s.pulseValue, { color: convLast == null ? palette.fog : (convMin != null && convLast >= convMin) ? palette.emerald : palette.gold }]}>
+                {convLast == null ? '—' : `${(convLast * 100).toFixed(0)}%`}
+                {convMin != null ? <Text style={{ color: palette.fog }}>{`  (min ${(convMin * 100).toFixed(0)}%)`}</Text> : null}
+              </Text>
+            </View>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Market regime</Text>
+              <Text style={[s.pulseValue, { color: regimeColor }]}>{regimeLabel || '—'}</Text>
+            </View>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Selectivity</Text>
+              <Text style={s.pulseValue}>
+                {convSelectivity == null ? '—' : `sitting out ${(convSelectivity * 100).toFixed(0)}%`}
+                <Text style={{ color: palette.fog }}>{conviction?.entered != null ? `  (${conviction.entered} taken)` : ''}</Text>
+              </Text>
+            </View>
+            <View style={s.pulseRow}>
+              <Text style={s.pulseLabel}>Last size</Text>
+              <Text style={[s.pulseValue, { color: convSizeMult != null && convSizeMult > 1 ? palette.emerald : palette.fog }]}>
+                {convSizeMult == null ? '—' : `${convSizeMult.toFixed(2)}× base`}
+              </Text>
+            </View>
+          </Gradient>
+        </>
+      )}
 
       {/* Top reject reasons */}
       {skipEntries.length > 0 && (

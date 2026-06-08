@@ -196,6 +196,7 @@ const {
   getSpreadSuppressionState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
+  getConvictionState,
   getStaleQuoteRetryTrackerSnapshot,
   getRollingSkipSnapshot,
   getRegimeVetoState,
@@ -2125,6 +2126,18 @@ app.get('/dashboard', async (req, res) => {
             return snap || null;
           } catch (err) {
             return { ranAt: new Date().toISOString(), regime: 'detector_failed', error: err?.message };
+          }
+        })(),
+        // Conviction engine (2026-06-08): selectivity + conviction-sizing state.
+        // Shows the last conviction score + components, how selective the bot is
+        // being (satOut / regimeVetoed vs entered), and the size multiplier in
+        // play. The "fat pitch" telemetry: high selectivityRate = sitting out
+        // chop as designed; avgConviction tracks setup quality over time.
+        conviction: (() => {
+          try {
+            return typeof getConvictionState === 'function' ? getConvictionState() : null;
+          } catch (err) {
+            return { enabled: null, error: err?.message };
           }
         })(),
         // Per-symbol trade feasibility audit (2026-05-20). Decomposes the
