@@ -53,6 +53,7 @@ const { evaluateMeanReversionSignal } = require('../modules/meanReversionSignal'
 const { evaluateRangeMeanReversionSignal } = require('../modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('../modules/barrierSignal');
 const { evaluateMicrostructureSignal } = require('../modules/microstructureSignal');
+const { evaluateBtcLeadLagSignal } = require('../modules/btcLeadLagSignal');
 const { evaluateTrendFollowingSignal } = require('../modules/trendFollowingSignal');
 const { evaluateRecentHighGate } = require('../modules/recentHighGate');
 
@@ -575,6 +576,7 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
   // SIGNAL_SELECTOR_VETO_ENABLED=false to trade pairs live. Phase 2 would
   // add cross-symbol bar plumbing here.
   const isPairs = strategy === 'pairs';
+  const isBtcLeadLag = strategy === 'btc_lead_lag';
   // Microstructure signal evaluates at one of four discrete horizons. Parse
   // the suffix once per replaySymbol call so the per-bar loop just reads the
   // resolved number.
@@ -836,6 +838,53 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
       stopLossBpsAbsForTrade = Number.isFinite(barrierSig.factors?.stopBps)
         ? Math.max(0, barrierSig.factors.stopBps)
         : Math.max(0, Number(opts.barrierStopLossBps) || 100);
+    } else if (isBtcLeadLag) {
+      // BTC lead-lag entry: alt goes long when BTC just moved up and the alt
+      // has not yet caught up. Pull BTC's recent return for the lead snapshot,
+      // then evaluate the REAL shipped signal module (backtest-vs-live parity).
+      // BTC itself returns btc_is_leader (ok:false) → counted as a skip, no trade.
+      let btcReturnBps = null;
+      if (btcIdx) {
+        const minute = Math.floor(tsMs[i] / 60_000);
+        const btcBarIdx = btcIdx.byTs.get(minute);
+        if (Number.isFinite(btcBarIdx)) {
+          btcReturnBps = btcRecentReturnAt(btcBarIdx, btcIdx, opts.btcLeadLagLookbackBars || 5);
+        }
+      }
+      const need = 30; // signal requiredBars=20 + headroom + in-progress
+      if (i + 1 < need) {
+        if (!stats.skipped.lead_lag_insufficient_history) stats.skipped.lead_lag_insufficient_history = 0;
+        stats.skipped.lead_lag_insufficient_history += 1;
+        continue;
+      }
+      const window = bars.slice(i - need + 2, i + 1);
+      window.push({ ...bars[i] }); // synthetic in-progress, dropped by signal
+      const bllConfig = {};
+      if (Number.isFinite(opts.bllBtcMinReturnBps)) bllConfig.btcMinReturnBps = opts.bllBtcMinReturnBps;
+      if (Number.isFinite(opts.bllMaxCatchupFraction)) bllConfig.maxCatchupFraction = opts.bllMaxCatchupFraction;
+      if (Number.isFinite(opts.bllCaptureFraction)) bllConfig.captureFraction = opts.bllCaptureFraction;
+      if (Number.isFinite(opts.bllMinProjectedBps)) bllConfig.minProjectedBps = opts.bllMinProjectedBps;
+      const bllSig = evaluateBtcLeadLagSignal({
+        pair: bars[i]?.S || resolvedSymbol || null,
+        bars1m: window,
+        btcLeadLag: Number.isFinite(btcReturnBps) ? { recentReturnBps: btcReturnBps, ageMs: 0 } : null,
+        config: bllConfig,
+      });
+      if (!bllSig?.ok) {
+        const reason = bllSig?.reason || 'btc_lead_lag_rejected';
+        if (!stats.skipped[reason]) stats.skipped[reason] = 0;
+        stats.skipped[reason] += 1;
+        continue;
+      }
+      sig = { tStat: 1, projectedBps: bllSig.projectedBps };
+      // Net = projected catch-up − fees, clamped to [floor, cap]. Mirrors
+      // deriveSignalTargetNetBps('btc_lead_lag') in trade.js.
+      const fees = Number(opts.feeBpsRoundTrip) || 0;
+      const floor = Number(opts.bllTargetNetBpsFloor) || 10;
+      const cap = Number(opts.bllSignalTargetMaxNetBps) || 60;
+      const raw = bllSig.projectedBps - fees;
+      signalDerivedNetBps = Math.max(floor, Math.min(cap, raw));
+      stopLossBpsAbsForTrade = Math.max(0, Number(opts.bllStopLossBps) || 25);
     } else if (isMicrostructure) {
       // Microstructure signal needs 60 1m bars (matches the module's
       // DEFAULT_CONFIG.barLookback1m so backtest-vs-live parity holds) +
@@ -1130,6 +1179,9 @@ function replaySymbol(bars, opts, btcBars = null, symbolHint = null) {
     } else if (isTrendFollowing) {
       activeMaxHoldMin = Number(opts.trendMaxHoldMin || opts.maxHoldMin || 180);
       activeBreakevenMin = Number(opts.trendBreakevenTimeoutMin || opts.breakevenTimeoutMin || 90);
+    } else if (isBtcLeadLag) {
+      activeMaxHoldMin = Number(opts.bllMaxHoldMin || opts.maxHoldMin || 6);
+      activeBreakevenMin = Number(opts.bllBreakevenTimeoutMin || opts.breakevenTimeoutMin || 5);
     } else {
       activeMaxHoldMin = Number(opts.maxHoldMin || 0);
       activeBreakevenMin = Number(opts.breakevenTimeoutMin || 45);
@@ -1379,7 +1431,8 @@ async function runBacktest(overrides = {}) {
   // gate. If BTC is in the test universe we'll reuse the same bars; if not,
   // we still pre-fetch when the gate is enabled.
   const btcSymbol = 'BTC/USD';
-  const btcLeadLagActive = opts.maxBtcLeadLagDropBps < 0;
+  const btcLeadLagActive = opts.maxBtcLeadLagDropBps < 0
+    || String(opts.strategy || '').toLowerCase() === 'btc_lead_lag';
   const barsBySymbol = {};
   if (btcLeadLagActive && !symbols.includes(btcSymbol)) {
     try {

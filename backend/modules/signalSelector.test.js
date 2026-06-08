@@ -504,4 +504,35 @@ function bt(overall) {
   assert.equal(scoped.realizedAvgNetBps, 15);
 }
 
+// btc_lead_lag (2026-06-08): wired as a ranked candidate + dashboard field.
+{
+  // Positive backtest with enough entries → admitted + surfaced.
+  const d = pickActiveSignal({
+    btcLeadLagBacktest: bt({ avgNetBpsPerEntry: 7, entries: 200 }),
+  });
+  assert.equal(d.signalVersion, 'btc_lead_lag', 'btc_lead_lag admitted when it is the only validated candidate');
+  assert.equal(d.activeNetBps, 7);
+  assert.equal(d.btcLeadLagNetBps, 7, 'btcLeadLagNetBps surfaced on the decision for the dashboard');
+}
+{
+  // Negative backtest (the expected taker-model result) → NOT admitted; the
+  // signal still runs live via operator pin + realized veto, not the selector.
+  const d = pickActiveSignal({
+    olsBacktest: bt({ avgNetBpsPerEntry: 5, entries: 200 }),
+    btcLeadLagBacktest: bt({ avgNetBpsPerEntry: -13, entries: 200 }),
+  });
+  assert.equal(d.signalVersion, 'ols', 'negative btc_lead_lag backtest is not promoted over a positive OLS');
+  assert.equal(d.btcLeadLagNetBps, -13, 'negative netBps still surfaced for visibility');
+}
+{
+  // Operator override to btc_lead_lag with a validated backtest → use it.
+  const d = pickActiveSignal({
+    btcLeadLagBacktest: bt({ avgNetBpsPerEntry: 6, entries: 100 }),
+    operatorOverride: 'btc_lead_lag',
+  });
+  assert.equal(d.signalVersion, 'btc_lead_lag');
+  assert.equal(d.tradingVeto, false);
+  assert.equal(d.reason, 'operator_override_validated');
+}
+
 console.log('signalSelector.test ok');

@@ -766,6 +766,11 @@ let lastBacktestMicro45m = null;
 // SIGNAL_VERSION=pairs + disable the veto to trade pairs live.
 let lastBacktestTrendFollowing = null;
 let lastBacktestPairs = null;
+// BTC lead-lag (2026-06-08). The harness models a taker entry, which understates
+// this maker-dependent signal — it is operator-pinned live and judged by the
+// realized veto, not auto-promoted by this backtest. Stored for dashboard + the
+// selector's ranking surface.
+let lastBacktestBtcLeadLag = null;
 let lastBacktestError = null;
 let backtestRunning = false;
 
@@ -1019,7 +1024,7 @@ function persistMrSweep(sweep) {
 // in backend/modules/signalSelector.js; this is just the integration glue.
 function refreshSignalSelectorDecision(reason = 'manual') {
   const operatorOverrideRaw = String(process.env.SIGNAL_VERSION || '').trim().toLowerCase();
-  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion', 'barrier'].includes(operatorOverrideRaw)
+  const operatorOverride = ['ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'range_mean_reversion', 'barrier', 'btc_lead_lag'].includes(operatorOverrideRaw)
     ? operatorOverrideRaw
     : null;
   const minBpsToActivate = Number.isFinite(Number(process.env.SIGNAL_SELECTOR_MIN_BPS))
@@ -1053,6 +1058,7 @@ function refreshSignalSelectorDecision(reason = 'manual') {
     micro45mBacktest: lastBacktestMicro45m,
     trendFollowingBacktest: lastBacktestTrendFollowing,
     pairsBacktest: lastBacktestPairs,
+    btcLeadLagBacktest: lastBacktestBtcLeadLag,
     operatorOverride,
     config: { minBpsToActivate, vetoEnabled, minBacktestEntries },
   });
@@ -1219,6 +1225,7 @@ async function runBacktestAndStore(overrides = {}, slot = 'primary') {
     else if (slot === 'micro_45m') lastBacktestMicro45m = stored;
     else if (slot === 'trend_following') lastBacktestTrendFollowing = stored;
     else if (slot === 'pairs') lastBacktestPairs = stored;
+    else if (slot === 'btc_lead_lag') lastBacktestBtcLeadLag = stored;
     else lastBacktestResult = stored;
     lastBacktestError = null;
     console.log('backtest_completed', { ranAt: result.ranAt, slot, ...result.overall });
@@ -1852,6 +1859,15 @@ app.get('/dashboard', async (req, res) => {
           perSymbol: lastBacktestPairs.perSymbol,
           gateSkipped: lastBacktestPairs.gateSkipped || null,
           note: 'Pairs / stat-arb signal candidate (2026-05-28). Single-symbol replay cannot simulate the cross-symbol spread logic; all entries are skipped with reason pairs_backtest_unsupported. To trade pairs live, an operator must pin SIGNAL_VERSION=pairs and disable the selector veto.',
+        } : null,
+        backtestBtcLeadLag: lastBacktestBtcLeadLag ? {
+          ranAt: lastBacktestBtcLeadLag.ranAt,
+          windowDays: lastBacktestBtcLeadLag.windowDays,
+          params: lastBacktestBtcLeadLag.params,
+          overall: lastBacktestBtcLeadLag.overall,
+          perSymbol: lastBacktestBtcLeadLag.perSymbol,
+          gateSkipped: lastBacktestBtcLeadLag.gateSkipped || null,
+          note: 'BTC lead-lag signal (2026-06-08): longs an alt when BTC just moved up and the alt has not yet caught up. CAVEAT: this backtest models a TAKER entry that crosses the spread, which UNDERstates the signal — it trades post-only LIMIT_MAKER live (the +edge only survives as a maker). Judge it by the LIVE realized-veto net bps, not this number. Operator-pinned via SIGNAL_VERSION=btc_lead_lag.',
         } : null,
         // Stage 3 MR stop-loss sweep — observational diagnostic, fires at
         // each restart. Shows mean_reversion at three stop-loss caps per
@@ -3401,6 +3417,18 @@ if (backtestSkipReason) {
       await runBacktestAndStore({
         strategy: 'pairs',
       }, 'pairs').catch(() => {});
+    }
+    // BTC lead-lag auto-backtest (2026-06-08). Surfaces a backtest result for
+    // the dashboard + selector ranking. CAVEAT: the harness models a taker /
+    // adverse-selection entry that crosses the spread, which UNDERstates this
+    // maker-dependent signal (it trades post-only LIMIT_MAKER live). So the
+    // selector will usually NOT auto-promote it from this number — it is
+    // operator-pinned live (SIGNAL_VERSION=btc_lead_lag) and judged by the
+    // realized-expectancy veto on real maker fills. Gate via BTC_LEAD_LAG_ENABLED.
+    if (String(process.env.BTC_LEAD_LAG_ENABLED || 'true').toLowerCase() !== 'false') {
+      await runBacktestAndStore({
+        strategy: 'btc_lead_lag',
+      }, 'btc_lead_lag').catch(() => {});
     }
     // 2026-05-17 Stage 3 sweep: backtest MR-5m and MR-15m at three stop-loss
     // caps each (60 / 80 / 100 by default) so the dashboard can show the

@@ -81,6 +81,7 @@ function getBacktestForSignal(version, backtests) {
   if (version === 'microstructure_45m') return backtests.micro45mBacktest || null;
   if (version === 'trend_following') return backtests.trendFollowingBacktest || null;
   if (version === 'pairs') return backtests.pairsBacktest || null;
+  if (version === 'btc_lead_lag') return backtests.btcLeadLagBacktest || null;
   return backtests.olsBacktest || null;  // 'ols' or fallback
 }
 
@@ -98,7 +99,8 @@ function pickActiveSignal({
   micro45mBacktest = null,
   trendFollowingBacktest = null,
   pairsBacktest = null,
-  operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion[_5m|_15m]' | 'range_mean_reversion' | 'barrier' | 'microstructure_{5,15,30,45}m' | null
+  btcLeadLagBacktest = null,
+  operatorOverride = null,        // 'ols' | 'multi_factor' | 'mean_reversion[_5m|_15m]' | 'range_mean_reversion' | 'barrier' | 'microstructure_{5,15,30,45}m' | 'btc_lead_lag' | null
   config = {},
 } = {}) {
   const cfg = { ...DEFAULTS, ...(config || {}) };
@@ -130,6 +132,15 @@ function pickActiveSignal({
   const trendFollowingEntries = readBacktestEntries(trendFollowingBacktest);
   const pairsNetBps = readBacktestNetBps(pairsBacktest);
   const pairsEntries = readBacktestEntries(pairsBacktest);
+  // BTC lead-lag (2026-06-08). NOTE: the backtest harness models a taker /
+  // adverse-selection entry that crosses the spread, which UNDERstates this
+  // signal's edge — it is maker-dependent (post-only LIMIT_MAKER). So the
+  // selector will rarely admit it as a candidate; that is intentional. The
+  // signal is operator-pinned live (liveDefaults SIGNAL_VERSION=btc_lead_lag)
+  // and judged by the realized-expectancy veto on LIVE maker fills, not by this
+  // taker-model backtest. The wiring here is for dashboard visibility + ranking.
+  const btcLeadLagNetBps = readBacktestNetBps(btcLeadLagBacktest);
+  const btcLeadLagEntries = readBacktestEntries(btcLeadLagBacktest);
 
   const candidates = [];
   if (olsNetBps != null && olsEntries >= cfg.minBacktestEntries && olsNetBps >= cfg.minBpsToActivate) {
@@ -171,13 +182,16 @@ function pickActiveSignal({
   if (pairsNetBps != null && pairsEntries >= cfg.minBacktestEntries && pairsNetBps >= cfg.minBpsToActivate) {
     candidates.push({ version: 'pairs', netBps: pairsNetBps, entries: pairsEntries });
   }
+  if (btcLeadLagNetBps != null && btcLeadLagEntries >= cfg.minBacktestEntries && btcLeadLagNetBps >= cfg.minBpsToActivate) {
+    candidates.push({ version: 'btc_lead_lag', netBps: btcLeadLagNetBps, entries: btcLeadLagEntries });
+  }
   candidates.sort((a, b) => b.netBps - a.netBps);
 
   const allBacktests = {
     olsBacktest, mfBacktest, meanRevBacktest, meanRev5mBacktest, meanRev15mBacktest,
     rangeMrBacktest, barrierBacktest,
     micro5mBacktest, micro15mBacktest, micro30mBacktest, micro45mBacktest,
-    trendFollowingBacktest, pairsBacktest,
+    trendFollowingBacktest, pairsBacktest, btcLeadLagBacktest,
   };
 
   // Operator override wins on signal version. Veto still applies unless
@@ -216,6 +230,7 @@ function pickActiveSignal({
       micro45mNetBps,
       trendFollowingNetBps,
       pairsNetBps,
+      btcLeadLagNetBps,
       activeNetBps: overrideNetBps,
       candidates,
       operatorOverride,
@@ -261,6 +276,7 @@ function pickActiveSignal({
       micro45mNetBps,
       trendFollowingNetBps,
       pairsNetBps,
+      btcLeadLagNetBps,
       activeNetBps: null,
       candidates,
       operatorOverride: null,
@@ -288,6 +304,7 @@ function pickActiveSignal({
     micro15mNetBps,
     micro30mNetBps,
     micro45mNetBps,
+    btcLeadLagNetBps,
     activeNetBps: best.netBps,
     candidates,
     operatorOverride: null,

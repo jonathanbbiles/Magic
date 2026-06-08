@@ -24,12 +24,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.DATA_BASE, 'https://data.alpaca.markets');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_UNIVERSE_MODE, 'configured');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ALLOW_DYNAMIC_UNIVERSE_IN_PRODUCTION, 'true');
 
-// 2026-05-30: Entry limit price mode flipped to 'mid'. On Binance.US (~0%
-// maker, tight USDT books) the prior passive 'bid_plus_tick' rest bled
-// ~16 bps/trade to adverse selection (entryModeAB diagnostic) — it only
-// fills when the market trades DOWN into it. Resting at mid removes that
-// adverse selection and is the dominant lever flipping signals positive.
+// 2026-05-30: mid removes the passive bid+tick adverse selection. KEPT at mid
+// for the 2026-06-08 btc_lead_lag rebuild — a config safety guard forces non-mid
+// back to mid, and mid matches the maker validation (+1.94 bps/trade).
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_LIMIT_PRICE_MODE, 'mid');
+// 2026-06-08: post-only (LIMIT_MAKER) guaranteed-maker entries for btc_lead_lag.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_POST_ONLY, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FILL_TIMEOUT_MS, '30000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
@@ -121,7 +121,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 // SIGNAL_VERSION='' (-> mean_reversion fallback) in Render. Full rationale in
 // liveDefaults.js. NB: mean_reversion_5m must be in trade.js's
 // SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist or the pin silently falls back.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'mean_reversion_5m');
+// 2026-06-08 STRATEGY REBUILD: pinned to 'btc_lead_lag' (replaces the loss-
+// making mean-reversion premise; see liveDefaults.js + docs/PROFITABILITY_
+// ANALYSIS_2026-06.md). Maker-dependent edge; realized-veto breaker stays armed
+// as the bound. Reversible via SIGNAL_VERSION env. Must be in trade.js's
+// SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-08) or it falls back.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'btc_lead_lag');
 
 // 2026-05-31 stop-the-bleed: quote freshness, fresh re-quote, and the hard
 // liquidity allowlist. See liveDefaults.js for the full rationale.
