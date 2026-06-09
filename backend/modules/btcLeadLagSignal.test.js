@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { evaluateBtcLeadLagSignal, DEFAULT_CONFIG } = require('./btcLeadLagSignal');
+const { evaluateBtcLeadLagSignal, isBtcLeadLagExecutionSafe, DEFAULT_CONFIG } = require('./btcLeadLagSignal');
 
 // Build `n` flat 1m bars at `price`, then optionally tilt the last `k+1` closes
 // to produce a target alt recent-return over the k-bar window.
@@ -123,6 +123,19 @@ const fresh = (retBps, ageMs = 1000) => ({ recentReturnBps: retBps, ageMs });
   });
   assert.equal(sig.ok, true);
   assert.equal(sig.projectedBps, DEFAULT_CONFIG.maxProjectedBps);
+})();
+
+// 11. Execution-safety guard: only binance_us + post-only is a guaranteed maker.
+(() => {
+  // The single positive-expectancy config.
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryPostOnly: true }), true);
+  // Every other combination trades the signal as a (net-negative) taker.
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryPostOnly: false }), false);
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: false, entryPostOnly: true }), false);
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: false, entryPostOnly: false }), false);
+  // Defensive: missing args default to unsafe (fail closed).
+  assert.equal(isBtcLeadLagExecutionSafe(), false);
+  assert.equal(isBtcLeadLagExecutionSafe({}), false);
 })();
 
 console.log('btcLeadLagSignal.test.js: all assertions passed');
