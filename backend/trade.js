@@ -36,7 +36,7 @@ const {
 } = require('./modules/entryEconomics');
 const { evaluateMultiFactorSignal } = require('./modules/multiFactorSignal');
 const { evaluateMeanReversionSignal } = require('./modules/meanReversionSignal');
-const { evaluateBtcLeadLagSignal } = require('./modules/btcLeadLagSignal');
+const { evaluateBtcLeadLagSignal, isBtcLeadLagExecutionSafe } = require('./modules/btcLeadLagSignal');
 const convictionEngine = require('./modules/convictionEngine');
 const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversionSignal');
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
@@ -1166,6 +1166,10 @@ let lastRealizedVetoState = null;
 function getRealizedVetoState() {
   return lastRealizedVetoState;
 }
+// Warn-once latch for the btc_lead_lag maker-execution guard so a misconfigured
+// pin doesn't spam the log every 5s scan. Reset is process-lifetime (a restart
+// re-warns), which is fine — the point is one loud line per misconfig session.
+let btcLeadLagUnsafeExecutionWarned = false;
 // Exploration-budget state for the dashboard meta surface. Shows whether the
 // metered "middle ground" path is enabled, how much of the rolling daily
 // budget is used, and the bounded worst-case exposure.
@@ -3331,6 +3335,33 @@ async function scanAndEnter() {
       floorBps: realizedVeto.floorBps,
     });
     bumpSkipReason('realized_expectancy_veto');
+    currentScanState = 'idle';
+    currentScanStartedAt = null;
+    return;
+  }
+
+  // SECOND SAFETY BRAKE (2026-06-09): maker-execution guard for btc_lead_lag.
+  // The signal backtests +1.94 bps ONLY as a guaranteed maker; as a taker it is
+  // -0.38 bps — negative expectancy. The maker guarantee exists only on
+  // binance_us with ENTRY_POST_ONLY=true (the buy maps to a LIMIT_MAKER the
+  // exchange rejects rather than crosses). ENTRY_POST_ONLY is a locked live
+  // default ('true'), but the trade.js readBoolean fallback is false and on
+  // Alpaca post_only is a no-op (LIMIT_MAKER is binance-only), so a misconfigured
+  // pin would trade the signal at a guaranteed loss. Halt NEW entries instead —
+  // same fail-safe shape as the realized veto; open positions still exit
+  // normally. Byte-for-byte no-op in the live config (binance_us + post-only),
+  // where isBtcLeadLagExecutionSafe() is true and this block is skipped.
+  if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag'
+    && !isBtcLeadLagExecutionSafe({ isBinanceExecution: IS_BINANCE_EXECUTION, entryPostOnly: ENTRY_POST_ONLY })) {
+    if (!btcLeadLagUnsafeExecutionWarned) {
+      console.warn('entry_scan_halted_btc_lead_lag_unsafe_execution', {
+        executionVenue: EXECUTION_VENUE,
+        entryPostOnly: ENTRY_POST_ONLY,
+        detail: 'btc_lead_lag is positive-expectancy only as a guaranteed maker (binance_us + ENTRY_POST_ONLY=true); refusing to trade it as a taker',
+      });
+      btcLeadLagUnsafeExecutionWarned = true;
+    }
+    bumpSkipReason('btc_lead_lag_requires_maker_execution');
     currentScanState = 'idle';
     currentScanStartedAt = null;
     return;

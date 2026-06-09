@@ -50,6 +50,17 @@ const DEFAULT_CONFIG = Object.freeze({
   requiredBars: 20,
 });
 
+// Execution-safety guard for the signal. The btc_lead_lag edge is +1.94 bps
+// ONLY as a guaranteed maker; as a taker it is -0.38 bps — negative expectancy
+// (docs/PROFITABILITY_ANALYSIS_2026-06.md). The maker guarantee exists ONLY on
+// binance_us with post-only enabled (the buy maps to a LIMIT_MAKER the exchange
+// rejects rather than crosses). On Alpaca post_only is a no-op (LIMIT_MAKER is
+// binance-only) AND fees are 30 bps round-trip, so the signal is guaranteed-loss
+// there. Pure so the live halt and its test agree on one source of truth.
+function isBtcLeadLagExecutionSafe({ isBinanceExecution = false, entryPostOnly = false } = {}) {
+  return Boolean(isBinanceExecution && entryPostOnly);
+}
+
 function isFiniteNumber(x) { return typeof x === 'number' && Number.isFinite(x); }
 
 function closesOf(bars) {
@@ -175,4 +186,4 @@ function evaluateBtcLeadLagSignal({
   };
 }
 
-module.exports = { evaluateBtcLeadLagSignal, DEFAULT_CONFIG };
+module.exports = { evaluateBtcLeadLagSignal, isBtcLeadLagExecutionSafe, DEFAULT_CONFIG };
