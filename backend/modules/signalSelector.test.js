@@ -366,6 +366,74 @@ function bt(overall) {
   assert.equal(REALIZED_VETO_DEFAULTS.minTrades, 10);
   assert.equal(REALIZED_VETO_DEFAULTS.floorBps, -10);
   assert.equal(REALIZED_VETO_DEFAULTS.lookbackTrades, 50);
+  assert.equal(REALIZED_VETO_DEFAULTS.maxAgeMs, 0);
+}
+
+// R-decay helper: build N closed-trade records for a signal at a fixed ts.
+function recsAt(signalVersion, bpsList, tsIso) {
+  return bpsList.map((b) => ({ type: 'closed_trade', signalVersion, realizedNetBps: b, ts: tsIso }));
+}
+
+// R-decay 1. Self-recovery: a frozen losing window ages out under maxAgeMs and
+// the veto LIFTS (insufficient_sample) instead of deadlocking at zero trades.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const stale = recsAt('btc_lead_lag', new Array(10).fill(-6), '2026-06-09T00:00:00Z'); // ~42h old
+  const v = evaluateRealizedVeto({
+    records: stale,
+    signalVersion: 'btc_lead_lag',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, false, 'stale frozen sample must age out and lift the veto');
+  assert.equal(v.reason, 'insufficient_sample');
+  assert.equal(v.agedOutCount, 10);
+  assert.equal(v.maxAgeMs, 86400000);
+}
+
+// R-decay 2. Fresh losers still veto: trades inside the window are NOT aged out,
+// so a genuinely-bleeding signal stays halted.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const fresh = recsAt('btc_lead_lag', new Array(12).fill(-30), '2026-06-11T12:00:00Z'); // 6h old
+  const v = evaluateRealizedVeto({
+    records: fresh,
+    signalVersion: 'btc_lead_lag',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, true, 'fresh bleeding trades must still halt');
+  assert.equal(v.agedOutCount, 0);
+}
+
+// R-decay 3. maxAgeMs disabled (0) → count-only window, ancient losers still
+// veto (backward-compatible / module default path).
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const ancient = recsAt('ols', new Array(15).fill(-40), '2025-01-01T00:00:00Z');
+  const v = evaluateRealizedVeto({
+    records: ancient,
+    signalVersion: 'ols',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 0 },
+  });
+  assert.equal(v.veto, true, 'with the clock disabled, age is ignored');
+  assert.equal(v.agedOutCount, 0);
+}
+
+// R-decay 4. A record with no parseable ts is kept (never aged out), so callers
+// that omit ts retain the prior behaviour even with the clock on.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const noTs = new Array(11).fill(-20).map((b) => ({ type: 'closed_trade', signalVersion: 'barrier', realizedNetBps: b }));
+  const v = evaluateRealizedVeto({
+    records: noTs,
+    signalVersion: 'barrier',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, true, 'untimestamped trades stay in-window');
+  assert.equal(v.agedOutCount, 0);
 }
 
 // R2. The canonical failure case: active signal realizing well below the floor
