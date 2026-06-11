@@ -380,6 +380,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
   SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-5',
   SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '20',
+  // 2026-06-11: self-recovery clock (24h). The breaker judges the active
+  // signal's last N *closed* trades — but while it halts ALL entries no new
+  // trades close, so the losing sample is frozen and the bot deadlocks at zero
+  // trades indefinitely (observed live: btc_lead_lag stuck at -6.16 bps over a
+  // frozen 10-trade window). Aging trades out of the window after 24h drains the
+  // frozen sample → the veto lifts as insufficient_sample → the bot re-probes at
+  // its tiny PORTFOLIO_SIZING_PCT size → the breaker re-judges on FRESH fills and
+  // recovers if they clear the floor, re-halts within ~10 closes if they don't.
+  // When the signal IS trading, 10 fresh trades accumulate in hours (well inside
+  // 24h), so this never weakens the live-active breaker — it only un-freezes a
+  // halted one. Set '0' in Render to disable (count-only window).
+  SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS: '86400000',
   // Exploration budget (2026-05-29). The middle ground between the backtest
   // veto's two failure modes: veto-all (the bot never buys — the 2026-05-28/29
   // dashboard sat at zero trades for 15h because both signals backtested

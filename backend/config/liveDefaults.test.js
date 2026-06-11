@@ -159,6 +159,7 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_VETO_ENABLED, 'true
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '10');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-5');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '20');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS, '86400000');
 
 // 2026-05-27: Adverse-selection-aware backtest fill model. Must stay ON in the
 // live defaults so the auto-backtest stops over-promising edge that doesn't

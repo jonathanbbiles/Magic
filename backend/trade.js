@@ -1108,6 +1108,16 @@ const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELE
 const SIGNAL_SELECTOR_REALIZED_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_REALIZED_VETO_ENABLED', true);
 const SIGNAL_SELECTOR_REALIZED_MIN_TRADES = Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_MIN_TRADES', 10));
 const SIGNAL_SELECTOR_REALIZED_FLOOR_BPS = readNumber('SIGNAL_SELECTOR_REALIZED_FLOOR_BPS', -10);
+// 2026-06-11: self-recovery clock for the realized breaker (default 24h). A
+// count-only window freezes while the veto halts all entries, so the breaker
+// deadlocks at zero trades. Aging out trades older than this drains a frozen
+// sample → the veto lifts as insufficient_sample → the bot re-probes at its
+// tiny configured size → the breaker re-judges on fresh fills. 0 disables it
+// (pre-2026-06-11 count-only behaviour). See signalSelector.evaluateRealizedVeto.
+const SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS = Math.max(
+  0,
+  readNumber('SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS', 86400000),
+);
 const SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES = Math.max(
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
   readNumber('SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES', 50),
@@ -3324,6 +3334,7 @@ async function scanAndEnter() {
       minTrades: SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
       floorBps: SIGNAL_SELECTOR_REALIZED_FLOOR_BPS,
       lookbackTrades: SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES,
+      maxAgeMs: SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS,
     },
   });
   lastRealizedVetoState = { ...realizedVeto, evaluatedAt: new Date().toISOString() };

@@ -346,9 +346,18 @@ const REALIZED_VETO_DEFAULTS = Object.freeze({
   // is computed over. Recency-weighted so a signal that has turned can clear
   // the veto without waiting for ancient losers to age out of the full file.
   lookbackTrades: 50,
+  // 2026-06-11: self-recovery clock. Trades whose close timestamp is older than
+  // this are dropped from the window. 0 = disabled (count-only window, the
+  // pre-2026-06-11 behaviour). A finite value lets a FROZEN losing sample drain
+  // on its own while the veto holds the bot at zero trades — see the long note
+  // in evaluateRealizedVeto. Module default stays 0 so the pure function is
+  // backward-compatible; the LIVE default is set finite in trade.js /
+  // liveDefaults (SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS), mirroring how
+  // lookbackTrades is 50 here but operator-tuned live.
+  maxAgeMs: 0,
 });
 
-function evaluateRealizedVeto({ records = [], signalVersion = null, config = {}, excludeSymbols = null } = {}) {
+function evaluateRealizedVeto({ records = [], signalVersion = null, config = {}, excludeSymbols = null, nowMs = Date.now() } = {}) {
   const cfg = { ...REALIZED_VETO_DEFAULTS, ...(config || {}) };
   const base = {
     veto: false,
@@ -359,6 +368,8 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     floorBps: cfg.floorBps,
     minTrades: cfg.minTrades,
     lookbackTrades: cfg.lookbackTrades,
+    maxAgeMs: cfg.maxAgeMs > 0 ? cfg.maxAgeMs : null,
+    agedOutCount: 0,
   };
   if (cfg.enabled === false) return { ...base, reason: 'disabled' };
   if (!signalVersion) return { ...base, reason: 'no_active_signal' };
@@ -399,9 +410,35 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
   }
 
   const filtered = driftAlerter.selectRealizedTrades(sourceRecords, signalVersion);
-  const recent = cfg.lookbackTrades > 0 ? filtered.slice(-cfg.lookbackTrades) : filtered;
+
+  // 2026-06-11: self-recovery via time-decay. A realised window built ONLY from
+  // the last N *closed* trades can never refresh while the veto is holding the
+  // bot at zero trades — no new trades close, so the losing sample is frozen and
+  // the breaker deadlocks (it will sit at zero trades forever). This is the same
+  // failure mode the per-symbol exclusion above fixes for blocklists, here for
+  // the passage of time. Aging out trades older than maxAgeMs lets a frozen
+  // sample drain on its own: once fewer than minTrades remain in-window the veto
+  // lifts as `insufficient_sample`, the bot re-probes at its (tiny) configured
+  // size, and the breaker re-judges on FRESH outcomes — recovering if they clear
+  // the floor, re-halting within ~minTrades closes if they do not. A trade whose
+  // `ts` is missing or unparseable is never aged out (kept as in-window), so
+  // callers that omit ts keep the prior count-only behaviour. maxAgeMs <= 0
+  // disables the clock entirely.
+  let agedOutCount = 0;
+  let timeScoped = filtered;
+  if (cfg.maxAgeMs > 0) {
+    timeScoped = filtered.filter((t) => {
+      const parsed = t?.ts ? Date.parse(t.ts) : NaN;
+      if (!Number.isFinite(parsed)) return true; // unknown age → keep in-window
+      const fresh = (nowMs - parsed) <= cfg.maxAgeMs;
+      if (!fresh) agedOutCount += 1;
+      return fresh;
+    });
+  }
+
+  const recent = cfg.lookbackTrades > 0 ? timeScoped.slice(-cfg.lookbackTrades) : timeScoped;
   if (recent.length < cfg.minTrades) {
-    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length, excludedSymbolTradeCount };
+    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length, excludedSymbolTradeCount, agedOutCount };
   }
   let sum = 0;
   for (const t of recent) sum += t.realizedNetBps;
@@ -414,6 +451,7 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     sampleSize: recent.length,
     realizedAvgNetBps: avg,
     excludedSymbolTradeCount,
+    agedOutCount,
   };
 }
 
