@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Constants from 'expo-constants';
 import {
   ActivityIndicator,
@@ -18,130 +18,94 @@ import {
 } from 'react-native';
 
 // ============================================================================
-// MAGIC TRADER — theatrical scalper dashboard
+// MAGIC MONEY — single-page console
 // ----------------------------------------------------------------------------
-// Single-file Expo app. Drop into App.js and run via Expo Go.
+// One screen. Answers two questions, in order:
+//   1. Running, or does it need me?   → STATUS (top, glanceable)
+//   2. What's it doing?               → the rest (dense, real, no fluff)
 //
-// Backend contract (unchanged, plug-compatible with the previous frontend):
-//   GET /dashboard        — full snapshot powering Stage / Cast / Backstage
-//   GET /debug/logs       — ring buffer of structured log lines
+// Aesthetic: engineered minimalism, coastal light, one bold pink accent.
+// Numbers live in monospace. Copy is terse. Cards arrive, they don't appear.
+// Law: every figure is a real /dashboard field. Missing = "—". Never a fake 0.
 //
-// Auth contract (unchanged):
+// Backend contract (unchanged): GET /dashboard
 //   EXPO_PUBLIC_BACKEND_URL  — base URL (default https://magic-lw8t.onrender.com)
-//   EXPO_PUBLIC_API_TOKEN    — optional bearer token (some endpoints public)
-//
-// Pure UI rewrite. Polling, retry, error boundary, and AppState pause/resume
-// are preserved verbatim from the previous version so behaviour stays stable.
+//   EXPO_PUBLIC_API_TOKEN    — optional bearer token (dashboard is public)
 // ============================================================================
 
-// ----------------------------------------------------------------------------
-// Theme — burlesque velvet, gold trim, hot magenta, vibrant green / rose.
-// Colour rules: green = good, rose = bad. Always.
-// ----------------------------------------------------------------------------
-const palette = {
-  velvet:      '#0E0820',  // deep aubergine — curtain
-  velvetSoft:  '#1A0F30',  // raised surface
-  velvetEdge:  '#2A1A4A',  // borders, dividers
-  velvetGlow:  '#3D2466',  // subtle highlight
-  gold:        '#F6C667',  // accent / "waiting" / calm
-  goldDim:     '#A8884A',
-  rose:        '#FF3D71',  // losses, errors, drawdown
-  roseDim:     '#9C1F44',
-  rosePale:    '#3A1224',  // tinted bg for negatives
-  emerald:     '#10D481',  // wins, ok, ascending
-  emeraldDim:  '#0E7F4F',
-  emeraldPale: '#0E2A1F',  // tinted bg for positives
-  magenta:     '#FF1F8C',  // active scanning, accent
-  magentaSoft: '#5C0E37',
-  cream:       '#F4ECDA',  // primary text
-  pearl:       '#D8CFB7',  // secondary text
-  fog:         '#7E7390',  // tertiary
-  ink:         '#070414',
+// Coastal light + confident pink. Green up / red down — pink is brand, not loss.
+const C = {
+  paper:    '#F6F2EA', // warm off-white ground
+  card:     '#FFFFFF',
+  ink:      '#15131A', // near-black
+  ink2:     '#2C2833',
+  sub:      '#69646F',
+  faint:    '#9C97A2',
+  line:     '#E7E0D4', // hairline
+  pink:     '#FF2D78', // brand / active / interactive
+  pinkSoft: '#FFE3EE',
+  up:       '#0F9E78', // gains
+  upSoft:   '#DBF1E9',
+  down:     '#E23B40', // losses
+  downSoft: '#FAE0E1',
+  amber:    '#BE8508', // caution / paused
+  amberSoft:'#F6EBCB',
 };
 
 const T = {
-  c: palette,
   font: Platform.OS === 'ios' ? 'System' : 'sans-serif',
-  fontMono: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  sp: { xxs: 2, xs: 4, sm: 8, md: 12, lg: 16, xl: 20, xxl: 28, huge: 40 },
-  r: { sm: 8, md: 14, lg: 20, xl: 28 },
+  mono: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+  sp: { xxs: 2, xs: 4, sm: 8, md: 12, lg: 16, xl: 22, xxl: 30, huge: 44 },
+  r: { sm: 8, md: 12, lg: 18, xl: 24 },
 };
 
 // ----------------------------------------------------------------------------
-// Backend config (unchanged from previous frontend).
+// Backend config (preserved behaviour from the prior frontend).
 // ----------------------------------------------------------------------------
 const POLL_MS = 20000;
-const LOG_POLL_MS = 5000;
 const TICKER_MS = 1000;
 const FETCH_TIMEOUT_MS = 20000;
+const STALE_WARN_MS = 90000;
+const STALE_BAD_MS = 240000;
 const DEFAULT_BACKEND_URL = 'https://magic-lw8t.onrender.com';
 
 function readExpoExtraConfig() {
-  const expoConfigExtra = Constants.expoConfig?.extra;
-  const manifest2Extra = Constants.manifest2?.extra?.expoClient?.extra;
-  const extra = expoConfigExtra ?? manifest2Extra;
+  const a = Constants.expoConfig?.extra;
+  const b = Constants.manifest2?.extra?.expoClient?.extra;
+  const extra = a ?? b;
   return extra && typeof extra === 'object' ? extra : {};
 }
-
-function readStringConfig(value) {
-  return String(value || '').trim();
-}
-
+const str = (v) => String(v || '').trim();
 function readWebOriginFallback() {
   if (Platform.OS !== 'web') return '';
   if (typeof window === 'undefined' || !window?.location?.origin) return '';
-  const origin = readStringConfig(window.location.origin);
-  return /^https?:\/\//i.test(origin) ? origin : '';
+  const o = str(window.location.origin);
+  return /^https?:\/\//i.test(o) ? o : '';
 }
-
 function resolveBackendConfig() {
   const extra = readExpoExtraConfig();
-  const envBackendUrl = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
-  const extraBackendUrl = readStringConfig(extra?.backendUrl);
-  const defaultBackendUrl = readStringConfig(DEFAULT_BACKEND_URL);
-  const webOriginFallback = readWebOriginFallback();
-  const envApiToken = readStringConfig(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
-  const extraApiToken = readStringConfig(extra?.apiToken);
-  const baseUrl = envBackendUrl || extraBackendUrl || defaultBackendUrl || webOriginFallback;
-  const apiToken = envApiToken || extraApiToken || '';
-  if (baseUrl) {
-    let warning = null;
-    if (!envBackendUrl) {
-      if (extraBackendUrl) warning = 'Using expo extra.backendUrl (not env).';
-      else if (defaultBackendUrl) warning = 'Using built-in backend URL.';
-      else if (webOriginFallback) warning = 'Using web origin fallback.';
-    }
-    return { baseUrl, apiToken, warning, missing: false };
-  }
-  return {
-    baseUrl: null,
-    apiToken,
-    warning: 'Missing required EXPO_PUBLIC_BACKEND_URL.',
-    missing: true,
-  };
+  const envUrl = str(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_BACKEND_URL : '');
+  const extraUrl = str(extra?.backendUrl);
+  const defUrl = str(DEFAULT_BACKEND_URL);
+  const webUrl = readWebOriginFallback();
+  const envTok = str(typeof process !== 'undefined' ? process?.env?.EXPO_PUBLIC_API_TOKEN : '');
+  const extraTok = str(extra?.apiToken);
+  const baseUrl = envUrl || extraUrl || defUrl || webUrl;
+  const apiToken = envTok || extraTok || '';
+  return baseUrl ? { baseUrl, apiToken, missing: false } : { baseUrl: null, apiToken, missing: true };
 }
-
 const BACKEND = resolveBackendConfig();
 const BASE_URL = BACKEND.baseUrl;
 const API_TOKEN = BACKEND.apiToken;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function makeHeaders() {
   const h = { Accept: 'application/json' };
-  if (API_TOKEN) {
-    h.Authorization = `Bearer ${API_TOKEN}`;
-    h['x-api-key'] = API_TOKEN;
-  }
+  if (API_TOKEN) { h.Authorization = `Bearer ${API_TOKEN}`; h['x-api-key'] = API_TOKEN; }
   return h;
 }
-
 async function apiFetch(path) {
-  if (!BASE_URL) {
-    const e = new Error('Missing EXPO_PUBLIC_BACKEND_URL');
-    e.status = 503;
-    throw e;
-  }
+  if (!BASE_URL) { const e = new Error('Missing EXPO_PUBLIC_BACKEND_URL'); e.status = 503; throw e; }
   const url = `${String(BASE_URL).replace(/\/$/, '')}${path}`;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -149,33 +113,21 @@ async function apiFetch(path) {
   try {
     res = await fetch(url, { headers: makeHeaders(), signal: controller.signal });
   } catch (err) {
-    if (err?.name === 'AbortError') {
-      const e = new Error(`Timeout after ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`);
-      e.status = 408;
-      throw e;
-    }
+    if (err?.name === 'AbortError') { const e = new Error(`Timeout after ${Math.round(FETCH_TIMEOUT_MS / 1000)}s`); e.status = 408; throw e; }
     throw err;
-  } finally {
-    clearTimeout(tid);
-  }
+  } finally { clearTimeout(tid); }
   const text = await res.text();
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch { /* ignore */ }
-  if (!res.ok) {
-    const e = new Error(json?.error || json?.message || text || 'Request failed');
-    e.status = res.status;
-    throw e;
-  }
+  if (!res.ok) { const e = new Error(json?.error || json?.message || text || 'Request failed'); e.status = res.status; throw e; }
   return json;
 }
-
 function isTransient(err) {
-  const s = Number(err?.status);
-  if ([408, 425, 429, 500, 502, 503, 504].includes(s)) return true;
+  const sc = Number(err?.status);
+  if ([408, 425, 429, 500, 502, 503, 504].includes(sc)) return true;
   const m = String(err?.message || '').toLowerCase();
   return m.includes('timed out') || m.includes('network') || m.includes('failed to fetch');
 }
-
 async function fetchWithRetry(path, retries = 0) {
   let last = null;
   for (let i = 0; i <= retries; i++) {
@@ -189,1300 +141,456 @@ async function fetchWithRetry(path, retries = 0) {
 }
 
 // ----------------------------------------------------------------------------
-// Formatting helpers.
+// Null-safe formatting. num() is the truth guardrail: Number(null)===0, so a
+// naive parse fakes a zero out of every missing field. Map empties → null → "—".
 // ----------------------------------------------------------------------------
-// num — null-safe number parse. CRITICAL: `Number(null)` and `Number('')` are
-// both 0 (a finite number), so a naive parse turns every missing/null backend
-// field into a fake 0 — the root of the "everything shows zeros" bug, since the
-// Binance position shape returns avg_entry_price / unrealized_pl / etc. as null.
-// We map null / undefined / '' to null so callers can fall back or render "—".
-const num = (v) => {
-  if (v == null || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
-
-function usd(v, decimals = 2) {
-  const n = num(v);
-  if (n == null) return '—';
-  return `$${n.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })}`;
-}
-
-function signedUsd(v) {
-  const n = num(v);
-  if (n == null) return '—';
-  const sign = n >= 0 ? '+' : '−';
-  const abs = Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return `${sign}$${abs}`;
-}
-
-function pct(v, decimals = 2) {
-  const n = num(v);
-  if (n == null) return '—';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(decimals)}%`;
-}
-
-function fmtBps(v) {
-  const n = num(v);
-  if (n == null) return '—';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(1)} bps`;
-}
-
-function liveAge(iso) {
-  const ms = Date.parse(String(iso || ''));
-  if (!Number.isFinite(ms)) return null;
-  return Math.max(0, Date.now() - ms);
-}
-
-function fmtElapsed(elapsedMs) {
-  if (elapsedMs == null) return '—';
-  const s = Math.floor(elapsedMs / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
+const num = (v) => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+function usd(v, d = 2) { const n = num(v); if (n == null) return '—'; return `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`; }
+function signedUsd(v) { const n = num(v); if (n == null) return '—'; const s = n >= 0 ? '+' : '−'; return `${s}$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
+function pct(v, d = 2) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`; }
+function bps(v) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(1)}`; }
+function fmtElapsed(ms) {
+  if (ms == null) return '—';
+  const sec = Math.floor(Math.abs(ms) / 1000);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
+  if (h < 24) return `${h}h${m % 60 ? ` ${m % 60}m` : ''}`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
-
-function fmtLogTime(ts) {
-  const d = new Date(ts);
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
+function prettySignal(v) {
+  const k = String(v || '').toLowerCase();
+  if (!k) return '—';
+  if (k.startsWith('btc_lead_lag')) return 'BTC Lag';
+  if (k.startsWith('mean_reversion')) return 'Mean Rev';
+  if (k.startsWith('microstructure')) return 'Microstr';
+  if (k === 'ols') return 'OLS';
+  if (k === 'barrier') return 'Barrier';
+  if (k === 'multi_factor') return 'Multi-F';
+  return String(v);
 }
+function regimeWord(r) {
+  const k = String(r || '').toLowerCase();
+  const map = { flat: 'Flat', benign: 'Friendly', adverse: 'Choppy', quiet: 'Quiet', wild: 'Wild' };
+  return map[k] || (r ? String(r) : '—');
+}
+const symShort = (x) => String(x || '').replace('/USD', '').replace('USD', '') || '—';
 
 // ----------------------------------------------------------------------------
-// derivePosition — single source of truth for every per-token number.
-//
-// THE ZEROS BUG: on Binance.US the position object returns avg_entry_price,
-// unrealized_pl, unrealized_plpc and cost_basis as NULL (those are Alpaca-only
-// fields). The old tiles read them directly, so entry price, P&L and % all
-// rendered blank/zero. The real data is present elsewhere: the entry price is
-// in the attached entry forensics (`forensics.buyLimit`), current_price +
-// market_value are populated, the resting take-profit is `sell.activeLimit`,
-// and the signal's per-trade target lives in `forensics` / `bot`. We recompute
-// everything here so each tile shows live, non-zero values — and fall back to a
-// clean null (rendered as "—") only when a field is genuinely absent.
+// computeHealth — the verdict brain. Pure (data, error, age) → status.
+// Severity order. Copy is terse and never apologetic.
 // ----------------------------------------------------------------------------
-function derivePosition(p) {
-  const fz = p?.forensics || {};
-  const bot = p?.bot || {};
-  const symbol = String(p?.symbol || '—');
-  const symShort = symbol.replace('/USD', '').replace('USD', '');
-  const qty = num(p?.qty);
-  const current = num(p?.current_price);
-  const marketValue = num(p?.market_value);
-  // entry: prefer the venue avg, then the entry forensics (Binance path).
-  const entry = num(p?.avg_entry_price) ?? num(fz.buyLimit) ?? num(bot.entryPrice);
-  // unrealized P&L: prefer venue-reported, else derive from entry + current.
-  let upl = num(p?.unrealized_pl);
-  let uplPct = num(p?.unrealized_plpc);
-  if (uplPct != null && Math.abs(uplPct) <= 1.5) uplPct *= 100; // Alpaca reports a fraction
-  if (upl == null && entry != null && current != null && qty != null) {
-    upl = qty * (current - entry);
+function computeHealth({ data, error, ageMs }) {
+  const red = (label, line, act) => ({ level: 'red', label, line, act });
+  const amber = (label, line, act) => ({ level: 'amber', label, line, act });
+  const green = (label, line, act) => ({ level: 'green', label, line, act });
+
+  if (error || !data) return red('OFFLINE', 'Dashboard unreachable.', 'Ping Claude — likely a deploy or network blip.');
+  if (ageMs != null && ageMs > STALE_BAD_MS) return red('SILENT', `No fresh read in ${fmtElapsed(ageMs)}.`, 'Check the Render deploy, or ask Claude.');
+
+  const meta = data.meta || {};
+  const acct = data.account || {};
+  if (acct.account_blocked || acct.trading_blocked) return red('BLOCKED', 'Exchange halted the account.', 'Check Binance.US for holds.');
+
+  if (meta.truth?.backendReachable === false) return red('NO FEED', 'Engine lost market data.', 'Ping Claude.');
+  const engine = meta.engineState ?? meta.runtime?.engineState ?? meta.truth?.engineState ?? null;
+  if (!engine) return amber('BOOTING', 'Engine just started.', null);
+
+  const veto = meta.signalSelector?.realizedVeto || {};
+  const halt = meta.risk?.tradingHaltedReason;
+  if (veto.veto || halt) {
+    const line = veto.veto
+      ? `Brake on. Last ${veto.sampleSize ?? '?'} ${prettySignal(veto.signalVersion)}: ${bps(veto.realizedAvgNetBps)} vs ${bps(veto.floorBps)} floor.`
+      : `Halted: ${String(halt)}.`;
+    return amber('PAUSED', line, 'Your call — it re-tests itself.');
   }
-  if (uplPct == null && entry != null && current != null && entry !== 0) {
-    uplPct = (current / entry - 1) * 100;
-  }
-  // take-profit target price + the signal's per-trade net target.
-  const grossBps = num(fz.signalDerivedGrossBps) ?? num(fz.grossTargetBps);
-  const targetPrice = num(p?.sell?.activeLimit) ?? num(bot.targetPrice)
-    ?? (entry != null && grossBps != null ? entry * (1 + grossBps / 10000) : null);
-  const targetNetBps = num(fz.targetNetProfitBps) ?? num(bot.expectedNetProfitBps) ?? num(fz.signalDerivedNetBps);
-  const stopBps = num(fz.stopLossBpsResolved) ?? num(fz.staticStopLossBps);
-  const spreadBps = num(fz.spreadBps);
-  const volBps = num(fz.volatilityBps);
-  const signal = fz.signalVersion || bot.signalVersion || null;
-  const state = p?.state || null;
-  // progress entry → target (clamped), and distance current → target (%).
-  let progress = 0;
-  if (entry != null && current != null && targetPrice != null && targetPrice !== entry) {
-    progress = Math.max(-0.5, Math.min(1.2, (current - entry) / (targetPrice - entry)));
-  }
-  const distToTargetPct = (current != null && targetPrice != null && current !== 0)
-    ? ((targetPrice - current) / current) * 100 : null;
-  const tone = upl == null ? 'neutral' : upl >= 0 ? 'good' : 'bad';
-  return {
-    symbol, symShort, qty, entry, current, marketValue, upl, uplPct,
-    targetPrice, targetNetBps, stopBps, spreadBps, volBps, signal, state,
-    progress, distToTargetPct, tone,
-  };
+  return green('RUNNING', 'Awake, scanning, clear to trade.', null);
 }
+const lvlColor = (l) => (l === 'green' ? C.up : l === 'amber' ? C.amber : C.down);
+const lvlSoft = (l) => (l === 'green' ? C.upSoft : l === 'amber' ? C.amberSoft : C.downSoft);
 
 // ----------------------------------------------------------------------------
-// computePortfolio — the backend does NOT emit an aggregate `portfolio` object;
-// it exposes per-position unrealized P&L and the account snapshot. Derive the
-// open P&L (sum of unrealized P&L) and its percentage (against cost basis) here
-// so the Stage's headline number isn't permanently blank. Cost basis per
-// position is market_value − unrealized_pl, falling back to qty × avg entry.
+// Motion + primitives.
 // ----------------------------------------------------------------------------
-function computePortfolio(data) {
-  const positions = Array.isArray(data?.positions) ? data.positions : [];
-  let totalPL = 0;
-  let totalCost = 0;
-  let exposure = 0;
-  let sawPL = false;
-  for (const p of positions) {
-    const d = derivePosition(p);
-    if (d.upl != null) { totalPL += d.upl; sawPL = true; }
-    const cost = (d.entry != null && d.qty != null)
-      ? d.entry * d.qty
-      : (d.marketValue != null && d.upl != null ? d.marketValue - d.upl : null);
-    if (cost != null) totalCost += cost;
-    if (d.marketValue != null) exposure += d.marketValue;
-  }
-  const portfolioValue = num(data?.account?.portfolio_value) ?? num(data?.account?.equity) ?? null;
-  const cash = num(data?.account?.cash) ?? num(data?.account?.buying_power) ?? null;
-  const openPL = sawPL ? totalPL : null;
-  const openPLPct = openPL != null && totalCost > 0 ? (openPL / totalCost) * 100 : null;
-  return { portfolioValue, cash, openPL, openPLPct, exposure, positionCount: positions.length };
-}
-
-// ----------------------------------------------------------------------------
-// Gradient — zero-dependency shim. We avoid expo-linear-gradient because
-// pasting App.js straight into Expo Go can fail to resolve native modules.
-// We approximate a soft diagonal gradient by layering two semi-transparent
-// fills on top of a solid base colour. Same prop surface as Gradient
-// (colors[], start, end ignored, style, children) so the rest of the file
-// stays unchanged.
-// ----------------------------------------------------------------------------
-function Gradient({ colors = [], style, children }) {
-  const base = colors[0] || palette.velvet;
-  const tint = colors[1] || base;
-  return (
-    <View style={[style, { backgroundColor: base, overflow: 'hidden' }]}>
-      {tint !== base ? (
-        <View
-          pointerEvents="none"
-          style={{
-            position: 'absolute',
-            top: 0, left: 0, right: 0, bottom: 0,
-            backgroundColor: tint,
-            opacity: 0.45,
-          }}
-        />
-      ) : null}
-      {tint !== base ? (
-        <View
-          pointerEvents="none"
-          style={{
-            position: 'absolute',
-            top: 0, left: 0, right: '50%', bottom: '50%',
-            backgroundColor: base,
-            opacity: 0.5,
-          }}
-        />
-      ) : null}
-      <View style={{ position: 'relative' }}>{children}</View>
-    </View>
-  );
-}
-
-// ----------------------------------------------------------------------------
-// useTicker — triggers a re-render every interval so live "Xs ago" labels
-// count up smoothly. Pauses when the app is backgrounded (caller passes ref).
-// ----------------------------------------------------------------------------
-function useTicker(intervalMs = TICKER_MS, activeRef) {
+function useTicker(activeRef) {
   const [, setTick] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => {
-      if (!activeRef || activeRef.current) setTick((n) => (n + 1) & 0xffff);
-    }, intervalMs);
+    const id = setInterval(() => { if (!activeRef || activeRef.current) setTick((n) => (n + 1) & 0xffff); }, TICKER_MS);
     return () => clearInterval(id);
-  }, [intervalMs, activeRef]);
+  }, [activeRef]);
 }
 
-// ----------------------------------------------------------------------------
-// Pulse — subtle pulsing dot, used for the engine state badge. Native driver
-// so it stays smooth without re-rendering the tree every frame.
-// ----------------------------------------------------------------------------
-function Pulse({ color = palette.magenta, size = 10, on = true }) {
-  const opacity = useRef(new Animated.Value(0.4)).current;
-  const scale = useRef(new Animated.Value(1)).current;
+// Reveal — content arrives: rises + fades on mount, staggered by `delay`.
+function Reveal({ delay = 0, children, style }) {
+  const a = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    if (!on) {
-      opacity.setValue(0.6);
-      scale.setValue(1);
-      return undefined;
-    }
-    const loop = Animated.loop(
-      Animated.parallel([
-        Animated.sequence([
-          Animated.timing(opacity, { toValue: 1, duration: 700, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-          Animated.timing(opacity, { toValue: 0.4, duration: 700, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-        ]),
-        Animated.sequence([
-          Animated.timing(scale, { toValue: 1.35, duration: 700, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-          Animated.timing(scale, { toValue: 1, duration: 700, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
-        ]),
-      ])
-    );
+    Animated.timing(a, { toValue: 1, duration: 460, delay, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [a, delay]);
+  return (
+    <Animated.View style={[style, { opacity: a, transform: [{ translateY: a.interpolate({ inputRange: [0, 1], outputRange: [16, 0] }) }] }]}>
+      {children}
+    </Animated.View>
+  );
+}
+
+// Pulse — live heartbeat dot. Native driver.
+function Pulse({ color = C.pink, size = 9, on = true }) {
+  const o = useRef(new Animated.Value(0.5)).current;
+  const sc = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    if (!on) { o.setValue(0.45); sc.setValue(1); return undefined; }
+    const loop = Animated.loop(Animated.parallel([
+      Animated.sequence([
+        Animated.timing(o, { toValue: 1, duration: 780, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        Animated.timing(o, { toValue: 0.4, duration: 780, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+      ]),
+      Animated.sequence([
+        Animated.timing(sc, { toValue: 1.5, duration: 780, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+        Animated.timing(sc, { toValue: 1, duration: 780, easing: Easing.inOut(Easing.quad), useNativeDriver: true }),
+      ]),
+    ]));
     loop.start();
     return () => loop.stop();
-  }, [on, opacity, scale]);
+  }, [on, o, sc]);
   return (
     <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
-      <Animated.View
-        style={{
-          width: size,
-          height: size,
-          borderRadius: size / 2,
-          backgroundColor: color,
-          opacity,
-          transform: [{ scale }],
-          shadowColor: color,
-          shadowOffset: { width: 0, height: 0 },
-          shadowOpacity: 0.8,
-          shadowRadius: size,
-        }}
-      />
+      <Animated.View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: color, opacity: o, transform: [{ scale: sc }] }} />
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-// Bar — a horizontal progress bar used for "distance to target" mini-meter.
-// Negative values render in rose, positive in emerald, capped at the edges.
-// ----------------------------------------------------------------------------
-function Bar({ value, height = 8 }) {
-  // value in [-0.5, 1.2]; 0 = entry, 1 = target. Below 0 = drawdown.
-  const v = Math.max(-0.5, Math.min(1.2, num(value) ?? 0));
-  const positiveWidth = Math.max(0, Math.min(1, v)) * 100;
-  const negativeWidth = v < 0 ? Math.max(0, Math.min(0.5, -v)) * 100 : 0;
-  const overWidth = v > 1 ? Math.max(0, Math.min(0.2, v - 1)) * 100 : 0;
+function Card({ children, style, accent }) {
+  return <View style={[s.card, accent ? { borderLeftColor: accent, borderLeftWidth: 3 } : null, style]}>{children}</View>;
+}
+function Label({ children }) { return <Text style={s.label}>{children}</Text>; }
+
+// A spec row: label left, mono value right. The workhorse of the dense view.
+function Row({ k, v, tone, last }) {
+  const color = tone === 'up' ? C.up : tone === 'down' ? C.down : tone === 'pink' ? C.pink : C.ink;
   return (
-    <View style={{ height, backgroundColor: palette.velvetEdge, borderRadius: height / 2, overflow: 'hidden', position: 'relative' }}>
-      {/* Center line at "0" */}
-      <View style={{ position: 'absolute', left: '33%', top: 0, bottom: 0, width: 1, backgroundColor: palette.fog, opacity: 0.3 }} />
-      {/* Negative (drawdown) extends LEFT from center */}
-      {negativeWidth > 0 && (
-        <View
-          style={{
-            position: 'absolute',
-            top: 0, bottom: 0,
-            right: '67%',
-            width: `${negativeWidth * 0.66}%`,
-            backgroundColor: palette.rose,
-          }}
-        />
-      )}
-      {/* Positive (toward target) extends RIGHT from center */}
-      {positiveWidth > 0 && (
-        <View
-          style={{
-            position: 'absolute',
-            top: 0, bottom: 0,
-            left: '33%',
-            width: `${positiveWidth * 0.5}%`,
-            backgroundColor: palette.emerald,
-          }}
-        />
-      )}
-      {/* Overshoot beyond target */}
-      {overWidth > 0 && (
-        <View
-          style={{
-            position: 'absolute',
-            top: 0, bottom: 0,
-            left: '83%',
-            width: `${overWidth * 0.85}%`,
-            backgroundColor: palette.gold,
-          }}
-        />
-      )}
+    <View style={[s.specRow, last ? null : s.specRowBorder]}>
+      <Text style={s.specKey}>{k}</Text>
+      <Text style={[s.specVal, { color }]} numberOfLines={1}>{v}</Text>
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-// Mood — picks a theatrical headline + colour based on portfolio + scan state.
-// ----------------------------------------------------------------------------
-function deriveMood({ openPL, engineOk, scanInProgress, hasPositions }) {
-  if (!engineOk) return { label: '🌑 LIGHTS OUT', sub: 'Engine unreachable', color: palette.rose, accent: palette.rose };
-  const pl = num(openPL);
-  if (!hasPositions && scanInProgress) return { label: '🔮 PROWLING', sub: 'Scanning the universe', color: palette.magenta, accent: palette.magenta };
-  if (!hasPositions) return { label: '🪞 INTERMISSION', sub: 'Waiting for the next scene', color: palette.gold, accent: palette.gold };
-  if (pl == null) return { label: '🎭 ON STAGE', sub: 'Positions live', color: palette.gold, accent: palette.gold };
-  if (pl >= 0.5) return { label: '✨ STANDING OVATION', sub: 'Profits growing', color: palette.emerald, accent: palette.emerald };
-  if (pl >= 0) return { label: '🌟 IN THE SPOTLIGHT', sub: 'Slightly green', color: palette.emerald, accent: palette.emerald };
-  if (pl >= -0.5) return { label: '🎭 ON STAGE', sub: 'Holding the line', color: palette.gold, accent: palette.gold };
-  if (pl >= -2) return { label: '🥀 BLEEDING ROUGE', sub: 'Drawdown — strategy intact', color: palette.rose, accent: palette.rose };
-  return { label: '🌧️ STORM ON STAGE', sub: 'Heavy drawdown', color: palette.rose, accent: palette.rose };
-}
-
-// ----------------------------------------------------------------------------
-// HeaderStrip — top of every tab. Pulse dot, app name, build / version.
-// ----------------------------------------------------------------------------
-// interpretMonitor — turn a /monitor payload into a single health verdict the
-// header pill + Backstage panel both read. Returns { tone, label, hb }.
-//   green  = trading, no flags
-//   gold   = veto active (benign — the safety brake is halting new entries)
-//   rose   = a real alert flag is present ([EXEC_FAIL]/[EQUITY_LOW]/[VETO_NEW])
-function interpretMonitor(monitor) {
-  const hb = monitor?.latest || null;
-  if (!hb) return { tone: 'idle', label: 'monitor —', hb: null };
-  const flags = Array.isArray(hb.flags) ? hb.flags : [];
-  if (flags.length > 0) return { tone: 'bad', label: flags.join(' · '), hb };
-  if (hb.veto) return { tone: 'warn', label: 'safety veto', hb };
-  return { tone: 'good', label: 'healthy', hb };
-}
-
-function HeaderStrip({ engineState, scanInProgress, lastScanAt, version, monitor }) {
-  const pulseColor = !engineState ? palette.fog
-    : scanInProgress ? palette.magenta
-    : String(engineState).toLowerCase() === 'ready' ? palette.emerald
-    : palette.gold;
-  const ageMs = liveAge(lastScanAt);
-  const mon = interpretMonitor(monitor);
-  const monColor = mon.tone === 'good' ? palette.emerald
-    : mon.tone === 'warn' ? palette.gold
-    : mon.tone === 'bad' ? palette.rose
-    : palette.fog;
+// Stat block (used in the headline grid).
+function Stat({ k, v, tone }) {
+  const color = tone === 'up' ? C.up : tone === 'down' ? C.down : C.ink;
   return (
-    <View style={s.headerStrip}>
-      <View style={s.headerLeft}>
-        <Pulse color={pulseColor} size={11} on={Boolean(engineState)} />
-        <View style={{ marginLeft: T.sp.sm }}>
-          <Text style={s.headerTitle}>MAGIC TRADER</Text>
-          <Text style={s.headerSub}>
-            {scanInProgress ? 'scanning' : (engineState || 'offline')}
-            {ageMs != null ? ` · last scan ${fmtElapsed(ageMs)} ago` : ''}
-          </Text>
-        </View>
-      </View>
-      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-        {/* Monitor health pill — at-a-glance "is the bot ok?" without leaving the header. */}
-        <View style={[s.monPill, { borderColor: monColor }]}>
-          <View style={[s.monDot, { backgroundColor: monColor }]} />
-          <Text style={[s.monPillText, { color: monColor }]} numberOfLines={1}>{mon.label}</Text>
-        </View>
-        {version ? (
-          <View style={[s.versionPill, { marginLeft: T.sp.xs }]}>
-            <Text style={s.versionPillText}>{String(version).slice(0, 7)}</Text>
-          </View>
-        ) : null}
-      </View>
+    <View style={s.stat}>
+      <Text style={s.statK}>{k}</Text>
+      <Text style={[s.statV, { color }]} numberOfLines={1}>{v}</Text>
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-// Banner — tinted info strip used for warnings, errors, fun status.
-// ----------------------------------------------------------------------------
-function Banner({ tone = 'info', children }) {
-  const map = {
-    info: { bg: 'rgba(246, 198, 103, 0.10)', border: palette.gold, text: palette.gold },
-    error: { bg: 'rgba(255, 61, 113, 0.10)', border: palette.rose, text: palette.rose },
-    ok: { bg: 'rgba(16, 212, 129, 0.10)', border: palette.emerald, text: palette.emerald },
-  };
-  const c = map[tone] || map.info;
+function Meter({ value, color = C.pink, height = 8 }) {
+  const v = value == null ? 0 : Math.max(0, Math.min(1, value));
   return (
-    <View style={[s.banner, { backgroundColor: c.bg, borderColor: c.border }]}>
-      <Text style={[s.bannerText, { color: c.text }]}>{children}</Text>
+    <View style={{ height, backgroundColor: C.line, borderRadius: height / 2, overflow: 'hidden' }}>
+      <View style={{ height: '100%', width: `${v * 100}%`, backgroundColor: color, borderRadius: height / 2 }} />
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-// MoneyTile — the giant portfolio-value tile on the Stage.
-// ----------------------------------------------------------------------------
-function MoneyTile({ portfolioValue, openPL, openPLPct, mood, deltaSinceLast }) {
-  const pl = num(openPL);
-  const arrow = pl == null ? '·' : pl >= 0 ? '▲' : '▼';
-  const arrowColor = pl == null ? palette.gold : pl >= 0 ? palette.emerald : palette.rose;
-  return (
-    <Gradient
-      colors={[palette.velvetSoft, palette.velvet]}
-      start={{ x: 0, y: 0 }}
-      end={{ x: 1, y: 1 }}
-      style={s.moneyTile}
-    >
-      <View style={s.moneyMoodRow}>
-        <Text style={[s.moneyMoodLabel, { color: mood.color }]} numberOfLines={1}>{mood.label}</Text>
-      </View>
-      <Text style={s.moneyValue}>{usd(portfolioValue)}</Text>
-      <Text style={[s.moneySub, { color: mood.color }]}>{mood.sub}</Text>
-      <View style={s.moneyDeltaRow}>
-        <Text style={[s.moneyDelta, { color: arrowColor }]}>{arrow} {signedUsd(openPL)} ({pct(openPLPct)})</Text>
-        {deltaSinceLast != null ? (
-          <Text style={[s.moneyDeltaSub, { color: deltaSinceLast > 0 ? palette.emerald : deltaSinceLast < 0 ? palette.rose : palette.fog }]}>
-            {deltaSinceLast > 0 ? '▲' : deltaSinceLast < 0 ? '▼' : '·'} {signedUsd(deltaSinceLast)} since last poll
-          </Text>
-        ) : null}
-      </View>
-    </Gradient>
-  );
-}
+// ============================================================================
+// SECTIONS
+// ============================================================================
 
-// ----------------------------------------------------------------------------
-// StatTriple — three side-by-side big stat cards (Open P&L / Win % / TP fill).
-// ----------------------------------------------------------------------------
-function StatTriple({ items }) {
+// STATUS — the glance. Bold word, dot, one terse line, action only if needed.
+function Status({ health }) {
+  const color = lvlColor(health.level);
   return (
-    <View style={s.statRow}>
-      {items.map((it, idx) => {
-        const tone = it.tone || 'neutral';
-        const color = tone === 'good' ? palette.emerald : tone === 'bad' ? palette.rose : palette.gold;
-        return (
-          <View key={idx} style={[s.statCell, { borderColor: 'rgba(255,255,255,0.06)' }]}>
-            <Text style={s.statLabel}>{it.label}</Text>
-            <Text style={[s.statValue, { color }]} numberOfLines={1}>{it.value}</Text>
-            {it.sub ? <Text style={s.statSub}>{it.sub}</Text> : null}
-          </View>
-        );
-      })}
+    <View style={[s.status, { backgroundColor: lvlSoft(health.level) }]}>
+      <View style={s.statusTop}>
+        <Pulse color={color} size={11} on={health.level !== 'red'} />
+        <Text style={[s.statusWord, { color }]}>{health.label}</Text>
+      </View>
+      <Text style={s.statusLine}>{health.line}</Text>
+      {health.act ? (
+        <View style={[s.statusAct, { borderColor: color }]}>
+          <Text style={[s.statusActText, { color }]}>{health.act}</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-// Chip — small in-theme label pill. Used for per-token signal/spread/stop tags.
-// ----------------------------------------------------------------------------
-function Chip({ label, tone = 'neutral' }) {
-  const color = tone === 'good' ? palette.emerald : tone === 'bad' ? palette.rose : palette.gold;
+// MONEY — the headline. Big mono equity, then the deltas that matter.
+function Money({ data }) {
+  const meta = data.meta || {};
+  const acct = data.account || {};
+  const ep = meta.performanceEpoch || {};
+  const equity = num(acct.equity) ?? num(acct.portfolio_value) ?? num(ep.currentEquity);
+  const cash = num(acct.cash) ?? num(acct.buying_power);
+  const sUsd = num(ep.pnlUsd);
+  const sPct = num(ep.pctChange);
+  const week = num(meta.weeklyChangePct);
+  const sc = ep.scorecard || {};
+  const trades = num(sc.totalClosedTrades);
+  const win = num(sc.winRate);
   return (
-    <View style={[s.chip, { borderColor: color }]}>
-      <Text style={[s.chipText, { color }]} numberOfLines={1}>{label}</Text>
-    </View>
+    <Card>
+      <Label>EQUITY</Label>
+      <Text style={s.equity}>{usd(equity)}</Text>
+      <View style={s.statGrid}>
+        <Stat k="SINCE RESET" v={`${signedUsd(sUsd)}`} tone={sUsd == null ? null : sUsd >= 0 ? 'up' : 'down'} />
+        <Stat k="" v={pct(sPct)} tone={sPct == null ? null : sPct >= 0 ? 'up' : 'down'} />
+        <Stat k="WEEK" v={pct(week)} tone={week == null ? null : week >= 0 ? 'up' : 'down'} />
+        <Stat k="CASH" v={usd(cash, 0)} />
+      </View>
+      <View style={s.winWrap}>
+        <View style={s.winHead}>
+          <Text style={s.winLabel}>WIN RATE · {trades == null ? 0 : trades} trades since reset</Text>
+          <Text style={s.winVal}>{win == null ? '—' : `${Math.round(win * 100)}%`}</Text>
+        </View>
+        <Meter value={win} color={win != null && win >= 0.5 ? C.up : C.pink} />
+      </View>
+    </Card>
   );
 }
 
-// prettyReason — humanise a backend skip/blocker reason for the watchlist.
-function prettyReason(reason) {
-  const map = {
-    micro_spread_regime_wide: 'spread too wide',
-    micro_prob_below_min: 'edge too low',
-    spread_too_wide: 'spread too wide',
-    stale_quote: 'quote stale',
-    no_quote: 'no quote',
-    universe_hard_allowlist_filtered: 'off allowlist',
-    concurrent_position_cap: 'slots full',
-    realized_expectancy_veto: 'bleed-halt',
-    insufficient_cash: 'low cash',
-    sizing_unavailable: 'sizing n/a',
-  };
-  if (map[reason]) return map[reason];
-  return String(reason || '').replace(/_/g, ' ');
-}
-
-// price formatter that scales decimals to the magnitude of the price.
-function priceFmt(px) {
-  if (px == null) return '—';
-  const abs = Math.abs(px);
-  return usd(px, abs >= 100 ? 2 : abs >= 1 ? 3 : 5);
-}
-
-// ----------------------------------------------------------------------------
-// CastCard — single position tile, big and theatrical. Reads DERIVED values so
-// entry / P&L / % / target are always live (never the null Binance fields).
-// ----------------------------------------------------------------------------
-function CastCard({ position, activeRef }) {
-  useTicker(TICKER_MS, activeRef);
-  const d = derivePosition(position);
-  const accent = d.tone === 'good' ? palette.emerald : d.tone === 'bad' ? palette.rose : palette.gold;
-  const heldSec = num(position?.heldSeconds);
-
+// ENGINE — what it's running, as a tight spec sheet.
+function Engine({ data }) {
+  const meta = data.meta || {};
+  const acct = data.account || {};
+  const veto = meta.signalSelector?.realizedVeto || {};
+  const venue = String(acct.raw_venue || acct.account_number || '').toLowerCase();
+  const venueLabel = venue === 'binance_us' ? 'Binance.US' : venue || '—';
+  const engineState = meta.engineState ?? meta.runtime?.engineState ?? '—';
+  const scanning = String(meta.truth?.currentEntryScanProgress?.state || '').toLowerCase() === 'scanning' || String(engineState).toLowerCase() === 'scanning';
+  const watching = num(meta.scanSymbolsCount);
+  const open = Array.isArray(data.positions) ? data.positions.length : 0;
   return (
-    <Gradient
-      colors={d.tone === 'good'
-        ? [palette.emeraldPale, palette.velvetSoft]
-        : d.tone === 'bad'
-          ? [palette.rosePale, palette.velvetSoft]
-          : [palette.velvetSoft, palette.velvet]}
-      start={{ x: 0, y: 0 }}
-      end={{ x: 1, y: 1 }}
-      style={[s.castCard, { borderColor: accent }]}
-    >
-      <View style={s.castHeader}>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Text style={[s.castSym, { color: palette.cream }]}>{d.symShort}</Text>
-          {d.state ? <Text style={s.castStateBadge}>{String(d.state).toUpperCase()}</Text> : null}
-        </View>
-        <Text style={[s.castPL, { color: accent }]}>{signedUsd(d.upl)}</Text>
-      </View>
-      <View style={s.castSubRow}>
-        <Text style={[s.castPct, { color: accent }]}>{pct(d.uplPct, 3)}</Text>
-        <Text style={s.castMeta}>
-          {d.marketValue != null ? `${usd(d.marketValue)} • ` : ''}held {heldSec != null ? fmtElapsed(heldSec * 1000) : '—'}
-        </Text>
-      </View>
-      <View style={{ marginTop: T.sp.md }}>
-        <Bar value={d.progress} height={10} />
-        <View style={s.castPriceRow}>
-          <Text style={s.castPriceLabel}>entry</Text>
-          <Text style={s.castPriceLabel}>now</Text>
-          <Text style={s.castPriceLabel}>TP {d.targetNetBps != null ? `+${d.targetNetBps.toFixed(0)}bps` : ''}</Text>
-        </View>
-        <View style={s.castPriceRow}>
-          <Text style={s.castPriceVal}>{priceFmt(d.entry)}</Text>
-          <Text style={[s.castPriceVal, { color: accent }]}>{priceFmt(d.current)}</Text>
-          <Text style={s.castPriceVal}>{priceFmt(d.targetPrice)}</Text>
+    <Card>
+      <View style={s.cardHead}>
+        <Label>ENGINE</Label>
+        <View style={s.headPulse}>
+          <Pulse color={scanning ? C.pink : C.faint} size={8} on={scanning} />
+          <Text style={[s.headPulseText, { color: scanning ? C.pink : C.sub }]}>{scanning ? 'scanning' : String(engineState)}</Text>
         </View>
       </View>
-      <View style={s.castChipRow}>
-        {d.signal ? <Chip label={String(d.signal).replace('microstructure_', 'micro ')} /> : null}
-        {d.spreadBps != null ? <Chip label={`spread ${d.spreadBps.toFixed(1)}bps`} /> : null}
-        {d.stopBps != null ? <Chip label={`stop −${d.stopBps.toFixed(0)}bps`} tone="bad" /> : null}
-      </View>
-      <View style={s.castFooter}>
-        <Text style={s.castFooterText}>
-          {d.distToTargetPct != null
-            ? `${d.distToTargetPct >= 0 ? '↑' : '↓'} ${Math.abs(d.distToTargetPct).toFixed(2)}% to take-profit`
-            : 'take-profit resting'}
-        </Text>
-      </View>
-    </Gradient>
+      <Row k="Signal" v={prettySignal(veto.signalVersion)} tone="pink" />
+      <Row k="Venue" v={venueLabel} />
+      <Row k="Watching" v={watching == null ? '—' : `${watching} coins`} />
+      <Row k="Open positions" v={String(open)} tone={open > 0 ? 'up' : null} last />
+    </Card>
   );
 }
 
-// ----------------------------------------------------------------------------
-// sortPositionsByHealth — green (winning %) at top, red (losing %) at bottom.
-// Sort key: unrealized_plpc descending. Ties break on unrealized_pl. Positions
-// with non-numeric P&L sink to the bottom so live winners/losers stay grouped.
-// ----------------------------------------------------------------------------
-function sortPositionsByHealth(positions) {
-  if (!Array.isArray(positions)) return [];
-  // Sort on DERIVED unrealized P&L% (winners on top), since the venue field is
-  // null on Binance. Ties break on derived P&L $.
-  return [...positions]
-    .map((p) => ({ p, d: derivePosition(p) }))
-    .sort((a, b) => {
-      const ap = a.d.uplPct;
-      const bp = b.d.uplPct;
-      if (ap == null && bp == null) return 0;
-      if (ap == null) return 1;
-      if (bp == null) return -1;
-      if (ap !== bp) return bp - ap;
-      const au = a.d.upl == null ? -Infinity : a.d.upl;
-      const bu = b.d.upl == null ? -Infinity : b.d.upl;
-      return bu - au;
-    })
-    .map((x) => x.p);
-}
-
-// ----------------------------------------------------------------------------
-// Stage — overview tab. The "tonight at a glance" view.
-// ----------------------------------------------------------------------------
-function Stage({ data, activeRef, onJumpToCast }) {
-  useTicker(TICKER_MS, activeRef);
-  const meta = data?.meta || {};
-  const truth = meta?.truth || {};
-  const runtime = meta?.runtime || {};
-  const portfolio = computePortfolio(data);
-  const positions = sortPositionsByHealth(data?.positions);
-  const scorecard = meta?.scorecard || {};
-  const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState ?? null;
-  const engineOk = String(engineState || '').toLowerCase() === 'ready' || String(engineState || '').toLowerCase() === 'scanning';
-  const scanInProgress = (truth?.currentEntryScanProgress?.state || '').toLowerCase() === 'scanning';
-  const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
-  const portfolioValue = portfolio?.portfolioValue ?? data?.account?.portfolio_value ?? data?.account?.equity;
-  const openPL = portfolio?.openPL;
-  const openPLPct = portfolio?.openPLPct;
-
-  const prevPLRef = useRef(num(openPL));
-  const [delta, setDelta] = useState(null);
-  useEffect(() => {
-    const next = num(openPL);
-    if (next != null && prevPLRef.current != null) {
-      const d = next - prevPLRef.current;
-      setDelta(Math.abs(d) > 0.001 ? d : 0);
-    }
-    prevPLRef.current = next;
-  }, [openPL]);
-
-  const mood = deriveMood({ openPL: num(openPL), engineOk, scanInProgress, hasPositions: positions.length > 0 });
-
-  const totalClosed = num(scorecard?.totalClosedTrades);
-  const winRate = num(scorecard?.winRate);
-  const tpFillRate = num(scorecard?.tpFillRate);
-  const expectancy = num(scorecard?.expectancyUsd);
-  const avgWin = num(scorecard?.avgWinUsd);
-  const avgLoss = num(scorecard?.avgLossUsd);
-
-  // Conviction engine + regime (2026-06-08): the "fat pitch" telemetry.
-  const conviction = meta?.conviction || {};
-  const regimeSnap = meta?.marketRegime || {};
-  const convLast = num(conviction?.last?.conviction);
-  const convMin = num(conviction?.minConviction);
-  const convSelectivity = num(conviction?.selectivityRate);
-  const convSizeMult = num(conviction?.last?.sizeMultiplier);
-  const regimeLabel = regimeSnap?.regime || conviction?.last?.components?.regimeLabel || null;
-  const regimeFavor = { benign: palette.emerald, wild: palette.gold, flat: palette.fog, quiet: palette.rose, adverse: palette.rose };
-  const regimeColor = regimeFavor[regimeLabel] || palette.fog;
-
-  const stats = [
-    { label: 'OPEN P&L',
-      value: signedUsd(openPL),
-      sub: pct(openPLPct),
-      tone: openPL == null ? 'neutral' : openPL >= 0 ? 'good' : 'bad' },
-    { label: 'WIN RATE',
-      value: winRate == null ? '—' : `${(winRate * 100).toFixed(0)}%`,
-      sub: totalClosed != null ? `${totalClosed} closed` : '—',
-      tone: winRate == null ? 'neutral' : winRate >= 0.5 ? 'good' : 'bad' },
-    { label: 'EXPECTANCY',
-      value: expectancy == null ? '—' : signedUsd(expectancy),
-      sub: tpFillRate != null ? `${(tpFillRate * 100).toFixed(0)}% TP fills` : '—',
-      tone: expectancy == null ? 'neutral' : expectancy >= 0 ? 'good' : 'bad' },
-  ];
-
-  const skipReasons = truth?.topSkipReasonsRolling || {};
-  const skipEntries = Object.entries(skipReasons).sort((a, b) => b[1] - a[1]).slice(0, 4);
-  const skipTotal = skipEntries.reduce((a, [, v]) => a + v, 0);
-
-  // Performance epoch — the honest "since reset" view of the current strategy.
-  const epoch = meta?.performanceEpoch || null;
-  const epochSc = epoch?.scorecard || {};
-  const epochPnl = num(epoch?.pnlUsd);
-  const epochPct = num(epoch?.pctChange);
-  const epochTrades = num(epochSc?.totalClosedTrades);
-  const epochWin = num(epochSc?.winRate);
-  const epochAvgBps = num(epochSc?.avgRealizedNetBps);
-  const epochDate = epoch?.epochStartIso ? String(epoch.epochStartIso).slice(0, 16).replace('T', ' ') : null;
-
-  return (
-    <View style={s.tabBody}>
-      <MoneyTile
-        portfolioValue={portfolioValue}
-        openPL={openPL}
-        openPLPct={openPLPct}
-        mood={mood}
-        deltaSinceLast={delta}
-      />
-
-      {/* Since-reset performance — the real read on the current strategy */}
-      {epoch?.active && (
-        <>
-          <View style={s.sectionHeader}>
-            <Text style={s.sectionHeaderTitle}>📍 SINCE RESET</Text>
-            <Text style={s.sectionHeaderSub}>{epochDate ? `point 0: ${epochDate} UTC` : 'tracking the new strategy'}</Text>
-          </View>
-          <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>P&amp;L since reset</Text>
-              <Text style={[s.pulseValue, { color: epochPnl == null ? palette.fog : epochPnl >= 0 ? palette.emerald : palette.rose }]}>
-                {epochPnl == null ? '—' : signedUsd(epochPnl)}
-                {epochPct != null ? <Text style={{ color: epochPnl >= 0 ? palette.emerald : palette.rose }}>{`  (${epochPct >= 0 ? '+' : ''}${epochPct.toFixed(2)}%)`}</Text> : null}
-              </Text>
-            </View>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Trades / win rate</Text>
-              <Text style={s.pulseValue}>
-                {epochTrades == null ? '0' : epochTrades} closed
-                {epochWin != null ? <Text style={{ color: epochWin >= 0.5 ? palette.emerald : palette.fog }}>{`  ·  ${(epochWin * 100).toFixed(0)}% win`}</Text> : null}
-              </Text>
-            </View>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Avg net / trade</Text>
-              <Text style={[s.pulseValue, { color: epochAvgBps == null ? palette.fog : epochAvgBps >= 0 ? palette.emerald : palette.rose }]}>
-                {epochAvgBps == null ? '— (warming up)' : `${epochAvgBps >= 0 ? '+' : ''}${epochAvgBps.toFixed(1)} bps`}
-              </Text>
-            </View>
-          </Gradient>
-        </>
-      )}
-
-      <StatTriple items={stats} />
-
-      {/* Engine pulse */}
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🔮 ENGINE PULSE</Text>
-      </View>
-      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
-        <View style={s.pulseRow}>
-          <Text style={s.pulseLabel}>State</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Pulse color={mood.accent} size={8} on={Boolean(engineState)} />
-            <Text style={[s.pulseValue, { marginLeft: T.sp.sm, color: mood.accent }]}>{engineState || 'offline'}</Text>
-          </View>
-        </View>
-        <View style={s.pulseRow}>
-          <Text style={s.pulseLabel}>Last scan</Text>
-          <Text style={s.pulseValue}>
-            {lastScanAt ? `${fmtElapsed(liveAge(lastScanAt))} ago` : '—'}
-          </Text>
-        </View>
-        <View style={s.pulseRow}>
-          <Text style={s.pulseLabel}>Universe</Text>
-          <Text style={s.pulseValue}>
-            {meta?.scanSymbolsCount ?? '—'} symbols ({meta?.envRequestedUniverseMode || '—'})
-          </Text>
-        </View>
-        <View style={s.pulseRow}>
-          <Text style={s.pulseLabel}>Avg win / loss</Text>
-          <Text style={s.pulseValue}>
-            <Text style={{ color: avgWin != null ? palette.emerald : palette.fog }}>{avgWin != null ? signedUsd(avgWin) : '—'}</Text>
-            {' / '}
-            <Text style={{ color: avgLoss != null ? palette.rose : palette.fog }}>{avgLoss != null ? signedUsd(avgLoss) : '—'}</Text>
-          </Text>
-        </View>
-      </Gradient>
-
-      {/* Conviction & regime — the "fat pitch" engine */}
-      {conviction?.enabled !== false && (
-        <>
-          <View style={s.sectionHeader}>
-            <Text style={s.sectionHeaderTitle}>🎯 CONVICTION</Text>
-            <Text style={s.sectionHeaderSub}>wait for the fat pitch, bet bigger on it</Text>
-          </View>
-          <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.pulseTile}>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Last conviction</Text>
-              <Text style={[s.pulseValue, { color: convLast == null ? palette.fog : (convMin != null && convLast >= convMin) ? palette.emerald : palette.gold }]}>
-                {convLast == null ? '—' : `${(convLast * 100).toFixed(0)}%`}
-                {convMin != null ? <Text style={{ color: palette.fog }}>{`  (min ${(convMin * 100).toFixed(0)}%)`}</Text> : null}
-              </Text>
-            </View>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Market regime</Text>
-              <Text style={[s.pulseValue, { color: regimeColor }]}>{regimeLabel || '—'}</Text>
-            </View>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Selectivity</Text>
-              <Text style={s.pulseValue}>
-                {convSelectivity == null ? '—' : `sitting out ${(convSelectivity * 100).toFixed(0)}%`}
-                <Text style={{ color: palette.fog }}>{conviction?.entered != null ? `  (${conviction.entered} taken)` : ''}</Text>
-              </Text>
-            </View>
-            <View style={s.pulseRow}>
-              <Text style={s.pulseLabel}>Last size</Text>
-              <Text style={[s.pulseValue, { color: convSizeMult != null && convSizeMult > 1 ? palette.emerald : palette.fog }]}>
-                {convSizeMult == null ? '—' : `${convSizeMult.toFixed(2)}× base`}
-              </Text>
-            </View>
-          </Gradient>
-        </>
-      )}
-
-      {/* Top reject reasons */}
-      {skipEntries.length > 0 && (
-        <>
-          <View style={s.sectionHeader}>
-            <Text style={s.sectionHeaderTitle}>🚪 WHY WE&apos;RE NOT BUYING</Text>
-            <Text style={s.sectionHeaderSub}>rolling skip reasons</Text>
-          </View>
-          <View style={s.reasonsTile}>
-            {skipEntries.map(([reason, count]) => {
-              const widthPct = skipTotal > 0 ? (count / skipTotal) * 100 : 0;
-              return (
-                <View key={reason} style={{ marginBottom: T.sp.sm }}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 3 }}>
-                    <Text style={s.reasonLabel}>{reason}</Text>
-                    <Text style={s.reasonCount}>{count}</Text>
-                  </View>
-                  <View style={{ height: 6, backgroundColor: palette.velvetEdge, borderRadius: 3, overflow: 'hidden' }}>
-                    <View style={{ height: 6, width: `${widthPct}%`, backgroundColor: palette.magenta, borderRadius: 3 }} />
-                  </View>
-                </View>
-              );
-            })}
-          </View>
-        </>
-      )}
-
-      {/* Tonight's Cast (last section, all positions, sorted green→red). */}
-      <Pressable onPress={onJumpToCast} style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🎭 TONIGHT&apos;S CAST</Text>
-        <Text style={s.sectionHeaderSub}>{positions.length} live · tap for details</Text>
-      </Pressable>
-      {positions.length === 0 ? (
-        <View style={s.emptyTile}>
-          <Text style={s.emptyTitle}>No positions on stage</Text>
-          <Text style={s.emptyBody}>The engine is looking for the next entry.</Text>
-        </View>
-      ) : (
-        positions.map((p, i) => <CastCardCompact key={p?.symbol || i} position={p} activeRef={activeRef} />)
-      )}
-    </View>
-  );
-}
-
-// ----------------------------------------------------------------------------
-// CastCardCompact — shorter version for the Stage preview list.
-// ----------------------------------------------------------------------------
-function CastCardCompact({ position, activeRef }) {
-  useTicker(TICKER_MS, activeRef);
-  const d = derivePosition(position);
-  const accent = d.tone === 'good' ? palette.emerald : d.tone === 'bad' ? palette.rose : palette.gold;
-  const heldSec = num(position?.heldSeconds);
-  return (
-    <View style={[s.compactCard, { borderColor: accent }]}>
-      <View style={s.compactRow}>
-        <Text style={[s.compactSym, { color: palette.cream }]}>{d.symShort}</Text>
-        <Text style={[s.compactPct, { color: accent }]}>{pct(d.uplPct, 2)}</Text>
-        <Text style={[s.compactPL, { color: accent }]}>{signedUsd(d.upl)}</Text>
-      </View>
-      <View style={{ marginTop: T.sp.xs }}>
-        <Bar value={d.progress} height={6} />
-      </View>
-      <Text style={s.compactMeta}>
-        {d.signal ? `${String(d.signal).replace('microstructure_', 'micro ')} • ` : ''}held {heldSec != null ? fmtElapsed(heldSec * 1000) : '—'}
-      </Text>
-    </View>
-  );
-}
-
-// ----------------------------------------------------------------------------
-// Cast — full-detail positions tab.
-// ----------------------------------------------------------------------------
-// ----------------------------------------------------------------------------
-// ScanBoard — per-token WATCHLIST. Surfaces what the bot is doing with every
-// universe symbol right now: HOLDING (live), or scanning/blocked (with the
-// reason + the symbol's historical edge). Fed by meta.tradeFeasibility +
-// meta.perSymbolExpectancy, so tokens that never open a position are still
-// visible — this is the "why isn't it trading X?" answer the old UI hid.
-// ----------------------------------------------------------------------------
-function ScanBoard({ data }) {
-  const meta = data?.meta || {};
-  const feas = Array.isArray(meta?.tradeFeasibility?.symbols) ? meta.tradeFeasibility.symbols : [];
-  const grid = Array.isArray(meta?.perSymbolExpectancy?.grid) ? meta.perSymbolExpectancy.grid : [];
-  const heldSet = new Set((Array.isArray(data?.positions) ? data.positions : []).map((p) => String(p?.symbol)));
-
-  // best historical avg net bps per symbol (across signals)
-  const edgeBySym = {};
-  for (const g of grid) {
-    const k = String(g?.symbol);
-    const v = num(g?.avgNetBps);
-    if (v == null) continue;
-    if (edgeBySym[k] == null || v > edgeBySym[k]) edgeBySym[k] = v;
+// BRAKE — the realized-expectancy circuit breaker. Numbers, not paragraphs.
+function Brake({ data }) {
+  const veto = data.meta?.signalSelector?.realizedVeto;
+  if (!veto || veto.enabled === false) {
+    return <Card><Label>BRAKE</Label><Text style={s.note}>Off in config — no auto-halt on a losing streak.</Text></Card>;
   }
-
-  const rows = {};
-  for (const f of feas) { const k = String(f?.symbol); if (k) rows[k] = { symbol: k, ...f }; }
-  for (const sym of heldSet) if (sym && !rows[sym]) rows[sym] = { symbol: sym };
-  const list = Object.values(rows);
-  if (list.length === 0) return null;
-
-  list.sort((a, b) => {
-    const ah = heldSet.has(a.symbol) ? 1 : 0;
-    const bh = heldSet.has(b.symbol) ? 1 : 0;
-    if (ah !== bh) return bh - ah;
-    return (num(b.feasibilityPct) ?? -1) - (num(a.feasibilityPct) ?? -1);
-  });
-
+  const on = Boolean(veto.veto);
+  const color = on ? C.amber : C.up;
   return (
-    <View style={{ marginTop: T.sp.xl }}>
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🔍 WATCHLIST</Text>
-        <Text style={s.sectionHeaderSub}>{list.length} symbols · why each is in or out</Text>
+    <Card accent={color}>
+      <View style={s.cardHead}>
+        <Label>SAFETY BRAKE</Label>
+        <Text style={[s.brakeState, { color }]}>{on ? 'ENGAGED' : 'CLEAR'}</Text>
       </View>
-      {list.map((r) => {
-        const held = heldSet.has(r.symbol);
-        const blocker = r.topBlocker ? prettyReason(r.topBlocker) : null;
-        const edge = edgeBySym[r.symbol];
-        const status = held ? 'HOLDING' : (blocker || 'scanning');
-        const statusColor = held ? palette.emerald : (r.chronicallyInfeasible ? palette.rose : palette.gold);
-        const feasPct = num(r.feasibilityPct);
-        return (
-          <View key={r.symbol} style={s.scanRow}>
-            <Text style={s.scanSym}>{r.symbol.replace('/USD', '')}</Text>
-            <View style={{ flex: 1, paddingHorizontal: T.sp.sm }}>
-              <Text style={[s.scanStatus, { color: statusColor }]} numberOfLines={1}>{status}</Text>
-              {!held && feasPct != null
-                ? <Text style={s.scanSub}>{`passes ${feasPct.toFixed(0)}% · ${num(r.rejections) ?? 0} skips`}</Text>
-                : null}
-            </View>
-            <Text style={[s.scanEdge, { color: edge == null ? palette.fog : edge >= 0 ? palette.emerald : palette.rose }]}>
-              {edge == null ? '—' : `${edge >= 0 ? '+' : ''}${edge.toFixed(0)}bps`}
-            </Text>
-          </View>
-        );
-      })}
-      <Text style={s.scanLegend}>edge = historical avg net bps/trade for this symbol (— = no closes yet)</Text>
-    </View>
+      <Row k="Recent avg" v={`${bps(veto.realizedAvgNetBps)} bps`} tone={on ? 'down' : 'up'} />
+      <Row k="Floor" v={`${bps(veto.floorBps)} bps`} />
+      <Row k="Sample" v={veto.sampleSize == null ? '—' : `${veto.sampleSize} trades`} last={!(on && num(veto.maxAgeMs))} />
+      {on && num(veto.maxAgeMs) ? (
+        <Text style={s.note}>
+          Self-recovery armed: stale fills age out over ~{fmtElapsed(num(veto.maxAgeMs))}, then it re-probes small.
+          {num(veto.agedOutCount) ? ` ${veto.agedOutCount} aged out.` : ''}
+        </Text>
+      ) : null}
+    </Card>
   );
 }
 
-// ----------------------------------------------------------------------------
-// Cast — full-detail positions tab + the per-token watchlist beneath it.
-// ----------------------------------------------------------------------------
-function Cast({ data, activeRef }) {
-  const positions = sortPositionsByHealth(data?.positions);
-  const meta = data?.meta || {};
-  const scan = meta?.lastEntryScanSummary || {};
-  const scanSub = scan?.universeSize != null
-    ? `${positions.length} live · scanning ${scan.universeSize}`
-    : `${positions.length} live`;
-  return (
-    <View style={s.tabBody}>
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🎭 TONIGHT&apos;S CAST</Text>
-        <Text style={s.sectionHeaderSub}>{scanSub}</Text>
-      </View>
-      {positions.length === 0 ? (
-        <View style={s.emptyTile}>
-          <Text style={s.emptyTitle}>🎭 No open positions</Text>
-          <Text style={s.emptyBody}>The engine is scanning — the watchlist below shows why each token is in or out.</Text>
-        </View>
-      ) : (
-        positions.map((p, i) => <CastCard key={p?.symbol || i} position={p} activeRef={activeRef} />)
-      )}
-      <ScanBoard data={data} />
-    </View>
-  );
-}
+// FLOOR — the look-and-see layer. Tight, real, scannable.
+function Floor({ data }) {
+  const meta = data.meta || {};
+  const conv = meta.conviction || {};
+  const feeds = meta.binanceFeedShadow?.overall || {};
+  const fresh = num(feeds.symbolsFresh);
+  const tracked = num(feeds.symbolsTracked);
 
-// ----------------------------------------------------------------------------
-// Backstage — diagnostics tab. Skip reasons, scan progress, scorecard detail.
-// ----------------------------------------------------------------------------
-// ----------------------------------------------------------------------------
-// MonitorPanel — the heartbeat "report" surfaced inside Backstage. Shows the
-// latest health verdict big, the key heartbeat fields, and a recent history
-// list. Reads the /monitor payload (latest + heartbeats[]).
-// ----------------------------------------------------------------------------
-function MonitorPanel({ monitor }) {
-  const mon = interpretMonitor(monitor);
-  const hb = mon.hb;
-  const heartbeats = Array.isArray(monitor?.heartbeats) ? monitor.heartbeats.slice(-12).reverse() : [];
-  const accent = mon.tone === 'good' ? palette.emerald
-    : mon.tone === 'warn' ? palette.gold
-    : mon.tone === 'bad' ? palette.rose
-    : palette.fog;
-  const ageMs = hb ? liveAge(hb.ts) : null;
-  const verdict = mon.tone === 'good' ? 'HEALTHY'
-    : mon.tone === 'warn' ? 'SAFETY VETO ACTIVE'
-    : mon.tone === 'bad' ? 'NEEDS ATTENTION'
-    : 'NO HEARTBEAT YET';
+  const grid = Array.isArray(meta.perSymbolExpectancy?.grid) ? meta.perSymbolExpectancy.grid : [];
+  const ranked = grid
+    .filter((g) => num(g?.avgNetBps) != null && num(g?.entries) != null && num(g.entries) >= 2)
+    .sort((a, b) => num(b.avgNetBps) - num(a.avgNetBps));
+  const best = ranked.slice(0, 3);
+  const worst = ranked.slice(-3).reverse();
 
   return (
     <View>
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>💓 MONITOR</Text>
-        <Text style={s.sectionHeaderSub}>
-          {ageMs != null ? `heartbeat ${fmtElapsed(ageMs)} ago` : 'awaiting first heartbeat'}
-        </Text>
-      </View>
-      <Gradient
-        colors={mon.tone === 'good' ? [palette.emeraldPale, palette.velvetSoft]
-          : mon.tone === 'bad' ? [palette.rosePale, palette.velvetSoft]
-          : [palette.velvetSoft, palette.velvet]}
-        style={[s.boxOffice, { borderColor: accent, borderWidth: 1 }]}
-      >
-        <View style={s.monVerdictRow}>
-          <View style={[s.monDot, { backgroundColor: accent, width: 12, height: 12, borderRadius: 6 }]} />
-          <Text style={[s.monVerdict, { color: accent }]}>{verdict}</Text>
+      <Card>
+        <Label>MARKET</Label>
+        <View style={[s.statGrid, { marginTop: T.sp.sm }]}>
+          <Stat k="REGIME" v={regimeWord(meta.marketRegime?.regime)} />
+          <Stat k="FEEDS" v={fresh == null || tracked == null ? '—' : `${fresh}/${tracked}`} tone={fresh != null && tracked != null && fresh >= tracked * 0.8 ? 'up' : null} />
+          <Stat k="CONVICTION" v={num(conv.avgConviction) == null ? '—' : num(conv.avgConviction).toFixed(2)} />
         </View>
-        {hb ? (
-          <>
-            <View style={s.boRow}><Text style={s.boLabel}>Equity</Text><Text style={s.boValue}>{hb.equity != null ? usd(hb.equity) : '—'}</Text></View>
-            <View style={s.boRow}><Text style={s.boLabel}>Open positions</Text><Text style={s.boValue}>{hb.openPositions ?? '—'}</Text></View>
-            <View style={s.boRow}>
-              <Text style={s.boLabel}>Trading state</Text>
-              <Text style={[s.boValue, { color: hb.veto ? palette.gold : palette.emerald }]}>
-                {hb.veto ? `halted (${hb.vetoReason || 'veto'})` : 'trading'}
-              </Text>
-            </View>
-            <View style={s.boRow}>
-              <Text style={s.boLabel}>Realized edge</Text>
-              <Text style={[s.boValue, { color: hb.realizedAvgNetBps == null ? palette.fog : hb.realizedAvgNetBps >= 0 ? palette.emerald : palette.rose }]}>
-                {hb.realizedAvgNetBps == null ? '—' : fmtBps(hb.realizedAvgNetBps)}{hb.sampleSize != null ? ` · n=${hb.sampleSize}` : ''}
-              </Text>
-            </View>
-            <View style={s.boRow}><Text style={s.boLabel}>Signal</Text><Text style={s.boValue}>{hb.signalVersion || '—'}</Text></View>
-            {hb.execFailure ? (
-              <View style={s.boRow}><Text style={s.boLabel}>Exec error</Text><Text style={[s.boValue, { color: palette.rose, flex: 1, textAlign: 'right' }]} numberOfLines={1}>{hb.execFailure}</Text></View>
-            ) : null}
-          </>
+      </Card>
+
+      <Card>
+        <Label>LEADERBOARD · bps / trade</Label>
+        {best.length === 0 && worst.length === 0 ? (
+          <Text style={s.note}>Not enough closed trades to rank yet.</Text>
         ) : (
-          <Text style={s.emptyBody}>The bot hasn&apos;t recorded a heartbeat yet — it records one each snapshot cycle (~30 min and on key events).</Text>
+          <View style={{ marginTop: T.sp.xs }}>
+            {best.map((g, i) => <Lead key={`b${i}`} rank={`${i + 1}`} g={g} />)}
+            {worst.length ? <View style={s.dash} /> : null}
+            {worst.map((g, i) => <Lead key={`w${i}`} rank="▾" g={g} />)}
+            <Text style={s.tiny}>Real closed-trade averages, per coin × strategy. ≥2 trades to list.</Text>
+          </View>
         )}
-        <Text style={s.monLegend}>green = healthy · gold = safety brake halting entries (benign) · rose = needs eyes</Text>
-      </Gradient>
-
-      {heartbeats.length > 0 ? (
-        <View style={s.reasonsTile}>
-          {heartbeats.map((h, i) => {
-            const flags = Array.isArray(h.flags) ? h.flags : [];
-            const dot = flags.length ? palette.rose : h.veto ? palette.gold : palette.emerald;
-            const a = liveAge(h.ts);
-            return (
-              <View key={h.tsMs || i} style={s.monHistRow}>
-                <View style={[s.monDot, { backgroundColor: dot }]} />
-                <Text style={s.monHistTime}>{a != null ? `${fmtElapsed(a)} ago` : '—'}</Text>
-                <Text style={s.monHistMid} numberOfLines={1}>
-                  {h.equity != null ? usd(h.equity, 0) : '—'} · {h.veto ? 'veto' : 'trading'}
-                  {h.realizedAvgNetBps != null ? ` · ${fmtBps(h.realizedAvgNetBps)}` : ''}
-                </Text>
-                {flags.length ? <Text style={s.monHistFlag} numberOfLines={1}>{flags.join(' ')}</Text> : null}
-              </View>
-            );
-          })}
-        </View>
-      ) : null}
+      </Card>
     </View>
   );
 }
 
-// ----------------------------------------------------------------------------
-function Backstage({ data, monitor, activeRef }) {
-  useTicker(TICKER_MS, activeRef);
-  const meta = data?.meta || {};
-  const truth = meta?.truth || {};
-  const scorecard = meta?.scorecard || {};
-  const lastScan = meta?.lastEntryScanSummary || {};
-  const skipReasons = truth?.topSkipReasonsRolling || {};
-  const skipEntries = Object.entries(skipReasons).sort((a, b) => b[1] - a[1]);
-  const skipTotal = skipEntries.reduce((a, [, v]) => a + v, 0);
-  const lastSuccess = meta?.lastSuccessfulAction;
-  const lastFailure = meta?.lastExecutionFailure;
-
+function Lead({ rank, g }) {
+  const v = num(g.avgNetBps);
+  const color = v == null ? C.sub : v >= 0 ? C.up : C.down;
   return (
-    <View style={s.tabBody}>
-      <MonitorPanel monitor={monitor} />
+    <View style={s.leadRow}>
+      <Text style={s.leadRank}>{rank}</Text>
+      <Text style={s.leadSym}>{symShort(g.symbol)}</Text>
+      <Text style={s.leadSig} numberOfLines={1}>{prettySignal(g.signalVersion)}</Text>
+      <Text style={[s.leadBps, { color }]}>{bps(v)}</Text>
+      <Text style={s.leadN}>{num(g.entries) == null ? '' : `×${g.entries}`}</Text>
+    </View>
+  );
+}
 
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>📜 BOX OFFICE</Text>
-        <Text style={s.sectionHeaderSub}>scorecard since last restart</Text>
-      </View>
-      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
-        <View style={s.boRow}><Text style={s.boLabel}>Closed trades</Text><Text style={s.boValue}>{scorecard?.totalClosedTrades ?? '—'}</Text></View>
-        <View style={s.boRow}>
-          <Text style={s.boLabel}>Win rate</Text>
-          <Text style={[s.boValue, { color: scorecard?.winRate == null ? palette.fog : scorecard.winRate >= 0.5 ? palette.emerald : palette.rose }]}>
-            {scorecard?.winRate == null ? '—' : `${(scorecard.winRate * 100).toFixed(0)}%`}
-          </Text>
-        </View>
-        <View style={s.boRow}>
-          <Text style={s.boLabel}>Expectancy</Text>
-          <Text style={[s.boValue, { color: scorecard?.expectancyUsd == null ? palette.fog : scorecard.expectancyUsd >= 0 ? palette.emerald : palette.rose }]}>
-            {scorecard?.expectancyUsd == null ? '—' : signedUsd(scorecard.expectancyUsd)}/trade
-          </Text>
-        </View>
-        <View style={s.boRow}><Text style={s.boLabel}>Avg win</Text><Text style={[s.boValue, { color: palette.emerald }]}>{scorecard?.avgWinUsd != null ? signedUsd(scorecard.avgWinUsd) : '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Avg loss</Text><Text style={[s.boValue, { color: palette.rose }]}>{scorecard?.avgLossUsd != null ? signedUsd(scorecard.avgLossUsd) : '—'}</Text></View>
-        <View style={s.boRow}>
-          <Text style={s.boLabel}>Profit factor</Text>
-          <Text style={[s.boValue, { color: scorecard?.profitFactor == null ? palette.fog : scorecard.profitFactor >= 1 ? palette.emerald : palette.rose }]}>
-            {scorecard?.profitFactor == null ? '—' : scorecard.profitFactor.toFixed(2)}
-          </Text>
-        </View>
-        <View style={s.boRow}><Text style={s.boLabel}>TP fill rate</Text><Text style={s.boValue}>{scorecard?.tpFillRate != null ? `${(scorecard.tpFillRate * 100).toFixed(0)}%` : '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Median hold</Text><Text style={s.boValue}>{scorecard?.medianHoldSeconds != null ? fmtElapsed(scorecard.medianHoldSeconds * 1000) : '—'}</Text></View>
-      </Gradient>
-
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🚪 SKIP REASONS</Text>
-        <Text style={s.sectionHeaderSub}>rolling — why we&apos;re not buying</Text>
-      </View>
-      {skipEntries.length === 0 ? (
-        <View style={s.emptyTile}>
-          <Text style={s.emptyTitle}>Nothing rejected lately</Text>
-          <Text style={s.emptyBody}>Either we&apos;re full or the gates are open.</Text>
-        </View>
-      ) : (
-        <View style={s.reasonsTile}>
-          {skipEntries.map(([reason, count]) => {
-            const widthPct = skipTotal > 0 ? (count / skipTotal) * 100 : 0;
-            return (
-              <View key={reason} style={{ marginBottom: T.sp.sm }}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 3 }}>
-                  <Text style={s.reasonLabel}>{reason}</Text>
-                  <Text style={s.reasonCount}>{count} ({widthPct.toFixed(0)}%)</Text>
-                </View>
-                <View style={{ height: 6, backgroundColor: palette.velvetEdge, borderRadius: 3, overflow: 'hidden' }}>
-                  <View style={{ height: 6, width: `${widthPct}%`, backgroundColor: palette.magenta, borderRadius: 3 }} />
-                </View>
-              </View>
-            );
-          })}
-        </View>
-      )}
-
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🔍 LAST SCAN</Text>
-      </View>
-      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
-        <View style={s.boRow}><Text style={s.boLabel}>Universe</Text><Text style={s.boValue}>{lastScan?.universeSize ?? '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Held</Text><Text style={s.boValue}>{lastScan?.heldCount ?? '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Slots open</Text><Text style={[s.boValue, { color: (lastScan?.slotsAvailable ?? 0) > 0 ? palette.emerald : palette.gold }]}>{lastScan?.slotsAvailable ?? '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Evaluated</Text><Text style={s.boValue}>{lastScan?.evaluated ?? '—'}</Text></View>
-        <View style={s.boRow}><Text style={s.boLabel}>Entered</Text><Text style={[s.boValue, { color: (lastScan?.entered ?? 0) > 0 ? palette.emerald : palette.fog }]}>{lastScan?.entered ?? '—'}</Text></View>
-      </Gradient>
-
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>🎬 LAST ACTION</Text>
-      </View>
-      <Gradient colors={[palette.velvetSoft, palette.velvet]} style={s.boxOffice}>
-        <View style={s.boRow}><Text style={s.boLabel}>Last success</Text>
-          <Text style={[s.boValue, { color: lastSuccess ? palette.emerald : palette.fog, fontSize: 12 }]} numberOfLines={1}>
-            {lastSuccess ? `${lastSuccess.symbol} ${lastSuccess.action}` : '—'}
-          </Text>
-        </View>
-        <View style={s.boRow}><Text style={s.boLabel}>Last failure</Text>
-          <Text style={[s.boValue, { color: lastFailure ? palette.rose : palette.fog, fontSize: 12 }]} numberOfLines={2}>
-            {lastFailure ? `${lastFailure.reason}: ${lastFailure.message}` : 'none'}
-          </Text>
-        </View>
-      </Gradient>
+// FOOTER — freshness, version, one-tap state grab for the Claude workflow.
+function Footer({ data, ageMs, health }) {
+  const version = String(data?.version || data?.meta?.runtime?.commit || '').slice(0, 7) || '—';
+  const stale = ageMs != null && ageMs > STALE_WARN_MS;
+  const onGrab = useCallback(() => {
+    try {
+      const meta = data?.meta || {};
+      const veto = meta.signalSelector?.realizedVeto || {};
+      const ep = meta.performanceEpoch || {};
+      const msg = [
+        `Magic Money — ${new Date().toISOString()}`,
+        `${health.label}: ${health.line}`,
+        `Equity ${usd(num(data?.account?.equity) ?? num(data?.account?.portfolio_value))} · since reset ${signedUsd(num(ep.pnlUsd))} (${pct(num(ep.pctChange))})`,
+        `Engine ${meta.engineState ?? '—'} · ${data?.account?.raw_venue ?? '—'} · signal ${veto.signalVersion ?? '—'}`,
+        `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}`,
+        `v${version} · data age ${fmtElapsed(ageMs)}`,
+      ].join('\n');
+      Share.share({ message: msg });
+    } catch (_) { /* best-effort */ }
+  }, [data, health, version, ageMs]);
+  return (
+    <View style={s.footer}>
+      <Pressable style={s.grab} onPress={onGrab}>
+        <Text style={s.grabText}>Grab state → Claude</Text>
+      </Pressable>
+      <Text style={[s.foot, stale ? { color: C.amber } : null]}>
+        {stale ? `STALE · ${fmtElapsed(ageMs)}` : `LIVE · ${fmtElapsed(ageMs)}`} · v{version}
+      </Text>
+      <Text style={s.tiny}>Live from the bot. Blanks mean no data — not zero.</Text>
     </View>
   );
 }
 
 // ----------------------------------------------------------------------------
-// Send — the logs + "copy bundle for AI" tab.
+// Shell + polling (preserved behaviour).
 // ----------------------------------------------------------------------------
-function Send({ data, logsRef, activeRef }) {
-  useTicker(TICKER_MS, activeRef);
-  const [logs, setLogs] = useState([]);
-  const [filter, setFilter] = useState('all');
-  const [logError, setLogError] = useState(null);
-  const lastTsRef = useRef(0);
+export default function App() {
+  return <ErrorBoundary><AppInner /></ErrorBoundary>;
+}
+
+function AppInner() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState(null);
+  const [loadedAt, setLoadedAt] = useState(null);
+  const activeRef = useRef(true);
+  useTicker(activeRef);
 
   useEffect(() => {
-    if (logsRef) logsRef.current = logs;
-  }, [logs, logsRef]);
+    const sub = AppState.addEventListener('change', (n) => { activeRef.current = n === 'active'; });
+    return () => sub.remove();
+  }, []);
 
-  const fetchLogs = useCallback(async () => {
+  const load = useCallback(async ({ isRefresh = false } = {}) => {
+    if (!BASE_URL) { setLoading(false); setRefreshing(false); setError('Backend URL not configured. Set EXPO_PUBLIC_BACKEND_URL.'); return; }
+    if (isRefresh) setRefreshing(true); else setLoading(true);
     try {
-      const since = lastTsRef.current;
-      const result = await apiFetch(`/debug/logs?since=${since}&limit=200`);
-      if (result?.entries?.length) {
-        setLogs((prev) => [...prev, ...result.entries].slice(-500));
-        lastTsRef.current = result.entries[result.entries.length - 1].ts;
-      }
-      setLogError(null);
+      const payload = await fetchWithRetry('/dashboard', isRefresh ? 1 : 3);
+      setData(payload); setLoadedAt(Date.now()); setError(null);
     } catch (err) {
-      setLogError(err?.message || 'Log fetch failed');
-    }
+      const msg = err?.message || 'Request failed';
+      setError(`${err?.status ? `HTTP ${err.status}` : 'Error'}: ${msg}`);
+    } finally { setLoading(false); setRefreshing(false); }
   }, []);
 
   useEffect(() => {
-    fetchLogs();
-    const id = setInterval(() => {
-      if (!activeRef || activeRef.current) fetchLogs();
-    }, LOG_POLL_MS);
+    load();
+    const id = setInterval(() => { if (activeRef.current) load(); }, POLL_MS);
     return () => clearInterval(id);
-  }, [fetchLogs, activeRef]);
+  }, [load]);
 
-  const filtered = useMemo(() => {
-    if (filter === 'all') return logs;
-    return logs.filter((e) => e.level === filter);
-  }, [logs, filter]);
+  const onRefresh = useCallback(() => load({ isRefresh: true }), [load]);
+  const ageMs = loadedAt ? Date.now() - loadedAt : null;
+  const health = computeHealth({ data, error, ageMs });
 
-  // The format the user pastes into our chats. One tap → clipboard.
-  const buildBundle = useCallback(() => {
-    const diagJson = JSON.stringify(data, null, 2);
-    const logLines = filtered.map((e) => `[${fmtLogTime(e.ts)}] [${e.level}] ${e.msg}`).join('\n');
-    return `=== DIAGNOSTICS ===\n${diagJson}\n\n=== LOGS (${filtered.length} entries) ===\n${logLines}`;
-  }, [data, filtered]);
-
-  const copyForAI = useCallback(async () => {
-    const text = buildBundle();
-    try { await Share.share({ message: text }); } catch { /* ignore */ }
-  }, [buildBundle]);
-
-  const copyLogsOnly = useCallback(async () => {
-    const text = filtered.map((e) => `[${fmtLogTime(e.ts)}] [${e.level}] ${e.msg}`).join('\n');
-    try { await Share.share({ message: text }); } catch { /* ignore */ }
-  }, [filtered]);
-
-  const copyDiagOnly = useCallback(async () => {
-    const text = JSON.stringify(data, null, 2);
-    try { await Share.share({ message: text }); } catch { /* ignore */ }
-  }, [data]);
-
-  const levelColor = (lvl) => lvl === 'error' ? palette.rose
-    : lvl === 'warn' ? palette.gold
-    : palette.cream;
+  if (loading && !data) {
+    return (
+      <SafeAreaView style={s.root}>
+        <StatusBar barStyle="dark-content" />
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+          <Text style={s.wordmark}>MAGIC MONEY</Text>
+          <View style={s.wordRule} />
+          <ActivityIndicator color={C.pink} size="large" style={{ marginTop: T.sp.xl }} />
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
-    <View style={s.tabBody}>
-      {/* Hero copy button */}
-      <Pressable onPress={copyForAI}>
-        <Gradient
-          colors={[palette.magenta, palette.rose]}
-          start={{ x: 0, y: 0 }}
-          end={{ x: 1, y: 1 }}
-          style={s.heroCopy}
-        >
-          <Text style={s.heroCopyEmoji}>📋✨</Text>
-          <Text style={s.heroCopyTitle}>COPY EVERYTHING FOR AI</Text>
-          <Text style={s.heroCopySub}>Diagnostics JSON + last {filtered.length} log lines, formatted</Text>
-        </Gradient>
-      </Pressable>
-
-      <View style={s.copyRow}>
-        <Pressable onPress={copyDiagOnly} style={s.copyHalf}>
-          <Text style={s.copyHalfLabel}>📊 Diagnostics only</Text>
-        </Pressable>
-        <Pressable onPress={copyLogsOnly} style={s.copyHalf}>
-          <Text style={s.copyHalfLabel}>📜 Logs only ({filtered.length})</Text>
-        </Pressable>
+    <SafeAreaView style={s.root}>
+      <StatusBar barStyle="dark-content" backgroundColor={C.paper} />
+      <View style={s.topBar}>
+        <View>
+          <Text style={s.wordmark}>MAGIC MONEY</Text>
+          <View style={s.wordRule} />
+        </View>
+        <View style={s.topRight}>
+          <Pulse color={lvlColor(health.level)} size={8} on={!error} />
+          <Text style={[s.topRightText, { color: lvlColor(health.level) }]}>{error ? 'OFFLINE' : 'LIVE'}</Text>
+        </View>
       </View>
 
-      <View style={s.sectionHeader}>
-        <Text style={s.sectionHeaderTitle}>📜 LIVE LOGS</Text>
-        <Text style={s.sectionHeaderSub}>polled every 5s</Text>
-      </View>
-
-      <View style={s.logsToolbar}>
-        {['all', 'info', 'warn', 'error'].map((f) => (
-          <Pressable
-            key={f}
-            style={[s.filterChip, filter === f && s.filterChipActive]}
-            onPress={() => setFilter(f)}
-          >
-            <Text style={[s.filterChipText, filter === f && s.filterChipTextActive]}>
-              {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
-            </Text>
-          </Pressable>
-        ))}
-        <Pressable
-          onPress={() => { setLogs([]); lastTsRef.current = 0; fetchLogs(); }}
-          style={[s.filterChip, { marginLeft: 'auto' }]}
-        >
-          <Text style={s.filterChipText}>↻ Refresh</Text>
-        </Pressable>
-      </View>
-
-      {logError ? <Banner tone="error">Log fetch error: {logError}</Banner> : null}
-
-      <View style={s.logsContainer}>
-        {filtered.length === 0 ? (
-          <Text style={s.logsEmpty}>No logs yet. Engine is quiet.</Text>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingHorizontal: T.sp.lg, paddingBottom: T.sp.huge }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.pink} colors={[C.pink]} />}
+        showsVerticalScrollIndicator={false}
+      >
+        <Reveal delay={0}><Status health={health} /></Reveal>
+        {data ? (
+          <>
+            <Reveal delay={70}><Money data={data} /></Reveal>
+            <Reveal delay={140}><Engine data={data} /></Reveal>
+            <Reveal delay={210}><Brake data={data} /></Reveal>
+            <Reveal delay={280}><Floor data={data} /></Reveal>
+            <Reveal delay={350}><Footer data={data} ageMs={ageMs} health={health} /></Reveal>
+          </>
         ) : (
-          filtered.slice(-200).map((entry, i) => (
-            <Text key={`${entry.ts}-${i}`} style={[s.logLine, { color: levelColor(entry.level) }]} selectable>
-              <Text style={s.logTs}>{fmtLogTime(entry.ts)} </Text>
-              <Text style={[s.logLevel, { color: levelColor(entry.level) }]}>[{entry.level}] </Text>
-              {entry.msg}
-            </Text>
-          ))
+          <Card><Text style={s.note}>{error || 'No data.'}</Text></Card>
         )}
-      </View>
-    </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
-// ----------------------------------------------------------------------------
-// TabBar — bottom nav with a glowing active indicator.
-// ----------------------------------------------------------------------------
-function TabBar({ active, onChange }) {
-  const tabs = [
-    { id: 'stage', label: 'Stage', emoji: '🎭' },
-    { id: 'cast', label: 'Cast', emoji: '🌟' },
-    { id: 'backstage', label: 'Backstage', emoji: '🔮' },
-    { id: 'send', label: 'Send', emoji: '📋' },
-  ];
-  return (
-    <View style={s.tabBar}>
-      {tabs.map((tab) => {
-        const isActive = active === tab.id;
-        return (
-          <Pressable key={tab.id} style={s.tabButton} onPress={() => onChange(tab.id)}>
-            <Text style={[s.tabEmoji, !isActive && { opacity: 0.4 }]}>{tab.emoji}</Text>
-            <Text style={[s.tabLabel, isActive && s.tabLabelActive]}>{tab.label}</Text>
-            {isActive ? <View style={s.tabActiveBar} /> : null}
-          </Pressable>
-        );
-      })}
-    </View>
-  );
-}
-
-// ----------------------------------------------------------------------------
-// ErrorBoundary (preserved from previous frontend).
-// ----------------------------------------------------------------------------
 class ErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { error: null }; }
   static getDerivedStateFromError(error) { return { error }; }
@@ -1491,12 +599,11 @@ class ErrorBoundary extends React.Component {
     if (this.state.error) {
       return (
         <SafeAreaView style={[s.root, { justifyContent: 'center', alignItems: 'center', padding: T.sp.xl }]}>
-          <StatusBar barStyle="light-content" />
-          <Text style={[s.heroCopyEmoji, { fontSize: 48 }]}>🪞</Text>
-          <Text style={s.errorTitle}>The mirror cracked</Text>
-          <Text style={s.errorMsg}>{String(this.state.error?.message || this.state.error)}</Text>
-          <Pressable style={s.errorBtn} onPress={() => this.setState({ error: null })}>
-            <Text style={s.errorBtnText}>Try again</Text>
+          <StatusBar barStyle="dark-content" />
+          <Text style={s.wordmark}>MAGIC MONEY</Text>
+          <Text style={[s.note, { marginTop: T.sp.lg, textAlign: 'center' }]}>{String(this.state.error?.message || this.state.error)}</Text>
+          <Pressable style={[s.grab, { marginTop: T.sp.lg }]} onPress={() => this.setState({ error: null })}>
+            <Text style={s.grabText}>Reset</Text>
           </Pressable>
         </SafeAreaView>
       );
@@ -1506,835 +613,66 @@ class ErrorBoundary extends React.Component {
 }
 
 // ----------------------------------------------------------------------------
-// App entry.
-// ----------------------------------------------------------------------------
-export default function App() {
-  return (
-    <ErrorBoundary>
-      <AppInner />
-    </ErrorBoundary>
-  );
-}
-
-function AppInner() {
-  const [data, setData] = useState(null);
-  const [monitor, setMonitor] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
-  const [tab, setTab] = useState('stage');
-  const logsRef = useRef([]);
-  const activeRef = useRef(true);
-
-  useEffect(() => {
-    const sub = AppState.addEventListener('change', (next) => {
-      activeRef.current = next === 'active';
-    });
-    return () => sub.remove();
-  }, []);
-
-  const load = useCallback(async ({ isRefresh = false } = {}) => {
-    if (!BASE_URL) {
-      setLoading(false);
-      setRefreshing(false);
-      setError('Backend URL not configured. Set EXPO_PUBLIC_BACKEND_URL.');
-      return;
-    }
-    if (isRefresh) setRefreshing(true);
-    else setLoading(true);
-    try {
-      const payload = await fetchWithRetry('/dashboard', isRefresh ? 1 : 3);
-      setData(payload);
-      setError(null);
-    } catch (err) {
-      const msg = err?.message || 'Request failed';
-      const status = err?.status ? `HTTP ${err.status}` : 'Error';
-      setError(`${status}: ${msg}`);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-    // Monitor heartbeat ring — separate, best-effort fetch. Never blocks or
-    // errors the main dashboard load; the panel just shows "—" if it fails.
-    try {
-      const mon = await apiFetch('/monitor?limit=40');
-      setMonitor(mon);
-    } catch (_) { /* monitor is non-critical; leave prior value */ }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const id = setInterval(() => {
-      if (activeRef.current) load();
-    }, POLL_MS);
-    return () => clearInterval(id);
-  }, [load]);
-
-  const onRefresh = useCallback(() => load({ isRefresh: true }), [load]);
-
-  const meta = data?.meta || {};
-  const runtime = meta?.runtime || {};
-  const truth = meta?.truth || {};
-  const engineState = meta?.engineState ?? runtime?.engineState ?? truth?.engineState;
-  const scanInProgress = (truth?.currentEntryScanProgress?.state || '').toLowerCase() === 'scanning';
-  const lastScanAt = meta?.lastEntryScanAt ?? truth?.lastEntryScanAt;
-  const version = data?.version ?? runtime?.commit ?? meta?.runtime?.version;
-
-  if (loading && !data) {
-    return (
-      <SafeAreaView style={s.root}>
-        <StatusBar barStyle="light-content" />
-        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-          <Text style={[s.heroCopyEmoji, { fontSize: 56, marginBottom: T.sp.md }]}>🎭</Text>
-          <Text style={[s.heroCopyTitle, { color: palette.cream }]}>MAGIC TRADER</Text>
-          <ActivityIndicator color={palette.magenta} size="large" style={{ marginTop: T.sp.lg }} />
-          <Text style={[s.statSub, { marginTop: T.sp.md }]}>raising the curtain...</Text>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  return (
-    <SafeAreaView style={s.root}>
-      <StatusBar barStyle="light-content" backgroundColor={palette.velvet} />
-      <HeaderStrip
-        engineState={engineState}
-        scanInProgress={scanInProgress}
-        lastScanAt={lastScanAt}
-        version={version}
-        monitor={monitor}
-      />
-
-      {error ? <Banner tone="error">{error}</Banner> : null}
-
-      <ScrollView
-        style={{ flex: 1 }}
-        contentContainerStyle={{ paddingBottom: T.sp.xxl + 60 }}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={palette.magenta} colors={[palette.magenta]} />}
-        showsVerticalScrollIndicator={false}
-      >
-        {tab === 'stage' && <Stage data={data} activeRef={activeRef} onJumpToCast={() => setTab('cast')} />}
-        {tab === 'cast' && <Cast data={data} activeRef={activeRef} />}
-        {tab === 'backstage' && <Backstage data={data} monitor={monitor} activeRef={activeRef} />}
-        {tab === 'send' && <Send data={data} logsRef={logsRef} activeRef={activeRef} />}
-      </ScrollView>
-
-      <TabBar active={tab} onChange={setTab} />
-    </SafeAreaView>
-  );
-}
-
-// ----------------------------------------------------------------------------
 // Styles.
 // ----------------------------------------------------------------------------
 const s = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: palette.velvet,
-  },
-  // -- Header strip
-  headerStrip: {
-    paddingHorizontal: T.sp.lg,
-    paddingVertical: T.sp.md,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    borderBottomColor: palette.velvetEdge,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  headerLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
-  headerTitle: {
-    color: palette.cream,
-    fontSize: 16,
-    fontWeight: '900',
-    letterSpacing: 2.5,
-    fontFamily: T.font,
-  },
-  headerSub: {
-    color: palette.fog,
-    fontSize: 11,
-    marginTop: 1,
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  versionPill: {
-    backgroundColor: palette.velvetEdge,
-    paddingHorizontal: T.sp.sm,
-    paddingVertical: 2,
-    borderRadius: 8,
-  },
-  versionPillText: {
-    color: palette.fog,
-    fontSize: 9,
-    fontFamily: T.fontMono,
-    letterSpacing: 0.5,
-  },
-  // -- Banner
-  banner: {
-    marginHorizontal: T.sp.lg,
-    marginTop: T.sp.sm,
-    paddingVertical: T.sp.sm,
-    paddingHorizontal: T.sp.md,
-    borderWidth: 1,
-    borderRadius: T.r.md,
-  },
-  bannerText: {
-    fontSize: 12,
-    fontFamily: T.font,
-  },
-  // -- Tab body
-  tabBody: {
-    paddingHorizontal: T.sp.lg,
-    paddingTop: T.sp.lg,
-    paddingBottom: T.sp.lg,
-  },
-  // -- Money tile
-  moneyTile: {
-    borderRadius: T.r.lg,
-    paddingVertical: T.sp.xl,
-    paddingHorizontal: T.sp.lg,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-    marginBottom: T.sp.md,
-  },
-  moneyMoodRow: { flexDirection: 'row', alignItems: 'center', marginBottom: T.sp.sm },
-  moneyMoodLabel: {
-    fontSize: 13,
-    fontWeight: '900',
-    letterSpacing: 2,
-    fontFamily: T.font,
-  },
-  moneyValue: {
-    color: palette.cream,
-    fontSize: 48,
-    fontWeight: '800',
-    letterSpacing: 0.5,
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  moneySub: {
-    fontSize: 13,
-    marginTop: T.sp.xs,
-    fontFamily: T.font,
-  },
-  moneyDeltaRow: {
-    marginTop: T.sp.md,
-    paddingTop: T.sp.sm,
-    borderTopColor: palette.velvetEdge,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  moneyDelta: {
-    fontSize: 16,
-    fontWeight: '700',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  moneyDeltaSub: {
-    fontSize: 11,
-    marginTop: 2,
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  // -- Stat triple
-  statRow: {
-    flexDirection: 'row',
-    gap: T.sp.sm,
-    marginBottom: T.sp.md,
-  },
-  statCell: {
-    flex: 1,
-    backgroundColor: palette.velvetSoft,
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    borderWidth: 1,
-  },
-  statLabel: {
-    color: palette.fog,
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 1.5,
-    fontFamily: T.font,
-  },
-  statValue: {
-    fontSize: 20,
-    fontWeight: '800',
-    marginTop: T.sp.xs,
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  statSub: {
-    color: palette.fog,
-    fontSize: 10,
-    marginTop: 2,
-    fontFamily: T.font,
-  },
-  // -- Section header
-  sectionHeader: {
-    marginTop: T.sp.lg,
-    marginBottom: T.sp.sm,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'baseline',
-  },
-  sectionHeaderTitle: {
-    color: palette.cream,
-    fontSize: 12,
-    fontWeight: '900',
-    letterSpacing: 2,
-    fontFamily: T.font,
-  },
-  sectionHeaderSub: {
-    color: palette.fog,
-    fontSize: 10,
-    fontFamily: T.font,
-  },
-  // -- Cast card (full)
-  castCard: {
-    borderRadius: T.r.lg,
-    padding: T.sp.lg,
-    borderLeftWidth: 4,
-    marginBottom: T.sp.sm,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  castHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  castSym: {
-    fontSize: 20,
-    fontWeight: '900',
-    letterSpacing: 1,
-    fontFamily: T.font,
-  },
-  castPL: {
-    fontSize: 18,
-    fontWeight: '800',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  castSubRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: T.sp.xs,
-  },
-  castPct: {
-    fontSize: 13,
-    fontWeight: '700',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  castMeta: {
-    color: palette.fog,
-    fontSize: 11,
-    fontFamily: T.font,
-  },
-  castPriceRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: T.sp.sm,
-  },
-  castPriceLabel: {
-    color: palette.fog,
-    fontSize: 9,
-    flex: 1,
-    fontFamily: T.font,
-    letterSpacing: 0.5,
-  },
-  castPriceVal: {
-    color: palette.cream,
-    fontSize: 13,
-    flex: 1,
-    fontWeight: '600',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-  },
-  castFooter: {
-    marginTop: T.sp.md,
-    paddingTop: T.sp.sm,
-    borderTopColor: palette.velvetEdge,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  castFooterText: {
-    color: palette.pearl,
-    fontSize: 11,
-    fontFamily: T.font,
-  },
-  // -- Compact cast card (Stage preview)
-  compactCard: {
-    backgroundColor: palette.velvetSoft,
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    marginBottom: T.sp.xs,
-    borderLeftWidth: 3,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  compactRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  compactSym: {
-    fontSize: 14,
-    fontWeight: '700',
-    fontFamily: T.font,
-    flex: 1,
-  },
-  compactPct: {
-    fontSize: 13,
-    fontWeight: '700',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-    marginRight: T.sp.md,
-  },
-  compactPL: {
-    fontSize: 13,
-    fontWeight: '700',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-    minWidth: 70,
-    textAlign: 'right',
-  },
-  compactMeta: {
-    color: palette.fog,
-    fontSize: 9,
-    marginTop: T.sp.xs,
-    fontFamily: T.font,
-  },
-  // -- Pulse / box-office tile
-  pulseTile: {
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  pulseRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: T.sp.xs,
-  },
-  pulseLabel: {
-    color: palette.fog,
-    fontSize: 11,
-    fontFamily: T.font,
-    letterSpacing: 0.5,
-  },
-  pulseValue: {
-    color: palette.cream,
-    fontSize: 13,
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-    fontWeight: '600',
-  },
-  // -- Reasons tile
-  reasonsTile: {
-    backgroundColor: palette.velvetSoft,
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  reasonLabel: {
-    color: palette.cream,
-    fontSize: 11,
-    fontFamily: T.fontMono,
-  },
-  reasonCount: {
-    color: palette.fog,
-    fontSize: 11,
-    fontFamily: T.fontMono,
-  },
-  // -- Box office (scorecard)
-  boxOffice: {
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-    marginBottom: T.sp.sm,
-  },
-  boRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: T.sp.sm,
-    borderBottomColor: palette.velvetEdge,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  boLabel: {
-    color: palette.fog,
-    fontSize: 12,
-    fontFamily: T.font,
-    letterSpacing: 0.3,
-  },
-  boValue: {
-    color: palette.cream,
-    fontSize: 14,
-    fontWeight: '700',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-    maxWidth: '60%',
-    textAlign: 'right',
-  },
-  // -- Empty state
-  emptyTile: {
-    backgroundColor: palette.velvetSoft,
-    borderRadius: T.r.md,
-    padding: T.sp.xl,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  emptyTitle: {
-    color: palette.gold,
-    fontSize: 14,
-    fontWeight: '700',
-    letterSpacing: 1,
-    fontFamily: T.font,
-    marginBottom: T.sp.xs,
-  },
-  emptyBody: {
-    color: palette.fog,
-    fontSize: 12,
-    textAlign: 'center',
-    fontFamily: T.font,
-  },
-  // -- Hero copy button
-  heroCopy: {
-    borderRadius: T.r.lg,
-    paddingVertical: T.sp.xl,
-    paddingHorizontal: T.sp.lg,
-    alignItems: 'center',
-    shadowColor: palette.magenta,
-    shadowOpacity: 0.4,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 16,
-    elevation: 6,
-    marginBottom: T.sp.md,
-  },
-  heroCopyEmoji: {
-    fontSize: 36,
-    marginBottom: T.sp.xs,
-  },
-  heroCopyTitle: {
-    color: palette.cream,
-    fontSize: 18,
-    fontWeight: '900',
-    letterSpacing: 2.5,
-    textAlign: 'center',
-    fontFamily: T.font,
-  },
-  heroCopySub: {
-    color: 'rgba(255,255,255,0.85)',
-    fontSize: 12,
-    textAlign: 'center',
-    marginTop: T.sp.xs,
-    fontFamily: T.font,
-  },
-  copyRow: {
-    flexDirection: 'row',
-    gap: T.sp.sm,
-    marginBottom: T.sp.md,
-  },
-  copyHalf: {
-    flex: 1,
-    backgroundColor: palette.velvetSoft,
-    paddingVertical: T.sp.md,
-    borderRadius: T.r.md,
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  copyHalfLabel: {
-    color: palette.cream,
-    fontSize: 12,
-    fontWeight: '700',
-    fontFamily: T.font,
-  },
-  // -- Logs
-  logsToolbar: {
-    flexDirection: 'row',
-    gap: T.sp.xs,
-    marginBottom: T.sp.sm,
-    flexWrap: 'wrap',
-  },
-  filterChip: {
-    paddingVertical: T.sp.xs,
-    paddingHorizontal: T.sp.sm,
-    borderRadius: T.r.sm,
-    backgroundColor: palette.velvetSoft,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-  },
-  filterChipActive: {
-    backgroundColor: palette.magentaSoft,
-    borderColor: palette.magenta,
-  },
-  filterChipText: {
-    color: palette.pearl,
-    fontSize: 11,
-    fontFamily: T.font,
-    fontWeight: '600',
-  },
-  filterChipTextActive: {
-    color: palette.cream,
-  },
-  logsContainer: {
-    backgroundColor: palette.ink,
-    borderRadius: T.r.md,
-    padding: T.sp.md,
-    borderWidth: 1,
-    borderColor: palette.velvetEdge,
-    minHeight: 200,
-  },
-  logsEmpty: {
-    color: palette.fog,
-    textAlign: 'center',
-    paddingVertical: T.sp.xl,
-    fontFamily: T.font,
-    fontSize: 12,
-  },
-  logLine: {
-    fontSize: 11,
-    fontFamily: T.fontMono,
-    paddingVertical: 1,
-    lineHeight: 15,
-  },
-  logTs: {
-    color: palette.fog,
-    fontFamily: T.fontMono,
-  },
-  logLevel: {
-    fontFamily: T.fontMono,
-    fontSize: 10,
-  },
-  // -- Tab bar
-  tabBar: {
-    flexDirection: 'row',
-    backgroundColor: palette.velvet,
-    borderTopColor: palette.velvetEdge,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    paddingBottom: Platform.OS === 'ios' ? 24 : T.sp.sm,
-    paddingTop: T.sp.sm,
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-  },
-  tabButton: {
-    flex: 1,
-    alignItems: 'center',
-    paddingVertical: T.sp.xs,
-    position: 'relative',
-  },
-  tabEmoji: {
-    fontSize: 22,
-    marginBottom: 2,
-  },
-  tabLabel: {
-    color: palette.fog,
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 1.5,
-    fontFamily: T.font,
-  },
-  tabLabelActive: {
-    color: palette.cream,
-  },
-  tabActiveBar: {
-    position: 'absolute',
-    bottom: 0,
-    width: 28,
-    height: 3,
-    borderRadius: 2,
-    backgroundColor: palette.magenta,
-    shadowColor: palette.magenta,
-    shadowOpacity: 0.8,
-    shadowOffset: { width: 0, height: 0 },
-    shadowRadius: 6,
-  },
-  // -- Error fallback
-  errorTitle: {
-    color: palette.cream,
-    fontSize: 22,
-    fontWeight: '900',
-    letterSpacing: 2,
-    marginTop: T.sp.md,
-    textAlign: 'center',
-    fontFamily: T.font,
-  },
-  errorMsg: {
-    color: palette.fog,
-    fontSize: 13,
-    marginTop: T.sp.sm,
-    textAlign: 'center',
-    fontFamily: T.fontMono,
-  },
-  errorBtn: {
-    marginTop: T.sp.xl,
-    paddingHorizontal: T.sp.xl,
-    paddingVertical: T.sp.md,
-    backgroundColor: palette.magenta,
-    borderRadius: T.r.md,
-  },
-  errorBtnText: {
-    color: palette.cream,
-    fontSize: 13,
-    fontWeight: '800',
-    letterSpacing: 1.5,
-    fontFamily: T.font,
-  },
-  // -- Per-token enrichments (2026-05-31 redesign)
-  castStateBadge: {
-    color: palette.gold,
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 1,
-    marginLeft: T.sp.sm,
-    paddingHorizontal: T.sp.sm,
-    paddingVertical: 1,
-    borderRadius: T.r.sm,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: palette.goldDim,
-    overflow: 'hidden',
-    fontFamily: T.font,
-  },
-  castChipRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: T.sp.xs,
-    marginTop: T.sp.md,
-  },
-  chip: {
-    paddingHorizontal: T.sp.sm,
-    paddingVertical: 2,
-    borderRadius: T.r.sm,
-    borderWidth: StyleSheet.hairlineWidth,
-    backgroundColor: palette.velvet,
-    marginRight: T.sp.xs,
-    marginBottom: T.sp.xs,
-  },
-  chipText: {
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.3,
-    fontFamily: T.font,
-  },
-  // -- Watchlist / scan board
-  scanRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: T.sp.sm,
-    paddingHorizontal: T.sp.md,
-    backgroundColor: palette.velvetSoft,
-    borderRadius: T.r.md,
-    marginBottom: T.sp.xs,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: palette.velvetEdge,
-  },
-  scanSym: {
-    color: palette.cream,
-    fontSize: 14,
-    fontWeight: '800',
-    fontFamily: T.font,
-    minWidth: 56,
-  },
-  scanStatus: {
-    fontSize: 12,
-    fontWeight: '700',
-    fontFamily: T.font,
-    letterSpacing: 0.3,
-  },
-  scanSub: {
-    color: palette.fog,
-    fontSize: 10,
-    fontFamily: T.font,
-    marginTop: 1,
-  },
-  scanEdge: {
-    fontSize: 12,
-    fontWeight: '800',
-    fontFamily: T.font,
-    fontVariant: ['tabular-nums'],
-    minWidth: 56,
-    textAlign: 'right',
-  },
-  scanLegend: {
-    color: palette.fog,
-    fontSize: 9,
-    fontFamily: T.font,
-    marginTop: T.sp.xs,
-    fontStyle: 'italic',
-  },
-  // -- Monitor (header pill + Backstage panel)
-  monPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: T.sp.sm,
-    paddingVertical: 3,
-    borderRadius: 10,
-    borderWidth: 1,
-    backgroundColor: palette.velvet,
-    maxWidth: 132,
-  },
-  monDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    marginRight: 5,
-  },
-  monPillText: {
-    fontSize: 9,
-    fontWeight: '800',
-    letterSpacing: 0.3,
-    fontFamily: T.font,
-  },
-  monVerdictRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: T.sp.sm,
-  },
-  monVerdict: {
-    fontSize: 16,
-    fontWeight: '900',
-    letterSpacing: 1,
-    marginLeft: T.sp.sm,
-    fontFamily: T.font,
-  },
-  monLegend: {
-    color: palette.fog,
-    fontSize: 9,
-    fontFamily: T.font,
-    marginTop: T.sp.md,
-    fontStyle: 'italic',
-  },
-  monHistRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 5,
-    borderBottomColor: palette.velvetEdge,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  monHistTime: {
-    color: palette.pearl,
-    fontSize: 10,
-    fontFamily: T.font,
-    width: 74,
-    marginLeft: T.sp.xs,
-  },
-  monHistMid: {
-    color: palette.cream,
-    fontSize: 11,
-    fontFamily: T.font,
-    flex: 1,
-  },
-  monHistFlag: {
-    color: palette.rose,
-    fontSize: 9,
-    fontWeight: '800',
-    fontFamily: T.font,
-    marginLeft: T.sp.xs,
-  },
+  root: { flex: 1, backgroundColor: C.paper },
+
+  topBar: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingHorizontal: T.sp.lg, paddingTop: T.sp.sm, paddingBottom: T.sp.md },
+  wordmark: { color: C.ink, fontSize: 19, fontWeight: '900', letterSpacing: 3 },
+  wordRule: { height: 3, width: 34, backgroundColor: C.pink, marginTop: 5, borderRadius: 2 },
+  topRight: { flexDirection: 'row', alignItems: 'center', marginTop: T.sp.xs },
+  topRightText: { marginLeft: T.sp.xs, fontSize: 11, fontWeight: '800', letterSpacing: 1.5 },
+
+  // Status hero
+  status: { borderRadius: T.r.lg, padding: T.sp.xl, marginBottom: T.sp.md },
+  statusTop: { flexDirection: 'row', alignItems: 'center' },
+  statusWord: { marginLeft: T.sp.sm, fontSize: 30, fontWeight: '900', letterSpacing: 2 },
+  statusLine: { color: C.ink2, fontSize: 15, lineHeight: 22, marginTop: T.sp.sm, fontWeight: '500' },
+  statusAct: { alignSelf: 'flex-start', borderWidth: 1.5, borderRadius: 999, paddingHorizontal: T.sp.md, paddingVertical: T.sp.xs, marginTop: T.sp.md },
+  statusActText: { fontSize: 13, fontWeight: '700' },
+
+  // Cards
+  card: { backgroundColor: C.card, borderRadius: T.r.lg, borderWidth: 1, borderColor: C.line, padding: T.sp.lg, marginBottom: T.sp.md },
+  cardHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: T.sp.xs },
+  label: { color: C.faint, fontSize: 11, fontWeight: '800', letterSpacing: 2 },
+  headPulse: { flexDirection: 'row', alignItems: 'center' },
+  headPulseText: { marginLeft: T.sp.xs, fontSize: 12, fontWeight: '700', fontFamily: T.mono },
+
+  equity: { color: C.ink, fontSize: 42, fontWeight: '800', fontFamily: T.mono, marginTop: T.sp.xs, marginBottom: T.sp.md, letterSpacing: -0.5 },
+
+  statGrid: { flexDirection: 'row', flexWrap: 'wrap' },
+  stat: { width: '25%', paddingVertical: T.sp.xs },
+  statK: { color: C.faint, fontSize: 9, fontWeight: '800', letterSpacing: 1, height: 12 },
+  statV: { color: C.ink, fontSize: 15, fontWeight: '700', fontFamily: T.mono, marginTop: 2 },
+
+  winWrap: { marginTop: T.sp.md },
+  winHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: T.sp.xs },
+  winLabel: { color: C.sub, fontSize: 11, fontWeight: '600' },
+  winVal: { color: C.ink, fontSize: 13, fontWeight: '800', fontFamily: T.mono },
+
+  // Spec rows
+  specRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: T.sp.sm },
+  specRowBorder: { borderBottomWidth: 1, borderBottomColor: C.line },
+  specKey: { color: C.sub, fontSize: 14, fontWeight: '500' },
+  specVal: { color: C.ink, fontSize: 15, fontWeight: '700', fontFamily: T.mono },
+
+  brakeState: { fontSize: 13, fontWeight: '900', letterSpacing: 1.5 },
+  note: { color: C.sub, fontSize: 12, lineHeight: 18, marginTop: T.sp.sm },
+  tiny: { color: C.faint, fontSize: 10, lineHeight: 15, marginTop: T.sp.sm },
+
+  // Leaderboard
+  leadRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: T.sp.xs },
+  leadRank: { color: C.faint, fontSize: 12, width: 20, fontFamily: T.mono },
+  leadSym: { color: C.ink, fontSize: 14, fontWeight: '800', width: 52, fontFamily: T.mono },
+  leadSig: { color: C.faint, fontSize: 11, flex: 1 },
+  leadBps: { fontSize: 14, fontWeight: '800', fontFamily: T.mono, width: 64, textAlign: 'right' },
+  leadN: { color: C.faint, fontSize: 11, width: 34, textAlign: 'right', fontFamily: T.mono },
+  dash: { height: 1, backgroundColor: C.line, marginVertical: T.sp.sm },
+
+  // Footer
+  footer: { alignItems: 'center', marginTop: T.sp.sm },
+  grab: { backgroundColor: C.pink, borderRadius: 999, paddingHorizontal: T.sp.xl, paddingVertical: T.sp.md },
+  grabText: { color: '#FFFFFF', fontSize: 14, fontWeight: '800', letterSpacing: 0.3 },
+  foot: { color: C.sub, fontSize: 11, fontWeight: '800', letterSpacing: 1, marginTop: T.sp.md, fontFamily: T.mono },
 });
