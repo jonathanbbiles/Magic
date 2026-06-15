@@ -1,5 +1,11 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-15: frontend CHANGE card — Binance-style time-windowed equity change
+
+The diagnostic dashboard (`Frontend/App.js`) gained a **CHANGE** card mirroring the Binance.US position screen's change readout: equity change over **24h / 1 week / 1 month / 3 month / 6 month / 1 year + all-time**, each shown as a `+$ / +%` pair, green up / red down. Windows without enough history render `—/—` (never a fabricated `$0`), so the card fills in over time as the bot accumulates equity snapshots.
+
+**Backend:** `equitySnapshots.getEquityChanges(latestEquity, nowMs)` computes each window from the existing 30-min equity-snapshot ring (5000 deep ≈ 104 days), finding the nearest historical snapshot within a per-window tolerance. Surfaced read-only at `meta.equityChanges` (`{ h24, d7, d30, d90, d180, d365, allTime }`, each `{ usd, pct, fromEquity, fromTs }` or `null`). Observational only — no trade decision reads it. Because snapshots land every 30 min, the 6-month and 1-year windows start `null` and populate as history grows. `meta.weeklyChangePct` and `meta.performanceEpoch` (SINCE RESET) are unchanged.
+
 ## 2026-06-07: learning engine — held-out validation gate (promote weights only when proven better)
 
 The auto-calibration scheduler (below) closes the *fit* loop, but until now it **wrote new weights unconditionally** whenever it had ≥500 samples — with no check that the freshly-fit weights were actually *better* than what the bot was already using. A small or unlucky-sample fit could silently replace good weights with worse ones, and the bot would trade them on the next restart. That's the classic overfitting trap.

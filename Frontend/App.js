@@ -148,6 +148,12 @@ const num = (v) => { if (v == null || v === '') return null; const n = Number(v)
 function usd(v, d = 2) { const n = num(v); if (n == null) return '—'; return `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`; }
 function signedUsd(v) { const n = num(v); if (n == null) return '—'; const s = n >= 0 ? '+' : '−'; return `${s}$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function pct(v, d = 2) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`; }
+// Binance-style "+$0.23/+0.04%" pair. Either side missing → "—/—".
+function changePair(usdV, pctV) {
+  const u = num(usdV); const p = num(pctV);
+  if (u == null && p == null) return '—/—';
+  return `${signedUsd(u)}/${p == null ? '—' : pct(p)}`;
+}
 function bps(v) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(1)}`; }
 function fmtElapsed(ms) {
   if (ms == null) return '—';
@@ -349,6 +355,45 @@ function Money({ data }) {
         </View>
         <Meter value={win} color={win != null && win >= 0.5 ? C.up : C.pink} />
       </View>
+    </Card>
+  );
+}
+
+// CHANGE — equity change across time horizons, the Binance position-screen
+// readout the operator asked for. Dollar + percent per window, green up / red
+// down, "—/—" when there isn't that much history yet. Every figure is a real
+// meta.equityChanges field — never a fabricated zero.
+const CHANGE_ROWS = [
+  ['24 Hour', 'h24'],
+  ['1 Week', 'd7'],
+  ['1 Month', 'd30'],
+  ['3 Month', 'd90'],
+  ['6 Month', 'd180'],
+  ['1 Year', 'd365'],
+  ['All-time', 'allTime'],
+];
+function Change({ data }) {
+  const ch = data.meta?.equityChanges || {};
+  return (
+    <Card>
+      <Label>CHANGE</Label>
+      <View style={{ marginTop: T.sp.xs }}>
+        {CHANGE_ROWS.map(([label, key], i) => {
+          const c = ch[key] || null;
+          const u = c ? num(c.usd) : null;
+          const tone = u == null ? null : u >= 0 ? 'up' : 'down';
+          return (
+            <Row
+              key={key}
+              k={`${label} Change`}
+              v={c ? changePair(c.usd, c.pct) : '—/—'}
+              tone={tone}
+              last={i === CHANGE_ROWS.length - 1}
+            />
+          );
+        })}
+      </View>
+      <Text style={s.tiny}>Equity vs each window back. Blank windows = not enough history yet.</Text>
     </Card>
   );
 }
@@ -578,10 +623,11 @@ function AppInner() {
         {data ? (
           <>
             <Reveal delay={70}><Money data={data} /></Reveal>
-            <Reveal delay={140}><Engine data={data} /></Reveal>
-            <Reveal delay={210}><Brake data={data} /></Reveal>
-            <Reveal delay={280}><Floor data={data} /></Reveal>
-            <Reveal delay={350}><Footer data={data} ageMs={ageMs} health={health} /></Reveal>
+            <Reveal delay={140}><Change data={data} /></Reveal>
+            <Reveal delay={210}><Engine data={data} /></Reveal>
+            <Reveal delay={280}><Brake data={data} /></Reveal>
+            <Reveal delay={350}><Floor data={data} /></Reveal>
+            <Reveal delay={420}><Footer data={data} ageMs={ageMs} health={health} /></Reveal>
           </>
         ) : (
           <Card><Text style={s.note}>{error || 'No data.'}</Text></Card>
