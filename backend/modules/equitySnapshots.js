@@ -6,6 +6,22 @@ const RING_BUFFER_SIZE = 5000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const WEEK_TOLERANCE_MS = 12 * 60 * 60 * 1000;
 
+// Multi-horizon change windows (mirrors the Binance.US position screen:
+// 24h / 1w / 1mo / 3mo / 6mo / 1yr + all-time). Snapshots land every 30 min
+// into a 5000-deep ring (~104 days of history), so the longer windows have no
+// data yet and honestly report null → the frontend renders "—/—" for them,
+// exactly like the reference screen. Each window has its own match tolerance
+// (you can't expect a year-old snapshot to land on the exact minute).
+const DAY_MS = 24 * 60 * 60 * 1000;
+const CHANGE_WINDOWS = [
+  { key: 'h24', ms: DAY_MS, toleranceMs: 4 * 60 * 60 * 1000 },
+  { key: 'd7', ms: 7 * DAY_MS, toleranceMs: 12 * 60 * 60 * 1000 },
+  { key: 'd30', ms: 30 * DAY_MS, toleranceMs: 2 * DAY_MS },
+  { key: 'd90', ms: 90 * DAY_MS, toleranceMs: 5 * DAY_MS },
+  { key: 'd180', ms: 180 * DAY_MS, toleranceMs: 10 * DAY_MS },
+  { key: 'd365', ms: 365 * DAY_MS, toleranceMs: 20 * DAY_MS },
+];
+
 const storage = resolveStoragePaths();
 const filePath = storage.paths.equitySnapshotsFile || null;
 const dirPath = filePath ? path.dirname(filePath) : null;
@@ -118,6 +134,78 @@ function getWeeklyChangePct(latestEquity, nowMs = Date.now()) {
   return { weeklyPct, weekAgoEquity: closest.equity, latestEquity: latest, weekAgoSnapshotTs: closest.snapshot.ts };
 }
 
+// Find the snapshot whose timestamp is closest to `targetTs` within `toleranceMs`.
+// Returns { equity, tsMs, ts } or null. Equity prefers `equity`, falls back to
+// `portfolio_value`; zero/non-finite equities are skipped (they'd produce a
+// divide-by-zero pct and aren't real readings).
+function getClosestSnapshot(targetTs, toleranceMs) {
+  const target = toFiniteNumber(targetTs);
+  if (!Number.isFinite(target)) return null;
+  let closest = null;
+  let minDiff = Number.POSITIVE_INFINITY;
+  for (let i = recentSnapshots.length - 1; i >= 0; i -= 1) {
+    const item = recentSnapshots[i];
+    const itemTs = toFiniteNumber(item?.tsMs);
+    const itemEquity = toFiniteNumber(item?.equity) ?? toFiniteNumber(item?.portfolio_value);
+    if (!Number.isFinite(itemTs) || !Number.isFinite(itemEquity) || itemEquity === 0) continue;
+    const diff = Math.abs(itemTs - target);
+    if (diff <= toleranceMs && diff < minDiff) {
+      minDiff = diff;
+      closest = { equity: itemEquity, tsMs: itemTs, ts: item?.ts || new Date(itemTs).toISOString() };
+    }
+  }
+  return closest;
+}
+
+// getEquityChanges — the multi-horizon change block behind the frontend CHANGE
+// card. For each window it finds the nearest historical snapshot and returns
+// the dollar + percent change to `latestEquity`. Windows with no in-tolerance
+// snapshot (e.g. 6mo/1yr before that much history exists) return null so the UI
+// shows "—/—". `allTime` uses the oldest snapshot on hand.
+function getEquityChanges(latestEquity, nowMs = Date.now()) {
+  // Reject empty input outright — Number(null)===0 would otherwise fake a $0
+  // equity and report a fictional −100% across every window.
+  if (latestEquity == null || latestEquity === '') return null;
+  const latest = toFiniteNumber(latestEquity);
+  const nowTs = toFiniteNumber(nowMs);
+  if (!Number.isFinite(latest) || !Number.isFinite(nowTs)) return null;
+
+  const buildChange = (past) => {
+    if (!past || !Number.isFinite(past.equity) || past.equity === 0) return null;
+    return {
+      usd: latest - past.equity,
+      pct: ((latest - past.equity) / past.equity) * 100,
+      fromEquity: past.equity,
+      fromTs: past.ts,
+    };
+  };
+
+  const changes = {};
+  for (const w of CHANGE_WINDOWS) {
+    changes[w.key] = buildChange(getClosestSnapshot(nowTs - w.ms, w.toleranceMs));
+  }
+
+  // All-time = oldest finite snapshot in the ring (the baseline we can see).
+  let oldest = null;
+  for (let i = 0; i < recentSnapshots.length; i += 1) {
+    const item = recentSnapshots[i];
+    const itemTs = toFiniteNumber(item?.tsMs);
+    const itemEquity = toFiniteNumber(item?.equity) ?? toFiniteNumber(item?.portfolio_value);
+    if (!Number.isFinite(itemTs) || !Number.isFinite(itemEquity) || itemEquity === 0) continue;
+    oldest = { equity: itemEquity, tsMs: itemTs, ts: item?.ts || new Date(itemTs).toISOString() };
+    break;
+  }
+  changes.allTime = buildChange(oldest);
+
+  return { latestEquity: latest, asOfTs: new Date(nowTs).toISOString(), ...changes };
+}
+
 hydrateRecentFromDisk();
 
-module.exports = { appendSnapshot, getNearestAtOrBefore, getWeeklyChangePct };
+module.exports = {
+  appendSnapshot,
+  getNearestAtOrBefore,
+  getWeeklyChangePct,
+  getClosestSnapshot,
+  getEquityChanges,
+};

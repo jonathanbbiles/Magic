@@ -1647,6 +1647,13 @@ app.get('/dashboard', async (req, res) => {
 
     const latestEquity = toFiniteNumberOrNull(account?.equity) ?? toFiniteNumberOrNull(account?.portfolio_value);
     const weekly = equitySnapshots.getWeeklyChangePct(latestEquity, nowMs);
+    // Multi-horizon equity change (24h / 1w / 1mo / 3mo / 6mo / 1yr + all-time),
+    // mirroring the Binance.US position screen. Windows without enough history
+    // come back null so the frontend shows "—/—". Observational only.
+    const equityChanges = (() => {
+      try { return equitySnapshots.getEquityChanges(latestEquity, nowMs); }
+      catch (_) { return null; }
+    })();
     // Performance epoch: stamp the baseline equity the first time we have a real
     // reading after a reset, then expose the since-reset block (P&L + a scorecard
     // filtered to trades at/after the epoch). Non-destructive; null when off.
@@ -1720,6 +1727,8 @@ app.get('/dashboard', async (req, res) => {
         weeklyChangePct: toFiniteNumberOrNull(weekly?.weeklyPct),
         weekAgoEquity: toFiniteNumberOrNull(weekly?.weekAgoEquity),
         latestEquity: toFiniteNumberOrNull(weekly?.latestEquity),
+        // Time-windowed equity change (Binance-style). null windows → "—/—".
+        equityChanges,
         // "Since reset" performance — the honest view of the current strategy,
         // filtered to trades at/after the configured epoch (point 0). Non-
         // destructive; meta.scorecard remains the all-time view.
