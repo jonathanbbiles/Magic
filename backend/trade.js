@@ -57,6 +57,7 @@ const marketRegimeDetector = require('./modules/marketRegimeDetector');
 const regimeVetoEvaluator = require('./modules/regimeVetoEvaluator');
 const staleQuoteRetryStatsModule = require('./modules/staleQuoteRetryStats');
 const { createSpreadSuppressionTracker } = require('./modules/spreadSuppression');
+const makerFillTracker = require('./modules/makerFillTracker');
 const { createRetryTracker: createStaleQuoteRetryTracker } = staleQuoteRetryStatsModule;
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
@@ -1203,6 +1204,17 @@ function getSpreadSuppressionState() {
         maxAcceptableRate: SPREAD_SUPPRESS_MAX_PASS_RATE,
       }),
     };
+  } catch (_) {
+    return null;
+  }
+}
+// Maker-fill-rate state for the dashboard meta surface. The BTC lead-lag edge
+// only exists on maker fills (+1.94 bps) vs taker (-0.38), so during a live
+// trial this funnel — submitted -> {filled | unfilled_cancelled |
+// rejected_post_only} — is the go/no-go instrument. Observational only.
+function getMakerFillState() {
+  try {
+    return { postOnly: ENTRY_POST_ONLY, ...makerFillTracker.buildSummary() };
   } catch (_) {
     return null;
   }
@@ -3632,6 +3644,17 @@ async function scanAndEnter() {
       if (buyOrder?.id) {
         const submittedAt = Date.now();
         const nowIso = new Date().toISOString();
+        // Maker-fill funnel (2026-06-18): the order rested (got an id). Its
+        // terminal fate is recorded later as 'filled' (buy_filled) or
+        // 'unfilled_cancelled' (entry_fill_timeout). Observational only.
+        try {
+          makerFillTracker.record({
+            outcome: 'submitted',
+            postOnly: ENTRY_POST_ONLY,
+            symbol: pair,
+            signalVersion: sig.signalVersion || ACTIVE_SIGNAL_VERSION,
+          });
+        } catch (_) { /* never let instrumentation break the scan */ }
         // STEP 3 (the sell signal): derive this trade's GTC sell target FROM
         // the entry signal. The exit manager reads signalDerivedGrossBps off
         // this prediction record and rests the sell at entry × (1 + gross).
@@ -3743,6 +3766,25 @@ async function scanAndEnter() {
         ? `${baseMessage} (binance ${binanceErrorCode}: ${binanceErrorMessage || 'no detail'})`
         : baseMessage;
       lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'buy_failed', message, binanceErrorCode, binanceErrorMessage };
+      // Maker-fill funnel (2026-06-18): a post-only (LIMIT_MAKER) entry that
+      // would have crossed is rejected by Binance (code -2010, "would
+      // immediately match and take"). That is the gate working as intended —
+      // we refused to pay taker — so it is tracked distinctly from a generic
+      // submit failure. Observational only.
+      if (ENTRY_POST_ONLY) {
+        const wouldCrossReject = Number(binanceErrorCode) === -2010
+          || /immediately match|would.*match|maker/i.test(String(baseMessage));
+        if (wouldCrossReject) {
+          try {
+            makerFillTracker.record({
+              outcome: 'rejected_post_only',
+              postOnly: true,
+              symbol: pair,
+              signalVersion: ACTIVE_SIGNAL_VERSION,
+            });
+          } catch (_) { /* never let instrumentation break the scan */ }
+        }
+      }
       rejectTrade(pair, 'buy_error', { message, binanceErrorCode, binanceErrorMessage });
     }
   }
@@ -3905,6 +3947,18 @@ async function reconcileExits() {
           error: err?.errorMessage || err?.message,
         });
       }
+      // Maker-fill funnel (2026-06-18): the rested entry never filled within
+      // ENTRY_FILL_TIMEOUT_MS and was recycled. Terminal state for 'submitted'.
+      // (A held position would have hit `byPair.has(pair)` continue above, so
+      // this is genuinely an unfilled rest, not a partial fill.)
+      try {
+        makerFillTracker.record({
+          outcome: 'unfilled_cancelled',
+          postOnly: ENTRY_POST_ONLY,
+          symbol: pair,
+          signalVersion: tradePredictions.get(pair)?.prediction?.signalVersion || ACTIVE_SIGNAL_VERSION,
+        });
+      } catch (_) { /* never let instrumentation break the reconcile */ }
       pendingBuys.delete(pair);
       tradePredictions.delete(pair);
       entryIntentState.delete(pair);
@@ -3965,6 +4019,16 @@ async function reconcileExits() {
       pred.buyFillObserved = true;
       pred.actualEntryPrice = avg;
       pred.buyFilledAt = new Date().toISOString();
+      // Maker-fill funnel (2026-06-18): the rested entry filled — the maker
+      // edge is captured. Terminal state for the 'submitted' event above.
+      try {
+        makerFillTracker.record({
+          outcome: 'filled',
+          postOnly: ENTRY_POST_ONLY,
+          symbol: pair,
+          signalVersion: pred.prediction?.signalVersion || ACTIVE_SIGNAL_VERSION,
+        });
+      } catch (_) { /* never let instrumentation break the reconcile */ }
       const entrySlipActualBps = Number.isFinite(pred.prediction?.buyLimit) && pred.prediction.buyLimit > 0
         ? ((avg - pred.prediction.buyLimit) / pred.prediction.buyLimit) * 10000
         : null;
@@ -4573,6 +4637,7 @@ module.exports = {
   getRealizedVetoState,
   getExplorationBudgetState,
   getSpreadSuppressionState,
+  getMakerFillState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,

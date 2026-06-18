@@ -122,6 +122,7 @@ function buildScorecard(limit = 5000, sinceMs = null) {
       avgNetPnlUsd: null,
       avgWinUsd: null,
       avgLossUsd: null,
+      winLossSizeRatio: null,
       expectancyUsd: null,
       profitFactor: null,
       medianHoldSeconds: null,
@@ -144,14 +145,23 @@ function buildScorecard(limit = 5000, sinceMs = null) {
   const winRate = net.length ? wins.length / net.length : null;
   const sumWin = wins.reduce((a, b) => a + b, 0);
   const sumLossAbs = Math.abs(losses.reduce((a, b) => a + b, 0));
+  const avgWinUsd = wins.length ? sumWin / wins.length : null;
+  const avgLossUsd = losses.length ? losses.reduce((a, b) => a + b, 0) / losses.length : null;
 
   return {
     totalClosedTrades: count,
     winRate,
     avgGrossPnlUsd: gross.length ? gross.reduce((a, b) => a + b, 0) / gross.length : null,
     avgNetPnlUsd: net.length ? net.reduce((a, b) => a + b, 0) / net.length : null,
-    avgWinUsd: wins.length ? sumWin / wins.length : null,
-    avgLossUsd: losses.length ? losses.reduce((a, b) => a + b, 0) / losses.length : null,
+    avgWinUsd,
+    avgLossUsd,
+    // Headline asymmetry metric: avg win size / avg loss size. The June
+    // analysis found this at 0.54 (a win is half a loss) — needs > 1.5 for
+    // the strategy to break even at its ~35% win rate. The inverted exits
+    // (let winners run, cut losers) are meant to push this above 1.
+    winLossSizeRatio: (avgWinUsd != null && avgLossUsd != null && Math.abs(avgLossUsd) > 0)
+      ? avgWinUsd / Math.abs(avgLossUsd)
+      : null,
     expectancyUsd: net.length ? net.reduce((a, b) => a + b, 0) / net.length : null,
     profitFactor: sumLossAbs > 0 ? sumWin / sumLossAbs : null,
     medianHoldSeconds: median(holds),
