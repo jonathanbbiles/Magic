@@ -200,6 +200,7 @@ const {
   getRealizedVetoState,
   getExplorationBudgetState,
   getSpreadSuppressionState,
+  getMakerFillState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getConvictionState,
@@ -1986,6 +1987,17 @@ app.get('/dashboard', async (req, res) => {
         spreadSuppression: (() => {
           try {
             return typeof getSpreadSuppressionState === 'function' ? getSpreadSuppressionState() : null;
+          } catch (_) {
+            return null;
+          }
+        })(),
+        // Maker-fill funnel (2026-06-18). The BTC lead-lag edge only exists on
+        // maker fills, so during a live trial fillRate is the go/no-go number:
+        // of resting post-only entries, what fraction filled (vs timed out
+        // unfilled, vs were rejected for would-cross). Observational only.
+        makerFillRate: (() => {
+          try {
+            return typeof getMakerFillState === 'function' ? getMakerFillState() : null;
           } catch (_) {
             return null;
           }
