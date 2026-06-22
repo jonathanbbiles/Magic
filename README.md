@@ -1,5 +1,17 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-22: SINCE RESET honesty split — separate deposits from trading P&L
+
+The `meta.performanceEpoch.pnlUsd` figure (and the frontend **SINCE RESET +$/%** tile) is `currentEquity − baselineEquity` — an **equity delta** that silently folds in **deposits/withdrawals and unrealized P&L on open positions**, so it is *not* a measure of whether the strategy made money. Live evidence of the trap: on 2026-06-22 the tile read **+$47.93 (+10.05%) since reset** while the deposit-free realized P&L over the same 77 closed trades was **−$0.76** (profit factor 0.31) — the "+10%" was a wallet top-up, not edge.
+
+`performanceEpoch.buildSinceEpoch` now also surfaces, all derived from the already-computed closed-trade scorecard (no new data source):
+
+- **`realizedTradingPnlUsd`** — deposit-free realized trading P&L = `scorecard.avgNetPnlUsd × scorecard.totalClosedTrades`. This is the honest "did the strategy make money" number.
+- **`externalFlowUsd`** — the remainder `pnlUsd − realizedTradingPnlUsd` (deposits/withdrawals + unrealized on open positions). Approximate by design.
+- **`externalFlowSuspected`** — `true` when the equity move is dominated by external flows (≥ $1 and larger in magnitude than realized trading P&L), i.e. the headline `+X%` is mostly deposits.
+
+Frontend (`Frontend/App.js`): the EQUITY card gains a **TRADING P&L** stat (the deposit-free number) and shows a one-line ⚠ note when `externalFlowSuspected`; the shareable snapshot adds a `Trading P&L (deposit-free)` line. **Observational only — no signal/gate/sizing/exit decision reads any of these fields** (Hard Rule #4 consumer: the dashboard surface). `meta.scorecard` and the raw `pnlUsd`/`pctChange` are unchanged.
+
 ## 2026-06-18: maker-fill instrument — make the BTC lead-lag live trial evaluable
 
 The `btc_lead_lag` strategy only has a positive edge **as a maker** (+1.94 bps/trade post-only vs **−0.38 as a taker** — see `docs/PROFITABILITY_ANALYSIS_2026-06.md` / `docs/BTC_LEAD_LAG_ROLLOUT.md`). With `ENTRY_POST_ONLY=true` the entry is submitted as a Binance `LIMIT_MAKER`, which the exchange **rejects** outright (code `-2010`) rather than letting it cross. So an entry attempt has three terminal fates — it rests and **fills**, it rests and is **cancelled unfilled** (`ENTRY_FILL_TIMEOUT_MS` recycles it), or it is **rejected for would-cross**. During a live trial the **maker fill rate** (of resting orders, what fraction filled) is the single most important number: a low fill rate means the realized scorecard is just the adverse-fill subset and can't be trusted.

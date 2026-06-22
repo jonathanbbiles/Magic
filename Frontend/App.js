@@ -338,6 +338,11 @@ function Money({ data }) {
   const sc = ep.scorecard || {};
   const trades = num(sc.totalClosedTrades);
   const win = num(sc.winRate);
+  // Honest split: equity delta vs deposit-free realized trading P&L. When the
+  // equity move is mostly deposits/withdrawals, say so instead of letting the
+  // "SINCE RESET +X%" tile read as strategy performance.
+  const tradingUsd = num(ep.realizedTradingPnlUsd);
+  const flowSuspected = ep.externalFlowSuspected === true;
   return (
     <Card>
       <Label>EQUITY</Label>
@@ -345,9 +350,15 @@ function Money({ data }) {
       <View style={s.statGrid}>
         <Stat k="SINCE RESET" v={`${signedUsd(sUsd)}`} tone={sUsd == null ? null : sUsd >= 0 ? 'up' : 'down'} />
         <Stat k="" v={pct(sPct)} tone={sPct == null ? null : sPct >= 0 ? 'up' : 'down'} />
+        <Stat k="TRADING P&L" v={tradingUsd == null ? '—' : signedUsd(tradingUsd)} tone={tradingUsd == null ? null : tradingUsd >= 0 ? 'up' : 'down'} />
         <Stat k="WEEK" v={pct(week)} tone={week == null ? null : week >= 0 ? 'up' : 'down'} />
         <Stat k="CASH" v={usd(cash, 0)} />
       </View>
+      {flowSuspected ? (
+        <Text style={s.flowNote}>
+          ⚠ SINCE RESET is mostly deposits/withdrawals, not trading. TRADING P&L is the deposit-free strategy result.
+        </Text>
+      ) : null}
       <View style={s.winWrap}>
         <View style={s.winHead}>
           <Text style={s.winLabel}>WIN RATE · {trades == null ? 0 : trades} trades since reset</Text>
@@ -523,6 +534,7 @@ function Footer({ data, ageMs, health }) {
         `Magic Money — ${new Date().toISOString()}`,
         `${health.label}: ${health.line}`,
         `Equity ${usd(num(data?.account?.equity) ?? num(data?.account?.portfolio_value))} · since reset ${signedUsd(num(ep.pnlUsd))} (${pct(num(ep.pctChange))})`,
+        `Trading P&L (deposit-free) ${signedUsd(num(ep.realizedTradingPnlUsd))}${ep.externalFlowSuspected === true ? ' · since-reset is mostly deposits' : ''}`,
         `Engine ${meta.engineState ?? '—'} · ${data?.account?.raw_venue ?? '—'} · signal ${veto.signalVersion ?? '—'}`,
         `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}`,
         `v${version} · data age ${fmtElapsed(ageMs)}`,
@@ -691,6 +703,8 @@ const s = StyleSheet.create({
   stat: { width: '25%', paddingVertical: T.sp.xs },
   statK: { color: C.faint, fontSize: 9, fontWeight: '800', letterSpacing: 1, height: 12 },
   statV: { color: C.ink, fontSize: 15, fontWeight: '700', fontFamily: T.mono, marginTop: 2 },
+
+  flowNote: { color: C.sub, fontSize: 11, fontWeight: '600', marginTop: T.sp.sm, lineHeight: 15 },
 
   winWrap: { marginTop: T.sp.md },
   winHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: T.sp.xs },
