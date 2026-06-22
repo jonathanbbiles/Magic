@@ -374,10 +374,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // the bot can bleed ~5 days' worth of expectancy before the breaker fires.
   // Shorter window (20 trades) + tighter floor (-5 bps, just past Binance.US
   // fees + single-trade noise) catches realized-vs-backtest divergence on the
-  // same order as the realized expectancy gain. min_trades stays at 10 to
-  // preserve the noise-floor sample.
+  // same order as the realized expectancy gain.
+  // 2026-06-22: min_trades lowered 10 → 6. At the post-only btc_lead_lag
+  // throughput (low maker fill rate + frequent btc_lead_too_weak skips) the
+  // bot does NOT accumulate 10 fresh closes within the 24h age-out window, so
+  // the breaker sat BLIND — observed live with sampleSize 8 / agedOutCount 68 /
+  // realizedAvgNetBps null (insufficient_sample) while the signal bled -8.8 bps
+  // over the epoch. 6 is still a meaningful noise-floor sample but is reachable
+  // at this throughput, so the sole halt authority can actually engage. Safe
+  // direction: the only downside of a more-sensitive breaker on a no-edge bot
+  // is sitting out, which is the correct failure mode.
   SIGNAL_SELECTOR_REALIZED_VETO_ENABLED: 'true',
-  SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '10',
+  SIGNAL_SELECTOR_REALIZED_MIN_TRADES: '6',
   SIGNAL_SELECTOR_REALIZED_FLOOR_BPS: '-5',
   SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES: '20',
   // 2026-06-11: self-recovery clock (24h). The breaker judges the active
@@ -388,9 +396,10 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // frozen sample → the veto lifts as insufficient_sample → the bot re-probes at
   // its tiny PORTFOLIO_SIZING_PCT size → the breaker re-judges on FRESH fills and
   // recovers if they clear the floor, re-halts within ~10 closes if they don't.
-  // When the signal IS trading, 10 fresh trades accumulate in hours (well inside
-  // 24h), so this never weakens the live-active breaker — it only un-freezes a
-  // halted one. Set '0' in Render to disable (count-only window).
+  // When the signal IS trading at healthy throughput, the min_trades sample
+  // accumulates well inside 24h, so this never weakens the live-active breaker —
+  // it only un-freezes a halted one. Set '0' in Render to disable (count-only
+  // window).
   SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS: '86400000',
   // Exploration budget (2026-05-29). The middle ground between the backtest
   // veto's two failure modes: veto-all (the bot never buys — the 2026-05-28/29

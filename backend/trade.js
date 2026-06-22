@@ -1107,7 +1107,7 @@ const SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES = Math.max(1, readNumber('SIGNAL_SELE
 // recent realized net bps proves it is losing. Open positions still exit
 // normally. Disable wholesale with SIGNAL_SELECTOR_REALIZED_VETO_ENABLED=false.
 const SIGNAL_SELECTOR_REALIZED_VETO_ENABLED = readBoolean('SIGNAL_SELECTOR_REALIZED_VETO_ENABLED', true);
-const SIGNAL_SELECTOR_REALIZED_MIN_TRADES = Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_MIN_TRADES', 10));
+const SIGNAL_SELECTOR_REALIZED_MIN_TRADES = Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_MIN_TRADES', 6));
 const SIGNAL_SELECTOR_REALIZED_FLOOR_BPS = readNumber('SIGNAL_SELECTOR_REALIZED_FLOOR_BPS', -10);
 // 2026-06-11: self-recovery clock for the realized breaker (default 24h). A
 // count-only window freezes while the veto halts all entries, so the breaker
