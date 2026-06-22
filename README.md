@@ -1,5 +1,20 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-22: maker-aggressive entry placement for continuation signals
+
+The live maker fill rate on the `btc_lead_lag` trial was **44%** (`meta.makerFillRate`: 19 filled / 24 unfilled-cancelled / 3 rejected), and the +1.94 bps maker edge is **−0.38 as a taker** — so fill quality is the dominant lever on profitability. Root cause: **`mid` placement is structurally backwards for a continuation/momentum buy.** `btc_lead_lag` buys expecting the alt to *rise* (catch up to BTC), but a post-only rest at mid only fills when price *falls* into it (you catch losers) and the ask lifts away on the up-move you were right about (you miss winners). `mid` is correct for mean-reversion (you *want* the dip), wrong for momentum.
+
+Fix: **signal-aware entry placement.** Continuation signals (`btc_lead_lag`, `trend_following`) now rest just inside the ask (`ask − ENTRY_MAKER_AGGRESSION_OFFSET_BPS`, capped one tick below ask to guarantee maker, floored at the bid) so the order sits nearest current price and fills on near-touch flow instead of only on adverse dips. Every other signal (mean-reversion family, barrier, microstructure) keeps its `ENTRY_LIMIT_PRICE_MODE` placement unchanged.
+
+**Taker-safe by construction:** the aggressive placement only activates under `ENTRY_POST_ONLY=true`, so the exchange rejects (a harmless no-op, recorded as `rejected_post_only`) anything that would cross — it can *never* become a taker fill. The only realized-economics change is filling a few bps nearer the ask (correct when the thesis move is ≫ the spread) at a higher rate. Downside is backstopped by the realized breaker (now firing at a 6-trade sample). The forensic `prediction.buyLimitPriceMode` now records the actual placement used (`maker_aggressive` / `mid` / …).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `ENTRY_MAKER_AGGRESSION_ENABLED` | `true` | Master kill. `false` → continuation signals fall back to `ENTRY_LIMIT_PRICE_MODE` (i.e. `mid`), the prior behaviour. |
+| `ENTRY_MAKER_AGGRESSION_OFFSET_BPS` | `1` | How far below the ask to rest. Smaller = more aggressive (closer to ask = higher fill rate, slightly worse entry price). Always capped one tick below ask so the order stays maker. |
+
+Watch `meta.makerFillRate.fillRate` (target ≥ ~0.6–0.7) and the since-reset `realizedTradingPnlUsd` after this ships.
+
 ## 2026-06-22: SINCE RESET honesty split — separate deposits from trading P&L
 
 The `meta.performanceEpoch.pnlUsd` figure (and the frontend **SINCE RESET +$/%** tile) is `currentEquity − baselineEquity` — an **equity delta** that silently folds in **deposits/withdrawals and unrealized P&L on open positions**, so it is *not* a measure of whether the strategy made money. Live evidence of the trap: on 2026-06-22 the tile read **+$47.93 (+10.05%) since reset** while the deposit-free realized P&L over the same 77 closed trades was **−$0.76** (profit factor 0.31) — the "+10%" was a wallet top-up, not edge.

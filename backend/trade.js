@@ -193,6 +193,27 @@ const ENTRY_POST_ONLY = readBoolean('ENTRY_POST_ONLY', false);
 // Set to 0 to disable (passive buy rests until the staircase exit logic
 // detects it on a held position — not recommended outside backtest parity).
 const ENTRY_FILL_TIMEOUT_MS = Math.max(0, readNumber('ENTRY_FILL_TIMEOUT_MS', 30000));
+// Maker-aggressive entry placement for CONTINUATION signals (2026-06-22).
+// `mid` placement is correct for mean-reversion (you WANT to catch the dip) but
+// structurally backwards for a momentum/continuation buy like btc_lead_lag: when
+// the alt rises (the thesis) the ask lifts away and a mid rest never fills (the
+// missed-winner half of the live 44% maker fill rate); when it falls a seller
+// hits the mid rest and you fill into a loser. For continuation signals we
+// instead rest just inside the ask (ask − offset, capped one tick below ask) so
+// the order sits at the front of the queue nearest current price — maximising
+// fill probability against near-touch flow and reducing adverse selection in the
+// filled subset. This is taker-SAFE: it only activates under ENTRY_POST_ONLY, so
+// the exchange rejects (harmless no-op, recorded as rejected_post_only) anything
+// that would cross — it can never become a taker fill. Mean-reversion and all
+// other signals keep their ENTRY_LIMIT_PRICE_MODE placement unchanged.
+const ENTRY_MAKER_AGGRESSION_ENABLED = readBoolean('ENTRY_MAKER_AGGRESSION_ENABLED', true);
+const ENTRY_MAKER_AGGRESSION_OFFSET_BPS = Math.max(0, readNumber('ENTRY_MAKER_AGGRESSION_OFFSET_BPS', 1));
+// Signals that BUY expecting continuation/momentum (price to rise after entry),
+// for which an aggressive near-ask maker rest fits the thesis. Mean-reversion,
+// range-MR, barrier and microstructure are NOT here — they keep mid/configured
+// placement. Mirrors the signal-aware dispatch in deriveStopLossBps.
+const CONTINUATION_SIGNALS = new Set(['btc_lead_lag', 'trend_following']);
+function isContinuationSignal(v) { return CONTINUATION_SIGNALS.has(String(v || '')); }
 // 2026-05-31 stop-the-bleed: re-fetch a fresh single-symbol quote at the top of
 // each per-symbol entry evaluation instead of trusting the batch-prefetched
 // quote. Binance.US bookTicker carries no server timestamp, so a prefetched
@@ -3613,11 +3634,26 @@ async function scanAndEnter() {
       // Operator can still override via ENTRY_LIMIT_PRICE_MODE.
       const projectedBps = Number.isFinite(sig.projectedBps) ? sig.projectedBps : 0;
       const tickInfo = await getAssetTickInfo(pair);
+      const tick = Number(tickInfo.priceIncrement) || 0;
+      const activeSignalForEntry = sig.signalVersion || ACTIVE_SIGNAL_VERSION;
+      // Maker-aggressive placement for continuation signals (taker-safe; only
+      // under post-only). Rest just inside the ask: ask − offset, but never
+      // closer than one tick below ask (guarantee maker) and never below the bid.
+      const makerAggressive = ENTRY_MAKER_AGGRESSION_ENABLED
+        && ENTRY_POST_ONLY
+        && isContinuationSignal(activeSignalForEntry)
+        && Number.isFinite(ask) && ask > 0 && Number.isFinite(bid) && bid > 0;
       let buyPriceRaw;
-      if (ENTRY_LIMIT_PRICE_MODE === 'ask') buyPriceRaw = ask;
-      else if (ENTRY_LIMIT_PRICE_MODE === 'bid_plus_tick') buyPriceRaw = bid + (Number(tickInfo.priceIncrement) || 0);
-      else buyPriceRaw = (ask + bid) / 2;
-      if (!Number.isFinite(buyPriceRaw) || buyPriceRaw <= 0) buyPriceRaw = ask;
+      let entryPlacement;
+      if (makerAggressive) {
+        const offsetTarget = ask * (1 - ENTRY_MAKER_AGGRESSION_OFFSET_BPS / 10000);
+        const makerCeiling = tick > 0 ? ask - tick : offsetTarget; // never cross
+        buyPriceRaw = Math.max(bid, Math.min(offsetTarget, makerCeiling));
+        entryPlacement = 'maker_aggressive';
+      } else if (ENTRY_LIMIT_PRICE_MODE === 'ask') { buyPriceRaw = ask; entryPlacement = 'ask'; }
+      else if (ENTRY_LIMIT_PRICE_MODE === 'bid_plus_tick') { buyPriceRaw = bid + tick; entryPlacement = 'bid_plus_tick'; }
+      else { buyPriceRaw = (ask + bid) / 2; entryPlacement = 'mid'; }
+      if (!Number.isFinite(buyPriceRaw) || buyPriceRaw <= 0) { buyPriceRaw = ask; entryPlacement = 'ask_fallback'; }
       const buyLimitStr = formatTickPrice(buyPriceRaw, tickInfo.priceIncrement);
       if (!buyLimitStr) { rejectTrade(pair, 'invalid_ask'); continue; }
       const buyLimitNum = Number(buyLimitStr);
@@ -3666,7 +3702,7 @@ async function scanAndEnter() {
           buyOrderId: buyOrder.id,
           exploration: false,
           buyLimit: buyLimitNum,
-          buyLimitPriceMode: ENTRY_LIMIT_PRICE_MODE,
+          buyLimitPriceMode: entryPlacement,
           buyLimitOffsetBpsFromAsk,
           entryFillTimeoutMs: ENTRY_FILL_TIMEOUT_MS,
           askAtSubmit: ask,
