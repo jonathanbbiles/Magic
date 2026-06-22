@@ -153,10 +153,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_MIN_BACKTEST_ENTRIES, '5');
 // can bleed ~5 days' worth of expectancy before the breaker fires.
 // Shorter window (20) + tighter floor (-5 bps, just past Binance.US
 // fees + single-trade noise) catches realized-vs-backtest divergence
-// on the same order as the realized expectancy gain. min_trades stays
-// at 10 to preserve the noise-floor sample.
+// on the same order as the realized expectancy gain. min_trades lowered
+// 10 → 6 (2026-06-22) so the breaker can engage at the low post-only
+// throughput where 10 fresh closes never accumulate inside the 24h window.
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_VETO_ENABLED, 'true');
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '10');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '6');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-5');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '20');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS, '86400000');
