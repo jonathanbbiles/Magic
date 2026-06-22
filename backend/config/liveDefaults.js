@@ -215,6 +215,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // Revert to 'false' in Render env if pinning a mean-reversion signal again.
   ENTRY_POST_ONLY: 'true',
   ENTRY_FILL_TIMEOUT_MS: '30000',
+  // 2026-06-22: maker-aggressive entry placement for CONTINUATION signals.
+  // mid placement is correct for mean-reversion but backwards for momentum:
+  // btc_lead_lag buys expecting the alt to RISE, but a mid rest only fills when
+  // price falls into it (caught losers) and misses the up-move (the live 44%
+  // fill rate / 24 unfilled-cancelled). For continuation signals we rest just
+  // inside the ask instead, maximising fill on near-touch flow. Taker-SAFE: only
+  // active under ENTRY_POST_ONLY, so the exchange rejects anything that would
+  // cross (harmless no-op) — it can never become a taker fill. Mean-reversion and
+  // every other signal keep their ENTRY_LIMIT_PRICE_MODE placement. Kill switch:
+  // ENTRY_MAKER_AGGRESSION_ENABLED='false' restores mid for continuation signals.
+  ENTRY_MAKER_AGGRESSION_ENABLED: 'true',
+  ENTRY_MAKER_AGGRESSION_OFFSET_BPS: '1',
   // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
   // projected forward move doesn't cover the gross target + entry/exit
   // slippage. In the May 2026 backtest it skipped 19,108 candidates — a
