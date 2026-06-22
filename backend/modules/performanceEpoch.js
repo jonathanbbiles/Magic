@@ -12,6 +12,13 @@
 // the full history stays on disk and the all-time scorecard is unchanged. To
 // reset again, bump PERFORMANCE_EPOCH_AT and redeploy.
 //
+// HONESTY SPLIT. `pnlUsd` (equity delta) folds in deposits/withdrawals and
+// unrealized P&L, so it is NOT a strategy-performance number. buildSinceEpoch
+// also surfaces `realizedTradingPnlUsd` (deposit-free, from the closed-trade
+// scorecard), `externalFlowUsd` (the unexplained remainder = deposits/withdrawals
+// + unrealized), and `externalFlowSuspected` (true when the equity move is
+// dominated by flows, i.e. a "+X%" tile that's really a wallet top-up).
+//
 // CONFIG-DRIVEN. The epoch is whatever PERFORMANCE_EPOCH_AT (ISO) resolves to.
 // On boot we reconcile: if the configured epoch differs from the persisted one,
 // we adopt the new epoch and clear the baseline (a real reset). The baseline
@@ -145,6 +152,30 @@ function buildSinceEpoch({ scorecardFn, currentEquity } = {}) {
   const pctChange = (baseline != null && baseline > 0 && haveCur) ? ((cur - baseline) / baseline) * 100 : null;
   let scorecard = null;
   try { scorecard = typeof scorecardFn === 'function' ? scorecardFn(5000, ms) : null; } catch (_) { scorecard = null; }
+
+  // Honesty split. `pnlUsd` is the raw equity delta (currentEquity vs baseline),
+  // which silently folds in deposits/withdrawals AND unrealized P&L on still-open
+  // positions — so it is NOT a measure of whether the strategy made money. The
+  // scorecard already carries the deposit-free realized trading P&L (sum of every
+  // closed trade's net P&L since the epoch); surface it explicitly so a +equity
+  // tile driven by a wallet top-up can't masquerade as performance.
+  const avgNet = Number(scorecard?.avgNetPnlUsd);
+  const closed = Number(scorecard?.totalClosedTrades);
+  const realizedTradingPnlUsd = (Number.isFinite(avgNet) && Number.isFinite(closed))
+    ? avgNet * closed
+    : null;
+  // Everything in the equity delta NOT explained by realized trading P&L:
+  // deposits/withdrawals + unrealized on open positions. Approximate by design.
+  const externalFlowUsd = (pnlUsd != null && realizedTradingPnlUsd != null)
+    ? pnlUsd - realizedTradingPnlUsd
+    : null;
+  // Flag when the equity move is dominated by external flows rather than trading,
+  // i.e. the headline "+X%" is mostly deposits. Material = ≥ $1 AND larger in
+  // magnitude than the realized trading P&L it's being mistaken for.
+  const externalFlowSuspected = (externalFlowUsd != null && realizedTradingPnlUsd != null)
+    ? (Math.abs(externalFlowUsd) >= 1 && Math.abs(externalFlowUsd) > Math.abs(realizedTradingPnlUsd))
+    : null;
+
   return {
     active: true,
     epochStartIso: _epoch.epochStartIso,
@@ -154,6 +185,9 @@ function buildSinceEpoch({ scorecardFn, currentEquity } = {}) {
     currentEquity: haveCur ? cur : null,
     pnlUsd,
     pctChange,
+    realizedTradingPnlUsd,
+    externalFlowUsd,
+    externalFlowSuspected,
     scorecard,
   };
 }

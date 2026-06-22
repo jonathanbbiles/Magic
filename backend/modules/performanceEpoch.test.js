@@ -86,6 +86,43 @@ const MS = Date.parse(ISO);
   assert.ok(Math.abs(block.pnlUsd - 4.77) < 1e-6, `pnlUsd ${block.pnlUsd}`);
   assert.ok(Math.abs(block.pctChange - 1.0) < 0.01, `pctChange ${block.pctChange}`);
   assert.equal(block.scorecard.totalClosedTrades, 7);
+  // scorecard had no avgNetPnlUsd -> realized trading P&L unknown -> nulls
+  assert.equal(block.realizedTradingPnlUsd, null, 'no avgNetPnlUsd => null realized');
+  assert.equal(block.externalFlowUsd, null);
+  assert.equal(block.externalFlowSuspected, null);
+})();
+
+// 6b. Honesty split: equity grew but realized trading P&L is negative -> the
+//     gain is external flow (a deposit), and the flag fires.
+(() => {
+  const fp = tmpFile(); ep._resetForTest(fp);
+  ep.loadEpoch({ epochAtIso: ISO, filePath: fp });
+  ep.ensureBaseline(477.05, { nowMs: MS, filePath: fp });
+  const block = ep.buildSinceEpoch({
+    // 77 trades averaging -$0.0098 each => realized ≈ -$0.76 (mirrors live data)
+    scorecardFn: () => ({ totalClosedTrades: 77, avgNetPnlUsd: -0.0098 }),
+    currentEquity: 524.99, // +$47.94 equity, almost all of it a deposit
+  });
+  assert.ok(Math.abs(block.pnlUsd - 47.94) < 1e-6, `pnlUsd ${block.pnlUsd}`);
+  assert.ok(Math.abs(block.realizedTradingPnlUsd - (-0.7546)) < 1e-6, `realized ${block.realizedTradingPnlUsd}`);
+  // external flow ≈ pnl - realized = 47.94 + 0.7546
+  assert.ok(Math.abs(block.externalFlowUsd - (block.pnlUsd - block.realizedTradingPnlUsd)) < 1e-9);
+  assert.ok(block.externalFlowUsd > 48, `externalFlow ${block.externalFlowUsd}`);
+  assert.equal(block.externalFlowSuspected, true, 'big deposit dwarfs tiny realized loss => flagged');
+})();
+
+// 6c. Honesty split: no external flow — equity delta IS the realized trading P&L.
+(() => {
+  const fp = tmpFile(); ep._resetForTest(fp);
+  ep.loadEpoch({ epochAtIso: ISO, filePath: fp });
+  ep.ensureBaseline(500, { nowMs: MS, filePath: fp });
+  const block = ep.buildSinceEpoch({
+    scorecardFn: () => ({ totalClosedTrades: 10, avgNetPnlUsd: 0.2 }), // +$2.00 realized
+    currentEquity: 502, // +$2.00 equity, fully explained by trading
+  });
+  assert.ok(Math.abs(block.realizedTradingPnlUsd - 2) < 1e-6);
+  assert.ok(Math.abs(block.externalFlowUsd) < 1e-6, `externalFlow ${block.externalFlowUsd}`);
+  assert.equal(block.externalFlowSuspected, false, 'no flow => not flagged');
 })();
 
 // 7. buildSinceEpoch null when no epoch active.
