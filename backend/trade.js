@@ -3956,7 +3956,7 @@ async function reconcileExits() {
           outcome: 'unfilled_cancelled',
           postOnly: ENTRY_POST_ONLY,
           symbol: pair,
-          signalVersion: tradePredictions.get(pair)?.prediction?.signalVersion || ACTIVE_SIGNAL_VERSION,
+          signalVersion: tradePredictions.get(pair)?.prediction?.signalVersion || SIGNAL_VERSION_OPERATOR_OVERRIDE || null,
         });
       } catch (_) { /* never let instrumentation break the reconcile */ }
       pendingBuys.delete(pair);
@@ -4026,7 +4026,7 @@ async function reconcileExits() {
           outcome: 'filled',
           postOnly: ENTRY_POST_ONLY,
           symbol: pair,
-          signalVersion: pred.prediction?.signalVersion || ACTIVE_SIGNAL_VERSION,
+          signalVersion: pred.prediction?.signalVersion || SIGNAL_VERSION_OPERATOR_OVERRIDE || null,
         });
       } catch (_) { /* never let instrumentation break the reconcile */ }
       const entrySlipActualBps = Number.isFinite(pred.prediction?.buyLimit) && pred.prediction.buyLimit > 0
