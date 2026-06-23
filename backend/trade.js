@@ -342,7 +342,19 @@ const MR_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MR_BREAKEVEN_TIMEOUT
 const BLL_MAX_HOLD_MS = Math.max(60000, readNumber('BLL_MAX_HOLD_MS', 360000));          // 6 min
 const BLL_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BLL_BREAKEVEN_TIMEOUT_MS', 300000)); // 5 min
 const BLL_STOP_LOSS_BPS = Math.max(1, readNumber('BLL_STOP_LOSS_BPS', 25));
-const BLL_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('BLL_TARGET_NET_PROFIT_BPS_FLOOR', 10));
+// 2026-06-22 asymmetry fix: TP floor raised 10 → 20. The live scorecard showed
+// winLossSizeRatio 0.50 (avg loss ~2× avg win) — structural, because the
+// smallest TP target (10 bps net) was far below the 25 bps hard stop, so a
+// stopped loser was ~2.5× a floor-target winner. Lifting the minimum target to
+// 20 narrows reward:risk from 0.4 toward ~0.8 (kept deliberately BELOW the 25
+// stop — this is conservative, not a claim of >1:1). Only the floor moves: the
+// validated 25 bps stop, the short 6-min max-hold, and the fast breakeven decay
+// are all unchanged (documented btc_lead_lag design). Projection-driven targets
+// above 20 are unaffected; this only lifts the thin-catch-up trades that were
+// being clipped tiny. Trades that no longer reach the higher TP still decay to
+// the breakeven floor (≥ $0), so the floor lift adds win SIZE without adding
+// loss size.
+const BLL_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('BLL_TARGET_NET_PROFIT_BPS_FLOOR', 20));
 const BLL_SIGNAL_TARGET_MAX_NET_BPS = Math.max(BLL_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('BLL_SIGNAL_TARGET_MAX_NET_BPS', 60));
 
 // Signal-aware exit timing helpers. The live exit manager and the

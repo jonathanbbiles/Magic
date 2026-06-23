@@ -1,5 +1,18 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-22: btc_lead_lag exit asymmetry — TP floor raised 10 → 20 bps
+
+The live scorecard showed `winLossSizeRatio` **0.50** (average loss ~2× average win) — a structural problem, not bad luck. `btc_lead_lag`'s smallest take-profit target was **10 bps net** while the hard stop is **25 bps**, so a stopped loser was ~2.5× a floor-target winner. With a ~48% win rate that asymmetry alone makes the strategy bleed even when the directional call is fine.
+
+Fix: raise `BLL_TARGET_NET_PROFIT_BPS_FLOOR` **10 → 20**, narrowing reward:risk from 0.4 toward ~0.8. Kept deliberately **below** the 25 bps stop — this is conservative (not a claim of >1:1), and **only the floor moves**:
+
+- The **validated 25 bps hard stop** (`BLL_STOP_LOSS_BPS`, robust in both backtest halves) is unchanged — losers are still cut fast.
+- The **6-min max-hold** and **fast breakeven staircase** (the documented short-clock `btc_lead_lag` design) are unchanged.
+- Projection-driven targets already above 20 bps are unaffected; this only lifts the thin-catch-up trades that were being clipped tiny.
+- Trades that no longer reach the higher TP still decay to the **breakeven floor (≥ $0)** — so the floor lift adds win *size* without adding loss size.
+
+Reversible via `BLL_TARGET_NET_PROFIT_BPS_FLOOR=10` in Render. **Watch** the since-reset `winLossSizeRatio` (target → 1.0) and `realizedTradingPnlUsd`; the realized breaker (6-trade sample, #489) backstops a regression.
+
 ## 2026-06-22: maker-aggressive entry placement for continuation signals
 
 The live maker fill rate on the `btc_lead_lag` trial was **44%** (`meta.makerFillRate`: 19 filled / 24 unfilled-cancelled / 3 rejected), and the +1.94 bps maker edge is **−0.38 as a taker** — so fill quality is the dominant lever on profitability. Root cause: **`mid` placement is structurally backwards for a continuation/momentum buy.** `btc_lead_lag` buys expecting the alt to *rise* (catch up to BTC), but a post-only rest at mid only fills when price *falls* into it (you catch losers) and the ask lifts away on the up-move you were right about (you miss winners). `mid` is correct for mean-reversion (you *want* the dip), wrong for momentum.
