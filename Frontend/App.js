@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import Constants from 'expo-constants';
+import * as Clipboard from 'expo-clipboard';
 import {
   ActivityIndicator,
   Animated,
@@ -522,30 +523,67 @@ function Lead({ rank, g }) {
 }
 
 // FOOTER — freshness, version, one-tap state grab for the Claude workflow.
+//
+// "Grab state → Claude" copies a paste-ready report to the CLIPBOARD (not the
+// share sheet) and appends the tail of the backend log ring so the paste is
+// actually diagnostic. RN 0.79 removed core Clipboard, so this uses
+// expo-clipboard. Failures surface in the button label — never swallowed.
+function fmtLogTail(entries, max = 40) {
+  if (!Array.isArray(entries) || entries.length === 0) return '(no log entries)';
+  return entries.slice(-max).map((e) => {
+    const t = num(e?.ts);
+    const stamp = t == null ? '--:--:--' : new Date(t).toISOString().slice(11, 19);
+    return `${stamp} ${String(e?.level ?? 'info').toUpperCase()} ${String(e?.msg ?? '')}`;
+  }).join('\n');
+}
 function Footer({ data, ageMs, health }) {
   const version = String(data?.version || data?.meta?.runtime?.commit || '').slice(0, 7) || '—';
   const stale = ageMs != null && ageMs > STALE_WARN_MS;
-  const onGrab = useCallback(() => {
+  const [copyState, setCopyState] = useState('idle'); // idle | copying | done | error
+  const onGrab = useCallback(async () => {
+    setCopyState('copying');
+    const meta = data?.meta || {};
+    const veto = meta.signalSelector?.realizedVeto || {};
+    const ep = meta.performanceEpoch || {};
+    const summary = [
+      `Magic Money — ${new Date().toISOString()}`,
+      `${health.label}: ${health.line}`,
+      `Equity ${usd(num(data?.account?.equity) ?? num(data?.account?.portfolio_value))} · since reset ${signedUsd(num(ep.pnlUsd))} (${pct(num(ep.pctChange))})`,
+      `Trading P&L (deposit-free) ${signedUsd(num(ep.realizedTradingPnlUsd))}${ep.externalFlowSuspected === true ? ' · since-reset is mostly deposits' : ''}`,
+      `Engine ${meta.engineState ?? '—'} · ${data?.account?.raw_venue ?? '—'} · signal ${veto.signalVersion ?? '—'}`,
+      `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}`,
+      `v${version} · data age ${fmtElapsed(ageMs)}`,
+    ].join('\n');
+    // Best-effort: append the backend log tail. A logs failure must not block
+    // the copy — fall back to "(logs unavailable)" and still copy the summary.
+    let logsBlock;
     try {
-      const meta = data?.meta || {};
-      const veto = meta.signalSelector?.realizedVeto || {};
-      const ep = meta.performanceEpoch || {};
-      const msg = [
-        `Magic Money — ${new Date().toISOString()}`,
-        `${health.label}: ${health.line}`,
-        `Equity ${usd(num(data?.account?.equity) ?? num(data?.account?.portfolio_value))} · since reset ${signedUsd(num(ep.pnlUsd))} (${pct(num(ep.pctChange))})`,
-        `Trading P&L (deposit-free) ${signedUsd(num(ep.realizedTradingPnlUsd))}${ep.externalFlowSuspected === true ? ' · since-reset is mostly deposits' : ''}`,
-        `Engine ${meta.engineState ?? '—'} · ${data?.account?.raw_venue ?? '—'} · signal ${veto.signalVersion ?? '—'}`,
-        `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}`,
-        `v${version} · data age ${fmtElapsed(ageMs)}`,
-      ].join('\n');
-      Share.share({ message: msg });
-    } catch (_) { /* best-effort */ }
+      const logs = await fetchWithRetry('/debug/logs', 1);
+      logsBlock = fmtLogTail(logs?.entries);
+    } catch (err) {
+      logsBlock = `(logs unavailable: ${String(err?.message || err)})`;
+    }
+    const msg = `${summary}\n\n--- recent logs ---\n${logsBlock}`;
+    try {
+      await Clipboard.setStringAsync(msg);
+      setCopyState('done');
+      setTimeout(() => setCopyState('idle'), 2000);
+    } catch (err) {
+      // Clipboard unavailable (rare) — fall back to the share sheet so the
+      // user still gets the text out, and show the failure rather than hide it.
+      try { await Share.share({ message: msg }); } catch (_) { /* noop */ }
+      setCopyState('error');
+      setTimeout(() => setCopyState('idle'), 3000);
+    }
   }, [data, health, version, ageMs]);
+  const grabLabel = copyState === 'copying' ? 'Grabbing…'
+    : copyState === 'done' ? 'Copied ✓'
+    : copyState === 'error' ? 'Copy failed — tap to retry'
+    : 'Grab state → Claude';
   return (
     <View style={s.footer}>
-      <Pressable style={s.grab} onPress={onGrab}>
-        <Text style={s.grabText}>Grab state → Claude</Text>
+      <Pressable style={s.grab} onPress={onGrab} disabled={copyState === 'copying'}>
+        <Text style={s.grabText}>{grabLabel}</Text>
       </Pressable>
       <Text style={[s.foot, stale ? { color: C.amber } : null]}>
         {stale ? `STALE · ${fmtElapsed(ageMs)}` : `LIVE · ${fmtElapsed(ageMs)}`} · v{version}
