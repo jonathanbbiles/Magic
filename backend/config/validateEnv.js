@@ -675,6 +675,25 @@ const validateEnv = () => {
     validationErrors.push(`EXECUTION_VENUE must be 'alpaca' or 'binance_us'. Received: "${process.env.EXECUTION_VENUE}".`);
   }
 
+  // Realized-volatility entry gate (2026-06-23). The gate is default-ON, so a
+  // bad threshold is a real footgun: a percentile floor outside [0,1] (e.g. > 1)
+  // would make EVERY reading fall in the "low" tail and suppress all entries —
+  // zero trades. Fail fast at boot rather than silently choking the bot.
+  if (process.env.VOL_GATE_MIN_PERCENTILE != null && String(process.env.VOL_GATE_MIN_PERCENTILE).trim() !== '') {
+    const p = Number(process.env.VOL_GATE_MIN_PERCENTILE);
+    if (!Number.isFinite(p) || p < 0 || p > 1) {
+      validationErrors.push(`VOL_GATE_MIN_PERCENTILE must be a number in [0,1]. Received: "${process.env.VOL_GATE_MIN_PERCENTILE}".`);
+    }
+  }
+  for (const name of ['VOL_GATE_MIN_OBSERVATIONS', 'VOL_GATE_LOOKBACK_BARS']) {
+    if (process.env[name] != null && String(process.env[name]).trim() !== '') {
+      const v = Number(process.env[name]);
+      if (!Number.isFinite(v) || v < 1) {
+        validationErrors.push(`${name} must be a positive number. Received: "${process.env[name]}".`);
+      }
+    }
+  }
+
   console.log('config_summary', {
     version:
       process.env.VERSION ||

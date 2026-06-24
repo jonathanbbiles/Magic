@@ -461,6 +461,23 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   SPREAD_SUPPRESS_ENABLED: 'true',
   SPREAD_SUPPRESS_MIN_OBSERVATIONS: '20',
   SPREAD_SUPPRESS_MAX_PASS_RATE: '0.05',
+  // Realized-volatility entry gate (2026-06-23). The 30-day Binance.US study
+  // found realized vol over ~30 min is the SINGLE strongest predictor of a
+  // winning long scalp (Spearman IC ≈ 0.17, ~2× the BTC lead-lag signal) —
+  // "vol decides WHEN a tradable move is available." The gate SUPPRESSES an
+  // entry when the symbol's current realized vol sits below VOL_GATE_MIN_
+  // PERCENTILE of its OWN trailing distribution (per-symbol percentile → robust
+  // across tokens). PURE FILTER: only removes entries — never relaxes the spread
+  // cap / freshness / realized-expectancy breaker / conviction, never changes
+  // sizing. Warming-up symbols (< VOL_GATE_MIN_OBSERVATIONS readings) are never
+  // suppressed. Default-ON but conservative (0.20 → only the dead bottom fifth
+  // of each symbol's vol regime is filtered; 80% pass). Reject reason
+  // `low_realized_vol`; surfaced at meta.volGate. Raise VOL_GATE_MIN_PERCENTILE
+  // toward 0.30-0.50 for more selectivity, or VOL_GATE_ENABLED=false to disable.
+  VOL_GATE_ENABLED: 'true',
+  VOL_GATE_MIN_PERCENTILE: '0.20',
+  VOL_GATE_MIN_OBSERVATIONS: '60',
+  VOL_GATE_LOOKBACK_BARS: '30',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND

@@ -344,4 +344,13 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_MIN_OBSERVATIONS, '20');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SPREAD_SUPPRESS_MAX_PASS_RATE, '0.05');
 
+// 2026-06-23 realized-volatility entry gate. Default-ON with a CONSERVATIVE
+// 20th-percentile floor (only the dead low-vol tail is filtered). Locked so a
+// disable, or an aggressive threshold that would choke throughput, is caught at
+// CI. The gate only removes entries — it can never relax another safety gate.
+assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_MIN_PERCENTILE, '0.20');
+assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_MIN_OBSERVATIONS, '60');
+assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_LOOKBACK_BARS, '30');
+
 console.log('live defaults tests passed');

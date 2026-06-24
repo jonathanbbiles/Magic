@@ -1,5 +1,52 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-06-23: realized-volatility entry gate (study's #1 winner-predictor)
+
+A 30-day study of 1-minute Binance.US bars across the 8 core tokens
+(BTC/ETH/SOL/XRP/ADA/LINK/DOGE/AVAX) labeled every winning long scalp with a
+triple-barrier method and asked which entry-time math predicts the winners. The
+single strongest predictor — by ~2× over the BTC lead-lag signal the bot already
+trades — was **realized volatility** over the last ~30 minutes (Spearman
+IC ≈ 0.17, t ≈ 26 on non-overlapping samples; significant and direction-stable
+across all 5 chronological walk-forward folds). Reading: **realized vol decides
+*when* a tradable move is available.** Entries taken in the bottom of a symbol's
+own realized-vol distribution are net-losing dead weight (bottom-decile win-rate
+≈ 0.5–0.7× the base rate); a model that only takes the top decile flipped several
+fee-inclusive configs from negative to **+~3 bps/trade net, positive in all 5
+folds**.
+
+**What shipped:** a realized-volatility **entry gate** (`backend/modules/realizedVolGate.js`),
+wired into `scanAndEnter` in `backend/trade.js`. At entry-evaluation time it
+computes the symbol's realized vol from the 1m bars the active signal already
+fetched (no extra API call), keeps a per-symbol trailing FIFO of those readings,
+and **SUPPRESSES the entry** when the current reading sits below
+`VOL_GATE_MIN_PERCENTILE` of that symbol's own distribution. Using a per-symbol
+*percentile* (not an absolute bps threshold) makes it robust across tokens with
+very different vol levels (BTC vs DOGE).
+
+- **Pure filter — it can ONLY remove entries.** It composes with, and never
+  relaxes, the spread cap, quote-freshness check, realized-expectancy breaker, or
+  conviction engine, and it never changes sizing. It runs after the active
+  signal returns `ok` and before conviction.
+- **Default-ON but conservative.** At the 20th-percentile default it filters only
+  the clearly-dead bottom fifth of each symbol's vol regime; 80% of regimes pass.
+- **Never blocks while warming up.** A symbol with fewer than
+  `VOL_GATE_MIN_OBSERVATIONS` readings is never suppressed, so a fresh process
+  (state is in-memory and re-warms after a restart) trades exactly as before until
+  enough history accrues — the conservative failure mode.
+- **Wired + surfaced (Hard Rule #4).** Reject reason `low_realized_vol` flows
+  through `rejectTrade` (rejection stats + `gateRejectionAudit`); live state is at
+  `meta.volGate` (per-symbol latest vol, its percentile, and the suppressed list).
+- This is an **entry-gate only** change. Exit risk-control posture
+  (stop / TP / max-hold) is untouched (Hard Rule #5).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `VOL_GATE_ENABLED` | `true` | Master kill. `false` → no vol gate (prior behavior); `meta.volGate.enabled=false`. |
+| `VOL_GATE_MIN_PERCENTILE` | `0.20` | Suppress when current realized vol is below this percentile of the symbol's own trailing distribution. Raise toward `0.30–0.50` for more selectivity; `0` disables suppression. Must be in `[0,1]` (validated at boot). |
+| `VOL_GATE_MIN_OBSERVATIONS` | `60` | Trailing readings required before the gate may suppress a symbol (else: warming up, never suppress). |
+| `VOL_GATE_LOOKBACK_BARS` | `30` | Number of 1m close-to-close returns used for each realized-vol reading (~30 min). |
+
 ## 2026-06-22: btc_lead_lag exit asymmetry — TP floor raised 10 → 20 bps
 
 The live scorecard showed `winLossSizeRatio` **0.50** (average loss ~2× average win) — a structural problem, not bad luck. `btc_lead_lag`'s smallest take-profit target was **10 bps net** while the hard stop is **25 bps**, so a stopped loser was ~2.5× a floor-target winner. With a ~48% win rate that asymmetry alone makes the strategy bleed even when the directional call is fine.
