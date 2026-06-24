@@ -58,6 +58,7 @@ const regimeVetoEvaluator = require('./modules/regimeVetoEvaluator');
 const staleQuoteRetryStatsModule = require('./modules/staleQuoteRetryStats');
 const { createSpreadSuppressionTracker } = require('./modules/spreadSuppression');
 const makerFillTracker = require('./modules/makerFillTracker');
+const realizedVolGateModule = require('./modules/realizedVolGate');
 const { createRetryTracker: createStaleQuoteRetryTracker } = staleQuoteRetryStatsModule;
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
@@ -1252,6 +1253,24 @@ function getMakerFillState() {
     return null;
   }
 }
+// Realized-volatility gate state for the dashboard meta surface: per-symbol
+// latest realized vol, its percentile within the symbol's own trailing
+// distribution, and which symbols are currently being suppressed.
+function getRealizedVolGateState() {
+  try {
+    if (!VOL_GATE_ENABLED) return { enabled: false };
+    return {
+      enabled: true,
+      lookbackBars: VOL_GATE_LOOKBACK_BARS,
+      ...realizedVolGate.summary({
+        minObservations: VOL_GATE_MIN_OBSERVATIONS,
+        minPercentile: VOL_GATE_MIN_PERCENTILE,
+      }),
+    };
+  } catch (_) {
+    return null;
+  }
+}
 // Legacy export-shape compatibility: code paths that read SIGNAL_VERSION as
 // a constant continue to work, but they always see the live decision.
 // Note: this is now a getter, not a static value.
@@ -1468,6 +1487,24 @@ const SPREAD_SUPPRESS_ENABLED = readBoolean('SPREAD_SUPPRESS_ENABLED', true);
 const SPREAD_SUPPRESS_MIN_OBSERVATIONS = Math.max(1, readNumber('SPREAD_SUPPRESS_MIN_OBSERVATIONS', 20));
 const SPREAD_SUPPRESS_MAX_PASS_RATE = Math.max(0, readNumber('SPREAD_SUPPRESS_MAX_PASS_RATE', 0.05));
 const spreadSuppressionTracker = createSpreadSuppressionTracker();
+
+// Realized-volatility entry gate (2026-06-23). The strongest predictor of a
+// winning long scalp in the 30-day Binance.US study (IC ≈ 0.17, ~2× the BTC
+// lead-lag signal): realized vol decides WHEN a tradable move is available. The
+// gate SUPPRESSES entries when a symbol's current ~30-min realized vol sits in
+// the low tail of its OWN trailing distribution (a per-symbol percentile, robust
+// across tokens). PURE FILTER — only ever removes entries; never relaxes the
+// spread cap, freshness check, realized-expectancy breaker, or conviction, and
+// never changes sizing. Default-ON but conservative (filters only the bottom
+// 20% of each symbol's vol regime); warming-up symbols are never suppressed.
+// Surfaced at meta.volGate; reject reason `low_realized_vol`. Disable with
+// VOL_GATE_ENABLED=false. See modules/realizedVolGate.js.
+const VOL_GATE_ENABLED = readBoolean('VOL_GATE_ENABLED', true);
+const VOL_GATE_MIN_PERCENTILE = Math.min(1, Math.max(0, readNumber('VOL_GATE_MIN_PERCENTILE', realizedVolGateModule.DEFAULT_MIN_PERCENTILE)));
+const VOL_GATE_MIN_OBSERVATIONS = Math.max(1, readNumber('VOL_GATE_MIN_OBSERVATIONS', realizedVolGateModule.DEFAULT_MIN_OBSERVATIONS));
+const VOL_GATE_LOOKBACK_BARS = Math.max(2, readNumber('VOL_GATE_LOOKBACK_BARS', realizedVolGateModule.DEFAULT_LOOKBACK_BARS));
+const realizedVolGate = realizedVolGateModule.createRealizedVolGate();
+
 const BARS_FETCH_RETRIES = Math.max(0, readNumber('BARS_FETCH_RETRIES', 2));
 const BARS_CACHE_TTL_MS = Math.max(5000, readNumber('BARS_CACHE_TTL_MS', 45000));
 let lastHttpError = null;
@@ -3604,7 +3641,40 @@ async function scanAndEnter() {
       else if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag') sig = await getBtcLeadLagSignalForPair(pair);
       else sig = await getPredictionSignal(pair);
       if (pair === BTC_LEAD_LAG_SYMBOL) recordBtcLeadLagSnapshot(sig);
+
+      // Realized-volatility reading (study's #1 winner-predictor). Record for
+      // EVERY scanned candidate that has bars — including signal-rejected ones —
+      // so each symbol's trailing vol distribution stays representative. The
+      // bars were already fetched by the signal getter (sig.featureBars.bars1m),
+      // so this adds no API call. Recording is cheap and side-effect-only.
+      const volBps = realizedVolGateModule.computeRealizedVolBps(
+        sig?.featureBars?.bars1m, VOL_GATE_LOOKBACK_BARS);
+      if (VOL_GATE_ENABLED && Number.isFinite(volBps)) realizedVolGate.record(pair, volBps);
+
       if (!sig.ok) { rejectTrade(pair, sig.reason || 'prediction_rejected'); continue; }
+
+      // STEP 1a (realized-vol gate). SUPPRESS the entry when this symbol's
+      // current realized vol sits in the low tail of its own trailing
+      // distribution — the study's strongest filter ("vol decides WHEN").
+      // PURE FILTER: only removes entries; never relaxes spread/freshness/
+      // breaker/conviction and never changes sizing. Warming-up symbols are
+      // never suppressed. Routes through rejectTrade so it shows in rejection
+      // stats + gateRejectionAudit; surfaced at meta.volGate.
+      if (VOL_GATE_ENABLED) {
+        const volDecision = realizedVolGate.evaluate(pair, volBps, {
+          minObservations: VOL_GATE_MIN_OBSERVATIONS,
+          minPercentile: VOL_GATE_MIN_PERCENTILE,
+        });
+        if (volDecision.suppress) {
+          rejectTrade(pair, 'low_realized_vol', {
+            volBps: Number(volBps.toFixed(2)),
+            percentile: Number((volDecision.percentile ?? 0).toFixed(3)),
+            minPercentile: VOL_GATE_MIN_PERCENTILE,
+            sampleSize: volDecision.sampleSize,
+          });
+          continue;
+        }
+      }
 
       // STEP 1b (selectivity + conviction sizing). Blend the signal's own
       // confidence with the market regime (BTC-derived) and the active signal's
@@ -4686,6 +4756,7 @@ module.exports = {
   getExplorationBudgetState,
   getSpreadSuppressionState,
   getMakerFillState,
+  getRealizedVolGateState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,

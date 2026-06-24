@@ -201,6 +201,7 @@ const {
   getExplorationBudgetState,
   getSpreadSuppressionState,
   getMakerFillState,
+  getRealizedVolGateState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getConvictionState,
@@ -1998,6 +1999,19 @@ app.get('/dashboard', async (req, res) => {
         makerFillRate: (() => {
           try {
             return typeof getMakerFillState === 'function' ? getMakerFillState() : null;
+          } catch (_) {
+            return null;
+          }
+        })(),
+        // Realized-volatility entry gate (2026-06-23). Per-symbol latest
+        // realized vol + its percentile within the symbol's own trailing
+        // distribution; suppressedSymbols are those currently in the low-vol
+        // tail and being filtered. The gate only REMOVES entries (reject reason
+        // low_realized_vol) — it never relaxes another gate. enabled:false when
+        // VOL_GATE_ENABLED=false.
+        volGate: (() => {
+          try {
+            return typeof getRealizedVolGateState === 'function' ? getRealizedVolGateState() : null;
           } catch (_) {
             return null;
           }
