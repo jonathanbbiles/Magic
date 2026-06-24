@@ -436,6 +436,73 @@ function recsAt(signalVersion, bpsList, tsIso) {
   assert.equal(v.agedOutCount, 0);
 }
 
+// R-decay 5. Clear ETA: a fresh bleeding window predicts WHEN the clock lifts it.
+// 12 trades 6h old, minTrades 10 → 3 must age out (12-10+1). They share one ts,
+// so the trigger ages out at ts + maxAgeMs = 6h-old + 24h = 18h from now.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const fresh = recsAt('btc_lead_lag', new Array(12).fill(-30), '2026-06-11T12:00:00Z'); // 6h old
+  const v = evaluateRealizedVeto({
+    records: fresh,
+    signalVersion: 'btc_lead_lag',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, true);
+  assert.equal(v.clearsOnClock, true);
+  assert.equal(v.agedTradesPending, 3, 'must drop 12→9 (below minTrades 10)');
+  assert.equal(v.clearsAtMs, Date.parse('2026-06-11T12:00:00Z') + 86400000);
+  assert.equal(v.clearsInMs, 18 * 3600 * 1000, 'clears 18h out (24h age − 6h elapsed)');
+}
+
+// R-decay 6. Staggered close times: the trigger is the k-th OLDEST in-window
+// trade. 11 trades, minTrades 10 → k=2; the 2nd-oldest sets the clear time.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const recs11 = [
+    ...recsAt('ols', [-30], '2026-06-11T00:00:00Z'), // oldest
+    ...recsAt('ols', [-30], '2026-06-11T01:00:00Z'), // 2nd oldest → trigger
+    ...recsAt('ols', new Array(9).fill(-30), '2026-06-11T15:00:00Z'),
+  ];
+  const v = evaluateRealizedVeto({
+    records: recs11,
+    signalVersion: 'ols',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, true);
+  assert.equal(v.agedTradesPending, 2);
+  assert.equal(v.clearsAtMs, Date.parse('2026-06-11T01:00:00Z') + 86400000);
+}
+
+// R-decay 7. Clock disabled (maxAgeMs 0) → no ETA even while vetoing.
+{
+  const v = evaluateRealizedVeto({
+    records: recs('ols', new Array(15).fill(-40)),
+    signalVersion: 'ols',
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 0 },
+  });
+  assert.equal(v.veto, true);
+  assert.equal(v.clearsOnClock, false);
+  assert.equal(v.clearsAtMs, null);
+  assert.equal(v.clearsInMs, null);
+}
+
+// R-decay 8. ≥ minTrades untimestamped trades can never age out → clock powerless.
+{
+  const now = Date.parse('2026-06-11T18:00:00Z');
+  const noTs = new Array(11).fill(-20).map((b) => ({ type: 'closed_trade', signalVersion: 'barrier', realizedNetBps: b }));
+  const v = evaluateRealizedVeto({
+    records: noTs,
+    signalVersion: 'barrier',
+    nowMs: now,
+    config: { minTrades: 10, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 },
+  });
+  assert.equal(v.veto, true);
+  assert.equal(v.clearsOnClock, false, 'untimestamped trades never age out');
+  assert.equal(v.clearsInMs, null);
+}
+
 // R2. The canonical failure case: active signal realizing well below the floor
 // over a full sample → veto fires.
 {

@@ -207,8 +207,11 @@ function computeHealth({ data, error, ageMs }) {
   const veto = meta.signalSelector?.realizedVeto || {};
   const halt = meta.risk?.tradingHaltedReason;
   if (veto.veto || halt) {
+    const eta = veto.veto && veto.clearsOnClock && num(veto.clearsInMs) != null
+      ? ` Clears in ~${fmtElapsed(num(veto.clearsInMs))}.`
+      : '';
     const line = veto.veto
-      ? `Brake on. Last ${veto.sampleSize ?? '?'} ${prettySignal(veto.signalVersion)}: ${bps(veto.realizedAvgNetBps)} vs ${bps(veto.floorBps)} floor.`
+      ? `Brake on. Last ${veto.sampleSize ?? '?'} ${prettySignal(veto.signalVersion)}: ${bps(veto.realizedAvgNetBps)} vs ${bps(veto.floorBps)} floor.${eta}`
       : `Halted: ${String(halt)}.`;
     return amber('PAUSED', line, 'Your call — it re-tests itself.');
   }
@@ -446,6 +449,9 @@ function Brake({ data }) {
   }
   const on = Boolean(veto.veto);
   const color = on ? C.amber : C.up;
+  const clearsInMs = num(veto.clearsInMs);
+  const clearsOnClock = Boolean(veto.clearsOnClock);
+  const clearText = clearVerdict(veto);
   return (
     <Card accent={color}>
       <View style={s.cardHead}>
@@ -454,15 +460,33 @@ function Brake({ data }) {
       </View>
       <Row k="Recent avg" v={`${bps(veto.realizedAvgNetBps)} bps`} tone={on ? 'down' : 'up'} />
       <Row k="Floor" v={`${bps(veto.floorBps)} bps`} />
-      <Row k="Sample" v={veto.sampleSize == null ? '—' : `${veto.sampleSize} trades`} last={!(on && num(veto.maxAgeMs))} />
-      {on && num(veto.maxAgeMs) ? (
-        <Text style={s.note}>
-          Self-recovery armed: stale fills age out over ~{fmtElapsed(num(veto.maxAgeMs))}, then it re-probes small.
-          {num(veto.agedOutCount) ? ` ${veto.agedOutCount} aged out.` : ''}
-        </Text>
-      ) : null}
+      <Row k="Sample" v={veto.sampleSize == null ? '—' : `${veto.sampleSize} trades`} />
+      <Row
+        k="Clears in"
+        v={on ? (clearsOnClock && clearsInMs != null ? `~${fmtElapsed(clearsInMs)}` : 'on next good fills') : '—'}
+        tone={on ? 'pink' : null}
+        last
+      />
+      {on ? <Text style={s.note}>{clearText}</Text> : null}
     </Card>
   );
+}
+
+// clearVerdict — plain-language "when does the brake lift" line. The clock-based
+// ETA (clearsInMs) is the honest, computable answer: if no trade closes first,
+// the oldest losing fills age out and the breaker re-probes small at that time.
+// When the clock can't recover it (disabled, or too many untimestamped fills),
+// the only path is fresh fills beating the floor.
+function clearVerdict(veto) {
+  const clearsInMs = num(veto.clearsInMs);
+  if (veto.clearsOnClock && clearsInMs != null) {
+    const aged = num(veto.agedOutCount);
+    const pending = num(veto.agedTradesPending);
+    const tail = pending ? ` ${pending} stale fill${pending === 1 ? '' : 's'} left to expire.` : '';
+    const past = aged ? ` ${aged} already aged out.` : '';
+    return `Auto-clears in ~${fmtElapsed(clearsInMs)} if no trade closes sooner — then it re-probes small.${tail}${past}`;
+  }
+  return 'Clears as soon as recent fills average back above the floor — or when a backtest picks a different signal.';
 }
 
 // FLOOR — the look-and-see layer. Tight, real, scannable.
@@ -551,7 +575,7 @@ function Footer({ data, ageMs, health }) {
       `Equity ${usd(num(data?.account?.equity) ?? num(data?.account?.portfolio_value))} · since reset ${signedUsd(num(ep.pnlUsd))} (${pct(num(ep.pctChange))})`,
       `Trading P&L (deposit-free) ${signedUsd(num(ep.realizedTradingPnlUsd))}${ep.externalFlowSuspected === true ? ' · since-reset is mostly deposits' : ''}`,
       `Engine ${meta.engineState ?? '—'} · ${data?.account?.raw_venue ?? '—'} · signal ${veto.signalVersion ?? '—'}`,
-      `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}`,
+      `Brake ${veto.veto ? 'ENGAGED' : 'clear'} — avg ${bps(veto.realizedAvgNetBps)} vs floor ${bps(veto.floorBps)} bps, n=${veto.sampleSize ?? '—'}${veto.veto && veto.clearsOnClock && num(veto.clearsInMs) != null ? ` · clears in ~${fmtElapsed(num(veto.clearsInMs))}` : ''}`,
       `v${version} · data age ${fmtElapsed(ageMs)}`,
     ].join('\n');
     // Best-effort: append the backend log tail. A logs failure must not block

@@ -370,6 +370,14 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     lookbackTrades: cfg.lookbackTrades,
     maxAgeMs: cfg.maxAgeMs > 0 ? cfg.maxAgeMs : null,
     agedOutCount: 0,
+    // Self-recovery ETA (populated only when the veto is engaged AND the clock
+    // can lift it). clearsOnClock=false means the time-decay clock alone can
+    // never clear it (clock disabled, or ≥ minTrades untimestamped trades that
+    // never age out) — recovery then needs fresh fills that beat the floor.
+    clearsOnClock: false,
+    clearsAtMs: null,
+    clearsInMs: null,
+    agedTradesPending: 0,
   };
   if (cfg.enabled === false) return { ...base, reason: 'disabled' };
   if (!signalVersion) return { ...base, reason: 'no_active_signal' };
@@ -444,6 +452,12 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
   for (const t of recent) sum += t.realizedNetBps;
   const avg = sum / recent.length;
   const veto = avg < cfg.floorBps;
+  // When halted, predict WHEN the self-recovery clock would lift the veto if no
+  // new trade closes first — so the dashboard can say "clears in ~4h" instead of
+  // a vague "ages out eventually". Only meaningful while vetoing.
+  const clearEstimate = veto
+    ? estimateRealizedVetoClear(recent, { minTrades: cfg.minTrades, maxAgeMs: cfg.maxAgeMs, nowMs })
+    : null;
   return {
     ...base,
     veto,
@@ -452,6 +466,42 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     realizedAvgNetBps: avg,
     excludedSymbolTradeCount,
     agedOutCount,
+    ...(clearEstimate || {}),
+  };
+}
+
+// Pure helper: given the in-window realised trades (ascending by close time) and
+// the breaker's clock config, predict when the time-decay self-recovery would
+// lift the veto ASSUMING no new trade closes first. The veto lifts the instant
+// fewer than `minTrades` trades remain in-window; trades age out oldest-first
+// once older than `maxAgeMs`. Untimestamped trades never age out, so if ≥
+// minTrades of them sit in-window the clock can never clear the veto on its own.
+function estimateRealizedVetoClear(recent, { minTrades, maxAgeMs, nowMs }) {
+  const off = { clearsOnClock: false, clearsAtMs: null, clearsInMs: null, agedTradesPending: 0 };
+  if (!Array.isArray(recent) || !(maxAgeMs > 0)) return off;
+  const dated = [];
+  let undatedCount = 0;
+  for (const t of recent) {
+    const parsed = t?.ts ? Date.parse(t.ts) : NaN;
+    if (Number.isFinite(parsed)) dated.push(parsed);
+    else undatedCount += 1;
+  }
+  // The window can never shrink below the untimestamped count; if those alone
+  // keep it at/above minTrades, the clock is powerless to recover.
+  if (undatedCount >= minTrades) return off;
+  dated.sort((a, b) => a - b); // oldest first
+  // k = how many in-window trades must age out for the count to fall to
+  // minTrades-1. recent.length ≥ minTrades here (the veto fired), so k ≥ 1, and
+  // undatedCount < minTrades guarantees k ≤ dated.length. The k-th oldest dated
+  // trade is the one whose aging-out trips the recovery.
+  const k = recent.length - minTrades + 1;
+  const triggerTs = dated[k - 1];
+  const clearsAtMs = triggerTs + maxAgeMs;
+  return {
+    clearsOnClock: true,
+    clearsAtMs,
+    clearsInMs: Math.max(0, clearsAtMs - nowMs),
+    agedTradesPending: k,
   };
 }
 
@@ -530,6 +580,7 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
 module.exports = {
   pickActiveSignal,
   evaluateRealizedVeto,
+  estimateRealizedVetoClear,
   setLatestDecision,
   getCurrentDecision,
   bootstrapDecisionFromEnv,
