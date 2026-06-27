@@ -149,12 +149,6 @@ const num = (v) => { if (v == null || v === '') return null; const n = Number(v)
 function usd(v, d = 2) { const n = num(v); if (n == null) return '—'; return `$${n.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d })}`; }
 function signedUsd(v) { const n = num(v); if (n == null) return '—'; const s = n >= 0 ? '+' : '−'; return `${s}$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function pct(v, d = 2) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(d)}%`; }
-// Binance-style "+$0.23/+0.04%" pair. Either side missing → "—/—".
-function changePair(usdV, pctV) {
-  const u = num(usdV); const p = num(pctV);
-  if (u == null && p == null) return '—/—';
-  return `${signedUsd(u)}/${p == null ? '—' : pct(p)}`;
-}
 function bps(v) { const n = num(v); if (n == null) return '—'; return `${n >= 0 ? '+' : ''}${n.toFixed(1)}`; }
 function fmtElapsed(ms) {
   if (ms == null) return '—';
@@ -181,6 +175,24 @@ function regimeWord(r) {
   const k = String(r || '').toLowerCase();
   const map = { flat: 'Flat', benign: 'Friendly', adverse: 'Choppy', quiet: 'Quiet', wild: 'Wild' };
   return map[k] || (r ? String(r) : '—');
+}
+// Plain-language market verdict with an emoji face. `enter` is the conviction
+// engine's own decision; the regime emoji is the mood of the tape.
+function regimeEmoji(r) {
+  const k = String(r || '').toLowerCase();
+  const map = { benign: '😎', flat: '😐', quiet: '😴', adverse: '😬', wild: '🌪️' };
+  return map[k] || '🤔';
+}
+function marketVerdict({ regime, enter, conviction, minConviction }) {
+  const k = String(regime || '').toLowerCase();
+  if (k === 'adverse') return { emoji: '🛑', word: 'Sitting out', sub: 'Choppy tape — waiting for calmer conditions.' };
+  if (k === 'wild') return { emoji: '🌪️', word: 'Cautious', sub: 'Wild swings — only the strongest setups qualify.' };
+  const c = num(conviction);
+  const floor = num(minConviction) ?? 0.45;
+  if (enter === true || (c != null && c >= floor)) {
+    return { emoji: regimeEmoji(regime), word: 'Good to enter', sub: 'Conditions clear — taking qualifying setups.' };
+  }
+  return { emoji: regimeEmoji(regime), word: 'Holding fire', sub: 'No setup strong enough right now — that’s normal.' };
 }
 const symShort = (x) => String(x || '').replace('/USD', '').replace('USD', '') || '—';
 
@@ -286,13 +298,13 @@ function Row({ k, v, tone, last }) {
   );
 }
 
-// Stat block (used in the headline grid).
-function Stat({ k, v, tone }) {
+// MiniStat — a compact column for the single-line money strip.
+function MiniStat({ k, v, tone }) {
   const color = tone === 'up' ? C.up : tone === 'down' ? C.down : C.ink;
   return (
-    <View style={s.stat}>
-      <Text style={s.statK}>{k}</Text>
-      <Text style={[s.statV, { color }]} numberOfLines={1}>{v}</Text>
+    <View style={s.miniStat}>
+      <Text style={s.miniStatK} numberOfLines={1}>{k}</Text>
+      <Text style={[s.miniStatV, { color }]} numberOfLines={1}>{v}</Text>
     </View>
   );
 }
@@ -306,25 +318,119 @@ function Meter({ value, color = C.pink, height = 8 }) {
   );
 }
 
+// LineChart — a dependency-free spark line. react-native-svg isn't installed,
+// so the line is drawn as a chain of absolutely-positioned, rotated <View>
+// segments (rotation is about each segment's centre, hence the cx/cy maths).
+// `points` are { y, label } in chronological order; x is spaced evenly.
+function LineChart({ points, height = 120, color = C.up }) {
+  const [w, setW] = useState(0);
+  const onLayout = useCallback((e) => setW(e.nativeEvent.layout.width), []);
+  const pad = 8;
+  const thick = 2.5;
+  const valid = Array.isArray(points) ? points.filter((p) => num(p?.y) != null) : [];
+  if (valid.length < 2) {
+    return (
+      <View onLayout={onLayout} style={{ height, justifyContent: 'center' }}>
+        <Text style={s.note}>Not enough history to chart yet — comes alive as the bot runs.</Text>
+      </View>
+    );
+  }
+  const ys = valid.map((p) => num(p.y));
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const span = maxY - minY || Math.abs(maxY) || 1;
+  const innerH = height - pad * 2;
+  const n = valid.length;
+  const xAt = (i) => (w <= 0 ? 0 : (i / (n - 1)) * (w - pad * 2) + pad);
+  const yAt = (val) => pad + (1 - (val - minY) / span) * innerH;
+
+  const segs = [];
+  const dots = [];
+  if (w > 0) {
+    for (let i = 0; i < n; i++) {
+      const x = xAt(i);
+      const y = yAt(ys[i]);
+      if (i < n - 1) {
+        const x2 = xAt(i + 1);
+        const y2 = yAt(ys[i + 1]);
+        const dx = x2 - x;
+        const dy = y2 - y;
+        const len = Math.hypot(dx, dy);
+        const ang = Math.atan2(dy, dx);
+        segs.push(
+          <View
+            key={`s${i}`}
+            style={{
+              position: 'absolute',
+              left: (x + x2) / 2 - len / 2,
+              top: (y + y2) / 2 - thick / 2,
+              width: len,
+              height: thick,
+              borderRadius: thick / 2,
+              backgroundColor: color,
+              transform: [{ rotate: `${ang}rad` }],
+            }}
+          />,
+        );
+      }
+      const isEnd = i === n - 1;
+      dots.push(
+        <View
+          key={`d${i}`}
+          style={{
+            position: 'absolute',
+            left: x - (isEnd ? 4 : 2.5),
+            top: y - (isEnd ? 4 : 2.5),
+            width: isEnd ? 8 : 5,
+            height: isEnd ? 8 : 5,
+            borderRadius: 4,
+            backgroundColor: isEnd ? color : C.card,
+            borderWidth: isEnd ? 0 : 1.5,
+            borderColor: color,
+          }}
+        />,
+      );
+    }
+  }
+  return (
+    <View onLayout={onLayout} style={{ height }}>
+      {segs}
+      {dots}
+      <View style={s.chartAxis}>
+        <Text style={s.chartTick} numberOfLines={1}>{valid[0].label}</Text>
+        <Text style={[s.chartTick, { textAlign: 'right' }]} numberOfLines={1}>{valid[n - 1].label}</Text>
+      </View>
+    </View>
+  );
+}
+
+// HBar — one horizontal magnitude bar for the leaderboard. Width ∝ |value|.
+function HBar({ value, maxAbs, color }) {
+  const v = num(value);
+  const frac = v == null || !maxAbs ? 0 : Math.min(1, Math.abs(v) / maxAbs);
+  return (
+    <View style={s.hbarTrack}>
+      <View style={[s.hbarFill, { width: `${Math.max(frac * 100, 3)}%`, backgroundColor: color }]} />
+    </View>
+  );
+}
+
 // ============================================================================
 // SECTIONS
 // ============================================================================
 
-// STATUS — the glance. Bold word, dot, one terse line, action only if needed.
+// STATUS — the glance, on a single slim line: dot · WORD · terse subtext.
+// Colour + dot carry the state; the action hint only appears when it matters.
 function Status({ health }) {
   const color = lvlColor(health.level);
   return (
     <View style={[s.status, { backgroundColor: lvlSoft(health.level) }]}>
-      <View style={s.statusTop}>
-        <Pulse color={color} size={11} on={health.level !== 'red'} />
+      <View style={s.statusLineRow}>
+        <Pulse color={color} size={8} on={health.level !== 'red'} />
         <Text style={[s.statusWord, { color }]}>{health.label}</Text>
+        <Text style={s.statusLine} numberOfLines={1}>{health.line}</Text>
       </View>
-      <Text style={s.statusLine}>{health.line}</Text>
-      {health.act ? (
-        <View style={[s.statusAct, { borderColor: color }]}>
-          <Text style={[s.statusActText, { color }]}>{health.act}</Text>
-        </View>
-      ) : null}
+      {health.act ? <Text style={[s.statusActText, { color }]} numberOfLines={1}>↳ {health.act}</Text> : null}
     </View>
   );
 }
@@ -347,16 +453,21 @@ function Money({ data }) {
   // "SINCE RESET +X%" tile read as strategy performance.
   const tradingUsd = num(ep.realizedTradingPnlUsd);
   const flowSuspected = ep.externalFlowSuspected === true;
+  // Glance direction: most-recent (24h) move, falling back to since-reset.
+  const dir = num(data.meta?.equityChanges?.h24?.usd) ?? sUsd;
+  const eqTone = dir == null ? C.ink : dir >= 0 ? C.up : C.down;
+  const eqArrow = dir == null ? '' : dir >= 0 ? ' ▲' : ' ▼';
   return (
     <Card>
-      <Label>EQUITY</Label>
-      <Text style={s.equity}>{usd(equity)}</Text>
-      <View style={s.statGrid}>
-        <Stat k="SINCE RESET" v={`${signedUsd(sUsd)}`} tone={sUsd == null ? null : sUsd >= 0 ? 'up' : 'down'} />
-        <Stat k="" v={pct(sPct)} tone={sPct == null ? null : sPct >= 0 ? 'up' : 'down'} />
-        <Stat k="TRADING P&L" v={tradingUsd == null ? '—' : signedUsd(tradingUsd)} tone={tradingUsd == null ? null : tradingUsd >= 0 ? 'up' : 'down'} />
-        <Stat k="WEEK" v={pct(week)} tone={week == null ? null : week >= 0 ? 'up' : 'down'} />
-        <Stat k="CASH" v={usd(cash, 0)} />
+      <View style={s.equityHead}>
+        <Label>EQUITY</Label>
+        <Text style={[s.equity, { color: eqTone }]} numberOfLines={1}>{usd(equity)}<Text style={s.equityArrow}>{eqArrow}</Text></Text>
+      </View>
+      <View style={s.moneyRow}>
+        <MiniStat k="SINCE RESET" v={`${signedUsd(sUsd)} ${pct(sPct)}`} tone={sUsd == null ? null : sUsd >= 0 ? 'up' : 'down'} />
+        <MiniStat k="TRADING P&L" v={tradingUsd == null ? '—' : signedUsd(tradingUsd)} tone={tradingUsd == null ? null : tradingUsd >= 0 ? 'up' : 'down'} />
+        <MiniStat k="WEEK" v={pct(week)} tone={week == null ? null : week >= 0 ? 'up' : 'down'} />
+        <MiniStat k="CASH" v={usd(cash, 0)} />
       </View>
       {flowSuspected ? (
         <Text style={s.flowNote}>
@@ -374,100 +485,136 @@ function Money({ data }) {
   );
 }
 
-// CHANGE — equity change across time horizons, the Binance position-screen
-// readout the operator asked for. Dollar + percent per window, green up / red
-// down, "—/—" when there isn't that much history yet. Every figure is a real
-// meta.equityChanges field — never a fabricated zero.
-const CHANGE_ROWS = [
-  ['24 Hour', 'h24'],
-  ['1 Week', 'd7'],
-  ['1 Month', 'd30'],
-  ['3 Month', 'd90'],
-  ['6 Month', 'd180'],
-  ['1 Year', 'd365'],
-  ['All-time', 'allTime'],
+// CHANGE — the equity trajectory as a line graph. Each meta.equityChanges
+// window carries the equity value AND timestamp it was measured from, so the
+// curve below is reconstructed from real historical points (never faked) and
+// drawn chronologically: oldest on the left, "Now" on the right.
+const CURVE_WINDOWS = [
+  ['allTime', 'Start'],
+  ['d365', '1Y'],
+  ['d180', '6M'],
+  ['d90', '3M'],
+  ['d30', '1M'],
+  ['d7', '1W'],
+  ['h24', '24H'],
 ];
+function buildEquityCurve(ch) {
+  if (!ch) return [];
+  const pts = [];
+  for (const [key, label] of CURVE_WINDOWS) {
+    const c = ch[key];
+    const eq = num(c?.fromEquity);
+    const ts = c?.fromTs ? Date.parse(c.fromTs) : null;
+    if (eq == null || ts == null || Number.isNaN(ts)) continue;
+    pts.push({ y: eq, ts, label });
+  }
+  const nowEq = num(ch.latestEquity);
+  if (nowEq != null) pts.push({ y: nowEq, ts: ch.asOfTs ? Date.parse(ch.asOfTs) : Date.now(), label: 'Now' });
+  pts.sort((a, b) => a.ts - b.ts);
+  // Collapse points measured within a minute of each other (overlapping windows).
+  const out = [];
+  for (const p of pts) {
+    if (out.length && Math.abs(out[out.length - 1].ts - p.ts) < 60000) out[out.length - 1] = p;
+    else out.push(p);
+  }
+  return out;
+}
 function Change({ data }) {
   const ch = data.meta?.equityChanges || {};
+  const curve = buildEquityCurve(ch);
+  const first = curve.length ? curve[0].y : null;
+  const last = curve.length ? curve[curve.length - 1].y : null;
+  const up = first != null && last != null ? last >= first : true;
+  const color = up ? C.up : C.down;
+  // Headline = all-time, then 1M / 1W / 24H as quick context chips.
+  const allTime = ch.allTime || null;
+  const chips = [['1M', ch.d30], ['1W', ch.d7], ['24H', ch.h24]];
   return (
     <Card>
-      <Label>CHANGE</Label>
-      <View style={{ marginTop: T.sp.xs }}>
-        {CHANGE_ROWS.map(([label, key], i) => {
-          const c = ch[key] || null;
-          const u = c ? num(c.usd) : null;
-          const tone = u == null ? null : u >= 0 ? 'up' : 'down';
+      <View style={s.cardHead}>
+        <Label>EQUITY OVER TIME</Label>
+        <Text style={[s.changeHeadVal, { color }]}>{allTime ? pct(allTime.pct) : '—'}<Text style={s.changeHeadSub}> all-time</Text></Text>
+      </View>
+      <LineChart points={curve} height={130} color={color} />
+      <View style={s.chipRow}>
+        {chips.map(([label, c]) => {
+          const p = c ? num(c.pct) : null;
+          const tone = p == null ? C.faint : p >= 0 ? C.up : C.down;
           return (
-            <Row
-              key={key}
-              k={`${label} Change`}
-              v={c ? changePair(c.usd, c.pct) : '—/—'}
-              tone={tone}
-              last={i === CHANGE_ROWS.length - 1}
-            />
+            <View key={label} style={s.chip}>
+              <Text style={s.chipK}>{label}</Text>
+              <Text style={[s.chipV, { color: tone }]}>{p == null ? '—' : pct(p)}</Text>
+            </View>
           );
         })}
       </View>
-      <Text style={s.tiny}>Equity vs each window back. Blank windows = not enough history yet.</Text>
+      <Text style={s.tiny}>Reconstructed from real equity readings. Flat early sections = not enough history yet.</Text>
     </Card>
   );
 }
 
-// ENGINE — what it's running, as a tight spec sheet.
+// ENGINE — condensed to one strip of chips. The detail (signal/venue/coins)
+// is "good to know" not "act on it", so it reads as a single quiet line with
+// the one figure that actually changes — open positions — emphasised.
 function Engine({ data }) {
   const meta = data.meta || {};
   const acct = data.account || {};
   const veto = meta.signalSelector?.realizedVeto || {};
   const venue = String(acct.raw_venue || acct.account_number || '').toLowerCase();
   const venueLabel = venue === 'binance_us' ? 'Binance.US' : venue || '—';
-  const engineState = meta.engineState ?? meta.runtime?.engineState ?? '—';
-  const scanning = String(meta.truth?.currentEntryScanProgress?.state || '').toLowerCase() === 'scanning' || String(engineState).toLowerCase() === 'scanning';
   const watching = num(meta.scanSymbolsCount);
   const open = Array.isArray(data.positions) ? data.positions.length : 0;
   return (
-    <Card>
-      <View style={s.cardHead}>
-        <Label>ENGINE</Label>
-        <View style={s.headPulse}>
-          <Pulse color={scanning ? C.pink : C.faint} size={8} on={scanning} />
-          <Text style={[s.headPulseText, { color: scanning ? C.pink : C.sub }]}>{scanning ? 'scanning' : String(engineState)}</Text>
-        </View>
-      </View>
-      <Row k="Signal" v={prettySignal(veto.signalVersion)} tone="pink" />
-      <Row k="Venue" v={venueLabel} />
-      <Row k="Watching" v={watching == null ? '—' : `${watching} coins`} />
-      <Row k="Open positions" v={String(open)} tone={open > 0 ? 'up' : null} last />
+    <Card style={s.engineCard}>
+      <Text style={s.engineLine} numberOfLines={1}>
+        <Text style={s.engineKey}>ENGINE  </Text>
+        <Text style={s.enginePink}>{prettySignal(veto.signalVersion)}</Text>
+        <Text style={s.engineDim}>  ·  {venueLabel}  ·  {watching == null ? '—' : `${watching} watched`}  ·  </Text>
+        <Text style={{ color: open > 0 ? C.up : C.sub, fontWeight: '800' }}>{open} open</Text>
+      </Text>
     </Card>
   );
 }
 
-// BRAKE — the realized-expectancy circuit breaker. Numbers, not paragraphs.
+// BRAKE — the realized-expectancy circuit breaker. When CLEAR it's a single
+// reassurance line (the status hero already shouts when it ENGAGES, so the full
+// readout would just be duplicate noise). When ENGAGED — the moment it matters —
+// it expands to the full numbers so the operator can see why and when it lifts.
 function Brake({ data }) {
   const veto = data.meta?.signalSelector?.realizedVeto;
   if (!veto || veto.enabled === false) {
-    return <Card><Label>BRAKE</Label><Text style={s.note}>Off in config — no auto-halt on a losing streak.</Text></Card>;
+    return <Card style={s.engineCard}><Text style={s.brakeLine} numberOfLines={1}><Text style={s.engineKey}>SAFETY BRAKE  </Text><Text style={s.engineDim}>off in config — no auto-halt on a losing streak</Text></Text></Card>;
   }
   const on = Boolean(veto.veto);
-  const color = on ? C.amber : C.up;
+  if (!on) {
+    return (
+      <Card style={s.engineCard}>
+        <Text style={s.brakeLine} numberOfLines={1}>
+          <Text style={s.engineKey}>SAFETY BRAKE  </Text>
+          <Text style={{ color: C.up, fontWeight: '900' }}>🟢 CLEAR  </Text>
+          <Text style={s.engineDim}>auto-halts if trades start bleeding</Text>
+        </Text>
+      </Card>
+    );
+  }
   const clearsInMs = num(veto.clearsInMs);
   const clearsOnClock = Boolean(veto.clearsOnClock);
-  const clearText = clearVerdict(veto);
   return (
-    <Card accent={color}>
+    <Card accent={C.amber}>
       <View style={s.cardHead}>
         <Label>SAFETY BRAKE</Label>
-        <Text style={[s.brakeState, { color }]}>{on ? 'ENGAGED' : 'CLEAR'}</Text>
+        <Text style={[s.brakeState, { color: C.amber }]}>🛑 ENGAGED</Text>
       </View>
-      <Row k="Recent avg" v={`${bps(veto.realizedAvgNetBps)} bps`} tone={on ? 'down' : 'up'} />
+      <Row k="Recent avg" v={`${bps(veto.realizedAvgNetBps)} bps`} tone="down" />
       <Row k="Floor" v={`${bps(veto.floorBps)} bps`} />
       <Row k="Sample" v={veto.sampleSize == null ? '—' : `${veto.sampleSize} trades`} />
       <Row
         k="Clears in"
-        v={on ? (clearsOnClock && clearsInMs != null ? `~${fmtElapsed(clearsInMs)}` : 'on next good fills') : '—'}
-        tone={on ? 'pink' : null}
+        v={clearsOnClock && clearsInMs != null ? `~${fmtElapsed(clearsInMs)}` : 'on next good fills'}
+        tone="pink"
         last
       />
-      {on ? <Text style={s.note}>{clearText}</Text> : null}
+      <Text style={s.note}>{clearVerdict(veto)}</Text>
     </Card>
   );
 }
@@ -489,57 +636,90 @@ function clearVerdict(veto) {
   return 'Clears as soon as recent fills average back above the floor — or when a backtest picks a different signal.';
 }
 
-// FLOOR — the look-and-see layer. Tight, real, scannable.
-function Floor({ data }) {
+// MARKET — the "is it a good time to enter?" verdict, up near the top where the
+// operator asked for it. Emoji + plain words carry the answer; the raw inputs
+// (tape mood, data freshness, conviction) sit underneath in friendly language.
+function Market({ data }) {
   const meta = data.meta || {};
   const conv = meta.conviction || {};
   const feeds = meta.binanceFeedShadow?.overall || {};
   const fresh = num(feeds.symbolsFresh);
   const tracked = num(feeds.symbolsTracked);
+  const regime = meta.marketRegime?.regime;
+  const v = marketVerdict({
+    regime,
+    enter: conv.last?.enter,
+    conviction: conv.last?.conviction ?? conv.avgConviction,
+    minConviction: conv.minConviction,
+  });
+  const feedsOk = fresh != null && tracked != null && fresh >= tracked * 0.8;
+  const c = num(conv.last?.conviction ?? conv.avgConviction);
+  return (
+    <Card accent={v.word === 'Good to enter' ? C.up : v.word === 'Sitting out' ? C.down : C.amber}>
+      <Label>MARKET</Label>
+      <View style={s.verdictRow}>
+        <Text style={s.verdictEmoji}>{v.emoji}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={s.verdictWord}>{v.word}</Text>
+          <Text style={s.verdictSub} numberOfLines={2}>{v.sub}</Text>
+        </View>
+      </View>
+      <View style={s.factRow}>
+        <View style={s.fact}>
+          <Text style={s.factK}>TAPE</Text>
+          <Text style={s.factV}>{regimeEmoji(regime)} {regimeWord(regime)}</Text>
+        </View>
+        <View style={s.fact}>
+          <Text style={s.factK}>DATA FEED</Text>
+          <Text style={[s.factV, { color: feedsOk ? C.up : C.amber }]}>{fresh == null || tracked == null ? '—' : `${fresh}/${tracked} live`}</Text>
+        </View>
+        <View style={s.fact}>
+          <Text style={s.factK}>CONFIDENCE</Text>
+          <Text style={[s.factV, { color: c == null ? C.ink : c >= (num(conv.minConviction) ?? 0.45) ? C.up : C.sub }]}>{c == null ? '—' : `${Math.round(c * 100)}%`}</Text>
+        </View>
+      </View>
+    </Card>
+  );
+}
 
+// LEADERBOARD — per-coin × strategy realized edge, drawn as magnitude bars so
+// the winners/losers read at a glance instead of a wall of numbers. (A true
+// time-moving line would need per-trade history the /dashboard doesn't expose
+// yet; these bars are the honest visual from the live averages we do have.)
+function Leaderboard({ data }) {
+  const meta = data.meta || {};
   const grid = Array.isArray(meta.perSymbolExpectancy?.grid) ? meta.perSymbolExpectancy.grid : [];
   const ranked = grid
     .filter((g) => num(g?.avgNetBps) != null && num(g?.entries) != null && num(g.entries) >= 2)
     .sort((a, b) => num(b.avgNetBps) - num(a.avgNetBps));
-  const best = ranked.slice(0, 3);
-  const worst = ranked.slice(-3).reverse();
-
+  const best = ranked.slice(0, 4);
+  const worst = ranked.slice(-4).reverse().filter((g) => !best.includes(g));
+  const shown = [...best, ...worst];
+  const maxAbs = shown.reduce((m, g) => Math.max(m, Math.abs(num(g.avgNetBps) || 0)), 0) || 1;
   return (
-    <View>
-      <Card>
-        <Label>MARKET</Label>
-        <View style={[s.statGrid, { marginTop: T.sp.sm }]}>
-          <Stat k="REGIME" v={regimeWord(meta.marketRegime?.regime)} />
-          <Stat k="FEEDS" v={fresh == null || tracked == null ? '—' : `${fresh}/${tracked}`} tone={fresh != null && tracked != null && fresh >= tracked * 0.8 ? 'up' : null} />
-          <Stat k="CONVICTION" v={num(conv.avgConviction) == null ? '—' : num(conv.avgConviction).toFixed(2)} />
+    <Card>
+      <Label>LEADERBOARD · bps / trade</Label>
+      {shown.length === 0 ? (
+        <Text style={s.note}>Not enough closed trades to rank yet.</Text>
+      ) : (
+        <View style={{ marginTop: T.sp.sm }}>
+          {shown.map((g, i) => <Lead key={`${g.symbol}${g.signalVersion}${i}`} g={g} maxAbs={maxAbs} />)}
+          <Text style={s.tiny}>Real closed-trade averages, per coin × strategy. ≥2 trades to list.</Text>
         </View>
-      </Card>
-
-      <Card>
-        <Label>LEADERBOARD · bps / trade</Label>
-        {best.length === 0 && worst.length === 0 ? (
-          <Text style={s.note}>Not enough closed trades to rank yet.</Text>
-        ) : (
-          <View style={{ marginTop: T.sp.xs }}>
-            {best.map((g, i) => <Lead key={`b${i}`} rank={`${i + 1}`} g={g} />)}
-            {worst.length ? <View style={s.dash} /> : null}
-            {worst.map((g, i) => <Lead key={`w${i}`} rank="▾" g={g} />)}
-            <Text style={s.tiny}>Real closed-trade averages, per coin × strategy. ≥2 trades to list.</Text>
-          </View>
-        )}
-      </Card>
-    </View>
+      )}
+    </Card>
   );
 }
 
-function Lead({ rank, g }) {
+function Lead({ g, maxAbs }) {
   const v = num(g.avgNetBps);
   const color = v == null ? C.sub : v >= 0 ? C.up : C.down;
   return (
     <View style={s.leadRow}>
-      <Text style={s.leadRank}>{rank}</Text>
       <Text style={s.leadSym}>{symShort(g.symbol)}</Text>
-      <Text style={s.leadSig} numberOfLines={1}>{prettySignal(g.signalVersion)}</Text>
+      <View style={s.leadBarWrap}>
+        <HBar value={v} maxAbs={maxAbs} color={color} />
+      </View>
       <Text style={[s.leadBps, { color }]}>{bps(v)}</Text>
       <Text style={s.leadN}>{num(g.entries) == null ? '' : `×${g.entries}`}</Text>
     </View>
@@ -697,11 +877,12 @@ function AppInner() {
         {data ? (
           <>
             <Reveal delay={70}><Money data={data} /></Reveal>
-            <Reveal delay={140}><Change data={data} /></Reveal>
-            <Reveal delay={210}><Engine data={data} /></Reveal>
-            <Reveal delay={280}><Brake data={data} /></Reveal>
-            <Reveal delay={350}><Floor data={data} /></Reveal>
-            <Reveal delay={420}><Footer data={data} ageMs={ageMs} health={health} /></Reveal>
+            <Reveal delay={140}><Market data={data} /></Reveal>
+            <Reveal delay={210}><Change data={data} /></Reveal>
+            <Reveal delay={280}><Engine data={data} /></Reveal>
+            <Reveal delay={350}><Brake data={data} /></Reveal>
+            <Reveal delay={420}><Leaderboard data={data} /></Reveal>
+            <Reveal delay={490}><Footer data={data} ageMs={ageMs} health={health} /></Reveal>
           </>
         ) : (
           <Card><Text style={s.note}>{error || 'No data.'}</Text></Card>
@@ -744,27 +925,56 @@ const s = StyleSheet.create({
   topRight: { flexDirection: 'row', alignItems: 'center', marginTop: T.sp.xs },
   topRightText: { marginLeft: T.sp.xs, fontSize: 11, fontWeight: '800', letterSpacing: 1.5 },
 
-  // Status hero
-  status: { borderRadius: T.r.lg, padding: T.sp.xl, marginBottom: T.sp.md },
-  statusTop: { flexDirection: 'row', alignItems: 'center' },
-  statusWord: { marginLeft: T.sp.sm, fontSize: 30, fontWeight: '900', letterSpacing: 2 },
-  statusLine: { color: C.ink2, fontSize: 15, lineHeight: 22, marginTop: T.sp.sm, fontWeight: '500' },
-  statusAct: { alignSelf: 'flex-start', borderWidth: 1.5, borderRadius: 999, paddingHorizontal: T.sp.md, paddingVertical: T.sp.xs, marginTop: T.sp.md },
-  statusActText: { fontSize: 13, fontWeight: '700' },
+  // Status — slim single line
+  status: { borderRadius: T.r.md, paddingHorizontal: T.sp.md, paddingVertical: T.sp.sm, marginBottom: T.sp.md },
+  statusLineRow: { flexDirection: 'row', alignItems: 'center' },
+  statusWord: { marginLeft: T.sp.sm, fontSize: 14, fontWeight: '900', letterSpacing: 1.5 },
+  statusLine: { color: C.ink2, fontSize: 12.5, marginLeft: T.sp.sm, fontWeight: '500', flex: 1 },
+  statusActText: { fontSize: 12, fontWeight: '700', marginTop: T.sp.xs, marginLeft: T.sp.lg },
 
   // Cards
   card: { backgroundColor: C.card, borderRadius: T.r.lg, borderWidth: 1, borderColor: C.line, padding: T.sp.lg, marginBottom: T.sp.md },
   cardHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: T.sp.xs },
   label: { color: C.faint, fontSize: 11, fontWeight: '800', letterSpacing: 2 },
-  headPulse: { flexDirection: 'row', alignItems: 'center' },
-  headPulseText: { marginLeft: T.sp.xs, fontSize: 12, fontWeight: '700', fontFamily: T.mono },
 
-  equity: { color: C.ink, fontSize: 42, fontWeight: '800', fontFamily: T.mono, marginTop: T.sp.xs, marginBottom: T.sp.md, letterSpacing: -0.5 },
+  // Equity — compact, label + value share one baseline; colour = direction
+  equityHead: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: T.sp.md },
+  equity: { fontSize: 26, fontWeight: '800', fontFamily: T.mono, letterSpacing: -0.5 },
+  equityArrow: { fontSize: 16, fontWeight: '900' },
 
-  statGrid: { flexDirection: 'row', flexWrap: 'wrap' },
-  stat: { width: '25%', paddingVertical: T.sp.xs },
-  statK: { color: C.faint, fontSize: 9, fontWeight: '800', letterSpacing: 1, height: 12 },
-  statV: { color: C.ink, fontSize: 15, fontWeight: '700', fontFamily: T.mono, marginTop: 2 },
+  // Money strip — all four figures on one line
+  moneyRow: { flexDirection: 'row', justifyContent: 'space-between' },
+  miniStat: { flex: 1, paddingRight: T.sp.xs },
+  miniStatK: { color: C.faint, fontSize: 8.5, fontWeight: '800', letterSpacing: 0.5 },
+  miniStatV: { color: C.ink, fontSize: 12.5, fontWeight: '700', fontFamily: T.mono, marginTop: 2 },
+
+  // Charts
+  chartAxis: { position: 'absolute', left: 0, right: 0, bottom: -2, flexDirection: 'row', justifyContent: 'space-between' },
+  chartTick: { color: C.faint, fontSize: 9, fontWeight: '700', flex: 1 },
+  changeHeadVal: { fontSize: 15, fontWeight: '800', fontFamily: T.mono },
+  changeHeadSub: { color: C.faint, fontSize: 10, fontWeight: '700' },
+  chipRow: { flexDirection: 'row', justifyContent: 'space-around', marginTop: T.sp.lg, paddingTop: T.sp.sm, borderTopWidth: 1, borderTopColor: C.line },
+  chip: { alignItems: 'center' },
+  chipK: { color: C.faint, fontSize: 9, fontWeight: '800', letterSpacing: 1 },
+  chipV: { fontSize: 14, fontWeight: '800', fontFamily: T.mono, marginTop: 2 },
+
+  // Engine / Brake one-line strips
+  engineCard: { paddingVertical: T.sp.md },
+  engineLine: { fontSize: 13 },
+  brakeLine: { fontSize: 13 },
+  engineKey: { color: C.faint, fontSize: 11, fontWeight: '800', letterSpacing: 1.5 },
+  enginePink: { color: C.pink, fontWeight: '800', fontFamily: T.mono },
+  engineDim: { color: C.sub, fontFamily: T.mono },
+
+  // Market verdict
+  verdictRow: { flexDirection: 'row', alignItems: 'center', marginTop: T.sp.sm, marginBottom: T.sp.md },
+  verdictEmoji: { fontSize: 34, marginRight: T.sp.md },
+  verdictWord: { color: C.ink, fontSize: 20, fontWeight: '900', letterSpacing: 0.3 },
+  verdictSub: { color: C.sub, fontSize: 12.5, marginTop: 2, lineHeight: 17 },
+  factRow: { flexDirection: 'row', justifyContent: 'space-between', paddingTop: T.sp.sm, borderTopWidth: 1, borderTopColor: C.line },
+  fact: { flex: 1 },
+  factK: { color: C.faint, fontSize: 9, fontWeight: '800', letterSpacing: 1 },
+  factV: { color: C.ink, fontSize: 13, fontWeight: '700', marginTop: 3 },
 
   flowNote: { color: C.sub, fontSize: 11, fontWeight: '600', marginTop: T.sp.sm, lineHeight: 15 },
 
@@ -783,14 +993,14 @@ const s = StyleSheet.create({
   note: { color: C.sub, fontSize: 12, lineHeight: 18, marginTop: T.sp.sm },
   tiny: { color: C.faint, fontSize: 10, lineHeight: 15, marginTop: T.sp.sm },
 
-  // Leaderboard
+  // Leaderboard — magnitude bars
   leadRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: T.sp.xs },
-  leadRank: { color: C.faint, fontSize: 12, width: 20, fontFamily: T.mono },
-  leadSym: { color: C.ink, fontSize: 14, fontWeight: '800', width: 52, fontFamily: T.mono },
-  leadSig: { color: C.faint, fontSize: 11, flex: 1 },
-  leadBps: { fontSize: 14, fontWeight: '800', fontFamily: T.mono, width: 64, textAlign: 'right' },
-  leadN: { color: C.faint, fontSize: 11, width: 34, textAlign: 'right', fontFamily: T.mono },
-  dash: { height: 1, backgroundColor: C.line, marginVertical: T.sp.sm },
+  leadSym: { color: C.ink, fontSize: 13, fontWeight: '800', width: 48, fontFamily: T.mono },
+  leadBarWrap: { flex: 1, marginHorizontal: T.sp.sm },
+  hbarTrack: { height: 9, backgroundColor: C.line, borderRadius: 5, overflow: 'hidden' },
+  hbarFill: { height: '100%', borderRadius: 5 },
+  leadBps: { fontSize: 13, fontWeight: '800', fontFamily: T.mono, width: 56, textAlign: 'right' },
+  leadN: { color: C.faint, fontSize: 10, width: 28, textAlign: 'right', fontFamily: T.mono },
 
   // Footer
   footer: { alignItems: 'center', marginTop: T.sp.sm },
