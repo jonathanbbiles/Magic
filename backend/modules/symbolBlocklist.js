@@ -67,6 +67,18 @@ function isMicroPairBlocked(pair, horizonMinutes, blocklists) {
   return false;
 }
 
+// BTC lead-lag per-symbol blocklist (2026-06-29). Same pattern as the MR /
+// microstructure blocklists — gate the live signal getter AND the auto-backtest
+// invocation by an identical set so the dashboard backtest reflects the universe
+// the live engine actually trades. btc_lead_lag is operator-pinned
+// (SIGNAL_VERSION=btc_lead_lag), so this is the per-symbol lever to trim its
+// structural losers without un-pinning the whole signal. Seeded in liveDefaults
+// with the symbols whose LIVE per-trade expectancy was worst in the 2026-06-29
+// dashboard snapshot (AVAX -14.2, LINK -11.1, ADA -10.4 bps).
+function readBtcLeadLagBlocklistFromEnv(env = process.env) {
+  return blocklistAsSet(env.BTC_LEAD_LAG_SYMBOL_BLOCKLIST);
+}
+
 module.exports = {
   parseSymbolBlocklist,
   blocklistAsSet,
@@ -75,4 +87,5 @@ module.exports = {
   isMrPairBlocked,
   readMicroBlocklistsFromEnv,
   isMicroPairBlocked,
+  readBtcLeadLagBlocklistFromEnv,
 };

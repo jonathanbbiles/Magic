@@ -355,7 +355,39 @@ const REALIZED_VETO_DEFAULTS = Object.freeze({
   // liveDefaults (SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS), mirroring how
   // lookbackTrades is 50 here but operator-tuned live.
   maxAgeMs: 0,
+  // 2026-06-29: cadence-adaptive recovery window (safe-only). When true, the
+  // age-out window is extended from the static maxAgeMs to at least the time
+  // the signal needs to close `minTrades` trades at its OWN observed cadence
+  // (median inter-trade interval). Floored at maxAgeMs, so it can ONLY ever
+  // lengthen the window, never shorten it — recovery is never faster than the
+  // static clock. Off here (backward-compatible pure default); the LIVE default
+  // is true via SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE. See the long note in
+  // evaluateRealizedVeto.
+  cadenceAdaptiveMaxAge: false,
 });
+
+// Pure helper: median time between consecutive closed trades (ms), from records
+// that carry a parseable `ts`. Returns null when fewer than two are datable.
+// Median (not mean) so occasional halt-induced gaps don't distort the cadence.
+function computeMedianInterTradeMs(trades) {
+  if (!Array.isArray(trades)) return null;
+  const ts = [];
+  for (const t of trades) {
+    const p = t?.ts ? Date.parse(t.ts) : NaN;
+    if (Number.isFinite(p)) ts.push(p);
+  }
+  if (ts.length < 2) return null;
+  ts.sort((a, b) => a - b);
+  const deltas = [];
+  for (let i = 1; i < ts.length; i += 1) {
+    const d = ts[i] - ts[i - 1];
+    if (d > 0) deltas.push(d);
+  }
+  if (deltas.length === 0) return null;
+  deltas.sort((a, b) => a - b);
+  const mid = Math.floor(deltas.length / 2);
+  return deltas.length % 2 ? deltas[mid] : (deltas[mid - 1] + deltas[mid]) / 2;
+}
 
 function evaluateRealizedVeto({ records = [], signalVersion = null, config = {}, excludeSymbols = null, nowMs = Date.now() } = {}) {
   const cfg = { ...REALIZED_VETO_DEFAULTS, ...(config || {}) };
@@ -369,6 +401,13 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     minTrades: cfg.minTrades,
     lookbackTrades: cfg.lookbackTrades,
     maxAgeMs: cfg.maxAgeMs > 0 ? cfg.maxAgeMs : null,
+    // Cadence-adaptive recovery window (2026-06-29). `cadenceMs` is the measured
+    // median inter-trade interval; `effectiveMaxAgeMs` is the window actually
+    // applied (= maxAgeMs unless cadence-adaptive extended it). Both default to
+    // the static configured values so the early-return paths stay consistent.
+    cadenceAdaptive: cfg.cadenceAdaptiveMaxAge === true,
+    cadenceMs: null,
+    effectiveMaxAgeMs: cfg.maxAgeMs > 0 ? cfg.maxAgeMs : null,
     agedOutCount: 0,
     // Self-recovery ETA (populated only when the veto is engaged AND the clock
     // can lift it). clearsOnClock=false means the time-decay clock alone can
@@ -432,21 +471,42 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
   // `ts` is missing or unparseable is never aged out (kept as in-window), so
   // callers that omit ts keep the prior count-only behaviour. maxAgeMs <= 0
   // disables the clock entirely.
+  // 2026-06-29: cadence-adaptive recovery window (safe-only). The fixed maxAgeMs
+  // encodes an assumption — "an actively-trading signal accumulates minTrades
+  // fresh closes within the window, so the clock only ever bites a HALTED
+  // signal." When that is false (a LOW-THROUGHPUT signal: post-only btc_lead_lag
+  // is the canonical case — its low maker fill rate means it does NOT close
+  // minTrades trades within 24h, see the 2026-06-22 min_trades note in
+  // liveDefaults), the static window ages trades out FASTER than fresh fills
+  // arrive, draining the sample below minTrades and leaving the breaker BLIND
+  // (insufficient_sample) on a bleeding signal. To make the window data-driven
+  // instead of a static timeout, extend it to at least the time the signal needs
+  // to close minTrades trades at its OWN observed cadence. Floored at the
+  // configured maxAgeMs → it can only lengthen the window, never shorten it, so
+  // recovery is never faster than the static clock (worst case == today). Only
+  // engages when the clock is enabled (maxAgeMs > 0) so '0 = disabled' is kept.
+  const cadenceMs = computeMedianInterTradeMs(filtered);
+  let effectiveMaxAgeMs = cfg.maxAgeMs;
+  if (cfg.maxAgeMs > 0 && cfg.cadenceAdaptiveMaxAge && cadenceMs != null) {
+    effectiveMaxAgeMs = Math.max(cfg.maxAgeMs, Math.ceil(cfg.minTrades * cadenceMs));
+  }
+
   let agedOutCount = 0;
   let timeScoped = filtered;
-  if (cfg.maxAgeMs > 0) {
+  if (effectiveMaxAgeMs > 0) {
     timeScoped = filtered.filter((t) => {
       const parsed = t?.ts ? Date.parse(t.ts) : NaN;
       if (!Number.isFinite(parsed)) return true; // unknown age → keep in-window
-      const fresh = (nowMs - parsed) <= cfg.maxAgeMs;
+      const fresh = (nowMs - parsed) <= effectiveMaxAgeMs;
       if (!fresh) agedOutCount += 1;
       return fresh;
     });
   }
+  const cadenceFields = { cadenceMs, effectiveMaxAgeMs: effectiveMaxAgeMs > 0 ? effectiveMaxAgeMs : null };
 
   const recent = cfg.lookbackTrades > 0 ? timeScoped.slice(-cfg.lookbackTrades) : timeScoped;
   if (recent.length < cfg.minTrades) {
-    return { ...base, reason: 'insufficient_sample', sampleSize: recent.length, excludedSymbolTradeCount, agedOutCount };
+    return { ...base, ...cadenceFields, reason: 'insufficient_sample', sampleSize: recent.length, excludedSymbolTradeCount, agedOutCount };
   }
   let sum = 0;
   for (const t of recent) sum += t.realizedNetBps;
@@ -456,10 +516,11 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
   // new trade closes first — so the dashboard can say "clears in ~4h" instead of
   // a vague "ages out eventually". Only meaningful while vetoing.
   const clearEstimate = veto
-    ? estimateRealizedVetoClear(recent, { minTrades: cfg.minTrades, maxAgeMs: cfg.maxAgeMs, nowMs })
+    ? estimateRealizedVetoClear(recent, { minTrades: cfg.minTrades, maxAgeMs: effectiveMaxAgeMs, nowMs })
     : null;
   return {
     ...base,
+    ...cadenceFields,
     veto,
     reason: veto ? 'realized_below_floor' : 'within_floor',
     sampleSize: recent.length,
@@ -581,6 +642,7 @@ module.exports = {
   pickActiveSignal,
   evaluateRealizedVeto,
   estimateRealizedVetoClear,
+  computeMedianInterTradeMs,
   setLatestDecision,
   getCurrentDecision,
   bootstrapDecisionFromEnv,

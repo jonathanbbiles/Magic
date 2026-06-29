@@ -770,6 +770,9 @@ const GATE_REJECTION_AUDIT_ENABLED = readBoolean('GATE_REJECTION_AUDIT_ENABLED',
 // by the live-defaults bootstrap; rationale in liveDefaults.js.
 const symbolBlocklist = require('./modules/symbolBlocklist');
 const MR_BLOCKLISTS = symbolBlocklist.readMrBlocklistsFromEnv(process.env);
+// btc_lead_lag per-symbol blocklist (2026-06-29). Read once at module load like
+// the MR blocklists. Gates the live getter AND the realized-veto exclude set.
+const BLL_BLOCKLIST = symbolBlocklist.readBtcLeadLagBlocklistFromEnv(process.env);
 // Per-horizon microstructure blocklists (2026-05-20). Same shared-with-
 // backtest pattern as MR_BLOCKLISTS so the auto-backtest result matches
 // the live universe. The 30m default in liveDefaults.js seeds the symbols
@@ -1157,6 +1160,14 @@ const SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES = Math.max(
   SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
   readNumber('SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES', 50),
 );
+// 2026-06-29: cadence-adaptive recovery window (safe-only). Extends the static
+// MAX_AGE_MS so it never ages the sample out FASTER than the active signal
+// closes minTrades trades at its own measured cadence — fixing the "breaker
+// went blind at low throughput" failure the 2026-06-22 min_trades cut patched
+// around. Floored at MAX_AGE_MS, so it only ever lengthens the window (never
+// recovers faster). Disable with SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE=false
+// to restore the pure static-24h clock.
+const SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE = readBoolean('SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE', true);
 
 // Exploration budget (2026-05-29). The middle ground between the backtest
 // veto's two failure modes (veto-all → never trades; veto-off → bleeds). When
@@ -2501,6 +2512,13 @@ async function getBtcLeadLagSignalForPair(pair) {
     } catch (_) { /* snapshot refresh is best-effort; never fatal */ }
     return { ok: false, reason: 'btc_is_leader' };
   }
+  // Per-symbol blocklist guard (2026-06-29). Refuses entries on symbols
+  // documented as structural losers for btc_lead_lag. Placed AFTER the BTC
+  // snapshot-refresh block above so blocking an alt never disables the leader
+  // refresh, and BEFORE the bars fetch so a blocked pair costs zero network.
+  if (symbolBlocklist.isPairBlocked(pair, BLL_BLOCKLIST)) {
+    return { ok: false, reason: 'btc_lead_lag_symbol_blocklisted' };
+  }
   try {
     const bars1mPayload = await fetchCryptoBars({ symbols: [pair], limit: 40, timeframe: '1Min' });
     const bars1m = bars1mPayload?.bars?.[pair] || bars1mPayload?.bars?.[toAlpacaSymbol(pair)] || [];
@@ -3401,11 +3419,13 @@ async function scanAndEnter() {
   // Exclude the active signal's blocklisted symbols from the realized-veto
   // window (2026-06-07). A symbol added to MR_SYMBOL_BLOCKLIST_* will never be
   // traded again on that timeframe, so its old closed trades must not keep the
-  // breaker halting the bot (and deadlocking the flush). Map the active MR
-  // timeframe to its blocklist set; non-MR signals pass null (no change).
+  // breaker halting the bot (and deadlocking the flush). Map the active signal
+  // to its blocklist set; signals without a per-symbol blocklist pass null.
+  // btc_lead_lag (2026-06-29) uses BLL_BLOCKLIST — same anti-deadlock treatment.
   const realizedVetoExcludeSymbols = ACTIVE_SIGNAL_VERSION === 'mean_reversion' ? MR_BLOCKLISTS.mr1m
     : ACTIVE_SIGNAL_VERSION === 'mean_reversion_5m' ? MR_BLOCKLISTS.mr5m
     : ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m' ? MR_BLOCKLISTS.mr15m
+    : ACTIVE_SIGNAL_VERSION === 'btc_lead_lag' ? BLL_BLOCKLIST
     : null;
   const realizedVeto = signalSelector.evaluateRealizedVeto({
     records: closedTradeStats.getRecent(SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES * 20),
@@ -3417,6 +3437,7 @@ async function scanAndEnter() {
       floorBps: SIGNAL_SELECTOR_REALIZED_FLOOR_BPS,
       lookbackTrades: SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES,
       maxAgeMs: SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS,
+      cadenceAdaptiveMaxAge: SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE,
     },
   });
   lastRealizedVetoState = { ...realizedVeto, evaluatedAt: new Date().toISOString() };

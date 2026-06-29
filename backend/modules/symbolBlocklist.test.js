@@ -7,6 +7,7 @@ const {
   isMrPairBlocked,
   readMicroBlocklistsFromEnv,
   isMicroPairBlocked,
+  readBtcLeadLagBlocklistFromEnv,
 } = require('./symbolBlocklist');
 
 // 1. Empty string, null, undefined all → [].
@@ -177,6 +178,20 @@ const {
 {
   assert.equal(isMicroPairBlocked('UNI/USD', 30, null), false);
   assert.equal(isMicroPairBlocked('UNI/USD', 30, undefined), false);
+}
+
+// 17. readBtcLeadLagBlocklistFromEnv: parses the env var to a case-insensitive
+// Set usable with isPairBlocked; empty/unset → empty set (no filtering).
+{
+  const b = readBtcLeadLagBlocklistFromEnv({ BTC_LEAD_LAG_SYMBOL_BLOCKLIST: 'AVAX/USD,LINK/USD,ADA/USD' });
+  assert.equal(isPairBlocked('AVAX/USD', b), true);
+  assert.equal(isPairBlocked('link/usd', b), true, 'case-insensitive');
+  assert.equal(isPairBlocked('ADA/USD', b), true);
+  assert.equal(isPairBlocked('ETH/USD', b), false, 'unlisted pair not blocked');
+
+  const empty = readBtcLeadLagBlocklistFromEnv({});
+  assert.equal(empty.size, 0);
+  assert.equal(isPairBlocked('AVAX/USD', empty), false, 'unset env → no filtering');
 }
 
 console.log('symbolBlocklist.test.js passed');
