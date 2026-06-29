@@ -7,6 +7,7 @@ const {
   bootstrapDecisionFromEnv,
   DEFAULTS,
   REALIZED_VETO_DEFAULTS,
+  computeMedianInterTradeMs,
 } = require('./signalSelector');
 
 // Build N closed-trade records for `signalVersion`, each carrying
@@ -501,6 +502,94 @@ function recsAt(signalVersion, bpsList, tsIso) {
   assert.equal(v.veto, true);
   assert.equal(v.clearsOnClock, false, 'untimestamped trades never age out');
   assert.equal(v.clearsInMs, null);
+}
+
+// ---- Cadence-adaptive recovery window (safe-only, 2026-06-29) ----
+
+// Build records at explicit ms-ages before `nowMs`, all at the same net bps.
+function recsAtAges(signalVersion, bps, agesMs, nowMs) {
+  return agesMs.map((age) => ({
+    type: 'closed_trade',
+    signalVersion,
+    realizedNetBps: bps,
+    ts: new Date(nowMs - age).toISOString(),
+  }));
+}
+
+// C0. computeMedianInterTradeMs: even spacing → that spacing; <2 datable → null.
+{
+  const now = Date.parse('2026-06-29T00:00:00Z');
+  const HOUR = 3600000;
+  const even = recsAtAges('x', -1, [0, HOUR, 2 * HOUR, 3 * HOUR], now);
+  assert.equal(computeMedianInterTradeMs(even), HOUR, 'even 1h spacing → 1h median');
+  assert.equal(computeMedianInterTradeMs([{ ts: new Date(now).toISOString() }]), null, 'one datable → null');
+  assert.equal(computeMedianInterTradeMs([{ realizedNetBps: -1 }, { realizedNetBps: -2 }]), null, 'no ts → null');
+}
+
+// C1. The core win: a LOW-THROUGHPUT bleeder whose static-24h window would drain
+// below minTrades (breaker goes BLIND → insufficient_sample → veto lifts), but
+// the cadence-adaptive window extends to keep the sample in-window so the
+// breaker STAYS armed. 8 losers spaced 12h apart; minTrades 6.
+{
+  const now = Date.parse('2026-06-29T00:00:00Z');
+  const H12 = 12 * 3600000;
+  const ages = [0, H12, 2 * H12, 3 * H12, 4 * H12, 5 * H12, 6 * H12, 7 * H12]; // 0..84h
+  const losers = recsAtAges('btc_lead_lag', -30, ages, now);
+
+  // Static 24h: only the 3 youngest (≤24h) survive → below minTrades → blind.
+  const stat = evaluateRealizedVeto({
+    records: losers, signalVersion: 'btc_lead_lag', nowMs: now,
+    config: { minTrades: 6, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000, cadenceAdaptiveMaxAge: false },
+  });
+  assert.equal(stat.veto, false, 'static clock ages the sample out and goes blind');
+  assert.equal(stat.reason, 'insufficient_sample');
+  assert.equal(stat.effectiveMaxAgeMs, 86400000, 'static: effective == configured');
+
+  // Cadence-adaptive: median delta 12h → effective = max(24h, 6×12h=72h) = 72h →
+  // 7 of 8 survive → breaker stays armed on the genuine bleed.
+  const adap = evaluateRealizedVeto({
+    records: losers, signalVersion: 'btc_lead_lag', nowMs: now,
+    config: { minTrades: 6, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000, cadenceAdaptiveMaxAge: true },
+  });
+  assert.equal(adap.veto, true, 'cadence-adaptive keeps the sample → breaker stays armed');
+  assert.equal(adap.cadenceMs, H12, 'measured 12h cadence');
+  assert.equal(adap.effectiveMaxAgeMs, 6 * H12, 'extended to minTrades × cadence');
+  assert.ok(adap.effectiveMaxAgeMs > 86400000, 'window only ever lengthens');
+}
+
+// C2. Safe-only floor: a FAST-cadence signal's window is NOT shortened below the
+// configured maxAgeMs — recovery is never faster than the static clock.
+{
+  const now = Date.parse('2026-06-29T00:00:00Z');
+  const MIN = 60000;
+  const ages = Array.from({ length: 8 }, (_, i) => i * 10 * MIN); // 10-min spacing
+  const fast = recsAtAges('btc_lead_lag', -30, ages, now);
+  const v = evaluateRealizedVeto({
+    records: fast, signalVersion: 'btc_lead_lag', nowMs: now,
+    config: { minTrades: 6, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000, cadenceAdaptiveMaxAge: true },
+  });
+  assert.equal(v.cadenceMs, 10 * MIN, 'fast 10-min cadence measured');
+  assert.equal(v.effectiveMaxAgeMs, 86400000, 'floored at configured 24h, never shorter');
+}
+
+// C3. maxAgeMs=0 (clock disabled) → cadence-adaptive must NOT switch aging on.
+{
+  const now = Date.parse('2026-06-29T00:00:00Z');
+  const H12 = 12 * 3600000;
+  const ages = [0, H12, 2 * H12, 3 * H12, 4 * H12, 5 * H12, 6 * H12, 7 * H12];
+  const losers = recsAtAges('ols', -30, ages, now);
+  const v = evaluateRealizedVeto({
+    records: losers, signalVersion: 'ols', nowMs: now,
+    config: { minTrades: 6, floorBps: -5, lookbackTrades: 20, maxAgeMs: 0, cadenceAdaptiveMaxAge: true },
+  });
+  assert.equal(v.agedOutCount, 0, 'disabled clock stays disabled regardless of cadence');
+  assert.equal(v.effectiveMaxAgeMs, null);
+  assert.equal(v.veto, true, 'count-only window still halts the bleeder');
+}
+
+// C4. Module default keeps cadence-adaptive OFF (backward-compatible pure fn).
+{
+  assert.equal(REALIZED_VETO_DEFAULTS.cadenceAdaptiveMaxAge, false);
 }
 
 // R2. The canonical failure case: active signal realizing well below the floor

@@ -413,6 +413,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // it only un-freezes a halted one. Set '0' in Render to disable (count-only
   // window).
   SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS: '86400000',
+  // 2026-06-29: cadence-adaptive recovery window (safe-only). The static 24h
+  // above assumes an active signal closes min_trades trades within 24h — but a
+  // low-throughput signal (post-only btc_lead_lag's low maker fill rate is the
+  // canonical case) does NOT, so the static window ages the sample out faster
+  // than fresh fills arrive and the breaker goes BLIND on a bleeder (the exact
+  // failure the 2026-06-22 min_trades 10→6 cut patched around). When true, the
+  // window is extended to max(24h, min_trades × the signal's OWN measured median
+  // inter-trade interval) so it only ever LENGTHENS — recovery is never faster
+  // than the static clock, only slower for slow signals. Strictly pro-safety:
+  // worst case it equals the static-24h behaviour. Disable with
+  // SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE='false' in Render env.
+  SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE: 'true',
   // Exploration budget (2026-05-29). The middle ground between the backtest
   // veto's two failure modes: veto-all (the bot never buys — the 2026-05-28/29
   // dashboard sat at zero trades for 15h because both signals backtested
@@ -754,6 +766,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   MR_SYMBOL_BLOCKLIST_5M: 'BCH/USD,DOGE/USD,XRP/USD',
   MR_SYMBOL_BLOCKLIST_15M: '',
   RANGE_MR_SYMBOL_BLOCKLIST: '',
+  // btc_lead_lag per-symbol blocklist (2026-06-29). btc_lead_lag is the live-
+  // pinned signal (SIGNAL_VERSION=btc_lead_lag) and was net-NEGATIVE on EVERY one
+  // of its 7 live symbols in the 2026-06-29 dashboard snapshot. Seeded with the
+  // 3 worst by per-trade expectancy — AVAX -14.2, LINK -11.1, ADA -10.4 bps —
+  // to trim the structural losers without un-pinning the signal; the realized
+  // breaker stays the backstop for the rest. Closed trades from these symbols
+  // are dropped from the realized-veto window (same 2026-06-07 anti-deadlock
+  // treatment as the MR blocklists). Operator can override / clear via
+  // BTC_LEAD_LAG_SYMBOL_BLOCKLIST in Render env.
+  BTC_LEAD_LAG_SYMBOL_BLOCKLIST: 'AVAX/USD,LINK/USD,ADA/USD',
   // Per-horizon microstructure blocklists (2026-05-20). The 30m default
   // mirrors the 2026-05-19 dashboard snapshot's catastrophic per-trade
   // losers: UNI -130 (1 trade), DOT -130 (1 trade), LTC -60.9 (2 trades),

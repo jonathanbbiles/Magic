@@ -3498,8 +3498,12 @@ if (backtestSkipReason) {
     // operator-pinned live (SIGNAL_VERSION=btc_lead_lag) and judged by the
     // realized-expectancy veto on real maker fills. Gate via BTC_LEAD_LAG_ENABLED.
     if (String(process.env.BTC_LEAD_LAG_ENABLED || 'true').toLowerCase() !== 'false') {
+      // Same blocklist the live getter applies (2026-06-29) so the dashboard
+      // backtest reflects the universe the live engine actually trades.
+      const btcLeadLagBlocklist = symbolBlocklist.parseSymbolBlocklist(process.env.BTC_LEAD_LAG_SYMBOL_BLOCKLIST);
       await runBacktestAndStore({
         strategy: 'btc_lead_lag',
+        blockedSymbols: btcLeadLagBlocklist,
       }, 'btc_lead_lag').catch(() => {});
     }
     // 2026-05-17 Stage 3 sweep: backtest MR-5m and MR-15m at three stop-loss

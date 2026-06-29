@@ -163,6 +163,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES, '6');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-5');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES, '20');
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS, '86400000');
+// 2026-06-29: cadence-adaptive recovery window (safe-only). Extends the static
+// 24h to the signal's own min_trades × median inter-trade interval when that is
+// longer, so a low-throughput signal's sample can't age out faster than fresh
+// fills arrive. Floored at 24h → never recovers faster than the static clock.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE, 'true');
 
 // 2026-05-27: Adverse-selection-aware backtest fill model. Must stay ON in the
 // live defaults so the auto-backtest stops over-promising edge that doesn't
@@ -302,6 +307,11 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_1M, 'BCH/USD');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_5M, 'BCH/USD,DOGE/USD,XRP/USD');
 assert.equal(LIVE_CRITICAL_DEFAULTS.MR_SYMBOL_BLOCKLIST_15M, '');
 assert.equal(LIVE_CRITICAL_DEFAULTS.RANGE_MR_SYMBOL_BLOCKLIST, '');
+// 2026-06-29: btc_lead_lag (the live-pinned signal) was net-negative on all 7
+// live symbols; the 3 worst by per-trade expectancy (AVAX -14.2, LINK -11.1,
+// ADA -10.4 bps) are blocked to trim the structural losers without un-pinning.
+// Locked so the evidence-backed block can't silently drop out.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BTC_LEAD_LAG_SYMBOL_BLOCKLIST, 'AVAX/USD,LINK/USD,ADA/USD');
 
 // 2026-05-28 add: three new strategies (trend_following, pairs, time_of_day filter).
 // trend_following and pairs are signal candidates the selector evaluates; they
