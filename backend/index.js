@@ -84,7 +84,8 @@ require('./config/bootstrapLiveEnv');
 const express = require('express');
 const { execSync } = require('child_process');
 const cors = require('cors');
-const { requireApiToken } = require('./auth');
+const { requireApiToken, isAuthenticated } = require('./auth');
+const { redactDiagnosticsBody } = require('./modules/diagnosticsRedaction');
 const { rateLimit } = require('./rateLimit');
 const validateEnv = require('./config/validateEnv');
 const { getRuntimeConfig, getRuntimeConfigSummary } = require('./config/runtimeConfig');
@@ -138,6 +139,23 @@ const staleQuoteRescue = require('./modules/staleQuoteRescue');
 
 validateEnv();
 const storagePaths = preflightStoragePaths();
+// Storage durability guard (2026-06-30): the realized-expectancy breaker, closed-
+// trade stats and equity snapshots persist under DATASET_DIR. On Render the disk
+// is EPHEMERAL unless a persistent disk is mounted — if storage resolves to the
+// ./data fallback (or DATASET_DIR is unset) that history is wiped on every
+// redeploy, resetting the breaker window. Warn loudly; see render.yaml.example.
+{
+  const ephemeralRoot = path.resolve('./data');
+  const resolvedRoot = storagePaths && storagePaths.writableRoot ? storagePaths.writableRoot : null;
+  if (!resolvedRoot || resolvedRoot === ephemeralRoot) {
+    console.warn('ephemeral_storage_warning', {
+      resolvedRoot,
+      datasetDirEnv: process.env.DATASET_DIR || null,
+      impact: 'trade history / closed-trade stats / equity snapshots are WIPED on redeploy, resetting the realized-expectancy breaker window',
+      fix: 'mount a persistent disk at /mnt/data and set DATASET_DIR=/mnt/data (see render.yaml.example)',
+    });
+  }
+}
 const runtimeConfig = getRuntimeConfig();
 const runtimeConfigSummary = getRuntimeConfigSummary();
 console.log('runtime_live_critical_config', {
@@ -425,6 +443,16 @@ const isPublicEndpoint = (req) =>
     || req.path === '/monitor'
   );
 
+// Unauthenticated-diagnostics redaction (2026-06-30). The endpoints above are
+// public so the dashboard can read them without a token, but when an API_TOKEN
+// IS configured an UNauthenticated caller must not receive live account equity,
+// cash, buying power, or open positions. Redact those fields for unauthenticated
+// callers only; the Expo dashboard sends the token and is unaffected. Toggle off
+// with REDACT_UNAUTHED_DIAGNOSTICS=false.
+const REDACT_UNAUTHED_DIAGNOSTICS = String(process.env.REDACT_UNAUTHED_DIAGNOSTICS || 'true').toLowerCase() !== 'false';
+const shouldRedactForRequest = (req) => REDACT_UNAUTHED_DIAGNOSTICS && !isAuthenticated(req);
+// redactDiagnosticsBody is imported from ./modules/diagnosticsRedaction (tested there).
+
 const serializeError = (error, fallbackMessage = 'Request failed') => {
   const statusCode = Number.isFinite(error?.statusCode)
     ? error.statusCode
@@ -649,6 +677,20 @@ app.use((req, res, next) => {
     return next();
   }
   return requireApiToken(req, res, next);
+});
+
+// Redact sensitive account/position fields from public diagnostics endpoints for
+// unauthenticated callers when auth is configured (see REDACT_UNAUTHED_DIAGNOSTICS).
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || !isPublicEndpoint(req) || !shouldRedactForRequest(req)) {
+    return next();
+  }
+  if (req.path === '/monitor' && String(req.query.format || '').toLowerCase() === 'text') {
+    return res.type('text/plain').send('monitor heartbeats hidden (unauthenticated). Provide the API token to view.\n');
+  }
+  const originalJson = res.json.bind(res);
+  res.json = (payload) => originalJson(redactDiagnosticsBody(req.path, payload));
+  return next();
 });
 
 app.get('/health', (req, res) => {
