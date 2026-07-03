@@ -1,5 +1,5 @@
 const assert = require('assert/strict');
-const { requireApiToken } = require('./auth');
+const { requireApiToken, isAuthenticated } = require('./auth');
 
 function mockReq(headers = {}) {
   return {
@@ -103,6 +103,29 @@ function mockReq(headers = {}) {
   } else {
     process.env.API_TOKEN = previous;
   }
+})();
+
+(function testIsAuthenticatedTrueWhenNoTokenConfigured() {
+  const previous = process.env.API_TOKEN;
+  delete process.env.API_TOKEN;
+  assert.equal(isAuthenticated(mockReq({})), true); // auth disabled => treated as authed
+  if (previous !== undefined) process.env.API_TOKEN = previous;
+})();
+
+(function testIsAuthenticatedFalseWhenTokenConfiguredButMissing() {
+  const previous = process.env.API_TOKEN;
+  process.env.API_TOKEN = 'backend_token_123456789';
+  assert.equal(isAuthenticated(mockReq({})), false);
+  assert.equal(isAuthenticated(mockReq({ authorization: 'Bearer wrong' })), false);
+  if (previous === undefined) delete process.env.API_TOKEN; else process.env.API_TOKEN = previous;
+})();
+
+(function testIsAuthenticatedTrueOnMatch() {
+  const previous = process.env.API_TOKEN;
+  process.env.API_TOKEN = 'backend_token_123456789';
+  assert.equal(isAuthenticated(mockReq({ authorization: 'Bearer backend_token_123456789' })), true);
+  assert.equal(isAuthenticated(mockReq({ 'x-api-key': 'backend_token_123456789' })), true);
+  if (previous === undefined) delete process.env.API_TOKEN; else process.env.API_TOKEN = previous;
 })();
 
 console.log('auth.test.js passed');

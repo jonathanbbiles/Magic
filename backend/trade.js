@@ -1038,6 +1038,13 @@ const MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER = readNumber(
   'MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER',
   -0.5,
 );
+// Equity-drawdown circuit breaker (2026-06-30). The unrealized-book gate above
+// is INERT on binance_us (fetchPositions returns cost_basis/unrealized_pl=null),
+// so it cannot protect the live venue. This venue-agnostic guard halts NEW
+// entries when account equity (populated on both venues) falls more than
+// MAX_EQUITY_DRAWDOWN_PCT below its running intra-session peak. Open positions
+// still exit. Peak is in-memory and resets on redeploy by design. 0 = disabled.
+const MAX_EQUITY_DRAWDOWN_PCT = readNumber('MAX_EQUITY_DRAWDOWN_PCT', 3.0);
 // Recent-high proximity gate. Operator pain: "we do good but then get stuck
 // when we bought when the market was too high." Refuses entries where the
 // bid is within REJECT_NEAR_HIGH_BPS of the highest close in the last
@@ -1191,6 +1198,7 @@ const EXPLORATION_CONFIG = Object.freeze({
 });
 
 const signalSelector = require('./modules/signalSelector');
+const { evaluateDrawdownHalt } = require('./modules/drawdownHalt');
 // Bootstrap: when the operator has overridden the signal AND disabled the
 // veto, allow trading from the moment the engine starts (without waiting
 // for the first backtest to complete). Otherwise the selector keeps its
@@ -1219,6 +1227,8 @@ function getSignalSelectorDecision() {
 // scanAndEnter). Surfaced on the dashboard at meta.signalSelector.realizedVeto
 // so the operator can see WHY the bot stopped trading the active signal.
 let lastRealizedVetoState = null;
+let equityPeakUsd = null;
+let lastDrawdownHaltState = null;
 function getRealizedVetoState() {
   return lastRealizedVetoState;
 }
@@ -3512,10 +3522,12 @@ async function scanAndEnter() {
   currentScanUniverseSize = universe.length;
 
   let held, openBuyPairs;
+  let aggregateUnrealizedPct = null;
   try {
     const idx = await buildHeldAndOpenSellsIndex();
     held = idx.held;
     openBuyPairs = idx.openBuyPairs;
+    aggregateUnrealizedPct = idx.aggregateUnrealizedPct;
   } catch (err) {
     lastExecutionFailure = { at: new Date().toISOString(), reason: 'positions_or_orders_fetch_failed', message: err?.errorMessage || err?.message || String(err) };
     currentScanState = 'idle';
@@ -3543,14 +3555,47 @@ async function scanAndEnter() {
   // STEP 2 sizing: PORTFOLIO_SIZING_PCT of equity, clamped to available cash.
   let availableCash = Infinity;
   let targetNotional = null;
+  let equityForDrawdown = null;
   try {
     const account = await fetchAccount();
     const cashNum = Number(account?.cash ?? account?.buying_power ?? account?.non_marginable_buying_power);
     if (Number.isFinite(cashNum)) availableCash = cashNum;
     const equityNum = Number(account?.equity ?? account?.portfolio_value);
-    if (Number.isFinite(equityNum) && equityNum > 0) targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
+    if (Number.isFinite(equityNum) && equityNum > 0) {
+      targetNotional = equityNum * PORTFOLIO_SIZING_PCT;
+      equityForDrawdown = equityNum;
+    }
   } catch (err) {
     // Soft-fail: let submitOrder surface any real error.
+  }
+
+  // ACCOUNT-LEVEL DRAWDOWN HALT (2026-06-30). Venue-agnostic circuit breaker:
+  // halts NEW entries when the account is drawing down (equity below its running
+  // peak, or aggregate unrealized book P&L below the threshold). Open positions
+  // still exit via the exit manager + per-position stops. Both inputs fail-open,
+  // so a data hiccup never freezes the bot. Fills the blind spot the realized-
+  // expectancy veto leaves (it only sees CLOSED trades of the active signal).
+  const drawdownHalt = evaluateDrawdownHalt({
+    equityUsd: equityForDrawdown,
+    peakUsd: equityPeakUsd,
+    maxEquityDrawdownPct: MAX_EQUITY_DRAWDOWN_PCT,
+    aggregateUnrealizedPct,
+    minUnrealizedPct: MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER,
+  });
+  equityPeakUsd = drawdownHalt.newPeakUsd;
+  if (drawdownHalt.halt) {
+    lastDrawdownHaltState = { at: new Date().toISOString(), ...drawdownHalt };
+    console.log('entry_scan_skipped_drawdown_halt', {
+      reason: drawdownHalt.reason,
+      equityUsd: drawdownHalt.equityUsd,
+      peakUsd: drawdownHalt.peakUsd,
+      equityDrawdownPct: drawdownHalt.equityDrawdownPct,
+      aggregateUnrealizedPct: drawdownHalt.aggregateUnrealizedPct,
+    });
+    bumpSkipReason(drawdownHalt.reason);
+    currentScanState = 'idle';
+    currentScanStartedAt = null;
+    return;
   }
   if (!Number.isFinite(targetNotional) || targetNotional <= 0) {
     bumpSkipReason('sizing_unavailable');
@@ -4157,6 +4202,7 @@ async function reconcileExits() {
     if (pred && !pred.buyFillObserved && Number.isFinite(avg) && avg > 0) {
       pred.buyFillObserved = true;
       pred.actualEntryPrice = avg;
+      pred.actualFilledQty = Number.isFinite(qty) && qty > 0 ? qty : null;
       pred.buyFilledAt = new Date().toISOString();
       // Maker-fill funnel (2026-06-18): the rested entry filled — the maker
       // edge is captured. Terminal state for the 'submitted' event above.
@@ -4578,7 +4624,19 @@ async function reconcileExits() {
     if (pred && Number.isFinite(entry) && entry > 0 && Number.isFinite(exit) && exit > 0) {
       const grossBps = ((exit - entry) / entry) * 10000;
       const netBps = grossBps - FEE_BPS_ROUND_TRIP;
-      const notional = Number(pred.prediction?.tradeNotional) || 0;
+      // Accounting fidelity (2026-06-30): prefer the ACTUAL filled notional
+      // (actual entry fill price x actual filled qty) over the planned/submitted
+      // tradeNotional, so $ P&L reflects real fills/partials. The realized bps
+      // above are already price-derived from actual entry/exit fills, and the
+      // breaker reads realizedNetBps — so its halt behavior is unchanged here.
+      const plannedNotionalUsd = Number(pred.prediction?.tradeNotional) || 0;
+      const actualEntryPx = Number(pred.actualEntryPrice);
+      const actualQty = Number(pred.actualFilledQty);
+      const realizedNotionalUsd = (Number.isFinite(actualEntryPx) && actualEntryPx > 0
+        && Number.isFinite(actualQty) && actualQty > 0)
+        ? actualEntryPx * actualQty
+        : null;
+      const notional = realizedNotionalUsd != null ? realizedNotionalUsd : plannedNotionalUsd;
       const grossPnlUsd = (grossBps * notional) / 10000;
       const netPnlUsd = (netBps * notional) / 10000;
       const holdSeconds = Math.max(0, (Date.now() - Number(pred.submittedAt || 0)) / 1000);
@@ -4603,6 +4661,9 @@ async function reconcileExits() {
           signalVersion: pred.prediction?.signalVersion ?? null,
           netPnlUsd,
           grossPnlUsd,
+          plannedNotionalUsd,
+          realizedNotionalUsd,
+          notionalBasis: realizedNotionalUsd != null ? 'actual_fill' : 'planned',
           holdSeconds,
           entrySpreadBps: pred.prediction?.spreadBps ?? null,
           entryQuoteAgeMs: pred.prediction?.quoteAgeMs ?? null,

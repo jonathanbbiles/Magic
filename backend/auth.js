@@ -38,4 +38,15 @@ const requireApiToken = (req, res, next) => {
   return next();
 };
 
-module.exports = { requireApiToken };
+// Non-throwing auth predicate (2026-06-30) for endpoints that are public by
+// design but must redact sensitive fields for unauthenticated callers. When no
+// API_TOKEN is configured there is nothing to gate, so every caller is treated
+// as authenticated (preserves the current open-by-default behavior).
+const isAuthenticated = (req) => {
+  const expectedToken = String(process.env.API_TOKEN || '').trim();
+  if (!expectedToken) return true;
+  const providedToken = getTokenFromRequest(req);
+  return Boolean(providedToken) && safeEqual(providedToken, expectedToken);
+};
+
+module.exports = { requireApiToken, isAuthenticated };
