@@ -1,1 +1,30 @@
-EéÝz°e¹êkŠ{SÃË1¢»axÆ ‰ÆÚrG§wm6ëN·ÑaØ¶«y©bÍç^Æ—œµ©ÜÉºÞjG«rZ,yÛki×¬µ«ljw^ªè­ÊÉÚ¦Èh¶Ê^®È¬¶éÝz°ÀL„L2:t^×«¶ŸŠW¬ÊË^š+<qºy^²ÆŠÉ"²j.ž×Â+a¢ëhëajØb²Ú+É©Ý¶›­æ¤z»0ŠwhÂ+0Š—¢w¯z¼«y×©–ŒƒyÉZ®)à¶ŠÉ!z·¦jG¬vêÚn)b·(§~¶¬¶»œ¶êÞjÇ(uäáŠÇâ•è¬©žv·§uêòji^Å©©•ê'¦êé¢Ç‘zw^®‰åÉ«­¡ªi–'¬iø¥zX­z¶¥—)Ú™çkzw^¯&¦• EšÙšµÈgjg©•©ëz¨©Ýz{ïj»-£*.­ìb²Ø§‚Ç«¾'¶§­éÚ™ëh­éÝz¼ššV§uÊ'ç-ŠÖ¬hnzšâžÚ+²)©—&u â²I¨º{^u«š{u«Z¶‹ayìb²Ø§‚Ç«¾'Š{ay§uêÝjÈ[¡ªÝ¶­jZ'z+,¹÷âr'§¶Ç«¾'²Ü©{›©ž™¨"q¶œ‘éÝ™«\‡*.­ìb²Ø§§uêìz»âqéÚ™êîžØ¦zzzº(´8«m§$zwi•©ìµªíz¶©z»"²×§µØ¬’·ªº*Þ±ªZ‰Ø§²Ö§qër¥êÞ‚*'¢· ¢yšµÈr¢êìz»âqêÞ‚*'nè¥t*&™©Ýž™œŠËZ®Ð¨šf§vzf²Ö«¶š–ØB…ç$=«aþš–ØZºÚz™hÊÚîyéïUªì‘ìƒ00ÈFö¥¹ïæžßÝjÖŠÉ'jg¦jœu«Zš‹§´ö­‡ù§·÷Zµ«"Íá
+# Render Blueprint TEMPLATE for the Magic backend (2026-06-30).
+#
+# WHY: the realized-expectancy breaker, closed-trade stats and equity snapshots
+# persist under DATASET_DIR. On Render the filesystem is EPHEMERAL unless a disk
+# is mounted â€” without one, that history (and the breaker's window) is wiped on
+# every redeploy. Declaring the disk here makes durability infrastructure-as-code.
+#
+# This file is named `render.yaml.example` on purpose: Render only auto-applies a
+# file literally named `render.yaml`. REVIEW and match `name`, `plan`, `region`
+# and env vars to your existing service, then rename to `render.yaml` and connect
+# it as a Blueprint (or simply add a Disk mounted at /mnt/data to the existing
+# service in the Render dashboard â€” that alone is sufficient).
+services:
+  - type: web
+    name: magic-backend            # <-- match your existing Render service name
+    runtime: node
+    rootDir: backend
+    plan: starter                  # a persistent disk requires a paid instance type
+    region: oregon                 # <-- match your service region
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: DATASET_DIR
+        value: /mnt/data
+    disk:
+      name: magic-data
+      mountPath: /mnt/data
+      sizeGB: 1
