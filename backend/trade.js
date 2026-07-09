@@ -209,6 +209,19 @@ const ENTRY_FILL_TIMEOUT_MS = Math.max(0, readNumber('ENTRY_FILL_TIMEOUT_MS', 30
 // other signals keep their ENTRY_LIMIT_PRICE_MODE placement unchanged.
 const ENTRY_MAKER_AGGRESSION_ENABLED = readBoolean('ENTRY_MAKER_AGGRESSION_ENABLED', true);
 const ENTRY_MAKER_AGGRESSION_OFFSET_BPS = Math.max(0, readNumber('ENTRY_MAKER_AGGRESSION_OFFSET_BPS', 1));
+// TAKER entry for CONTINUATION signals (2026-07-09). The honest adverse-selection
+// backtest (research_data/validate_structural.py) showed the passive maker rest
+// is the bleed — it reproduces the live btc_lead_lag loss (~-8.7 bps) — while
+// CROSSING to the ask (taker, guaranteed fill, no adverse selection) flips
+// expectancy to +3..+11 bps net after the binance_us fee, positive in all 4
+// regime windows (BTC +13% / +1% / -18% / -27%). On Binance.US's ~0% maker /
+// 0.0095% taker fee + tight USDT books, paying the tiny taker cost to guarantee a
+// non-adversely-selected fill beats resting into adverse selection. When enabled,
+// a continuation-signal entry is placed as a marketable limit at the ask with
+// post-only OFF (a genuine taker); this takes PRECEDENCE over maker-aggression /
+// post-only for those signals. Every other signal is unchanged. Revert with
+// ENTRY_TAKER_FOR_CONTINUATION=false (falls back to the maker-aggressive rest).
+const ENTRY_TAKER_FOR_CONTINUATION = readBoolean('ENTRY_TAKER_FOR_CONTINUATION', true);
 // Signals that BUY expecting continuation/momentum (price to rise after entry),
 // for which an aggressive near-ask maker rest fits the thesis. Mean-reversion,
 // range-MR, barrier and microstructure are NOT here — they keep mid/configured
@@ -334,28 +347,26 @@ const MF_MAX_HOLD_MS = Math.max(0, readNumber('MF_MAX_HOLD_MS', 21600000));
 const MR_MAX_HOLD_MS = Math.max(0, readNumber('MR_MAX_HOLD_MS', 2700000));     // 45 min
 const MR_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('MR_BREAKEVEN_TIMEOUT_MS', 1800000));  // 30 min
 
-// BTC lead-lag exit timing (2026-06-08, docs/PROFITABILITY_ANALYSIS_2026-06.md).
-// The lead-lag catch-up plays out in ~5 minutes; the sandbox edge came from a
-// short time-bounded hold. So: short max-hold, fast breakeven decay, a TIGHT
-// protective stop (cut the trade if BTC reverses) and a TP from the projected
-// catch-up. This is the inverted-exit shape (let the catch-up run on a short
-// clock, cut losers fast) vs the legacy small-TP/huge-SL bleed.
-const BLL_MAX_HOLD_MS = Math.max(60000, readNumber('BLL_MAX_HOLD_MS', 360000));          // 6 min
+// BTC lead-lag exit timing.
+// 2026-07-09 RETUNE (honest-fill backtest, research_data/validate_structural.py):
+// once the entry is a TAKER (adverse selection removed), the honest backtest shows
+// the exit should CUT LOSERS FASTER and LET WINNERS RUN — the direct fix for the
+// live winLossSizeRatio ~0.51 (losers ~2× winners). Best-validated non-extreme
+// exit across all 4 regime windows: stop 25→15 bps, TP floor 20→40 bps, max-hold
+// 6→30 min (TP:SL ~2.7:1, vs the old ~0.8:1). Pooled +10.2 bps/trade net, PF ~2,
+// positive in every window. The tighter stop also LOWERS capital-at-risk per
+// trade. Revert via the BLL_* env vars below. (The old short-hold/25-stop shape
+// was tuned for the MAKER regime, which live data showed bleeds at ~-8.7 bps.)
+const BLL_MAX_HOLD_MS = Math.max(60000, readNumber('BLL_MAX_HOLD_MS', 1800000));         // 30 min
 const BLL_BREAKEVEN_TIMEOUT_MS = Math.max(30000, readNumber('BLL_BREAKEVEN_TIMEOUT_MS', 300000)); // 5 min
-const BLL_STOP_LOSS_BPS = Math.max(1, readNumber('BLL_STOP_LOSS_BPS', 25));
-// 2026-06-22 asymmetry fix: TP floor raised 10 → 20. The live scorecard showed
-// winLossSizeRatio 0.50 (avg loss ~2× avg win) — structural, because the
-// smallest TP target (10 bps net) was far below the 25 bps hard stop, so a
-// stopped loser was ~2.5× a floor-target winner. Lifting the minimum target to
-// 20 narrows reward:risk from 0.4 toward ~0.8 (kept deliberately BELOW the 25
-// stop — this is conservative, not a claim of >1:1). Only the floor moves: the
-// validated 25 bps stop, the short 6-min max-hold, and the fast breakeven decay
-// are all unchanged (documented btc_lead_lag design). Projection-driven targets
-// above 20 are unaffected; this only lifts the thin-catch-up trades that were
-// being clipped tiny. Trades that no longer reach the higher TP still decay to
-// the breakeven floor (≥ $0), so the floor lift adds win SIZE without adding
-// loss size.
-const BLL_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('BLL_TARGET_NET_PROFIT_BPS_FLOOR', 20));
+const BLL_STOP_LOSS_BPS = Math.max(1, readNumber('BLL_STOP_LOSS_BPS', 15));
+// 2026-07-09: TP floor raised to 40 (was 20; originally 10) as the "let winners
+// run" half of the asymmetry fix (see the timing comment above). With the taker
+// entry + 15 bps stop this makes reward:risk ~2.7:1 (vs the old ~0.8:1 that drove
+// winLossSizeRatio 0.51). Projection-driven targets above 40 are unaffected; this
+// lifts the thin-catch-up trades that were being clipped tiny. Stays under the
+// BLL_SIGNAL_TARGET_MAX_NET_BPS cap (60).
+const BLL_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('BLL_TARGET_NET_PROFIT_BPS_FLOOR', 40));
 const BLL_SIGNAL_TARGET_MAX_NET_BPS = Math.max(BLL_TARGET_NET_PROFIT_BPS_FLOOR, readNumber('BLL_SIGNAL_TARGET_MAX_NET_BPS', 60));
 
 // Signal-aware exit timing helpers. The live exit manager and the
@@ -3475,13 +3486,15 @@ async function scanAndEnter() {
   // same fail-safe shape as the realized veto; open positions still exit
   // normally. Byte-for-byte no-op in the live config (binance_us + post-only),
   // where isBtcLeadLagExecutionSafe() is true and this block is skipped.
+  const btcLeadLagTakerMode = ENTRY_TAKER_FOR_CONTINUATION && isContinuationSignal('btc_lead_lag');
   if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag'
-    && !isBtcLeadLagExecutionSafe({ isBinanceExecution: IS_BINANCE_EXECUTION, entryPostOnly: ENTRY_POST_ONLY })) {
+    && !isBtcLeadLagExecutionSafe({ isBinanceExecution: IS_BINANCE_EXECUTION, entryPostOnly: ENTRY_POST_ONLY, entryTakerMode: btcLeadLagTakerMode })) {
     if (!btcLeadLagUnsafeExecutionWarned) {
       console.warn('entry_scan_halted_btc_lead_lag_unsafe_execution', {
         executionVenue: EXECUTION_VENUE,
         entryPostOnly: ENTRY_POST_ONLY,
-        detail: 'btc_lead_lag is positive-expectancy only as a guaranteed maker (binance_us + ENTRY_POST_ONLY=true); refusing to trade it as a taker',
+        entryTakerMode: btcLeadLagTakerMode,
+        detail: 'btc_lead_lag requires binance_us with EITHER guaranteed maker (ENTRY_POST_ONLY=true) OR taker mode (ENTRY_TAKER_FOR_CONTINUATION=true); refusing an ambiguous config',
       });
       btcLeadLagUnsafeExecutionWarned = true;
     }
@@ -3787,13 +3800,25 @@ async function scanAndEnter() {
       // Maker-aggressive placement for continuation signals (taker-safe; only
       // under post-only). Rest just inside the ask: ask − offset, but never
       // closer than one tick below ask (guarantee maker) and never below the bid.
-      const makerAggressive = ENTRY_MAKER_AGGRESSION_ENABLED
+      // TAKER entry for continuation signals takes PRECEDENCE (2026-07-09): cross
+      // to the ask as a marketable limit with post-only OFF (a genuine taker) —
+      // the validated fix for the maker adverse-selection bleed.
+      const takerContinuation = ENTRY_TAKER_FOR_CONTINUATION
+        && isContinuationSignal(activeSignalForEntry)
+        && Number.isFinite(ask) && ask > 0;
+      const makerAggressive = !takerContinuation
+        && ENTRY_MAKER_AGGRESSION_ENABLED
         && ENTRY_POST_ONLY
         && isContinuationSignal(activeSignalForEntry)
         && Number.isFinite(ask) && ask > 0 && Number.isFinite(bid) && bid > 0;
       let buyPriceRaw;
       let entryPlacement;
-      if (makerAggressive) {
+      let orderPostOnly = ENTRY_POST_ONLY;
+      if (takerContinuation) {
+        buyPriceRaw = ask;            // marketable limit at the ask -> taker fill
+        entryPlacement = 'taker';
+        orderPostOnly = false;        // must NOT be post-only or the exchange rejects the cross
+      } else if (makerAggressive) {
         const offsetTarget = ask * (1 - ENTRY_MAKER_AGGRESSION_OFFSET_BPS / 10000);
         const makerCeiling = tick > 0 ? ask - tick : offsetTarget; // never cross
         buyPriceRaw = Math.max(bid, Math.min(offsetTarget, makerCeiling));
@@ -3822,7 +3847,7 @@ async function scanAndEnter() {
         time_in_force: 'gtc',
         limit_price: buyLimitStr,
         notional: effectiveNotional.toFixed(2),
-        post_only: ENTRY_POST_ONLY,
+        post_only: orderPostOnly,
       });
       const buyOrder = buyRes?.buy || buyRes;
       if (buyOrder?.id) {
@@ -3834,7 +3859,7 @@ async function scanAndEnter() {
         try {
           makerFillTracker.record({
             outcome: 'submitted',
-            postOnly: ENTRY_POST_ONLY,
+            postOnly: orderPostOnly,
             symbol: pair,
             signalVersion: sig.signalVersion || ACTIVE_SIGNAL_VERSION,
           });
@@ -3955,7 +3980,7 @@ async function scanAndEnter() {
       // immediately match and take"). That is the gate working as intended —
       // we refused to pay taker — so it is tracked distinctly from a generic
       // submit failure. Observational only.
-      if (ENTRY_POST_ONLY) {
+      if (orderPostOnly) {
         const wouldCrossReject = Number(binanceErrorCode) === -2010
           || /immediately match|would.*match|maker/i.test(String(baseMessage));
         if (wouldCrossReject) {

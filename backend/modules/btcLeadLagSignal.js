@@ -50,15 +50,29 @@ const DEFAULT_CONFIG = Object.freeze({
   requiredBars: 20,
 });
 
-// Execution-safety guard for the signal. The btc_lead_lag edge is +1.94 bps
-// ONLY as a guaranteed maker; as a taker it is -0.38 bps — negative expectancy
-// (docs/PROFITABILITY_ANALYSIS_2026-06.md). The maker guarantee exists ONLY on
-// binance_us with post-only enabled (the buy maps to a LIMIT_MAKER the exchange
-// rejects rather than crosses). On Alpaca post_only is a no-op (LIMIT_MAKER is
-// binance-only) AND fees are 30 bps round-trip, so the signal is guaranteed-loss
-// there. Pure so the live halt and its test agree on one source of truth.
-function isBtcLeadLagExecutionSafe({ isBinanceExecution = false, entryPostOnly = false } = {}) {
-  return Boolean(isBinanceExecution && entryPostOnly);
+// Execution-safety guard for the signal.
+//
+// PREMISE INVERSION (2026-07-09): the original guard refused to trade btc_lead_lag
+// as a taker, on the belief (docs/PROFITABILITY_ANALYSIS_2026-06.md) that it was
+// "+1.94 bps as a maker / -0.38 as a taker". LIVE DATA REFUTED THAT: as a
+// guaranteed maker the signal realized ~-8.7 bps/trade over 210 live trades — i.e.
+// the "maker +1.94" backtest was ~10 bps optimistic (it did not model maker
+// ADVERSE SELECTION: a passive rest only fills when price ticks into it, so the
+// fills are the losers, and the winners run away unfilled). An honest backtest
+// that MODELS adverse-selection fills reproduces the live maker loss (-6 to -8 bps
+// across 4 regimes) AND shows the TAKER (cross-to-ask, guaranteed fill, no adverse
+// selection) at +3 to +11 bps net after the binance_us fee (research_data/
+// validate_structural.py; positive in every regime, PF 1.3-3.5). So the sign is
+// the OPPOSITE of the old premise: taker is the edge, passive maker is the bleed.
+//
+// The guard now permits btc_lead_lag on binance_us when EITHER a guaranteed maker
+// (post-only) OR an explicit taker mode is in force. It still refuses Alpaca
+// (30 bps round-trip fees = guaranteed loss) and still refuses a binance config
+// that is neither (post-only off with no explicit taker mode = a misconfiguration
+// that would cross unintentionally). Pure so the live halt and its test agree.
+function isBtcLeadLagExecutionSafe({ isBinanceExecution = false, entryPostOnly = false, entryTakerMode = false } = {}) {
+  if (!isBinanceExecution) return false;
+  return Boolean(entryPostOnly || entryTakerMode);
 }
 
 function isFiniteNumber(x) { return typeof x === 'number' && Number.isFinite(x); }
