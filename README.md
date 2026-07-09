@@ -1,5 +1,58 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-07-09: TAKER entry + exit retune for btc_lead_lag (structural fix — inverts the maker-only premise)
+
+**The problem.** `btc_lead_lag` was live-bleeding ~**−8.7 bps/trade** (210 trades) with
+winLossSizeRatio ~0.51 (losers ~2× winners). An honest backtest that MODELS
+**maker adverse selection** (a passive rest only fills when price ticks into it → your
+fills are the losers, winners run away unfilled) **reproduces that loss** (−6 to −8 bps
+across 4 regime windows), which means the earlier "maker +1.94 bps" analysis was ~10 bps
+optimistic — it never modeled adverse selection. The killer is **execution**, not the signal.
+
+**The fix (validated on the honest adverse-selection model + binance_us fee, head-to-head
+vs the live baseline, 4 windows spanning BTC +13% / +1% / −18% / −27%):**
+
+1. **TAKER entry for continuation signals** (`ENTRY_TAKER_FOR_CONTINUATION=true`). When
+   `btc_lead_lag` fires, cross to the ask as a marketable limit (post-only OFF) — a
+   guaranteed, non-adversely-selected fill. On Binance.US's ~0% maker / 0.0095% taker fee +
+   tight USDT books, the tiny taker cost is far cheaper than adverse selection. This
+   **inverts the prior maker-only premise** (which live data refuted) and updates the
+   `isBtcLeadLagExecutionSafe` guard to permit the validated taker path (still refuses Alpaca
+   and ambiguous configs).
+2. **Exit retune** (cut losers faster + let winners run → fix winLossSizeRatio): stop
+   **25→15 bps** (`BLL_STOP_LOSS_BPS`), TP floor **20→40 bps** (`BLL_TARGET_NET_PROFIT_BPS_FLOOR`),
+   max-hold **6→30 min** (`BLL_MAX_HOLD_MS`) → reward:risk ~2.7:1. The tighter stop also lowers
+   capital-at-risk per trade.
+
+**Honest backtest, net bps/trade after 2 bps fee (chosen config = taker + TP40/SL15/H30):**
+
+| window (BTC drift) | baseline (maker, live shape) | **shipped (taker + retune)** | PF |
+|---|--:|--:|--:|
+| UP2 (+13%) | −7.8 | **+11.6** | 2.49 |
+| CHOPPY (+1%) | −7.6 | **+10.6** | 2.36 |
+| UP-orig (−18%) | −6.9 | **+8.1** | 1.95 |
+| DOWN (−27%) | −6.1 | **+10.2** | 2.45 |
+| **pooled** | **−6.95** | **+10.2** | ~2 |
+
+Positive in every regime, 20k+ trades sampled, never worse than baseline. **Caveat:** the
+taker side is backtest-validated but unproven live; absolute magnitudes carry optimism
+(the maker side of the same model matched live within ~2 bps). Backstops kept **armed and
+untouched**: the realized-expectancy breaker (−5 floor, halts within ~6 closes if live
+betrays the backtest) and conservative sizing (2% of equity).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `ENTRY_TAKER_FOR_CONTINUATION` | `true` | Taker (cross-to-ask) entry for continuation signals (`btc_lead_lag`, `trend_following`). `false` → maker-aggressive rest (prior behavior). Takes precedence over post-only for those signals; other signals unchanged. |
+| `BLL_STOP_LOSS_BPS` | `15` | btc_lead_lag hard stop (was 25). |
+| `BLL_TARGET_NET_PROFIT_BPS_FLOOR` | `40` | btc_lead_lag TP floor (was 20). |
+| `BLL_MAX_HOLD_MS` | `1800000` | btc_lead_lag max-hold, 30 min (was 6 min). |
+
+**Activation:** these are code defaults, so the merge auto-activates on deploy **unless** the
+Render env pins old values. To guarantee/verify, set in Render:
+`ENTRY_TAKER_FOR_CONTINUATION=true`, `BLL_STOP_LOSS_BPS=15`,
+`BLL_TARGET_NET_PROFIT_BPS_FLOOR=40`, `BLL_MAX_HOLD_MS=1800000` (keep `SIGNAL_VERSION=btc_lead_lag`,
+`EXECUTION_VENUE=binance_us`). Revert: `ENTRY_TAKER_FOR_CONTINUATION=false`.
+
 ## 2026-07-09: since-#491 scorecard slice (observational)
 
 A live diagnosis found the `btc_lead_lag` strategy bleeding (~−8.7 bps/trade net

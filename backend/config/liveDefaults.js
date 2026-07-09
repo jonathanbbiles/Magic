@@ -227,6 +227,25 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // ENTRY_MAKER_AGGRESSION_ENABLED='false' restores mid for continuation signals.
   ENTRY_MAKER_AGGRESSION_ENABLED: 'true',
   ENTRY_MAKER_AGGRESSION_OFFSET_BPS: '1',
+  // 2026-07-09 TAKER ENTRY for continuation signals (btc_lead_lag). The honest
+  // adverse-selection backtest (research_data/validate_structural.py) proved the
+  // passive maker rest is the bleed — it reproduces the live btc_lead_lag loss
+  // (~-8.7 bps) — while crossing to the ask (taker) flips expectancy to +3..+11
+  // bps net after the binance_us fee, positive in all 4 regime windows. On
+  // Binance.US's ~0% maker / 0.0095% taker fee + tight USDT books, the tiny taker
+  // cost is far cheaper than adverse selection. This INVERTS the prior maker-only
+  // premise (which live data refuted). Takes precedence over post-only /
+  // maker-aggression for continuation signals; every other signal is unchanged.
+  // Revert with ENTRY_TAKER_FOR_CONTINUATION='false' (-> maker-aggressive rest).
+  ENTRY_TAKER_FOR_CONTINUATION: 'true',
+  // 2026-07-09 btc_lead_lag exit retune (pairs with taker entry). Cut losers
+  // faster + let winners run to fix winLossSizeRatio ~0.51: stop 25→15, TP floor
+  // 20→40, max-hold 6→30 min (reward:risk ~2.7:1). Best-validated non-extreme exit
+  // on the honest backtest (+10.2 bps/trade, PF ~2, positive every window). The
+  // realized-expectancy breaker stays armed and UNTOUCHED as the live backstop.
+  BLL_STOP_LOSS_BPS: '15',
+  BLL_TARGET_NET_PROFIT_BPS_FLOOR: '40',
+  BLL_MAX_HOLD_MS: '1800000',
   // 2026-05-15 rollback: was 'true'. This gate refuses OLS entries whose
   // projected forward move doesn't cover the gross target + entry/exit
   // slippage. In the May 2026 backtest it skipped 19,108 candidates — a

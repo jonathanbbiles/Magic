@@ -20,6 +20,33 @@ The full strategy is documented in `README.md` (top level). Read it before makin
 
 **Default signal is `mean_reversion`** when `SIGNAL_VERSION` is unset (no more backtest auto-selector picking the live signal). **As of 2026-06-04 the code default is pinned to `mean_reversion_5m`** — a *bounded re-probe* after the breaker held the bot at zero trades >24h on the 1m fallback; a 3-day replay of real data showed `mean_reversion_5m` is the only currently-positive signal (+6.4 bps / 26 trades / 69% win). The realized breaker stays armed at −5 so a bleed auto-halts within ~10 closes; this is a controlled experiment, NOT a durable-edge claim (it was +3.8/−38.1 across two prior windows). **`mean_reversion_5m` and `mean_reversion_15m` were added to the `SIGNAL_VERSION_OPERATOR_OVERRIDE` allowlist in `trade.js` (2026-06-04)** — without that, a `*_5m/_15m` pin silently nulls to the bare `mean_reversion` (1m) fallback. Set `SIGNAL_VERSION=''` in Render to revert to the fallback, or any other signal to pin.
 
+## 2026-07-09: btc_lead_lag flipped to TAKER entry + retuned exit (SUPERSEDES the maker-only rule below)
+
+**READ THIS BEFORE trusting the "post-only maker is essential / maker +1.94 / taker −0.38"
+claims in the 2026-06-08 section below — live data refuted them.** As a guaranteed maker the
+signal realized **~−8.7 bps/trade over 210 live trades** (winLossSizeRatio ~0.51). The old
+"maker +1.94" backtest never modeled **maker adverse selection** (a passive rest fills only
+when price ticks into it → you catch the losers, winners run away unfilled). An honest
+backtest that DOES model it (`research_data/validate_structural.py`) reproduces the live
+maker loss (−6 to −8 bps across 4 regime windows) and shows the **TAKER** (cross-to-ask,
+guaranteed fill) at **+3 to +11 bps net** after the binance_us fee, positive in every regime.
+
+**Shipped (2026-07-09, live-money, ship-and-merge under owner directive):**
+- **`ENTRY_TAKER_FOR_CONTINUATION=true`** (liveDefaults, locked). Continuation signals
+  (`btc_lead_lag`, `trend_following`) now enter as a **taker** — marketable limit at the ask,
+  `post_only` forced OFF for that order — taking PRECEDENCE over post-only / maker-aggression.
+  Wired in `scanAndEnter` (the `takerContinuation` branch) + `orderPostOnly` threaded through
+  submit / maker-fill tracker / −2010 handling. Every non-continuation signal is unchanged.
+- **`isBtcLeadLagExecutionSafe` INVERTED** (`btcLeadLagSignal.js`): now safe on binance_us with
+  EITHER guaranteed maker (post-only) OR explicit taker mode; still refuses Alpaca (30 bps
+  fees) and a binance config that is neither (fail-safe). The old guard hard-blocked taker.
+- **Exit retune** (Hard Rule #5 change, explicitly owner-directed): `BLL_STOP_LOSS_BPS` 25→15,
+  `BLL_TARGET_NET_PROFIT_BPS_FLOOR` 20→40, `BLL_MAX_HOLD_MS` 6→30 min (reward:risk ~2.7:1) —
+  the "cut losers faster + let winners run" fix for winLossSizeRatio. All in liveDefaults, locked.
+- **Backstops UNTOUCHED:** realized-expectancy breaker (−5 floor) stays the sole halt authority;
+  sizing stays 2% of equity. Caveat: taker is backtest-validated but unproven live — the breaker
+  is the live safety net. Revert with `ENTRY_TAKER_FOR_CONTINUATION=false` in Render.
+
 ## 2026-06-08: NEW signal `btc_lead_lag` + post-only maker entries (envelope-push rebuild)
 
 A 60-day study of real trades + Binance.US klines (`docs/PROFITABILITY_ANALYSIS_2026-06.md`) found the root cause of the bleed: **1m mean-reversion is the wrong sign** (buying 1m dips loses −5 bps/trade *before* costs; crypto weakly *continues* at 1m, it doesn't revert), and **execution costs exceed any edge** (avg entry crossed a 17.6 bps spread for a <10 bps signal). The one robust, order-of-magnitude-stronger predictor is **BTC lead-lag**: BTC's recent return predicts ALT forward returns at corr 0.13–0.15 (pooled t=15, robust in both 30-day halves, every alt). Alts lag BTC by minutes; that lag is tradeable.

@@ -125,13 +125,21 @@ const fresh = (retBps, ageMs = 1000) => ({ recentReturnBps: retBps, ageMs });
   assert.equal(sig.projectedBps, DEFAULT_CONFIG.maxProjectedBps);
 })();
 
-// 11. Execution-safety guard: only binance_us + post-only is a guaranteed maker.
+// 11. Execution-safety guard (2026-07-09 premise inversion): safe on binance_us
+// with EITHER guaranteed maker (post-only) OR explicit taker mode. The honest
+// adverse-selection backtest showed taker is the edge and passive maker is the
+// bleed (validate_structural.py), inverting the old maker-only rule.
 (() => {
-  // The single positive-expectancy config.
+  // Guaranteed maker on binance — still safe.
   assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryPostOnly: true }), true);
-  // Every other combination trades the signal as a (net-negative) taker.
+  // Explicit taker mode on binance — now safe (the validated fix).
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryTakerMode: true }), true);
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryPostOnly: false, entryTakerMode: true }), true);
+  // Binance but NEITHER maker nor taker declared — ambiguous/misconfig, still unsafe.
   assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: true, entryPostOnly: false }), false);
+  // Alpaca (30 bps fees) — unsafe regardless of mode.
   assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: false, entryPostOnly: true }), false);
+  assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: false, entryTakerMode: true }), false);
   assert.equal(isBtcLeadLagExecutionSafe({ isBinanceExecution: false, entryPostOnly: false }), false);
   // Defensive: missing args default to unsafe (fail closed).
   assert.equal(isBtcLeadLagExecutionSafe(), false);

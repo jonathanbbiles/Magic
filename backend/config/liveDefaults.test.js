@@ -33,6 +33,14 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_POST_ONLY, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_FILL_TIMEOUT_MS, '30000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_MAKER_AGGRESSION_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_MAKER_AGGRESSION_OFFSET_BPS, '1');
+// 2026-07-09: taker entry for continuation signals (the validated fix for the
+// maker adverse-selection bleed) + the paired btc_lead_lag exit retune (cut
+// losers faster / let winners run). Locked so a silent revert to the bleeding
+// maker-only + short-hold/wide-TP-floor posture is caught at CI.
+assert.equal(LIVE_CRITICAL_DEFAULTS.ENTRY_TAKER_FOR_CONTINUATION, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BLL_STOP_LOSS_BPS, '15');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BLL_TARGET_NET_PROFIT_BPS_FLOOR, '40');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BLL_MAX_HOLD_MS, '1800000');
 assert.equal(LIVE_CRITICAL_DEFAULTS.EXIT_NET_PROFIT_AFTER_FEES_BPS, '45');
 assert.equal(LIVE_CRITICAL_DEFAULTS.PROFIT_BUFFER_BPS, '5');
 
