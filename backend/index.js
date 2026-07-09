@@ -1540,6 +1540,21 @@ app.get('/dashboard', async (req, res) => {
     const managerStatus = safeSnapshot('manager', getTradingManagerStatus) || {};
     const concurrency = await getConcurrencyGuardStatus().catch(() => null);
     const scorecard = safeSnapshot('scorecard', () => closedTradeStats.buildScorecard());
+    // Observational slice (2026-07-09): closed-trade scorecard restricted to
+    // trades that closed AT/AFTER the #491 btc_lead_lag TP-floor raise
+    // (10 -> 20 bps net, merged 2026-06-23T03:30:59Z). Lets an operator isolate
+    // whether that exit-asymmetry fix actually moved winLossSizeRatio /
+    // expectancy, without it being diluted by pre-fix trades in the all-time
+    // and since-reset (2026-06-08) views. PURE DIAGNOSTIC — no signal/gate/
+    // sizing/exit decision reads this; it only reuses closedTradeStats'
+    // existing sinceMs filter. Surfaced at meta.scorecardSinceTpFloorFix.
+    const TP_FLOOR_FIX_AT_ISO = '2026-06-23T03:30:59Z';
+    const TP_FLOOR_FIX_AT_MS = Date.parse(TP_FLOOR_FIX_AT_ISO);
+    const scorecardSinceTpFloorFix = safeSnapshot('scorecardSinceTpFloorFix',
+      () => {
+        const sc = closedTradeStats.buildScorecard(5000, TP_FLOOR_FIX_AT_MS);
+        return sc ? { sinceIso: TP_FLOOR_FIX_AT_ISO, sincePr: 491, ...sc } : null;
+      });
     const entryDiagnostics = safeSnapshot('entryDiagnostics', getEntryDiagnosticsSnapshot);
     const universeDiagnostics = safeSnapshot('universeDiagnostics', getUniverseDiagnosticsSnapshot);
     const predictorWarmup = safeSnapshot('predictorWarmup', getPredictorWarmupSnapshot);
@@ -2611,6 +2626,7 @@ app.get('/dashboard', async (req, res) => {
           lastExecutionFailure,
         },
         scorecard,
+        scorecardSinceTpFloorFix,
       },
       diagnostics: {
         entryScan: entryDiagnostics?.entryScan || null,

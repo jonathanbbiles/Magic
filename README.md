@@ -1,5 +1,22 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US)
 
+## 2026-07-09: since-#491 scorecard slice (observational)
+
+A live diagnosis found the `btc_lead_lag` strategy bleeding (~−8.7 bps/trade net
+over 210 trades since the 2026-06-08 reset, winLossSizeRatio ~0.51 — losers ~2×
+winners). #491 raised the take-profit floor 10 → 20 bps to shrink that asymmetry,
+but the all-time and since-reset scorecards blend pre- and post-#491 trades, so
+you can't see whether the fix actually moved the needle.
+
+This adds **`meta.scorecardSinceTpFloorFix`** — the exact same closed-trade
+scorecard (`closedTradeStats.buildScorecard`) restricted to trades that closed
+at/after the #491 merge (`2026-06-23T03:30:59Z`), tagged `{ sinceIso, sincePr:491 }`.
+It reuses the existing `sinceMs` filter (the same mechanism behind the
+performance-epoch since-reset view) — **pure diagnostic, no signal / gate / sizing
+/ exit decision reads it**, nothing deleted, all other scorecard views unchanged.
+Read `winLossSizeRatio` and `avgRealizedNetBps` there to judge the TP-floor fix on
+post-fix trades only.
+
 ## 2026-06-23: realized-volatility entry gate (study's #1 winner-predictor)
 
 A 30-day study of 1-minute Binance.US bars across the 8 core tokens
