@@ -96,6 +96,25 @@ async function testCancel() {
   assert.equal(open.length, 0, 'no open orders after cancel');
 }
 
+// ---- 7. Concurrent reads (the /dashboard pattern) never null the account ----
+// fetchAccount + fetchPositions + fetchOrders fire in parallel on every
+// dashboard load; each triggers settlement. Regression guard for the race that
+// made fetchAccount reject -> null account on the live dashboard.
+async function testConcurrentReads() {
+  _resetForTest({ cash: 5000, positions: { 'BTC/USD': { qty: 2, avgEntryPrice: 100 } } });
+  quotesRef.value = { 'BTC/USD': { bp: 100, ap: 100.1 } };
+  for (let i = 0; i < 5; i += 1) {
+    const [acct, pos, ord] = await Promise.all([
+      fetchAccount(), fetchPositions(), fetchOrders({ status: 'open' }),
+    ]);
+    assert.ok(acct && acct.equity != null, `iteration ${i}: account must never be null under concurrency`);
+    assert.equal(acct.raw_venue, 'paper');
+    assert.ok(Number(acct.equity) > 5000, 'equity = cash + marked positions');
+    assert.equal(pos.length, 1);
+    assert.ok(Array.isArray(ord));
+  }
+}
+
 (async () => {
   testDecideFill();
   await testTakerBuy();
@@ -103,5 +122,6 @@ async function testCancel() {
   await testTpSell();
   await testEquity();
   await testCancel();
+  await testConcurrentReads();
   console.log('paperBroker.test.js: all assertions passed');
 })().catch((err) => { console.error(err); process.exit(1); });
