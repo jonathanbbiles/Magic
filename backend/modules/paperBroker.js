@@ -69,6 +69,17 @@ function buildConfig() {
 let state = null;
 let persistencePath = null;
 let quoteFetcher = null; // injectable for tests; default = binanceMarketData.fetchBookTickers
+// Last successfully-fetched prices ({ [canonical]: {bid,ask,mid} }). Read
+// methods value positions from this cache WITHOUT triggering their own
+// settlement, so equity/positions never depend on a live fetch succeeding.
+let lastPrices = {};
+// Coalesces concurrent settlement into ONE in-flight operation. The /dashboard
+// route calls fetchAccount + fetchPositions + fetchOrders in parallel, and the
+// reconciler polls concurrently — without this, several settleWithQuotes runs
+// would race on shared state (double-counting fills, and occasionally throwing,
+// which surfaced as a null account on the dashboard). All concurrent callers
+// now await the same settle.
+let settleInFlight = null;
 
 const MAX_TERMINAL_ORDERS = 500; // cap retained history so the file stays bounded
 
@@ -334,7 +345,16 @@ async function fetchQuotes(symbolList) {
       out[canonical] = { bid, ask, mid: (bid + ask) / 2 };
     }
   }
+  // Warm the price cache so read methods can value positions without their own
+  // fetch (and survive a transient fetch failure).
+  lastPrices = { ...lastPrices, ...out };
   return out;
+}
+
+// Best price for a symbol: freshest settle quotes, else the cached last price.
+function priceFor(sym, quotes) {
+  const q = (quotes && quotes[sym]) || lastPrices[sym];
+  return q && Number.isFinite(q.mid) && q.mid > 0 ? q.mid : null;
 }
 
 // Symbols we currently need a price for: every open order + every held position.
@@ -350,11 +370,24 @@ function activeSymbols() {
 }
 
 // Fetch fresh quotes for all active symbols, settle resting orders, return the
-// quotes map (reused by the caller for equity valuation).
+// quotes map. Coalesced: concurrent callers share ONE in-flight settle so
+// settleWithQuotes never runs re-entrantly (no fill double-counting, no race
+// throw). Never rejects — a fetch failure degrades to the cached price map.
 async function refreshAndSettle(nowMs = Date.now()) {
-  const quotes = await fetchQuotes(activeSymbols());
-  settleWithQuotes(quotes, nowMs);
-  return quotes;
+  if (settleInFlight) return settleInFlight;
+  settleInFlight = (async () => {
+    try {
+      const quotes = await fetchQuotes(activeSymbols());
+      settleWithQuotes(quotes, nowMs);
+      return quotes;
+    } catch (err) {
+      logOnce('warn', 'paper_broker_settle_failed', 'paper_broker_settle_failed', { error: err?.message });
+      return {};
+    } finally {
+      settleInFlight = null;
+    }
+  })();
+  return settleInFlight;
 }
 
 function trimTerminalOrders() {
@@ -399,11 +432,14 @@ function shapedOrder(o) {
 
 async function fetchAccount(_opts = {}) {
   const st = ensureState();
-  const quotes = await refreshAndSettle();
+  // Settle best-effort (coalesced, never rejects), then value from the price
+  // cache. Wrapped so the account is ALWAYS returned — a null account would
+  // wrongly read as "offline" on the dashboard even though paper is running.
+  let quotes = {};
+  try { quotes = await refreshAndSettle(); } catch (_) { quotes = {}; }
   let longMarketValue = 0;
   for (const [sym, pos] of Object.entries(st.positions)) {
-    const q = quotes[sym];
-    const px = q ? q.mid : Number(pos.avgEntryPrice) || 0;
+    const px = priceFor(sym, quotes) || Number(pos.avgEntryPrice) || 0;
     if (px > 0) longMarketValue += Number(pos.qty) * px;
   }
   const cash = Number(st.cash) || 0;
@@ -432,13 +468,13 @@ async function fetchAccount(_opts = {}) {
 
 async function fetchPositions(_opts = {}) {
   const st = ensureState();
-  const quotes = await refreshAndSettle();
+  let quotes = {};
+  try { quotes = await refreshAndSettle(); } catch (_) { quotes = {}; }
   const out = [];
   for (const [sym, pos] of Object.entries(st.positions)) {
     const qty = Number(pos.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
-    const q = quotes[sym];
-    const px = q ? q.mid : Number(pos.avgEntryPrice) || 0;
+    const px = priceFor(sym, quotes) || Number(pos.avgEntryPrice) || 0;
     out.push({
       symbol: sym, asset_id: sym, exchange: 'paper', asset_class: 'crypto',
       qty: String(qty), qty_available: String(qty),
@@ -621,6 +657,8 @@ function getState() {
 function _setQuoteFetcher(fn) { quoteFetcher = fn; }
 function _resetForTest(initial = {}) {
   persistencePath = ''; // disable disk in tests
+  lastPrices = {};
+  settleInFlight = null;
   state = { ...freshState(), ...initial };
   if (!state.positions) state.positions = {};
   if (!state.orders) state.orders = {};
