@@ -3795,6 +3795,11 @@ async function scanAndEnter() {
       rejectTrade(pair, 'concurrent_position_cap', { heldCount, placed, cap: MAX_CONCURRENT_POSITIONS_SOFT_CAP });
       continue;
     }
+    // Declared at loop-body scope (not inside the try) so the catch block below
+    // can read it — the buy-failure post-only-reject metric references it. Prior
+    // to this it was declared inside the try, making the catch reference a
+    // ReferenceError (a pre-existing latent bug + the eslint no-undef error).
+    let orderPostOnly = ENTRY_POST_ONLY;
     try {
       // Fresh re-quote (2026-05-31): when enabled, fetch a current single-symbol
       // quote so the freshness/spread gates and the entry price all act on a
@@ -3952,7 +3957,7 @@ async function scanAndEnter() {
         && Number.isFinite(ask) && ask > 0 && Number.isFinite(bid) && bid > 0;
       let buyPriceRaw;
       let entryPlacement;
-      let orderPostOnly = ENTRY_POST_ONLY;
+      orderPostOnly = ENTRY_POST_ONLY; // hoisted to loop-body scope above (catch reads it)
       if (takerContinuation) {
         buyPriceRaw = ask;            // marketable limit at the ask -> taker fill
         entryPlacement = 'taker';
