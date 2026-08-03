@@ -118,6 +118,8 @@ The weight-learning loop is now two layers, and the key invariant is: **new entr
 
 6. **Ship-and-merge is the default workflow.** When a change is complete and tests pass, push the branch, open the PR via the GitHub MCP, and merge it (squash, into `main`) without waiting for explicit confirmation each time. This is a standing instruction from the repo owner (2026-05-21). Exceptions: if tests fail, if the change touches anything the user flagged as risky in the same session, or if the user explicitly says "don't merge yet."
 
+7. **Paper-mode autonomy (standing grant, 2026-08-03).** The repo owner granted full standing authorization to build, push, and merge changes autonomously **while the bot is in paper mode** (`EXECUTION_VENUE=paper` — the in-process paper broker on live Binance.US data, zero real money). Iterate freely on the strategy from live paper data — fix bugs, tune, ship — then report what changed. **The boundary this grant is built on: real money.** Do NOT, without explicit fresh owner confirmation, switch the venue to live `binance_us`, fund/route real orders, or weaken a safety brake (realized-expectancy breaker, stop, max-hold) in a way that would matter with real capital. The authorization is scoped to the zero-risk paper venue; anything that risks real funds still needs a check-in.
+
 ## Useful commands
 
 ```sh
