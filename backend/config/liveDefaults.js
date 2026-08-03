@@ -696,14 +696,16 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // toward 0.6 to be pickier; CONVICTION_ENGINE_ENABLED=false to disable.
   CONVICTION_ENGINE_ENABLED: 'true',
   CONVICTION_MIN: '0.45',
-  // Performance epoch — "point 0" for tracking the reality of the 2026-06-08
-  // strategy rebuild (btc_lead_lag + maker execution + conviction engine), set
-  // just after that stack went live. The dashboard's meta.performanceEpoch shows
-  // the since-reset P&L + a scorecard filtered to trades at/after this time, so
-  // the ~274 legacy mean-reversion trades stop polluting the view. NON-
-  // destructive — meta.scorecard remains the all-time view; nothing is deleted.
+  // Performance epoch — "point 0" for tracking the reality of the CURRENT
+  // strategy. Bumped 2026-08-03 to the paper trend_momentum rebuild: the prior
+  // epoch (2026-06-08) anchored on the ~$477 btc_lead_lag account and 218 of its
+  // trades, which — mixed with the fresh $10k paper balance — made the dashboard
+  // read a nonsense "+1996% since reset" and show btc_lead_lag's losing
+  // scorecard as if it were the new strategy's. Re-anchoring here captures the
+  // paper baseline (~$10k) and filters the scorecard to paper trend_momentum
+  // trades only. NON-destructive — meta.scorecard remains the all-time view.
   // To reset again, bump this timestamp and redeploy (baseline re-anchors).
-  PERFORMANCE_EPOCH_AT: '2026-06-08T23:00:00Z',
+  PERFORMANCE_EPOCH_AT: '2026-08-03T19:30:00Z',
   // Barrier signal — restored from commit fbdb924 (the project's initial
   // commit). Trade-construction signal: barrier-touch probability + EWMA
   // vol-scaled stop + EMA momentum + micro-momentum + orderbook bias.

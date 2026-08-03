@@ -18,6 +18,17 @@ const { redactDiagnosticsBody } = require('./diagnosticsRedaction');
   assert.strictEqual(body.positions.length, 1);
 }
 
+// /dashboard PAPER: virtual account is not sensitive -> returned intact.
+{
+  const body = { ok: true, account: { equity: '10000', cash: '10000', raw_venue: 'paper' }, positions: [{ symbol: 'ADA/USD', qty: '5' }], meta: { latestEquity: 10000, engineState: 'running' } };
+  const out = redactDiagnosticsBody('/dashboard', body);
+  assert.strictEqual(out, body); // untouched
+  assert.strictEqual(out.account.equity, '10000');
+  assert.strictEqual(out.positions.length, 1);
+  assert.strictEqual(out.meta.latestEquity, 10000);
+  assert.ok(!out.redacted);
+}
+
 // /debug/status: open positions/orders emptied; flags preserved.
 {
   const body = { ok: true, trading: { TRADING_ENABLED: true }, diagnostics: { openPositions: [{ symbol: 'BTC/USD' }], openOrders: [{ id: '1' }], activeSlotsUsed: 3 } };
