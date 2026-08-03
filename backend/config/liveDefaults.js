@@ -363,7 +363,18 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // (or '' for the mean_reversion fallback) in Render env. Requires btc_lead_lag
   // in the trade.js SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-08).
   // Runbook: docs/BTC_LEAD_LAG_ROLLOUT.md.
-  SIGNAL_VERSION: 'btc_lead_lag',
+  //
+  // 2026-08-03 REBUILD: default flipped btc_lead_lag → 'trend_momentum', the
+  // longer-horizon systematic brain (higher-timeframe trend + relative-strength
+  // vs BTC). This deliberately moves the strategy UP the timeframe, off the
+  // minute-scalping every prior signal bled on, to the trend/momentum risk
+  // premia whose moves (hundreds of bps) dwarf the ~2-bps round-trip cost. It is
+  // meant to be validated in PAPER first (EXECUTION_VENUE=paper) before any live
+  // funding. The realized-expectancy breaker stays the sole halt authority.
+  // Reversible via SIGNAL_VERSION env (any allowlisted signal, or '' for the
+  // mean_reversion fallback). Must be in the trade.js
+  // SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-08-03) or it falls back.
+  SIGNAL_VERSION: 'trend_momentum',
   // Signal selector / backtest-veto knobs. The selector vetoes ALL entries
   // when no signal has cleared SIGNAL_SELECTOR_MIN_BPS in its most recent
   // 30-day auto-backtest — exactly the safety net that stops the bot from

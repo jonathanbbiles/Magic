@@ -134,7 +134,10 @@ const validateEnv = () => {
   // not required at all when venue=binance_us; the validator just warns if
   // they're set (operator is paying for an Alpaca seat they don't use).
   const executionVenueResolved = String(process.env.EXECUTION_VENUE || 'alpaca').trim().toLowerCase();
-  const alpacaUsedForExecution = executionVenueResolved !== 'binance_us';
+  // Neither binance_us nor paper needs Alpaca: binance_us routes bars/quotes
+  // through Binance.US public REST, and paper uses that same public feed with
+  // the in-process paper broker (no auth, no funds).
+  const alpacaUsedForExecution = executionVenueResolved !== 'binance_us' && executionVenueResolved !== 'paper';
   const alpacaNeeded = alpacaUsedForExecution; // Phase 2: data path also moves with venue.
   const placeholderSecretPatterns = [
     /<[^>]+>/i,
@@ -671,8 +674,14 @@ const validateEnv = () => {
     if (parsedBinanceUrl && String(parsedBinanceUrl.hostname || '').toLowerCase() !== expectedBinanceHost) {
       validationErrors.push(`BINANCE_US_REST_URL must resolve to "${expectedBinanceHost}". Received host "${parsedBinanceUrl.hostname}".`);
     }
+  } else if (executionVenue === 'paper') {
+    // Paper trading (2026-08-03): the in-process paper broker fills a virtual
+    // portfolio against Binance.US PUBLIC market data. No brokerage credentials
+    // of any kind are required, and no real order ever leaves the process — so
+    // the live-only host guards (Alpaca / Binance) do not apply here. This is
+    // the zero-risk test-bed for validating a strategy before funding it.
   } else if (executionVenue !== 'alpaca') {
-    validationErrors.push(`EXECUTION_VENUE must be 'alpaca' or 'binance_us'. Received: "${process.env.EXECUTION_VENUE}".`);
+    validationErrors.push(`EXECUTION_VENUE must be 'alpaca', 'binance_us', or 'paper'. Received: "${process.env.EXECUTION_VENUE}".`);
   }
 
   // Realized-volatility entry gate (2026-06-23). The gate is default-ON, so a

@@ -42,6 +42,7 @@ const { evaluateRangeMeanReversionSignal } = require('./modules/rangeMeanReversi
 const { evaluateBarrierSignal } = require('./modules/barrierSignal');
 const { evaluateMicrostructureSignal, computeFlowImbalance } = require('./modules/microstructureSignal');
 const { evaluateTrendFollowingSignal } = require('./modules/trendFollowingSignal');
+const { evaluateTrendMomentumSignal, evaluateTrendMomentumExit } = require('./modules/trendMomentumSignal');
 const {
   evaluatePairsSignal,
   parsePairDefinitions,
@@ -83,8 +84,17 @@ const explorationBudget = require('./modules/explorationBudget');
 const binanceExecution = require('./modules/binanceExecution');
 const binanceSymbols = require('./modules/binanceSymbols');
 const binanceMarketData = require('./modules/binanceMarketData');
+const paperBroker = require('./modules/paperBroker');
 const EXECUTION_VENUE = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-const IS_BINANCE_EXECUTION = EXECUTION_VENUE === 'binance_us';
+// Paper trading (EXECUTION_VENUE=paper) reuses Binance.US's PUBLIC market-data
+// + boot path (real live prices via /bookTicker + /klines, NO auth, NO funds)
+// and redirects ONLY order execution to the in-process paper broker. So paper
+// is treated exactly like binance for every DATA / BOOT branch below (making
+// IS_BINANCE_EXECUTION true), while the 8 order/account primitives intercept it
+// separately via IS_PAPER_EXECUTION (see the paperBroker dispatch). This keeps
+// the diff tiny: no data path or boot branch needs to learn a third venue.
+const IS_PAPER_EXECUTION = EXECUTION_VENUE === 'paper';
+const IS_BINANCE_EXECUTION = EXECUTION_VENUE === 'binance_us' || IS_PAPER_EXECUTION;
 const SECONDARY_FEED_ENABLED_TRADE = String(
   process.env.SECONDARY_FEED_ENABLED || 'false',
 ).toLowerCase() === 'true';
@@ -226,7 +236,7 @@ const ENTRY_TAKER_FOR_CONTINUATION = readBoolean('ENTRY_TAKER_FOR_CONTINUATION',
 // for which an aggressive near-ask maker rest fits the thesis. Mean-reversion,
 // range-MR, barrier and microstructure are NOT here — they keep mid/configured
 // placement. Mirrors the signal-aware dispatch in deriveStopLossBps.
-const CONTINUATION_SIGNALS = new Set(['btc_lead_lag', 'trend_following']);
+const CONTINUATION_SIGNALS = new Set(['btc_lead_lag', 'trend_following', 'trend_momentum']);
 function isContinuationSignal(v) { return CONTINUATION_SIGNALS.has(String(v || '')); }
 // 2026-05-31 stop-the-bleed: re-fetch a fresh single-symbol quote at the top of
 // each per-symbol entry evaluation instead of trusting the batch-prefetched
@@ -271,7 +281,10 @@ const TARGET_NET_PROFIT_BPS = Math.min(50, Math.max(5, readNumber('TARGET_NET_PR
 //     mostly-maker fills; widen if Tier I pairs dominate stops.
 // Operator can override via FEE_BPS_ROUND_TRIP env var at any time.
 const EXECUTION_VENUE_FOR_FEE_DEFAULT = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-const FEE_BPS_DEFAULT = EXECUTION_VENUE_FOR_FEE_DEFAULT === 'binance_us' ? 2 : 30;
+// Paper fills against live Binance.US prices under Binance.US's fee schedule,
+// so it shares the 2-bps round-trip default (not Alpaca's 30).
+const FEE_BPS_DEFAULT = (EXECUTION_VENUE_FOR_FEE_DEFAULT === 'binance_us'
+  || EXECUTION_VENUE_FOR_FEE_DEFAULT === 'paper') ? 2 : 30;
 const FEE_BPS_ROUND_TRIP = Math.max(0, readNumber('FEE_BPS_ROUND_TRIP', FEE_BPS_DEFAULT));
 // Gross upward move the sell limit requires above entry.
 const GROSS_TARGET_BPS = TARGET_NET_PROFIT_BPS + FEE_BPS_ROUND_TRIP;
@@ -384,6 +397,7 @@ function getMaxHoldMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_30m'
       || signalVersion === 'microstructure_45m') return MICRO_MAX_HOLD_MS;
   if (signalVersion === 'trend_following') return TREND_FOLLOWING_MAX_HOLD_MS;
+  if (signalVersion === 'trend_momentum') return TREND_MOMENTUM_MAX_HOLD_MS;
   if (signalVersion === 'pairs') return PAIRS_MAX_HOLD_MS;
   if (signalVersion === 'btc_lead_lag') return BLL_MAX_HOLD_MS;
   return MAX_HOLD_MS;
@@ -400,6 +414,7 @@ function getBreakevenTimeoutMsForSignal(signalVersion) {
       || signalVersion === 'microstructure_30m'
       || signalVersion === 'microstructure_45m') return MICRO_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'trend_following') return TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS;
+  if (signalVersion === 'trend_momentum') return TREND_MOMENTUM_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'pairs') return PAIRS_BREAKEVEN_TIMEOUT_MS;
   if (signalVersion === 'btc_lead_lag') return BLL_BREAKEVEN_TIMEOUT_MS;
   return BREAKEVEN_TIMEOUT_MS;
@@ -646,6 +661,45 @@ const TREND_FOLLOWING_STOP_LOSS_BPS = Math.max(1, readNumber('TREND_FOLLOWING_ST
 const TREND_FOLLOWING_MAX_HOLD_MS = Math.max(60_000, readNumber('TREND_FOLLOWING_MAX_HOLD_MS', 10_800_000));         // 3 h
 const TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('TREND_FOLLOWING_BREAKEVEN_TIMEOUT_MS', 5_400_000)); // 1.5 h
 
+// --- Trend-momentum signal (2026-08-03, longer-horizon systematic brain) ----
+// DAILY time-series trend-following, the form that VALIDATED POSITIVE on real
+// Binance.US data (SMA 20/50 daily: +408 bps/trade, +76,767 bps total over the
+// majors while buy-and-hold was -2,465 bps/symbol). Entry logic + the pure
+// trailing-exit helper live in modules/trendMomentumSignal.js; these knobs
+// shape it and the exit posture. The REAL exit is the trailing MA-cross (in
+// reconcileExits); the stop/TP/max-hold below are deliberately WIDE backstops
+// so the trailing exit does the work. Every knob is read here (Hard Rule #4)
+// and flows into TREND_MOMENTUM_CONFIG_OVERRIDES / the exit branches below.
+const TREND_MOMENTUM_HTF_TIMEFRAME = String(process.env.TREND_MOMENTUM_HTF_TIMEFRAME || '1Day').trim() || '1Day';
+const TREND_MOMENTUM_HTF_LIMIT = Math.max(60, Math.floor(readNumber('TREND_MOMENTUM_HTF_LIMIT', 120)));
+const TREND_MOMENTUM_BENCHMARK_SYMBOL = String(process.env.TREND_MOMENTUM_BENCHMARK_SYMBOL || 'BTC/USD').trim() || 'BTC/USD';
+const TREND_MOMENTUM_BENCHMARK_TTL_MS = Math.max(0, readNumber('TREND_MOMENTUM_BENCHMARK_TTL_MS', 300_000));
+const TREND_MOMENTUM_FAST_PERIOD = Math.max(2, Math.floor(readNumber('TREND_MOMENTUM_FAST_PERIOD', 20)));
+const TREND_MOMENTUM_SLOW_PERIOD = Math.max(TREND_MOMENTUM_FAST_PERIOD + 1, Math.floor(readNumber('TREND_MOMENTUM_SLOW_PERIOD', 50)));
+const TREND_MOMENTUM_REQUIRE_REL_STRENGTH = readBoolean('TREND_MOMENTUM_REQUIRE_REL_STRENGTH', false);
+const TREND_MOMENTUM_MIN_REL_STRENGTH_BPS = readNumber('TREND_MOMENTUM_MIN_REL_STRENGTH_BPS', 0);
+const TREND_MOMENTUM_PROJECTED_TARGET_BPS = Math.max(100, readNumber('TREND_MOMENTUM_PROJECTED_TARGET_BPS', 2000));
+const TREND_MOMENTUM_CONFIG_OVERRIDES = {
+  fastPeriod: TREND_MOMENTUM_FAST_PERIOD,
+  slowPeriod: TREND_MOMENTUM_SLOW_PERIOD,
+  requireRelStrength: TREND_MOMENTUM_REQUIRE_REL_STRENGTH,
+  minRelStrengthBps: TREND_MOMENTUM_MIN_REL_STRENGTH_BPS,
+  projectedTargetBps: TREND_MOMENTUM_PROJECTED_TARGET_BPS,
+};
+// Exit posture (NEW signal — establishes its own WIDE backstop caps; does not
+// re-tune any existing signal's, per Hard Rule #5). The trailing MA-cross exit
+// (TREND_MOMENTUM_TRAILING_EXIT_ENABLED, in reconcileExits) is the real exit;
+// the stop/TP/hold are far-out disaster bounds so they rarely fire first.
+const TREND_MOMENTUM_TRAILING_EXIT_ENABLED = readBoolean('TREND_MOMENTUM_TRAILING_EXIT_ENABLED', true);
+const TREND_MOMENTUM_STOP_LOSS_BPS = Math.max(1, readNumber('TREND_MOMENTUM_STOP_LOSS_BPS', 2000));       // 20% catastrophe stop
+const TREND_MOMENTUM_TARGET_NET_PROFIT_BPS_FLOOR = Math.max(1, readNumber('TREND_MOMENTUM_TARGET_NET_PROFIT_BPS_FLOOR', 1000));
+const TREND_MOMENTUM_SIGNAL_TARGET_MAX_NET_BPS = Math.max(
+  TREND_MOMENTUM_TARGET_NET_PROFIT_BPS_FLOOR,
+  readNumber('TREND_MOMENTUM_SIGNAL_TARGET_MAX_NET_BPS', 3000),
+);
+const TREND_MOMENTUM_MAX_HOLD_MS = Math.max(60_000, readNumber('TREND_MOMENTUM_MAX_HOLD_MS', 7_776_000_000));            // 90 d
+const TREND_MOMENTUM_BREAKEVEN_TIMEOUT_MS = Math.max(30_000, readNumber('TREND_MOMENTUM_BREAKEVEN_TIMEOUT_MS', 7_776_000_000)); // 90 d (effectively off)
+
 // Pairs / stat-arb signal env knobs.
 const PAIRS_LOOKBACK_BARS = Math.max(30, readNumber('PAIRS_LOOKBACK_BARS', 120));
 const PAIRS_MIN_R_SQUARED = readNumber('PAIRS_MIN_R_SQUARED', 0.5);
@@ -820,6 +874,14 @@ function deriveStopLossBps(volatilityBps, spreadBps, signalVersion = 'ols', pair
   else if (signalVersion === 'microstructure_30m') cap = MICRO_STOP_LOSS_BPS_30M;
   else if (signalVersion === 'microstructure_45m') cap = MICRO_STOP_LOSS_BPS_45M;
   else if (signalVersion === 'trend_following') cap = TREND_FOLLOWING_STOP_LOSS_BPS;
+  else if (signalVersion === 'trend_momentum') {
+    // Trend-following exits on the trailing MA-cross, NOT a tight vol-scaled
+    // stop. Return the wide fixed catastrophe stop directly (bypass vol-scaling)
+    // so a quiet-market small sigma can't shrink it into a whipsaw that breaks
+    // the validated edge. This is the new signal's own posture, not a re-tune
+    // of any existing signal (Hard Rule #5).
+    return TREND_MOMENTUM_STOP_LOSS_BPS;
+  }
   else if (signalVersion === 'pairs') cap = PAIRS_STOP_LOSS_BPS;
   else if (signalVersion === 'btc_lead_lag') cap = BLL_STOP_LOSS_BPS;
   else cap = STOP_LOSS_BPS;
@@ -1136,7 +1198,7 @@ const SIGNAL_VERSION_RAW = String(process.env.SIGNAL_VERSION || '').trim().toLow
 const SIGNAL_VERSION_OPERATOR_OVERRIDE = [
   'ols', 'multi_factor', 'mean_reversion', 'mean_reversion_5m', 'mean_reversion_15m', 'barrier',
   'microstructure_5m', 'microstructure_15m', 'microstructure_30m', 'microstructure_45m',
-  'btc_lead_lag',
+  'btc_lead_lag', 'trend_momentum',
 ].includes(SIGNAL_VERSION_RAW)
   ? SIGNAL_VERSION_RAW
   : null;
@@ -1405,6 +1467,19 @@ function deriveSignalTargetNetBps(projectedBps, signalVersion = 'ols') {
     if (!Number.isFinite(projected)) return MICRO_TARGET_NET_BPS_FLOOR;
     const signalNet = projected - FEE_BPS_ROUND_TRIP;
     return Math.max(MICRO_TARGET_NET_BPS_FLOOR, Math.min(MICRO_SIGNAL_TARGET_MAX_NET_BPS, signalNet));
+  }
+  // Trend-momentum: projectedBps is the ATR-derived expected trend move (gross).
+  // Net = gross − fees, clamped to the trend-momentum floor/cap. Same forward-
+  // move convention as btc_lead_lag, just at a longer-horizon (hundreds of bps)
+  // scale, so the cap is much wider.
+  if (signalVersion === 'trend_momentum') {
+    const projected = Number(projectedBps);
+    if (!Number.isFinite(projected)) return TREND_MOMENTUM_TARGET_NET_PROFIT_BPS_FLOOR;
+    const signalNet = projected - FEE_BPS_ROUND_TRIP;
+    return Math.max(
+      TREND_MOMENTUM_TARGET_NET_PROFIT_BPS_FLOOR,
+      Math.min(TREND_MOMENTUM_SIGNAL_TARGET_MAX_NET_BPS, signalNet),
+    );
   }
   // BTC lead-lag: projectedBps is the expected forward catch-up move (gross).
   // Net = gross − fees, clamped to the lead-lag floor/cap. Same convention as
@@ -1720,6 +1795,7 @@ function binanceMidPriceLookup(baseAsset) {
 }
 
 async function fetchAccount() {
+  if (IS_PAPER_EXECUTION) return paperBroker.fetchAccount({ midPriceLookup: binanceMidPriceLookup });
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.fetchAccount({ midPriceLookup: binanceMidPriceLookup });
   }
@@ -1763,6 +1839,7 @@ async function fetchClock() {
 // --- positions / assets --------------------------------------------------
 
 async function fetchPositions() {
+  if (IS_PAPER_EXECUTION) return paperBroker.fetchPositions();
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.fetchPositions({
       universe: binanceSymbols.listCanonicalSymbols(),
@@ -1774,6 +1851,7 @@ async function fetchPositions() {
 }
 
 async function fetchPosition(symbol) {
+  if (IS_PAPER_EXECUTION) return paperBroker.fetchPosition(symbol);
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.fetchPosition(symbol, {
       midPriceLookup: binanceMidPriceLookup,
@@ -1842,6 +1920,9 @@ function expandNestedOrders(orders) {
 }
 
 async function fetchOrders(query = {}) {
+  if (IS_PAPER_EXECUTION) {
+    return paperBroker.fetchOrders({ status: query.status || 'open', symbol: query.symbol || null });
+  }
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.fetchOrders({
       status: query.status || 'open',
@@ -1857,6 +1938,7 @@ async function fetchOrders(query = {}) {
 }
 
 async function fetchOrderById(id, opts = {}) {
+  if (IS_PAPER_EXECUTION) return paperBroker.fetchOrderById(id, { symbol: opts.symbol || null });
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.fetchOrderById(id, { symbol: opts.symbol || null });
   }
@@ -1869,6 +1951,7 @@ async function fetchOrderById(id, opts = {}) {
 }
 
 async function replaceOrder(id, body) {
+  if (IS_PAPER_EXECUTION) return paperBroker.replaceOrder(id, body, { symbol: body?.symbol || null });
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.replaceOrder(id, body, { symbol: body?.symbol || null });
   }
@@ -1876,6 +1959,7 @@ async function replaceOrder(id, body) {
 }
 
 async function cancelOrder(id, opts = {}) {
+  if (IS_PAPER_EXECUTION) return paperBroker.cancelOrder(id, { symbol: opts.symbol || null });
   if (IS_BINANCE_EXECUTION) {
     return binanceExecution.cancelOrder(id, { symbol: opts.symbol || null });
   }
@@ -1893,6 +1977,14 @@ async function cancelOrder(id, opts = {}) {
 // `submitOrder` handles /buy, /orders, and /trade POSTs. For a BUY it returns
 // { ok, buy, sell } (sell attaches later via the exit manager once filled).
 async function submitOrder(payload = {}) {
+  if (IS_PAPER_EXECUTION) {
+    // Paper broker fills against live Binance.US prices; inject the same
+    // base-asset mid lookup binance uses as a pricing fallback.
+    return withOrderSubmitQueue(() => paperBroker.submitOrder({
+      ...payload,
+      midPriceLookup: (base) => binanceMidPriceLookup(base),
+    }));
+  }
   if (IS_BINANCE_EXECUTION) {
     // Inject midPriceLookup so the adapter can convert notional→quantity
     // and run the MIN_NOTIONAL pre-flight. limit_price is also used as
@@ -2639,6 +2731,52 @@ async function getTrendFollowingSignalForPair(pair) {
     return sig;
   } catch (err) {
     return { ok: false, reason: 'trend_following_signal_failed', error: err?.message };
+  }
+}
+
+// Trend-momentum signal wrapper (2026-08-03, longer-horizon systematic brain).
+// Fetches HIGHER-timeframe bars (default 1h) for the pair and — as the
+// cross-sectional benchmark — for BTC. The BTC benchmark is fetched once per
+// scan and cached (TREND_MOMENTUM_BENCHMARK_TTL_MS) so the whole candidate loop
+// shares one BTC fetch. When the benchmark is unavailable the evaluator degrades
+// to the absolute-trend gate alone (relative-strength gate skipped).
+let trendMomentumBtcBarsCache = { at: 0, bars: null };
+async function getTrendMomentumBenchmarkBars() {
+  const now = Date.now();
+  if (trendMomentumBtcBarsCache.bars
+      && (now - trendMomentumBtcBarsCache.at) <= TREND_MOMENTUM_BENCHMARK_TTL_MS) {
+    return trendMomentumBtcBarsCache.bars;
+  }
+  try {
+    const payload = await fetchCryptoBars({
+      symbols: [TREND_MOMENTUM_BENCHMARK_SYMBOL],
+      limit: TREND_MOMENTUM_HTF_LIMIT,
+      timeframe: TREND_MOMENTUM_HTF_TIMEFRAME,
+    });
+    const bars = payload?.bars?.[TREND_MOMENTUM_BENCHMARK_SYMBOL]
+      || payload?.bars?.[toAlpacaSymbol(TREND_MOMENTUM_BENCHMARK_SYMBOL)] || null;
+    if (Array.isArray(bars) && bars.length) {
+      trendMomentumBtcBarsCache = { at: now, bars };
+      return bars;
+    }
+  } catch (_) { /* benchmark is best-effort; degrade to absolute-trend only */ }
+  return trendMomentumBtcBarsCache.bars; // may be stale/null — evaluator handles it
+}
+
+async function getTrendMomentumSignalForPair(pair) {
+  try {
+    const barsPayload = await fetchCryptoBars({
+      symbols: [pair], limit: TREND_MOMENTUM_HTF_LIMIT, timeframe: TREND_MOMENTUM_HTF_TIMEFRAME,
+    });
+    const barsHtf = barsPayload?.bars?.[pair] || barsPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+    const btcBars = pair === TREND_MOMENTUM_BENCHMARK_SYMBOL ? null : await getTrendMomentumBenchmarkBars();
+    const sig = evaluateTrendMomentumSignal({
+      pair, bars: barsHtf, btcBars, config: TREND_MOMENTUM_CONFIG_OVERRIDES,
+    });
+    if (sig && typeof sig === 'object') sig.featureBars = { barsHtf };
+    return sig;
+  } catch (err) {
+    return { ok: false, reason: 'trend_momentum_signal_failed', error: err?.message };
   }
 }
 
@@ -3716,6 +3854,7 @@ async function scanAndEnter() {
       else if (ACTIVE_SIGNAL_VERSION === 'microstructure_30m') sig = await getMicrostructureSignalForPair(pair, quote, 30);
       else if (ACTIVE_SIGNAL_VERSION === 'microstructure_45m') sig = await getMicrostructureSignalForPair(pair, quote, 45);
       else if (ACTIVE_SIGNAL_VERSION === 'trend_following') sig = await getTrendFollowingSignalForPair(pair);
+      else if (ACTIVE_SIGNAL_VERSION === 'trend_momentum') sig = await getTrendMomentumSignalForPair(pair);
       else if (ACTIVE_SIGNAL_VERSION === 'pairs') sig = await getPairsSignalForPair(pair);
       else if (ACTIVE_SIGNAL_VERSION === 'btc_lead_lag') sig = await getBtcLeadLagSignalForPair(pair);
       else sig = await getPredictionSignal(pair);
@@ -4327,6 +4466,65 @@ async function reconcileExits() {
     // Signal-aware max-hold: MF uses MF_MAX_HOLD_MS (default 6 h) so its
     // wider TP target has the σ-time it needs to develop.
     const positionSignalVersion = tradePredictions.get(pair)?.prediction?.signalVersion || 'ols';
+
+    // Trailing trend-break exit (2026-08-03, owner-authorized new exit mechanism
+    // for the trend_momentum signal — Hard Rule #5). A trend-follower's edge IS
+    // its exit: close the position (market IOC) once the latest CLOSED DAILY bar
+    // falls back below the fast SMA, so the strategy sits in cash through
+    // downtrends. This is the exact mirror of the entry condition and of the
+    // validated backtest's exit rule. ONLY applies to trend_momentum positions;
+    // every other signal's exit posture is byte-for-byte unchanged. Fires before
+    // the (far-out) max-hold / TP backstops so it is the primary exit.
+    if (TREND_MOMENTUM_TRAILING_EXIT_ENABLED
+        && positionSignalVersion === 'trend_momentum'
+        && Number.isFinite(avg) && avg > 0) {
+      try {
+        const dailyPayload = await fetchCryptoBars({
+          symbols: [pair], limit: TREND_MOMENTUM_HTF_LIMIT, timeframe: TREND_MOMENTUM_HTF_TIMEFRAME,
+        });
+        const dailyBars = dailyPayload?.bars?.[pair] || dailyPayload?.bars?.[toAlpacaSymbol(pair)] || [];
+        const exitEval = evaluateTrendMomentumExit({ bars: dailyBars, config: TREND_MOMENTUM_CONFIG_OVERRIDES });
+        if (exitEval.exit) {
+          const existing = openSellByPair.get(pair);
+          if (existing?.id) await cancelOrder(existing.id);
+          const sellResult = await submitOrder({
+            symbol: pair, side: 'sell', type: 'market', time_in_force: 'ioc', qty: String(qty),
+          });
+          const sellOrder = sellResult?.id ? sellResult : sellResult?.sell || sellResult;
+          const triggeredAt = sellOrder?.submitted_at || new Date().toISOString();
+          const orderFillPrice = Number(sellOrder?.filled_avg_price);
+          const quote = await getLatestQuote(pair).catch(() => null);
+          const bidNow = Number(quote?.bp);
+          const exitPrice = Number.isFinite(orderFillPrice) && orderFillPrice > 0
+            ? orderFillPrice
+            : (Number.isFinite(bidNow) && bidNow > 0 ? bidNow : avg);
+          const realizedGrossBps = avg > 0 ? ((exitPrice - avg) / avg) * 10000 : 0;
+          exitState.set(pair, {
+            ...exitState.get(pair),
+            sellOrderId: sellOrder?.id || null,
+            targetPrice: exitPrice,
+            sellOrderSubmittedAt: triggeredAt,
+            reconciliationState: 'trend_break_exit',
+            lastReconciliationAction: 'trend_break_market_sell',
+            expectedNetProfitBps: realizedGrossBps - FEE_BPS_ROUND_TRIP,
+            minNetProfitBps: realizedGrossBps - FEE_BPS_ROUND_TRIP,
+            trendBreakExitTriggered: true,
+            trendBreakExitAt: triggeredAt,
+            trendBreakExitPrice: exitPrice,
+            trendBreakSmaFast: exitEval.smaFast,
+          });
+          lastSuccessfulAction = { at: new Date().toISOString(), symbol: pair, action: 'trend_break_market_sell', orderId: sellOrder?.id || null };
+          console.log('exit_trend_break_triggered', {
+            symbol: pair, close: exitEval.close, smaFast: exitEval.smaFast, newOrderId: sellOrder?.id || null,
+          });
+          continue;
+        }
+      } catch (err) {
+        lastExecutionFailure = { at: new Date().toISOString(), symbol: pair, reason: 'trend_break_exit_failed', message: err?.errorMessage || err?.message || String(err) };
+        console.warn('exit_trend_break_failed', { symbol: pair, error: err?.errorMessage || err?.message });
+      }
+    }
+
     const positionMaxHoldMs = getMaxHoldMsForSignal(positionSignalVersion);
     if (positionMaxHoldMs > 0 && Number.isFinite(avg) && avg > 0) {
       const existing = openSellByPair.get(pair);
@@ -4639,10 +4837,13 @@ async function reconcileExits() {
     // fills).
     const stopLossClose = state?.stopLossTriggered === true;
     const maxHoldClose = state?.maxHoldExitTriggered === true;
+    const trendBreakClose = state?.trendBreakExitTriggered === true;
     const stopLossExitPrice = Number(state?.stopLossExitPrice);
     const maxHoldExitPrice = Number(state?.maxHoldExitPrice);
+    const trendBreakExitPrice = Number(state?.trendBreakExitPrice);
     let exit;
     if (stopLossClose && Number.isFinite(stopLossExitPrice) && stopLossExitPrice > 0) exit = stopLossExitPrice;
+    else if (trendBreakClose && Number.isFinite(trendBreakExitPrice) && trendBreakExitPrice > 0) exit = trendBreakExitPrice;
     else if (maxHoldClose && Number.isFinite(maxHoldExitPrice) && maxHoldExitPrice > 0) exit = maxHoldExitPrice;
     else exit = Number(state?.targetPrice);
     const closedAt = new Date().toISOString();
@@ -4672,6 +4873,7 @@ async function reconcileExits() {
       // tpFillRate=1 simultaneously when a single stop-out fired).
       let exitReason;
       if (stopLossClose) exitReason = 'stop_loss';
+      else if (trendBreakClose) exitReason = 'trend_break';
       else if (maxHoldClose) exitReason = 'max_hold';
       else if (state?.breakevenAttached) exitReason = 'breakeven_limit';
       else exitReason = 'tp_limit';
