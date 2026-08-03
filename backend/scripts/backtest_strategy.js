@@ -1382,7 +1382,9 @@ async function runBacktest(overrides = {}) {
   // means the dispatcher in index.js doesn't need a venue branch — the
   // bars come back in identical shape regardless of source.
   const venue = String(opts.executionVenue || process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-  const isBinanceVenue = venue === 'binance_us';
+  // Paper trading shares Binance.US's public data path (bars via /api/v3/klines),
+  // so the backtester sources bars the same way it does for binance_us.
+  const isBinanceVenue = venue === 'binance_us' || venue === 'paper';
   const dataBase = (opts.dataBase || process.env.DATA_BASE || 'https://data.alpaca.markets').replace(/\/+$/, '');
   let headers = null;
   let binanceMarketData = null;

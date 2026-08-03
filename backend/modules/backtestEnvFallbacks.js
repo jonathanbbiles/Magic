@@ -93,7 +93,8 @@ function resolveBacktestFeeBps(overrides = {}, env = process.env) {
   const fromEnv = parseEnvNumber(env.FEE_BPS_ROUND_TRIP);
   if (fromEnv !== undefined) return Math.max(0, fromEnv);
   const venue = String(env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-  return venue === 'binance_us' ? 2 : 30;
+  // Paper fills against Binance.US prices under its fee schedule → 2 bps.
+  return (venue === 'binance_us' || venue === 'paper') ? 2 : 30;
 }
 
 function resolveLiveEngineFallbacks(overrides = {}, env = process.env) {

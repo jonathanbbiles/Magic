@@ -3254,7 +3254,9 @@ async function bootstrapTrading() {
   // execution + data paths. The old `startup_blocked_missing_alpaca_auth`
   // bail-out only applies when Alpaca is actually in use.
   const executionVenue = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-  const alpacaAuthRequired = executionVenue !== 'binance_us';
+  // Neither binance_us nor paper needs Alpaca creds to boot (paper runs the
+  // in-process paper broker over Binance.US public data — no auth, no funds).
+  const alpacaAuthRequired = executionVenue !== 'binance_us' && executionVenue !== 'paper';
   const emitStartupTruthSummaryOnce = () => {
     if (startupTruthLogged) return;
     const baseStatus = getAlpacaBaseStatus();
@@ -3355,7 +3357,9 @@ const backtestSkipReason = (() => {
   if (!BACKTEST_AUTORUN_ENABLED) return 'autorun_disabled';
   if (process.env.NODE_ENV === 'test') return 'test_env';
   const venueForBacktest = String(process.env.EXECUTION_VENUE || 'alpaca').toLowerCase();
-  if (venueForBacktest !== 'binance_us'
+  // binance_us and paper both source backtest bars from Binance.US public
+  // klines (no Alpaca creds needed).
+  if (venueForBacktest !== 'binance_us' && venueForBacktest !== 'paper'
       && !(process.env.APCA_API_KEY_ID || process.env.ALPACA_KEY_ID || process.env.ALPACA_API_KEY_ID || process.env.ALPACA_API_KEY)) {
     return 'no_alpaca_creds';
   }

@@ -1,4 +1,95 @@
-# Magic — Crypto Trading Bot (Alpaca + Binance.US)
+# Magic — Crypto Trading Bot (Alpaca + Binance.US + Paper)
+
+## 2026-08-03: STRATEGY REBUILD — paper venue + daily trend-following brain (`trend_momentum`)
+
+A deliberate rebuild of the decision brain (infrastructure kept intact) around a
+simple, honest thesis: **stop scalping the noise floor and move UP the timeframe
+to the trend/momentum risk premia** — the one class of edge with decades of
+out-of-sample survival, whose moves (hundreds of bps) dwarf the ~2-bps
+round-trip cost. Two things shipped:
+
+### 1. Paper-trading venue (`EXECUTION_VENUE=paper`)
+
+A third execution venue alongside `alpaca` and `binance_us`. It fills a **virtual
+portfolio against REAL, LIVE Binance.US public prices** (`/bookTicker` + `/klines`
+— no API keys, no funds, nothing leaves the process). Module:
+`backend/modules/paperBroker.js`, mirroring `binanceExecution.js`'s exact
+Alpaca-shape primitives so it drops into the existing venue dispatch with zero
+downstream changes. Fills are honest and slightly conservative: a crossing order
+takes (pays the spread + taker fee); a resting limit fills as a maker only once
+the market trades through it (modeling adverse selection). State persists to
+`${writableRoot}/paper_broker_state.json`. **This is the switch to flip on:** set
+`EXECUTION_VENUE=paper` in Render env — no other credentials needed. `validateEnv`
+exempts paper from the live-only host guards because no real order is ever placed.
+
+### 2. `trend_momentum` — daily time-series trend-following
+
+Module: `backend/modules/trendMomentumSignal.js`. Default signal
+(`SIGNAL_VERSION` default flipped `btc_lead_lag → trend_momentum`).
+
+- **Entry:** on DAILY bars, `close > SMA(20)` AND `SMA(20) > SMA(50)` (confirmed
+  uptrend). Optional relative-strength-vs-BTC filter (`TREND_MOMENTUM_REQUIRE_REL_STRENGTH`,
+  default off — not part of the validated entry).
+- **Exit (the edge):** a **trailing MA-cross** — close the position (market IOC)
+  once the latest closed daily bar falls back below `SMA(20)`. This sits the
+  strategy in CASH during downtrends, which is where trend-following makes its
+  money. Implemented in `reconcileExits` via the pure `evaluateTrendMomentumExit`
+  helper. **This is a NEW exit mechanism, owner-authorized 2026-08-03 per Hard
+  Rule #5, and applies ONLY to `trend_momentum` positions** — every other
+  signal's stop/TP/max-hold posture is byte-for-byte unchanged.
+- **Backstops (far out, so the trailing exit is the real exit):** a fixed 2000-bps
+  (20%) catastrophe stop (bypasses vol-scaling so a quiet market can't shrink it
+  into a whipsaw), a 90-day max-hold, and a far (~2000-bps) TP.
+
+**Honest validation** (walk-forward, REAL Binance.US daily klines, the wired
+modules end-to-end, 2 bps fee, `scripts/validate_trend_momentum.js --days=720`):
+
+| | net bps/trade | win rate | PF | note |
+|---|--:|--:|--:|---|
+| **Overall (169 trades, 10 majors)** | **+414** | 29% | 2.25 | 8/10 symbols positive |
+| — same period, buy & hold the alts | −2,752/symbol | — | — | the alt basket fell |
+| Regime third 1 | +1,441 | 37% | 5.40 | strong-trend regime |
+| Regime third 2 | +37 | 32% | 1.12 | flat |
+| Regime third 3 | −261 | 18% | 0.25 | choppy/reversal — it whipsaws |
+
+**Read this honestly:** 29% win rate with a strongly positive average is the
+textbook trend-following signature (many small whipsaw losses, a few big trend
+rides). The edge is **real but regime-dependent** — it prints in trends and
+bleeds in chop (window 3 was negative). It is NOT a smooth equity curve, and it
+is NOT a money printer. An earlier intraday version (1h, fixed TP/stop) was built
+and validated first and **LOST** (−36.6 bps/trade, negative in every window);
+it was discarded rather than shipped. Short-formation momentum (7–30d) was
+negative in every configuration tested. This daily/trailing form is the only one
+that validated positive — which is exactly why paper trading it first (not
+funding it) is the plan.
+
+**Interaction to watch in paper:** the realized-expectancy breaker (−10 bps floor)
+was tuned for high-win-rate scalping. A low-win-rate/high-variance trend-follower
+can trip it during a normal whipsaw string, halting entries before the trend that
+pays for them arrives. That is protective in a genuinely bad regime (window 3) but
+can also cut a good strategy short. Watch `meta.signalSelector.realizedVeto` on the
+paper dashboard; widen `SIGNAL_SELECTOR_REALIZED_FLOOR_BPS` for this signal if the
+breaker is halting healthy trend-following.
+
+**To turn on paper trading:** set `EXECUTION_VENUE=paper` in Render env (the
+`SIGNAL_VERSION=trend_momentum` default is already the brain). Nothing else.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `EXECUTION_VENUE` | `alpaca` | `paper` = in-process broker on live Binance.US data (zero risk); `binance_us` = live money; `alpaca` = legacy. |
+| `PAPER_STARTING_EQUITY` | `10000` | Virtual USD the paper portfolio starts with. |
+| `PAPER_MAKER_FEE_BPS` / `PAPER_TAKER_FEE_BPS` | `0` / `0.95` | Binance.US fee schedule applied to paper fills. |
+| `SIGNAL_VERSION` | `trend_momentum` | The rebuilt default brain. `''` → `mean_reversion` fallback; any allowlisted signal to pin another. |
+| `TREND_MOMENTUM_HTF_TIMEFRAME` | `1Day` | Bar timeframe for the signal + trailing exit. |
+| `TREND_MOMENTUM_FAST_PERIOD` / `TREND_MOMENTUM_SLOW_PERIOD` | `20` / `50` | Validated SMA pair. |
+| `TREND_MOMENTUM_REQUIRE_REL_STRENGTH` | `false` | Optional "must outperform BTC" entry filter. |
+| `TREND_MOMENTUM_TRAILING_EXIT_ENABLED` | `true` | Master switch for the trailing MA-cross exit. |
+| `TREND_MOMENTUM_STOP_LOSS_BPS` | `2000` | Fixed catastrophe backstop (not vol-scaled). |
+| `TREND_MOMENTUM_MAX_HOLD_MS` | `7776000000` | 90-day max-hold backstop. |
+
+Kept intact by design: all venue adapters, data feeds, the realized-expectancy
+breaker, sizing (2% of equity), exit machinery for every other signal, the
+dashboard, and all diagnostics.
 
 ## 2026-07-09: TAKER entry + exit retune for btc_lead_lag (structural fix — inverts the maker-only premise)
 
@@ -1778,7 +1869,7 @@ See `.github/workflows/ci.yml`.
 
 ## What the bot does NOT do (intentional)
 
-- **No trailing stop.** The stop is static at fill time (vol-scaled, but fixed once the position opens), not adaptive. The staircase does decay the take-profit over time, but never the stop side.
+- **No trailing stop — EXCEPT for `trend_momentum`.** For every other signal the stop is static at fill time (vol-scaled, but fixed once the position opens), not adaptive; the staircase decays the take-profit over time, but never the stop side. The `trend_momentum` signal (2026-08-03) is the deliberate exception: it exits on a **trailing MA-cross** (close back below `SMA(20)` on daily bars) — that trailing exit IS its edge. It applies only to `trend_momentum` positions and is gated by `TREND_MOMENTUM_TRAILING_EXIT_ENABLED` (default on).
 - **No leverage.**
 - **No averaging down or pyramiding.**
 - **No cross-symbol correlation guard.** When `ENTRY_UNIVERSE_MODE=dynamic` and 30+ pairs are in scope, the engine can become long the same beta on multiple symbols simultaneously. The portfolio-drawdown gate (`MIN_PORTFOLIO_UNREALIZED_PCT_TO_ENTER`) is a coarse proxy: it pauses *new* entries once correlated open positions have already started bleeding, but it doesn't prevent the first N entries from clustering before drawdown manifests.

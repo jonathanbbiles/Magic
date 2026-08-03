@@ -136,7 +136,12 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.REJECT_NEAR_HIGH_LOOKBACK_BARS, '30');
 // ANALYSIS_2026-06.md). Maker-dependent edge; realized-veto breaker stays armed
 // as the bound. Reversible via SIGNAL_VERSION env. Must be in trade.js's
 // SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-06-08) or it falls back.
-assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'btc_lead_lag');
+// 2026-08-03 REBUILD: default flipped to 'trend_momentum' (longer-horizon
+// systematic brain — HTF trend + relative-strength vs BTC). Meant to be
+// validated in PAPER (EXECUTION_VENUE=paper) before live funding; the realized-
+// expectancy breaker stays the sole halt authority. Must be in trade.js's
+// SIGNAL_VERSION_OPERATOR_OVERRIDE allowlist (added 2026-08-03) or it falls back.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_VERSION, 'trend_momentum');
 
 // 2026-05-31 stop-the-bleed: quote freshness, fresh re-quote, and the hard
 // liquidity allowlist. See liveDefaults.js for the full rationale.
