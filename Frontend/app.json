@@ -4,7 +4,8 @@
     "slug": "magic-money",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0f17",
     "extra": {}
   }
 }
