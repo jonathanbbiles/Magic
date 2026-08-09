@@ -759,4 +759,73 @@ function recsAtAges(signalVersion, bps, agesMs, nowMs) {
   assert.equal(d.reason, 'operator_override_validated');
 }
 
+// ---------------------------------------------------------------------------
+// resolveRealizedVetoConfig — per-signal breaker calibration (2026-08-09).
+// These overrides LOOSEN the halt posture for one signal, so the tests pin
+// exactly which signals are affected and that everything else is untouched.
+{
+  const { resolveRealizedVetoConfig, evaluateRealizedVeto } = require('./signalSelector');
+  const base = { enabled: true, minTrades: 6, floorBps: -5, lookbackTrades: 20, maxAgeMs: 86400000 };
+  const perSignal = { trend_momentum: { floorBps: -600, minTrades: 20, lookbackTrades: 20 } };
+
+  // No override map / no signal → base passes through untouched.
+  assert.deepEqual(
+    resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base }),
+    { ...base, perSignalOverrideApplied: false, perSignalOverrideKey: null },
+  );
+  assert.equal(resolveRealizedVetoConfig({ signalVersion: null, base, perSignal }).floorBps, -5);
+
+  // The overridden signal gets the loosened calibration.
+  const tm = resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal });
+  assert.equal(tm.floorBps, -600);
+  assert.equal(tm.minTrades, 20);
+  assert.equal(tm.lookbackTrades, 20);
+  assert.equal(tm.perSignalOverrideApplied, true);
+  assert.equal(tm.perSignalOverrideKey, 'trend_momentum');
+  // Fields NOT in the override are inherited from base, not dropped.
+  assert.equal(tm.maxAgeMs, 86400000);
+  assert.equal(tm.enabled, true);
+
+  // Case-insensitive on the signal name.
+  assert.equal(resolveRealizedVetoConfig({ signalVersion: 'TREND_MOMENTUM', base, perSignal }).floorBps, -600);
+
+  // EVERY OTHER SIGNAL IS UNCHANGED — this is the safety-critical assertion.
+  for (const sig of ['btc_lead_lag', 'mean_reversion', 'mean_reversion_5m', 'microstructure_15m', 'ols', 'barrier']) {
+    const r = resolveRealizedVetoConfig({ signalVersion: sig, base, perSignal });
+    assert.equal(r.floorBps, -5, `${sig} must keep the global scalping floor`);
+    assert.equal(r.minTrades, 6, `${sig} must keep the global minTrades`);
+    assert.equal(r.perSignalOverrideApplied, false);
+  }
+
+  // Malformed overrides are ignored rather than corrupting the config.
+  assert.equal(resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal: { trend_momentum: null } }).floorBps, -5);
+  assert.equal(resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal: { trend_momentum: { floorBps: 'abc' } } }).floorBps, -5);
+  // A partial override applies only the finite field.
+  const partial = resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal: { trend_momentum: { floorBps: -600, minTrades: NaN } } });
+  assert.equal(partial.floorBps, -600);
+  assert.equal(partial.minTrades, 6);
+
+  // End-to-end through evaluateRealizedVeto: a -60 bps average is a HALT under
+  // the scalping floor and PASSES under the trend-follower floor. This is the
+  // whole point of the change — a normal whipsaw string must not halt a
+  // 28.5%-win-rate trend-follower — and the diagnostic must say so.
+  const records = Array.from({ length: 20 }, (_, i) => ({
+    symbol: 'BTC/USD', signalVersion: 'trend_momentum', realizedNetBps: -60,
+    ts: new Date(Date.now() - i * 60000).toISOString(),
+  }));
+  const strict = evaluateRealizedVeto({ records, signalVersion: 'trend_momentum', config: resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base }) });
+  assert.equal(strict.veto, true, '-60 bps halts under the -5 scalping floor');
+  assert.equal(strict.perSignalOverrideApplied, false);
+
+  const loose = evaluateRealizedVeto({ records, signalVersion: 'trend_momentum', config: resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal }) });
+  assert.equal(loose.veto, false, '-60 bps is normal whipsaw for a trend-follower and must NOT halt');
+  assert.equal(loose.floorBps, -600);
+  assert.equal(loose.perSignalOverrideApplied, true, 'the loosened posture must be visible on the diagnostic');
+
+  // The breaker is still ARMED: a genuinely catastrophic bleed still halts.
+  const catastrophic = records.map((r) => ({ ...r, realizedNetBps: -900 }));
+  const halted = evaluateRealizedVeto({ records: catastrophic, signalVersion: 'trend_momentum', config: resolveRealizedVetoConfig({ signalVersion: 'trend_momentum', base, perSignal }) });
+  assert.equal(halted.veto, true, 'a -900 bps average must still halt — the brake is loosened, not removed');
+}
+
 console.log('signalSelector.test ok');

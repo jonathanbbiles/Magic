@@ -455,6 +455,50 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   // worst case it equals the static-24h behaviour. Disable with
   // SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE='false' in Render env.
   SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE: 'true',
+  // ---------------------------------------------------------------------
+  // Per-signal breaker calibration (2026-08-09, OWNER-AUTHORIZED, Hard Rule #5)
+  //
+  // ⚠️ THESE LOOSEN THE HALT POSTURE FOR `trend_momentum` ONLY. ⚠️
+  //
+  // The globals above (-5 bps over a 20-trade window) are a SCALPING
+  // calibration. `trend_momentum` is a 28.5%-win-rate daily trend-follower
+  // (winners avg +3,206 bps, losers avg -639 bps) whose long strings of small
+  // losses are its SIGNATURE. Replaying its 1,377-trade 6.88-year walk-forward
+  // (scripts/validate_trend_momentum_long.js) against the -5 floor, the breaker
+  // would have been ENGAGED 61.0% OF THE TIME (58.9% at a 20-trade window,
+  // 62.8% at 6). A brake engaged 61% of the time is an off switch.
+  //
+  // -600 bps is PRE-REGISTERED from that backtest's own risk tail, by a stated
+  // rule fixed BEFORE looking at any live data: the SHALLOWEST floor that keeps
+  // the brake engaged <15% of the time on the ungated 1,377-trade stream, while
+  // still firing well before the worst 20-trade window ever observed
+  // (-1,181 bps). Measured halt rate by floor (20-trade window, replayed
+  // through the real evaluateRealizedVeto — scripts/validate_shipped_regime_and_breaker.js):
+  //     floor    ungated   gated(shipped)
+  //       -5      58.9%      36.4%
+  //     -200      46.9%      25.9%
+  //     -400      31.4%      12.1%   <- GROWTH_PLAN's first estimate; too tight
+  //     -600      14.7%       3.5%   <- SHIPPED
+  //     -800       3.8%       0.0%   <- never fires in 6.9y = effectively dead
+  // -600 is alive (it demonstrably fires) without being an off switch.
+  // Never nudge it because it just fired: tuning the floor in response to a halt
+  // is the banned re-pin anti-pattern (#455/#456) wearing a different hat.
+  //
+  // WHAT THIS MEANS: the breaker no longer halts trend_momentum on ordinary
+  // bleed, only on a catastrophic one (a 20-trade average 1,058 bps below the
+  // strategy's +458 bps mean). Correct on the ZERO-RISK PAPER VENUE,
+  // where a false halt costs the whole experiment. **If EXECUTION_VENUE is ever
+  // flipped paper -> binance_us (real money), re-confirming this floor must be a
+  // conscious, explicit decision.** For real capital the account-level
+  // drawdown halt (modules/drawdownHalt.js) is the correct catastrophe brake —
+  // not this per-trade expectancy floor.
+  //
+  // Every OTHER signal is unchanged and still governed by the -5 global.
+  // Restore the old posture here too with
+  // SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM='-5' in Render env.
+  SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM: '-600',
+  SIGNAL_SELECTOR_REALIZED_MIN_TRADES_TREND_MOMENTUM: '20',
+  SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES_TREND_MOMENTUM: '20',
   // Exploration budget (2026-05-29). The middle ground between the backtest
   // veto's two failure modes: veto-all (the bot never buys — the 2026-05-28/29
   // dashboard sat at zero trades for 15h because both signals backtested
@@ -520,6 +564,32 @@ const LIVE_CRITICAL_DEFAULTS = Object.freeze({
   VOL_GATE_MIN_PERCENTILE: '0.20',
   VOL_GATE_MIN_OBSERVATIONS: '60',
   VOL_GATE_LOOKBACK_BARS: '30',
+  // BTC chop/trend regime gate (2026-08-09). Sits out non-trending markets.
+  // The daily trend-follower whipsaws in chop: 53% of its 1,377 backtested
+  // trades fired there and lost -169 bps/trade, vs +1,136 (mixed) / +1,397
+  // (trending). The CAUSAL gate — trailing Kaufman efficiency ratio of BTC
+  // daily closes, read only from bars at/before the decision bar — validated at
+  // btc_er(30) >= 0.30 (scripts/validate_trend_momentum_regime_gate.js):
+  //   trades 1,377 -> 640   net +458 -> +872 bps/trade
+  //   win 28.5% -> 40.8%    PF 2.00 -> 3.32
+  //   max DD -19.2% -> -7.8%   Calmar 0.75 -> 1.42
+  // HONEST: this does NOT raise return at the live 2% sizing — it halves
+  // throughput, so CAGR falls 14.4% -> 11.1%. It buys return PER UNIT OF RISK.
+  // Converting that into return requires higher sizing, which is a SEPARATE,
+  // LATER decision gated on a real live sample (docs/GROWTH_PLAN.md). Sizing is
+  // deliberately UNCHANGED by this change — PORTFOLIO_SIZING_PCT is untouched
+  // (code default '0.07' below; the running paper deploy overrides it to ~2% in
+  // Render env, which is the config GROWTH_PLAN's tables are computed at).
+  // Also honest: 0.30 was selected on the full 6.9y sample (in-sample), and the
+  // gate improves but does not flip the currently-losing regime (2025-26:
+  // -283 -> -164 bps/trade).
+  // Pure filter — only removes entries; reject reason `chop_regime_btc_er_low`,
+  // surfaced at meta.btcRegimeGate. An unknown regime never suppresses.
+  // Disable with BTC_REGIME_GATE_ENABLED=false; loosen with a lower
+  // BTC_REGIME_GATE_MIN_ER (0.25 keeps more throughput, less selectivity).
+  BTC_REGIME_GATE_ENABLED: 'true',
+  BTC_REGIME_GATE_ER_WINDOW: '30',
+  BTC_REGIME_GATE_MIN_ER: '0.30',
   // Adverse-selection-aware passive fill model (2026-05-27). The backtest used
   // to treat mid (`candidateClose`) as both the rest price and the fill
   // threshold, then add halfSpread to the entry price — over-filling AND

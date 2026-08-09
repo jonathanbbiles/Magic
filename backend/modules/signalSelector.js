@@ -389,6 +389,73 @@ function computeMedianInterTradeMs(trades) {
   return deltas.length % 2 ? deltas[mid] : (deltas[mid - 1] + deltas[mid]) / 2;
 }
 
+// ---------------------------------------------------------------------------
+// Per-signal breaker calibration (2026-08-09, owner-authorized — Hard Rule #5).
+//
+// THE PROBLEM. The breaker's floor/window are a SCALPING calibration: -5 bps
+// over a 20-trade window assumes a high-win-rate signal whose per-trade outcomes
+// cluster within a few bps of zero. `trend_momentum` is the opposite animal — a
+// 28.5%-win-rate daily trend-follower whose winners average +3,206 bps and whose
+// losers average -639 bps. Long strings of small losses punctuated by rare large
+// wins are its SIGNATURE, not a malfunction.
+//
+// Replaying the shipped strategy's 1,377-trade sequence (6.88y walk-forward,
+// scripts/validate_trend_momentum_long.js) against the live -5 floor:
+//
+//   window= 6 trades -> breaker engaged 62.8% of the time (worst window -1,846 bps)
+//   window=10 trades -> breaker engaged 61.0% of the time (worst window -1,648 bps)
+//   window=20 trades -> breaker engaged 58.9% of the time (worst window -1,181 bps)
+//
+// A brake engaged 61% of the time is not a brake, it is an off switch. The
+// strategy's own risk tail (33 consecutive losers; worst rolling-20 average
+// -1,181 bps) says the floor is off by roughly two orders of magnitude FOR THIS
+// SIGNAL.
+//
+// THE FIX. A per-signal override map. The global default is UNCHANGED (-5 bps
+// live) and still governs every other signal; only signals with an explicit
+// entry get a different calibration. Resolution is `perSignal[signal] ?? base`
+// per field, so an override may set only the floor and inherit the rest.
+//
+// ⚠️ THIS LOOSENS THE HALT POSTURE FOR THE OVERRIDDEN SIGNAL. ⚠️
+// At the shipped -600 bps floor the breaker no longer halts on ordinary bleed —
+// it halts only on a genuinely catastrophic one. Replayed over the strategy's
+// own 1,377-trade walk-forward, the -5 global would have been engaged 58.9% of
+// the time; -600 is engaged 14.7% ungated and 3.5% with the shipped chop gate. That is the correct calibration for a
+// trend-follower running on the ZERO-RISK PAPER VENUE, where the cost of a false
+// halt (never learning whether the strategy works) exceeds the cost of a real
+// one. **If the venue is ever flipped paper -> live money, re-confirming this
+// floor must be a conscious, explicit decision.** The account-level drawdown
+// halt (modules/drawdownHalt.js) — not this per-trade expectancy floor — is the
+// right catastrophe brake for real capital.
+//
+// The pre-2026-08-09 behaviour is always one env var away: set
+// SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM='-5' (or empty the override
+// map) to restore the scalping floor for this signal too.
+//
+// NOT the banned re-pin anti-pattern (#455/#456): this does not swap the active
+// signal, and the floor is PRE-REGISTERED from the backtest's risk tail rather
+// than moved in response to the breaker firing. Set it once, from evidence,
+// before trading — never nudge it because it just halted you.
+//
+// Pure: takes the base config + the override map and returns the merged config.
+function resolveRealizedVetoConfig({ signalVersion = null, base = {}, perSignal = null } = {}) {
+  const merged = { ...base };
+  if (!signalVersion || !perSignal || typeof perSignal !== 'object') {
+    return { ...merged, perSignalOverrideApplied: false, perSignalOverrideKey: null };
+  }
+  const key = String(signalVersion).toLowerCase();
+  const override = perSignal[key];
+  if (!override || typeof override !== 'object') {
+    return { ...merged, perSignalOverrideApplied: false, perSignalOverrideKey: null };
+  }
+  let applied = false;
+  for (const field of ['floorBps', 'minTrades', 'lookbackTrades', 'maxAgeMs']) {
+    const v = Number(override[field]);
+    if (Number.isFinite(v)) { merged[field] = v; applied = true; }
+  }
+  return { ...merged, perSignalOverrideApplied: applied, perSignalOverrideKey: applied ? key : null };
+}
+
 function evaluateRealizedVeto({ records = [], signalVersion = null, config = {}, excludeSymbols = null, nowMs = Date.now() } = {}) {
   const cfg = { ...REALIZED_VETO_DEFAULTS, ...(config || {}) };
   const base = {
@@ -417,6 +484,11 @@ function evaluateRealizedVeto({ records = [], signalVersion = null, config = {},
     clearsAtMs: null,
     clearsInMs: null,
     agedTradesPending: 0,
+    // 2026-08-09: true when a per-signal calibration replaced the global
+    // floor/window for this signal (see resolveRealizedVetoConfig). Surfaced so
+    // the dashboard makes a LOOSENED halt posture visible rather than implicit.
+    perSignalOverrideApplied: cfg.perSignalOverrideApplied === true,
+    perSignalOverrideKey: cfg.perSignalOverrideKey || null,
   };
   if (cfg.enabled === false) return { ...base, reason: 'disabled' };
   if (!signalVersion) return { ...base, reason: 'no_active_signal' };
@@ -641,6 +713,7 @@ function bootstrapDecisionFromEnv({ operatorOverride = null, vetoEnabled = true 
 module.exports = {
   pickActiveSignal,
   evaluateRealizedVeto,
+  resolveRealizedVetoConfig,
   estimateRealizedVetoClear,
   computeMedianInterTradeMs,
   setLatestDecision,

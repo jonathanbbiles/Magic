@@ -220,6 +220,7 @@ const {
   getSpreadSuppressionState,
   getMakerFillState,
   getRealizedVolGateState,
+  getBtcRegimeGateState,
   getMicroFlowShadowTrackerSnapshot,
   getMarketRegimeSnapshot,
   getConvictionState,
@@ -2069,6 +2070,21 @@ app.get('/dashboard', async (req, res) => {
         volGate: (() => {
           try {
             return typeof getRealizedVolGateState === 'function' ? getRealizedVolGateState() : null;
+          } catch (_) {
+            return null;
+          }
+        })(),
+        // BTC chop/trend regime gate (2026-08-09). Market-wide regime read via
+        // the trailing Kaufman efficiency ratio of BTC daily closes. currentRegime
+        // is 'trending' | 'chop' | 'unknown'; while 'chop' the gate suppresses
+        // entries (reject reason chop_regime_btc_er_low) because the daily
+        // trend-follower whipsaws there. Pure filter — only REMOVES entries,
+        // never relaxes another gate and never changes sizing. 'unknown' (bars
+        // unavailable) never suppresses. enabled:false when
+        // BTC_REGIME_GATE_ENABLED=false.
+        btcRegimeGate: (() => {
+          try {
+            return typeof getBtcRegimeGateState === 'function' ? getBtcRegimeGateState() : null;
           } catch (_) {
             return null;
           }

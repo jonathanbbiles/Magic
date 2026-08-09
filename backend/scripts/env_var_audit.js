@@ -68,6 +68,15 @@ const NON_ENV_ALLOWLIST = new Set([
   // mcp/magic-diagnostics/server.js (not backend/) and is overridable by the
   // MAGIC_BACKEND_URL env var — it is not itself an env var.
   'DEFAULT_BACKEND_URL',
+  // Repo DOC FILENAMES that happen to be SCREAMING_SNAKE (2026-08-09). These are
+  // markdown files under docs/, referenced by name in README/CLAUDE prose — not
+  // env vars, and there is nothing in backend/ that could ever "read" them. The
+  // alternative (contorting prose to avoid writing the real filename) makes the
+  // docs worse without making Hard Rule #4 any stronger.
+  'GROWTH_PLAN',
+  'PROFITABILITY_ANALYSIS',
+  'BTC_LEAD_LAG_ROLLOUT',
+  'VOL_SELECTOR_PLAN',
   // External services / deploy infrastructure (env exists, but not in this
   // backend's process.env — they're consumed by Render / Expo, not our JS)
   'RENDER_URL',

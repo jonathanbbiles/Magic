@@ -703,6 +703,46 @@ const validateEnv = () => {
     }
   }
 
+  // BTC chop/trend regime gate (2026-08-09). Default-ON, so a bad threshold is a
+  // real footgun in the same way VOL_GATE_MIN_PERCENTILE is: an efficiency-ratio
+  // floor above 1.0 is unreachable (ER is bounded in [0,1]), so EVERY scan would
+  // read as chop and suppress every entry — zero trades, silently. Fail fast.
+  if (process.env.BTC_REGIME_GATE_MIN_ER != null && String(process.env.BTC_REGIME_GATE_MIN_ER).trim() !== '') {
+    const er = Number(process.env.BTC_REGIME_GATE_MIN_ER);
+    if (!Number.isFinite(er) || er < 0 || er > 1) {
+      validationErrors.push(`BTC_REGIME_GATE_MIN_ER must be a number in [0,1] (Kaufman efficiency ratio). Received: "${process.env.BTC_REGIME_GATE_MIN_ER}".`);
+    }
+  }
+  if (process.env.BTC_REGIME_GATE_ER_WINDOW != null && String(process.env.BTC_REGIME_GATE_ER_WINDOW).trim() !== '') {
+    const w = Number(process.env.BTC_REGIME_GATE_ER_WINDOW);
+    if (!Number.isFinite(w) || w < 2) {
+      validationErrors.push(`BTC_REGIME_GATE_ER_WINDOW must be a number >= 2 (trailing daily closes). Received: "${process.env.BTC_REGIME_GATE_ER_WINDOW}".`);
+    }
+  }
+
+  // Per-signal realized-expectancy breaker overrides (2026-08-09). These LOOSEN
+  // the halt posture, so the guard is about making a mistake loud rather than
+  // silent: a POSITIVE floor would halt the signal permanently (realized avg can
+  // essentially never exceed it), and a non-numeric value would silently fall
+  // back to the global -5 and quietly re-strangle the trend-follower.
+  if (process.env.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM != null
+      && String(process.env.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM).trim() !== '') {
+    const f = Number(process.env.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM);
+    if (!Number.isFinite(f)) {
+      validationErrors.push(`SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM must be a number (bps). Received: "${process.env.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM}".`);
+    } else if (f > 0) {
+      validationErrors.push(`SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM must be <= 0 (a realized-expectancy FLOOR in bps). A positive floor halts the signal permanently. Received: "${f}".`);
+    }
+  }
+  for (const name of ['SIGNAL_SELECTOR_REALIZED_MIN_TRADES_TREND_MOMENTUM', 'SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES_TREND_MOMENTUM']) {
+    if (process.env[name] != null && String(process.env[name]).trim() !== '') {
+      const v = Number(process.env[name]);
+      if (!Number.isFinite(v) || v < 1) {
+        validationErrors.push(`${name} must be a positive number. Received: "${process.env[name]}".`);
+      }
+    }
+  }
+
   console.log('config_summary', {
     version:
       process.env.VERSION ||

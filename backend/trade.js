@@ -60,6 +60,7 @@ const staleQuoteRetryStatsModule = require('./modules/staleQuoteRetryStats');
 const { createSpreadSuppressionTracker } = require('./modules/spreadSuppression');
 const makerFillTracker = require('./modules/makerFillTracker');
 const realizedVolGateModule = require('./modules/realizedVolGate');
+const btcRegimeGateModule = require('./modules/btcRegimeGate');
 const { createRetryTracker: createStaleQuoteRetryTracker } = staleQuoteRetryStatsModule;
 const { evaluateRecentHighGate } = require('./modules/recentHighGate');
 const tradeForensics = require('./modules/tradeForensics');
@@ -1249,6 +1250,48 @@ const SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES = Math.max(
 // to restore the pure static-24h clock.
 const SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE = readBoolean('SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE', true);
 
+// ---------------------------------------------------------------------------
+// Per-signal breaker calibration (2026-08-09, OWNER-AUTHORIZED — Hard Rule #5).
+//
+// ⚠️ THIS LOOSENS THE HALT POSTURE FOR `trend_momentum`. READ BEFORE CHANGING. ⚠️
+//
+// The globals above (-5 bps floor / 20-trade window live) are a SCALPING
+// calibration. `trend_momentum` is a 28.5%-win-rate daily trend-follower whose
+// winners average +3,206 bps and losers -639 bps; long strings of small losses
+// are its signature, not a malfunction. Replaying its 1,377-trade 6.88-year
+// walk-forward against the -5 floor, the breaker would have been engaged
+// **61.0%** of the time (20-trade window: 58.9%; 6-trade: 62.8%). A brake
+// engaged 61% of the time is an off switch, not a brake.
+//
+// The floor below is PRE-REGISTERED from that backtest's own risk tail by a
+// rule fixed before looking at live data: the SHALLOWEST floor keeping the brake
+// engaged <15% of the time on the ungated trade stream while still firing well
+// before the worst observed 20-trade window (-1,181 bps). Measured: -400 -> 31.4%
+// (too tight), -600 -> 14.7% ungated / 3.5% on the shipped gated stream,
+// -800 -> 3.8%/0.0% (never fires in 6.9y = a dead brake). Not tuned in response
+// to a live halt — that is the banned re-pin anti-pattern in a different
+// costume. Set once, from evidence, then left alone.
+//
+// WHAT THIS MEANS OPERATIONALLY: at -600 bps the breaker no longer halts on
+// ordinary bleed, only on a genuinely catastrophic one (a 20-trade average
+// 1,058 bps below the strategy's +458 bps mean). That trade-off is
+// correct on the ZERO-RISK PAPER VENUE, where a false halt costs us the entire
+// experiment. **If EXECUTION_VENUE is ever flipped paper -> binance_us (real
+// money), re-confirming this floor must be a conscious, explicit decision.**
+// For real capital the account-level drawdown halt (modules/drawdownHalt.js) is
+// the correct catastrophe brake — not this per-trade expectancy floor.
+//
+// Every other signal is UNCHANGED and still governed by the -5 global.
+// Restore the old behaviour for trend_momentum too with
+// SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM=-5 in Render env.
+const SIGNAL_SELECTOR_REALIZED_PER_SIGNAL = Object.freeze({
+  trend_momentum: Object.freeze({
+    floorBps: readNumber('SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM', -600),
+    minTrades: Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_MIN_TRADES_TREND_MOMENTUM', 20)),
+    lookbackTrades: Math.max(1, readNumber('SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES_TREND_MOMENTUM', 20)),
+  }),
+});
+
 // Exploration budget (2026-05-29). The middle ground between the backtest
 // veto's two failure modes (veto-all → never trades; veto-off → bleeds). When
 // the BACKTEST veto would halt all entries, allow a strictly-capped trickle of
@@ -1611,6 +1654,34 @@ const VOL_GATE_MIN_PERCENTILE = Math.min(1, Math.max(0, readNumber('VOL_GATE_MIN
 const VOL_GATE_MIN_OBSERVATIONS = Math.max(1, readNumber('VOL_GATE_MIN_OBSERVATIONS', realizedVolGateModule.DEFAULT_MIN_OBSERVATIONS));
 const VOL_GATE_LOOKBACK_BARS = Math.max(2, readNumber('VOL_GATE_LOOKBACK_BARS', realizedVolGateModule.DEFAULT_LOOKBACK_BARS));
 const realizedVolGate = realizedVolGateModule.createRealizedVolGate();
+
+// BTC chop/trend regime gate (2026-08-09). Sits out non-trending markets, where
+// the daily trend-follower whipsaws: 53% of its 1,377 backtested trades fired in
+// chop and lost -169 bps/trade there, vs +1,136/+1,397 in mixed/trending. The
+// causal gate (trailing Kaufman efficiency ratio of BTC, no lookahead) validated
+// at btc_er(30)>=0.30: +458 -> +872 bps/trade, PF 2.00 -> 3.32, max DD -19.2% ->
+// -7.8% (scripts/validate_trend_momentum_regime_gate.js).
+//
+// HONEST: this does NOT raise return at the live 2% sizing — it halves
+// throughput, so CAGR falls 14.4% -> 11.1%. It raises return PER UNIT OF RISK
+// (Calmar 0.75 -> 1.42). Spending that on higher sizing is a SEPARATE, LATER
+// decision gated on a real live sample (docs/GROWTH_PLAN.md). Sizing unchanged.
+//
+// PURE FILTER: only removes entries; never relaxes the spread cap, quote
+// freshness, the realized breaker, or conviction, and never touches sizing. An
+// unknown regime (bars unavailable/too short) NEVER suppresses.
+// Surfaced at meta.btcRegimeGate; reject reason `chop_regime_btc_er_low`.
+// Disable with BTC_REGIME_GATE_ENABLED=false.
+const BTC_REGIME_GATE_ENABLED = readBoolean('BTC_REGIME_GATE_ENABLED', true);
+const BTC_REGIME_GATE_ER_WINDOW = Math.max(2, Math.floor(
+  readNumber('BTC_REGIME_GATE_ER_WINDOW', btcRegimeGateModule.DEFAULT_ER_WINDOW)));
+const BTC_REGIME_GATE_MIN_ER = Math.min(1, Math.max(0,
+  readNumber('BTC_REGIME_GATE_MIN_ER', btcRegimeGateModule.DEFAULT_MIN_ER)));
+const btcRegimeGate = btcRegimeGateModule.createBtcRegimeGate();
+function getBtcRegimeGateState() {
+  if (!BTC_REGIME_GATE_ENABLED) return { enabled: false };
+  return { enabled: true, ...btcRegimeGate.summary() };
+}
 
 const BARS_FETCH_RETRIES = Math.max(0, readNumber('BARS_FETCH_RETRIES', 2));
 const BARS_CACHE_TTL_MS = Math.max(5000, readNumber('BARS_CACHE_TTL_MS', 45000));
@@ -3586,11 +3657,13 @@ async function scanAndEnter() {
     : ACTIVE_SIGNAL_VERSION === 'mean_reversion_15m' ? MR_BLOCKLISTS.mr15m
     : ACTIVE_SIGNAL_VERSION === 'btc_lead_lag' ? BLL_BLOCKLIST
     : null;
-  const realizedVeto = signalSelector.evaluateRealizedVeto({
-    records: closedTradeStats.getRecent(SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES * 20),
+  // 2026-08-09: resolve the per-signal breaker calibration BEFORE evaluating.
+  // Global floor/window apply unless the active signal has an explicit override
+  // (currently only trend_momentum — see SIGNAL_SELECTOR_REALIZED_PER_SIGNAL for
+  // the full rationale and the ⚠️ loosened-halt-posture warning).
+  const realizedVetoConfig = signalSelector.resolveRealizedVetoConfig({
     signalVersion: ACTIVE_SIGNAL_VERSION,
-    excludeSymbols: realizedVetoExcludeSymbols,
-    config: {
+    base: {
       enabled: SIGNAL_SELECTOR_REALIZED_VETO_ENABLED,
       minTrades: SIGNAL_SELECTOR_REALIZED_MIN_TRADES,
       floorBps: SIGNAL_SELECTOR_REALIZED_FLOOR_BPS,
@@ -3598,6 +3671,16 @@ async function scanAndEnter() {
       maxAgeMs: SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS,
       cadenceAdaptiveMaxAge: SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE,
     },
+    perSignal: SIGNAL_SELECTOR_REALIZED_PER_SIGNAL,
+  });
+  const realizedVeto = signalSelector.evaluateRealizedVeto({
+    records: closedTradeStats.getRecent(Math.max(
+      SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES,
+      realizedVetoConfig.lookbackTrades,
+    ) * 20),
+    signalVersion: ACTIVE_SIGNAL_VERSION,
+    excludeSymbols: realizedVetoExcludeSymbols,
+    config: realizedVetoConfig,
   });
   lastRealizedVetoState = { ...realizedVeto, evaluatedAt: new Date().toISOString() };
   if (realizedVeto.veto) {
@@ -3606,6 +3689,7 @@ async function scanAndEnter() {
       realizedAvgNetBps: realizedVeto.realizedAvgNetBps,
       sampleSize: realizedVeto.sampleSize,
       floorBps: realizedVeto.floorBps,
+      perSignalOverrideApplied: realizedVeto.perSignalOverrideApplied,
     });
     bumpSkipReason('realized_expectancy_veto');
     currentScanState = 'idle';
@@ -3766,6 +3850,34 @@ async function scanAndEnter() {
     return;
   }
 
+  // BTC chop/trend regime gate (2026-08-09). Evaluated ONCE per scan — it is a
+  // market-wide regime read, not a per-symbol one, so computing it per candidate
+  // would repeat identical math 30×. The per-candidate loop below still routes
+  // each suppressed candidate through rejectTrade so the gate shows up in
+  // rejection stats and gateRejectionAudit like every other gate.
+  //
+  // NO EXTRA API CALL: getTrendMomentumBenchmarkBars() is the same TTL-cached BTC
+  // daily-bar fetch the trend_momentum signal already performs once per scan and
+  // shares across the whole candidate loop.
+  //
+  // FAIL-OPEN BY DESIGN: bars unavailable or too short → reason
+  // `insufficient_bars`, suppress:false. An unknown regime is never treated as
+  // chop, so a data outage can never silently halt the bot.
+  let btcRegimeDecision = null;
+  if (BTC_REGIME_GATE_ENABLED) {
+    try {
+      const btcDailyBars = await getTrendMomentumBenchmarkBars();
+      btcRegimeDecision = btcRegimeGateModule.evaluateBtcRegime({
+        bars: btcDailyBars,
+        erWindow: BTC_REGIME_GATE_ER_WINDOW,
+        minEfficiencyRatio: BTC_REGIME_GATE_MIN_ER,
+      });
+      btcRegimeGate.record(btcRegimeDecision);
+    } catch (_) {
+      btcRegimeDecision = null; // fail open — never block entries on a gate error
+    }
+  }
+
   // Batched quote warm-up (one multi-symbol call per chunk instead of N serial
   // single-symbol calls). The loop reads this Map first.
   const prefetchedQuotes = runtimeConfig.entryPrefetchQuotes
@@ -3897,6 +4009,23 @@ async function scanAndEnter() {
           });
           continue;
         }
+      }
+
+      // STEP 1a-2 (BTC chop/trend regime gate). SUPPRESS the entry while the
+      // market-wide regime is chop — where this daily trend-follower whipsaws
+      // (-169 bps/trade on 53% of backtested trades, vs +1,136/+1,397 in
+      // mixed/trending). Decision computed once per scan above; applied here so
+      // each suppressed candidate lands in rejection stats + gateRejectionAudit.
+      // PURE FILTER: only removes entries; never relaxes spread/freshness/
+      // breaker/conviction and never changes sizing. Surfaced at
+      // meta.btcRegimeGate.
+      if (BTC_REGIME_GATE_ENABLED && btcRegimeDecision && btcRegimeDecision.suppress) {
+        rejectTrade(pair, 'chop_regime_btc_er_low', {
+          efficiencyRatio: btcRegimeDecision.efficiencyRatio,
+          minEfficiencyRatio: BTC_REGIME_GATE_MIN_ER,
+          erWindow: BTC_REGIME_GATE_ER_WINDOW,
+        });
+        continue;
       }
 
       // STEP 1b (selectivity + conviction sizing). Blend the signal's own
@@ -5071,6 +5200,7 @@ module.exports = {
   getSpreadSuppressionState,
   getMakerFillState,
   getRealizedVolGateState,
+  getBtcRegimeGateState,
   getBinanceExecutionStatus,
   getMicroFlowShadowTrackerSnapshot,
   getStaleQuoteRetryTrackerSnapshot,
