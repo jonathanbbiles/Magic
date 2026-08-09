@@ -22,6 +22,17 @@ the market trades through it (modeling adverse selection). State persists to
 `EXECUTION_VENUE=paper` in Render env — no other credentials needed. `validateEnv`
 exempts paper from the live-only host guards because no real order is ever placed.
 
+**Dust filter (2026-08-09).** `paperBroker.fetchPositions` drops un-sellable dust,
+porting the identical rule from `binanceExecution.fetchPositions` (see the
+2026-05-27 section below): a holding whose quantized qty rounds below `LOT_SIZE`,
+or whose notional is below `MIN_NOTIONAL`, is not a manageable position. Observed
+live: 0.0999 ADA (~$0.02) left over from a filled exit made the reconciler retry
+a sell every ~16s for 5.8 days (`paper_submit_quantity_too_small_after_quantization`
+→ `exit_sell_failed` + `exit_max_hold_failed`) while holding one of three
+concurrency slots. Same semantics as binance: the `LOT_SIZE` pass needs no price,
+the `MIN_NOTIONAL` pass only drops when a price resolves (missing price = unknown,
+not dust), and dust still counts toward equity in `fetchAccount`.
+
 ### 2. `trend_momentum` — daily time-series trend-following
 
 Module: `backend/modules/trendMomentumSignal.js`. Default signal
