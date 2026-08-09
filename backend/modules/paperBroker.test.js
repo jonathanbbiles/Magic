@@ -1,5 +1,23 @@
 const assert = require('assert');
 const paperBroker = require('./paperBroker');
+const binanceSymbols = require('./binanceSymbols');
+
+// Exchange-info fixture (same shape as binanceSymbols.test.js's `info`) so the
+// dust test can exercise real LOT_SIZE / MIN_NOTIONAL filters hermetically.
+function symbolInfo(symbol, { status = 'TRADING', stepSize = '0.001', tickSize = '0.01', minN = '10', quote = 'USD' } = {}) {
+  return {
+    symbol,
+    status,
+    baseAsset: symbol.replace(/(USD|USDT)$/, ''),
+    quoteAsset: quote,
+    permissions: ['SPOT'],
+    filters: [
+      { filterType: 'LOT_SIZE', stepSize, minQty: stepSize, maxQty: '9000000' },
+      { filterType: 'PRICE_FILTER', tickSize, minPrice: tickSize, maxPrice: '1000000' },
+      { filterType: 'NOTIONAL', minNotional: minN },
+    ],
+  };
+}
 
 const {
   decideFill, settleWithQuotes, _setQuoteFetcher, _resetForTest,
@@ -115,6 +133,57 @@ async function testConcurrentReads() {
   }
 }
 
+// ---- 8. Un-sellable dust is filtered out of fetchPositions ----
+// Regression guard for the live 2026-08-09 failure: 0.0999 ADA (~$0.02) left
+// over from a filled exit could not have a sell placed against it, so the exit
+// reconciler retried submitOrder every ~16s for 5.8 days
+// (paper_submit_quantity_too_small_after_quantization) while the phantom
+// position held a concurrency slot. Mirrors binanceExecution.fetchPositions:
+// sub-LOT_SIZE and sub-MIN_NOTIONAL holdings are dropped from the position
+// list but STILL count toward equity.
+async function testDustFiltered() {
+  binanceSymbols._testReset();
+  binanceSymbols._testInjectExchangeInfo({
+    exchangeInfo: {
+      symbols: [
+        symbolInfo('BTCUSD', { stepSize: '0.00001', tickSize: '0.01', minN: '10' }),
+        symbolInfo('ADAUSD', { stepSize: '0.1', tickSize: '0.0001', minN: '10' }),
+        symbolInfo('ETHUSD', { stepSize: '0.0001', tickSize: '0.01', minN: '10' }),
+      ],
+    },
+    universe: ['BTC/USD', 'ADA/USD', 'ETH/USD'],
+  });
+  try {
+    _resetForTest({
+      cash: 5000,
+      positions: {
+        'BTC/USD': { qty: 2, avgEntryPrice: 100 },          // real position
+        'ADA/USD': { qty: 0.0999, avgEntryPrice: 0.19427 }, // sub-LOT_SIZE dust (step 0.1)
+        'ETH/USD': { qty: 0.001, avgEntryPrice: 1900 },     // $1.90 < $10 MIN_NOTIONAL dust
+      },
+    });
+    quotesRef.value = {
+      'BTC/USD': { bp: 100, ap: 100.1 },
+      'ADA/USD': { bp: 0.197, ap: 0.1975 },
+      'ETH/USD': { bp: 1900, ap: 1900.5 },
+    };
+    const positions = await fetchPositions();
+    const syms = positions.map((p) => p.symbol);
+    assert.deepEqual(syms, ['BTC/USD'], `expected only BTC/USD, got ${JSON.stringify(syms)}`);
+    // Dust is not a position, but it is still real value: equity must include it.
+    const acct = await fetchAccount();
+    const equity = Number(acct.equity);
+    assert.ok(equity > 5200, `dust must still count toward equity, got ${equity}`);
+    // A held position whose price cannot be resolved is "unknown", not dust.
+    _resetForTest({ cash: 5000, positions: { 'BTC/USD': { qty: 2, avgEntryPrice: 100 } } });
+    quotesRef.value = {};
+    const stillHeld = await fetchPositions();
+    assert.equal(stillHeld.length, 1, 'position with no live quote must be kept');
+  } finally {
+    binanceSymbols._testReset();
+  }
+}
+
 (async () => {
   testDecideFill();
   await testTakerBuy();
@@ -123,5 +192,6 @@ async function testConcurrentReads() {
   await testEquity();
   await testCancel();
   await testConcurrentReads();
+  await testDustFiltered();
   console.log('paperBroker.test.js: all assertions passed');
 })().catch((err) => { console.error(err); process.exit(1); });

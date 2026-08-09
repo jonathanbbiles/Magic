@@ -466,6 +466,20 @@ async function fetchAccount(_opts = {}) {
   };
 }
 
+// Un-sellable DUST is filtered out — the same rule (and for the same reason) as
+// binanceExecution.fetchPositions. A holding the broker can't place a sell
+// against — quantized qty below the pair's LOT_SIZE/stepSize, or notional below
+// its MIN_NOTIONAL — is not a manageable position: surfacing it makes the exit
+// reconciler attach a GTC sell that submitOrder rejects with
+// `paper_submit_quantity_too_small_after_quantization` /
+// `paper_submit_min_notional_too_small` on every scan, forever, while falsely
+// consuming a concurrency slot. Observed live 2026-08-09: 0.0999 ADA (~$0.02)
+// left over from a filled exit spammed exit_sell_failed + exit_max_hold_failed
+// every ~16s for 5.8 days and held one of three slots.
+//
+// Mirrors binance exactly: the LOT_SIZE pass needs no price, the MIN_NOTIONAL
+// pass only drops when a price actually resolves (missing price = "unknown",
+// not "dust"), and dust still counts toward equity in fetchAccount.
 async function fetchPositions(_opts = {}) {
   const st = ensureState();
   let quotes = {};
@@ -474,7 +488,13 @@ async function fetchPositions(_opts = {}) {
   for (const [sym, pos] of Object.entries(st.positions)) {
     const qty = Number(pos.qty);
     if (!Number.isFinite(qty) || qty <= 0) continue;
+    // LOT_SIZE dust: the sellable (quantized) quantity rounds to zero, so no
+    // sell can ever be placed. Needs no price.
+    const sellableQty = quantizeQty(sym, qty);
+    if (!Number.isFinite(sellableQty) || sellableQty <= 0) continue;
     const px = priceFor(sym, quotes) || Number(pos.avgEntryPrice) || 0;
+    // MIN_NOTIONAL dust: worth less than the pair's minimum order value.
+    if (px > 0 && !meetsMinNotional(sym, sellableQty, px)) continue;
     out.push({
       symbol: sym, asset_id: sym, exchange: 'paper', asset_class: 'crypto',
       qty: String(qty), qty_available: String(qty),
