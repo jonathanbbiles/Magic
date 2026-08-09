@@ -1,5 +1,140 @@
 # Magic — Crypto Trading Bot (Alpaca + Binance.US + Paper)
 
+## 2026-08-09: chop/regime entry gate + per-signal breaker calibration (PAPER)
+
+Steps 1–2 of `docs/GROWTH_PLAN.md`, owner-approved 2026-08-09. Both ship to the
+**paper venue** (`EXECUTION_VENUE=paper`) — the venue is untouched, no real money
+is involved, and **sizing is deliberately unchanged**.
+
+### 1. BTC chop/trend regime gate (`modules/btcRegimeGate.js`)
+
+**The problem.** `trend_momentum` is a daily trend-follower, and the 6.88-year
+walk-forward showed **53% of its 1,377 trades fire in choppy markets and lose
+there**: choppy quarters −169 bps/trade, vs mixed +1,136 and trending +1,397.
+
+**The gate.** A **causal** market-regime filter: the Kaufman efficiency ratio
+(ER = |net move| / total path travelled) of BTC over the trailing 30 daily
+closes, read only from bars at or before the decision bar. Entries are suppressed
+while `ER < 0.30` — i.e. while BTC is going nowhere expensively.
+
+> The regime *diagnostic* in `validate_trend_momentum_long.js` buckets trades by
+> the ER of the quarter they entered in, which includes bars **after** the entry.
+> That is a valid diagnostic and an invalid filter. This gate is the causal
+> version, validated separately in
+> `scripts/validate_trend_momentum_regime_gate.js`.
+
+**Validated** (real Binance.US daily klines, 30 symbols, execution-honest
+next-open timing, 8 bps round-trip cost; re-asserted against the shipped modules
+and shipped defaults by `scripts/validate_shipped_regime_and_breaker.js`):
+
+| | baseline | shipped gate |
+|---|--:|--:|
+| trades | 1,377 | 640 (−54% throughput) |
+| net bps/trade | +458 | **+872** (+90%) |
+| win rate | 28.5% | **40.8%** |
+| profit factor | 2.00 | **3.32** |
+| max drawdown @2% sizing | −19.2% | **−7.8%** |
+| Calmar @2% sizing | 0.75 | **1.42** |
+
+**Read this honestly: the gate does NOT raise return at current sizing.** It
+nearly halves throughput, so CAGR at 2% sizing goes *down* (14.4% → 11.1%). What
+it raises is return **per unit of risk**. Converting that back into return means
+sizing up, which is a **separate, later decision gated on a real live sample** —
+`PORTFOLIO_SIZING_PCT` is untouched by this change. Two further caveats: the 0.30
+threshold was selected on the full 6.9-year sample (in-sample), and the gate
+improves but does **not** flip the currently-losing regime (2025–26: −283 →
+−164 bps/trade).
+
+**Safe by construction.** Pure filter — it can only ever *remove* entries. It
+never relaxes the spread cap, quote-freshness check, realized-expectancy breaker,
+or conviction engine, and never touches sizing. When BTC bars are unavailable or
+too short the regime reads `unknown` and **nothing is suppressed** — a data
+outage can never silently halt the bot. Evaluated once per scan (a market-wide
+read) and applied per candidate via `rejectTrade('chop_regime_btc_er_low', …)` so
+it lands in rejection stats and `gateRejectionAudit` like every other gate. **No
+extra API call:** it reuses the TTL-cached BTC daily-bar fetch the
+`trend_momentum` signal already performs once per scan.
+
+Surfaced at **`meta.btcRegimeGate`** (`currentRegime` ∈ `trending|chop|unknown`,
+`efficiencyRatio`, `suppressionRate`, `regimeHeldMs`).
+
+| Env var | Default | Notes |
+|---|---|---|
+| `BTC_REGIME_GATE_ENABLED` | `true` | Master kill. `false` → no suppression, `meta.btcRegimeGate` reports `{enabled:false}`. |
+| `BTC_REGIME_GATE_ER_WINDOW` | `30` | Trailing daily closes for the efficiency ratio. |
+| `BTC_REGIME_GATE_MIN_ER` | `0.30` | Suppress below this. Lower (0.25) = more throughput, less selectivity. `0` = never suppresses. Validated at boot to be within [0,1] — a value > 1 would suppress every entry forever. |
+
+### 2. Per-signal realized-expectancy breaker calibration
+
+⚠️ **THIS LOOSENS THE HALT POSTURE FOR `trend_momentum`.** ⚠️ Owner-authorized
+2026-08-09, satisfying Hard Rule #5's explicit-instruction requirement.
+
+**The problem.** The breaker's floor (−5 bps over a 20-trade window) is a
+**scalping** calibration. `trend_momentum` is a 28.5%-win-rate daily
+trend-follower whose winners average +3,206 bps and losers −639 bps; long strings
+of small losses are its *signature*, not a malfunction. Replayed through the real
+`evaluateRealizedVeto` over its own 1,377-trade walk-forward, the −5 floor would
+have had the brake **engaged 58.9% of the time**. A brake engaged 59% of the time
+is not a brake, it is an off switch — and it would have prevented the strategy
+from ever being evaluated.
+
+**The fix.** A **per-signal override map**. The global floor is **unchanged** and
+still governs every other signal; only `trend_momentum` gets a different
+calibration. Resolution is per-field (`resolveRealizedVetoConfig`, pure), so an
+override may set only the floor and inherit the rest.
+
+**Choosing the floor — the rule was fixed before looking at any live data:** the
+shallowest floor that keeps the brake engaged **<15%** of the time on the ungated
+trade stream while still firing well before the worst 20-trade window ever
+observed (−1,181 bps). Measured halt rates:
+
+| floor | ungated stream | shipped (gated) stream | |
+|--:|--:|--:|---|
+| −5 | 58.9% | 36.4% | the old scalping floor |
+| −200 | 46.9% | 25.9% | |
+| −400 | 31.4% | 12.1% | the growth plan's first estimate — too tight |
+| **−600** | **14.7%** | **3.5%** | **shipped** |
+| −800 | 3.8% | 0.0% | never fires in 6.9 years = a dead brake |
+
+−600 is alive (it demonstrably fires) without being an off switch, and sits
+1,058 bps below the strategy's +458 bps mean.
+
+**What this means operationally.** The breaker no longer halts `trend_momentum`
+on ordinary bleed — only on a genuinely catastrophic one. That trade-off is
+correct on the **zero-risk paper venue**, where a false halt costs the entire
+experiment. **If `EXECUTION_VENUE` is ever flipped `paper` → `binance_us` (real
+money), re-confirming this floor must be a conscious, explicit decision.** For
+real capital the account-level drawdown halt (`modules/drawdownHalt.js`) is the
+correct catastrophe brake — not a per-trade expectancy floor.
+
+**This is not the banned re-pin anti-pattern** (#455/#456): it does not swap the
+active signal, and the floor is *pre-registered* from the backtest's risk tail
+rather than moved in response to the breaker firing. Set it once, from evidence,
+then leave it alone — nudging the floor because it just halted you is the same
+anti-pattern in a different costume.
+
+The brake is **loosened, not removed**: a −900 bps 20-trade average still halts,
+and every recovery mechanism (time-decay clock, cadence-adaptive window,
+per-symbol exclusion) is unchanged. `meta.signalSelector.realizedVeto` now carries
+`perSignalOverrideApplied` / `perSignalOverrideKey` so a loosened posture is
+visible on the dashboard rather than implicit.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM` | `-600` | Per-signal floor. Set to `-5` to restore the old scalping posture for this signal too. Must be ≤ 0 (validated at boot — a positive floor would halt permanently). |
+| `SIGNAL_SELECTOR_REALIZED_MIN_TRADES_TREND_MOMENTUM` | `20` | Sample floor before the breaker can fire for this signal. |
+| `SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES_TREND_MOMENTUM` | `20` | Recency window for this signal. |
+
+Every other signal keeps `SIGNAL_SELECTOR_REALIZED_FLOOR_BPS` (`-5`) unchanged.
+
+### Validation
+
+```sh
+node backend/scripts/validate_shipped_regime_and_breaker.js   # 13 ship-gate assertions
+node backend/scripts/validate_trend_momentum_regime_gate.js   # full causal gate sweep
+cd backend && npm test && npm run smoke
+```
+
 ## 2026-08-03: STRATEGY REBUILD — paper venue + daily trend-following brain (`trend_momentum`)
 
 A deliberate rebuild of the decision brain (infrastructure kept intact) around a

@@ -182,6 +182,17 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MAX_AGE_MS, '864000
 // fills arrive. Floored at 24h → never recovers faster than the static clock.
 assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_CADENCE_ADAPTIVE, 'true');
 
+// Per-signal breaker calibration (2026-08-09, owner-authorized). These LOOSEN
+// the halt posture for trend_momentum only — the -5 global still governs every
+// other signal. Pinned here so the loosening can never drift silently, and so a
+// paper -> live-money venue flip has to consciously re-confirm it.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS_TREND_MOMENTUM, '-600');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_MIN_TRADES_TREND_MOMENTUM, '20');
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_LOOKBACK_TRADES_TREND_MOMENTUM, '20');
+// The global floor must stay at the scalping calibration — the per-signal
+// override is the ONLY thing that loosens, and only for trend_momentum.
+assert.equal(LIVE_CRITICAL_DEFAULTS.SIGNAL_SELECTOR_REALIZED_FLOOR_BPS, '-5');
+
 // 2026-05-27: Adverse-selection-aware backtest fill model. Must stay ON in the
 // live defaults so the auto-backtest stops over-promising edge that doesn't
 // survive real passive-limit fills. If this drifts to 'false', the
@@ -375,5 +386,15 @@ assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_ENABLED, 'true');
 assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_MIN_PERCENTILE, '0.20');
 assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_MIN_OBSERVATIONS, '60');
 assert.equal(LIVE_CRITICAL_DEFAULTS.VOL_GATE_LOOKBACK_BARS, '30');
+
+// BTC chop/trend regime gate (2026-08-09). Validated config is btc_er(30)>=0.30.
+assert.equal(LIVE_CRITICAL_DEFAULTS.BTC_REGIME_GATE_ENABLED, 'true');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BTC_REGIME_GATE_ER_WINDOW, '30');
+assert.equal(LIVE_CRITICAL_DEFAULTS.BTC_REGIME_GATE_MIN_ER, '0.30');
+// Sizing is explicitly NOT part of this change — the chop filter buys
+// risk-adjusted return; spending it on size is a later, separately-gated call.
+// (PORTFOLIO_SIZING_PCT is pinned at '0.07' near the top of this file; the
+// running paper deploy overrides it to ~2% via Render env. Nothing here moves
+// either value.)
 
 console.log('live defaults tests passed');
